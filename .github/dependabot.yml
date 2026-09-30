@@ -25,3 +25,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # One PR per update run, so actions released together (for example
+    # codeql-action init, analyze, and upload-sarif) are never split.
+    groups:
+      actions:
+        patterns: ["*"]
