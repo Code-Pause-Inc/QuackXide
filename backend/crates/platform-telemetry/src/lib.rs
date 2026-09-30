@@ -93,6 +93,11 @@ mod tests {
 
     #[test]
     fn emitting_without_init_does_not_panic() {
+        // Emitting outside a capture can race a capture's install (see
+        // `capture`), so hold the same exclusive lock.
+        let _exclusive = capture::capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         security_audit_event(AuditKind::ServiceStart, None, "ok", "test boot");
         security_audit_event(
             AuditKind::DataAccess,
