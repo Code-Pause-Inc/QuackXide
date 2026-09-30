@@ -1,27 +1,47 @@
 version: 2
 updates:
+  # Minor and patch updates arrive grouped; each major update arrives in its
+  # own pull request for deliberate review. Crates that only work at matching
+  # versions are grouped so they move together.
   - package-ecosystem: cargo
     directory: /backend
     schedule:
       interval: weekly
     groups:
+      query-engine:
+        patterns: ["datafusion*", "arrow*", "parquet", "object_store"]
       rust:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+  # The fuzz crate builds against the workspace crates; its versions follow
+  # the workspace, so major updates happen there first.
   - package-ecosystem: cargo
     directory: /backend/fuzz
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       rust-fuzz:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: npm
     directory: /frontend
     schedule:
       interval: weekly
     groups:
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
       npm:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    # One pull request per run, so actions released together (for example
+    # codeql-action init, analyze, and upload-sarif) are never split.
+    groups:
+      actions:
+        patterns: ["*"]
