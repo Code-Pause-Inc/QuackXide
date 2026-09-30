@@ -60,7 +60,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Deployment | **Build** | Reproducible deployment of the API and enclave workers onto confidential VMs. |
 | Benchmarks | **Build** | None exist. Measure query latency, encryption throughput, and enclave overhead against synthetic datasets, and track them for regressions. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
-| DataFusion upgrade | **Harden** | Move from DataFusion 49 to the current release to clear the `quick-xml` advisories recorded in `backend/deny.toml`; the disclosure allowlist and `tests/bypass.rs` must pass unchanged. |
+| DataFusion upgrade | **Harden** | Move from DataFusion 49 to the current release to clear the `quick-xml` advisories recorded in `backend/deny.toml` and the `thrift` advisory allowed in `.github/workflows/dependency-review.yml`; the disclosure allowlist and `tests/bypass.rs` must pass unchanged. |
 | Dominance rule | **Build** | Suppress `MIN`/`MAX` (and sums) dominated by a single individual, closing the extreme-value residual in `docs/THREAT_MODEL.md`. |
 | A test for every failure path | **Harden** | Every refusal (403, 422, 429, 503, attestation, malformed input) has a negative test. |
 
