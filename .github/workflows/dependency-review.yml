@@ -21,4 +21,7 @@ jobs:
           # docs/PROJECT_SCOPE.md; keep in step with backend/deny.toml.
           allow-ghsas: GHSA-2f9f-gq7v-9h6m
           comment-summary-in-pr: on-failure
+          # r-efi is MIT OR Apache-2.0 OR LGPL-2.1-or-later; used under MIT or
+          # Apache-2.0. The deny list otherwise matches the LGPL alternative.
+          allow-dependencies-licenses: pkg:cargo/r-efi
           deny-licenses: GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, LGPL-2.1-only, LGPL-2.1-or-later, LGPL-3.0-only, LGPL-3.0-or-later, SSPL-1.0, BUSL-1.1

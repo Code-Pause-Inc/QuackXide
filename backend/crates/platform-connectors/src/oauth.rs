@@ -125,7 +125,7 @@ async fn post_token_form(
     form: Vec<(&'static str, &str)>,
 ) -> Result<TokenResponse, ConnectorError> {
     let response = client
-        .post(&config.token_url)
+        .post(token_endpoint(&config.token_url)?)
         .form(&form)
         .send()
         .await
@@ -147,6 +147,28 @@ async fn post_token_form(
     )
 }
 
+/// Credentials are only ever sent over TLS; plain HTTP is accepted for
+/// loopback endpoints (local test servers) and nothing else.
+fn token_endpoint(raw: &str) -> Result<reqwest::Url, ConnectorError> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| ConnectorError::OAuth("invalid token endpoint URL".into()))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
+        _ => Err(ConnectorError::OAuth(
+            "token endpoint must use https".into(),
+        )),
+    }
+}
+
 pub fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, ConnectorError> {
     serde_json::from_slice(bytes)
         .map_err(|_| ConnectorError::OAuth("malformed token response".into()))
@@ -161,6 +183,23 @@ mod tests {
             token_url: "https://idp.example/token".into(),
             client_id: "client-1".into(),
             client_secret: SecretString::new("s3cret".into()),
+        }
+    }
+
+    #[test]
+    fn token_endpoint_requires_tls_off_loopback() {
+        assert!(token_endpoint("https://idp.example/token").is_ok());
+        assert!(token_endpoint("http://127.0.0.1:8080/token").is_ok());
+        assert!(token_endpoint("http://[::1]:8080/token").is_ok());
+        assert!(token_endpoint("http://localhost/token").is_ok());
+        for bad in [
+            "http://idp.example/token",
+            "http://10.0.0.5/token",
+            "ftp://idp.example/token",
+            "not a url",
+            "",
+        ] {
+            assert!(token_endpoint(bad).is_err(), "{bad}");
         }
     }
 
