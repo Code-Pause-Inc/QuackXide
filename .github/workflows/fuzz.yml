@@ -1,0 +1,31 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [paddle_signature, ndjson, hpke_envelope, jwt_verify]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} for 5 minutes
+        working-directory: backend/fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: backend/fuzz/artifacts/

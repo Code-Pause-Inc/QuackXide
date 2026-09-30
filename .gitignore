@@ -1,0 +1,16 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Local env & secrets — only *.example files are ever committed
+.env
+.env.*
+!.env.example
+
+# Editor/OS noise
+.DS_Store
+*.swp

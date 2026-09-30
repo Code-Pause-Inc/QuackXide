@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": [
+    { "id": 14, "name": "Sample Partner GmbH", "email": "office@partner-a.example", "is_company": true },
+    { "id": 15, "name": "Jordan Sample", "email": "jordan@partner-b.example", "is_company": false },
+    { "id": 16, "name": "Riverside Supplies", "email": null, "is_company": true }
+  ]
+}

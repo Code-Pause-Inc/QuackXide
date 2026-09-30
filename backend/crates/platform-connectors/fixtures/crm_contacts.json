@@ -1,0 +1,7 @@
+{
+  "contacts": [
+    { "id": "c-001", "name": "Alex Sample", "email": "alex@lead-one.example", "stage": "qualified" },
+    { "id": "c-002", "name": "Sam Sample", "email": "sam@lead-two.example", "stage": "new" },
+    { "id": "c-003", "name": "Kit Sample", "email": null, "stage": "won" }
+  ]
+}

@@ -1,0 +1,44 @@
+name: Bug report
+description: Something behaves incorrectly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities must be reported privately — see SECURITY.md.
+        Use synthetic data only in reproductions.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Observed behavior, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps, ideally as a failing test.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The commit you tested against.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Backend API
+        - Query engine / disclosure
+        - Crypto / keys
+        - Connectors
+        - Storage
+        - Frontend
+        - Docs / tooling
+    validations:
+      required: true

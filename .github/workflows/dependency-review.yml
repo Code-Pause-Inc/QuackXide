@@ -1,0 +1,27 @@
+name: dependency-review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: moderate
+          # thrift < 0.23 (via parquet 55, pinned by DataFusion 49): memory DoS
+          # when parsing Parquet metadata. QuackXide only reads Parquet it wrote
+          # and sealed itself. Cleared by the DataFusion upgrade in
+          # docs/PROJECT_SCOPE.md; keep in step with backend/deny.toml.
+          allow-ghsas: GHSA-2f9f-gq7v-9h6m
+          comment-summary-in-pr: on-failure
+          # r-efi is MIT OR Apache-2.0 OR LGPL-2.1-or-later; used under MIT or
+          # Apache-2.0. The deny list otherwise matches the LGPL alternative.
+          allow-dependencies-licenses: pkg:cargo/r-efi
+          deny-licenses: GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, LGPL-2.1-only, LGPL-2.1-or-later, LGPL-3.0-only, LGPL-3.0-or-later, SSPL-1.0, BUSL-1.1

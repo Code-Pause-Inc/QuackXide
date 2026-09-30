@@ -1,0 +1,33 @@
+{
+  "QueryResponse": {
+    "Invoice": [
+      {
+        "Id": "1042",
+        "TxnDate": "2026-07-01",
+        "TotalAmt": 1250.0,
+        "Balance": 0.0,
+        "CurrencyRef": { "value": "USD" },
+        "CustomerRef": { "value": "58", "name": "Sample Customer A" }
+      },
+      {
+        "Id": "1043",
+        "TxnDate": "2026-07-14",
+        "TotalAmt": 480.25,
+        "Balance": 480.25,
+        "CurrencyRef": { "value": "USD" },
+        "CustomerRef": { "value": "61", "name": "Sample Customer B" }
+      },
+      {
+        "Id": "1044",
+        "TxnDate": "2026-07-21",
+        "TotalAmt": 99.99,
+        "Balance": 49.99,
+        "CurrencyRef": { "value": "EUR" },
+        "CustomerRef": { "value": "62", "name": "Sample Customer C" }
+      }
+    ],
+    "startPosition": 1,
+    "maxResults": 3
+  },
+  "time": "2026-07-30T08:00:00.000-07:00"
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Refuse commit messages that credit a tool. Enable with:
+#   git config core.hooksPath scripts/hooks
+exec "$(git rev-parse --show-toplevel)/scripts/attribution-guard.sh" msg "$1"
