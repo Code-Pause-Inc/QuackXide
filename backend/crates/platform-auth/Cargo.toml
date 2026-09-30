@@ -1,0 +1,26 @@
+[package]
+name = "platform-auth"
+description = "JWT verification for tenant-scoped API access: dev HS256 and production RS256/JWKS."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+platform-core.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+jsonwebtoken.workspace = true
+rand.workspace = true
+rsa = { workspace = true, features = ["pem"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

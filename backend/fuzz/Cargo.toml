@@ -1,0 +1,50 @@
+[package]
+name = "platform-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+platform-auth = { path = "../crates/platform-auth" }
+platform-billing = { path = "../crates/platform-billing" }
+platform-connectors = { path = "../crates/platform-connectors" }
+platform-crypto = { path = "../crates/platform-crypto" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+# Standalone: needs nightly and cargo-fuzz, never part of the stable build.
+[workspace]
+
+[[bin]]
+name = "paddle_signature"
+path = "fuzz_targets/paddle_signature.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ndjson"
+path = "fuzz_targets/ndjson.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hpke_envelope"
+path = "fuzz_targets/hpke_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_verify"
+path = "fuzz_targets/jwt_verify.rs"
+test = false
+doc = false
+bench = false

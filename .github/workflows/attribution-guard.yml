@@ -1,0 +1,27 @@
+name: attribution-guard
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tracked files
+        run: scripts/attribution-guard.sh tree
+      - name: Commit messages (pull request)
+        if: github.event_name == 'pull_request'
+        run: scripts/attribution-guard.sh range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+      - name: Commit messages (push)
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: scripts/attribution-guard.sh range "${{ github.event.before }}..${{ github.event.after }}"
+      - name: Commit messages (new branch)
+        if: github.event_name == 'push' && github.event.before == '0000000000000000000000000000000000000000'
+        run: scripts/attribution-guard.sh range "${{ github.event.after }}"

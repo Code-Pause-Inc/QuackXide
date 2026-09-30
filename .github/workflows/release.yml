@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: scripts/check.sh
+      - name: Build release artifacts
+        run: |
+          cargo build --manifest-path backend/Cargo.toml --release --locked \
+            -p platform-api -p platform-connectors
+          mkdir -p dist
+          for bin in platform-api connector-worker; do
+            cp "backend/target/release/$bin" dist/
+          done
+          tar -C frontend/dist -czf dist/frontend.tar.gz .
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

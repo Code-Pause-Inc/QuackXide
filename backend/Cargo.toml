@@ -1,0 +1,114 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/platform-core",
+    "crates/platform-config",
+    "crates/platform-telemetry",
+    "crates/platform-crypto",
+    "crates/platform-storage",
+    "crates/platform-enclave",
+    "crates/platform-connectors",
+    "crates/platform-auth",
+    "crates/platform-tenancy",
+    "crates/platform-billing",
+    "crates/quackxide-engine",
+    "crates/platform-api",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/Code-Pause-Inc/QuackXide"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+# ── internal crates ──────────────────────────────────────────────────────────
+platform-core = { path = "crates/platform-core" }
+platform-config = { path = "crates/platform-config" }
+platform-telemetry = { path = "crates/platform-telemetry" }
+platform-crypto = { path = "crates/platform-crypto" }
+platform-storage = { path = "crates/platform-storage" }
+platform-enclave = { path = "crates/platform-enclave" }
+platform-connectors = { path = "crates/platform-connectors" }
+platform-auth = { path = "crates/platform-auth" }
+platform-tenancy = { path = "crates/platform-tenancy" }
+platform-billing = { path = "crates/platform-billing" }
+quackxide-engine = { path = "crates/quackxide-engine" }
+
+# ── async runtime + HTTP edge ────────────────────────────────────────────────
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+
+# ── serialization + core types ───────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+async-trait = "0.1"
+futures = "0.3"
+
+# ── errors ───────────────────────────────────────────────────────────────────
+thiserror = "2"
+anyhow = "1"
+
+# ── telemetry ────────────────────────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# ── configuration ────────────────────────────────────────────────────────────
+dotenvy = "0.15"
+
+# ── cryptography (server side holds public-key / index material ONLY —
+#     drive master keys are browser-generated and never exist here) ──────────
+aes-gcm = "0.10"
+hpke = { version = "0.12", features = ["alloc", "x25519"] }
+hmac = "0.12"
+# SHA-1 only for TOTP (RFC 6238 HMAC): virtually every authenticator app
+# (Google/Microsoft/Authy/1Password) hardcodes SHA-1 regardless of what an
+# otpauth:// URI's `algorithm` parameter claims, so this is an interop
+# requirement, not a security choice — HMAC-SHA1's soundness as a MAC is
+# unaffected by SHA-1's collision weaknesses (those break plain hashing, not
+# HMAC). Never used for anything else in this workspace. Pinned to the 0.10
+# line (not the newest 0.11) because it targets `digest` 0.10.x — the same
+# trait generation as `hmac 0.12`/`sha2 0.10` already pinned below; 0.11
+# targets `digest` 0.11.x and does not implement the traits `hmac 0.12`
+# expects.
+sha1 = "0.10"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+rand = "0.8"
+
+# ── auth + storage backends ─────────────────────────────────────────────────
+jsonwebtoken = "9"
+object_store = { version = "0.12", features = ["gcp"] }
+# RSA keypair generation for the `keygen` binary (auth hardening). jsonwebtoken
+# itself signs/verifies RS256 fine via `ring` — `ring` deliberately does not
+# generate RSA keys, so this pure-Rust RustCrypto crate (same family as the
+# sha2/hmac/aes-gcm/hpke already in the workspace) covers just that gap.
+rsa = "0.9"
+http-body-util = "0.1"                                            # API integration tests
+
+# ── connector pipelines ─────────────────────────────────────────────────────
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+arrow = "55"
+parquet = { version = "55", features = ["arrow"] }
+
+# ── query engine ─────────────────────────────────────────────────────────────
+datafusion = "49"                                                 # arrow/parquet 55 chosen to match
+
+# ── testing ─────────────────────────────────────────────────────────────────
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

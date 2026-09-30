@@ -1,0 +1,14 @@
+# Security-critical paths require review from the maintainer. Everything
+# else is reviewed by the core team.
+
+/backend/crates/platform-crypto/               @AxolDad
+/backend/crates/platform-enclave/              @AxolDad
+/backend/crates/platform-auth/                 @AxolDad
+/backend/crates/quackxide-engine/src/policy.rs @AxolDad
+/backend/crates/quackxide-engine/src/disclosure.rs @AxolDad
+/frontend/src/lib/crypto/                      @AxolDad
+/scripts/                                      @AxolDad
+/.github/                                      @AxolDad
+/deny.toml                                     @AxolDad
+/LICENSE-*                                     @AxolDad
+/NOTICE                                        @AxolDad

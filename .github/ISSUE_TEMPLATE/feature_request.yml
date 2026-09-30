@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose new behavior or a change to existing behavior.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What need does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The change you propose, and alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Effect on the no-naked-data invariant, disclosure control, key custody, or the threat model.
+    validations:
+      required: true
