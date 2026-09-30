@@ -16,7 +16,7 @@ jobs:
       matrix:
         target: [paddle_signature, ndjson, hpke_envelope, jwt_verify]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly --profile minimal
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -25,7 +25,7 @@ jobs:
         working-directory: backend/fuzz
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
       - if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-${{ matrix.target }}-artifacts
           path: backend/fuzz/artifacts/
