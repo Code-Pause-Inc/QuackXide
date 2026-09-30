@@ -69,9 +69,9 @@ dotenvy = "0.15"
 
 # ── cryptography (server side holds public-key / index material ONLY —
 #     drive master keys are browser-generated and never exist here) ──────────
-aes-gcm = "0.10"
-hpke = { version = "0.12", features = ["alloc", "x25519"] }
-hmac = "0.12"
+aes-gcm = "0.11"
+hpke = { version = "0.14", features = ["alloc", "x25519"] }
+hmac = "0.13"
 # SHA-1 only for TOTP (RFC 6238 HMAC): virtually every authenticator app
 # (Google/Microsoft/Authy/1Password) hardcodes SHA-1 regardless of what an
 # otpauth:// URI's `algorithm` parameter claims, so this is an interop
@@ -82,15 +82,15 @@ hmac = "0.12"
 # trait generation as `hmac 0.12`/`sha2 0.10` already pinned below; 0.11
 # targets `digest` 0.11.x and does not implement the traits `hmac 0.12`
 # expects.
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 zeroize = { version = "1", features = ["derive"] }
-base64 = "0.22"
-rand = "0.8"
+base64 = "0.23"
+rand = "0.10"
 
 # ── auth + storage backends ─────────────────────────────────────────────────
-jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
-object_store = { version = "0.12", features = ["gcp"] }
+jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
+object_store = { version = "0.14", features = ["gcp"] }
 # RSA key generation for the `keygen` binary; jsonwebtoken's RustCrypto
 # backend uses the same crate for RS256.
 rsa = "0.9"
@@ -98,8 +98,8 @@ http-body-util = "0.1"                                            # API integrat
 
 # ── connector pipelines ─────────────────────────────────────────────────────
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-arrow = "55"
-parquet = { version = "55", features = ["arrow"] }
+arrow = "60"
+parquet = { version = "60", features = ["arrow"] }
 
 # ── query engine ─────────────────────────────────────────────────────────────
 datafusion = "49"                                                 # arrow/parquet 55 chosen to match
