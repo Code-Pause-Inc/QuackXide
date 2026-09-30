@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-30
+
 ### Added
 
 * Core system, published as the base for the first production release
@@ -44,3 +46,6 @@ uses [Semantic Versioning](https://semver.org/).
 AxolDad — Jeremy L.D. Ryan. The USF core contribution team — Jake
 Abendroth, William Shenker, Angelina Tam, and Gabriel Zubovsky — is credited
 from its first release onward. See `CONTRIBUTORS.md`.
+
+[Unreleased]: https://github.com/Code-Pause-Inc/QuackXide/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Code-Pause-Inc/QuackXide/releases/tag/v0.1.0
