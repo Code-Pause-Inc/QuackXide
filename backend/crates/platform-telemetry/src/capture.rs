@@ -13,7 +13,7 @@ use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 /// Captures are exclusive process-wide. Scoped subscribers share the global
 /// callsite-interest cache, and a guard dropping on another thread can make
 /// the audit callsite briefly read as disabled, losing an event.
-fn capture_lock() -> &'static Mutex<()> {
+pub(crate) fn capture_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(Mutex::default)
 }
@@ -83,27 +83,54 @@ impl AuditCapture {
             _guard: guard,
             _exclusive: exclusive,
         };
-        // The audit callsite registers lazily, and a concurrent first hit can
-        // drop an emission mid-registration. Prime until a probe arrives,
-        // then discard the probes.
+        // The audit callsite registers lazily. A first emission on another
+        // thread can still be registering it when this capture installs,
+        // then cache it as disabled, so events reach neither subscriber.
+        // A probe arriving mid-registration proves nothing, so after each
+        // arrival recompute every callsite's interest against the live
+        // dispatchers and require a probe to arrive again.
+        capture.prime(PRIME_ATTEMPTS);
         for _ in 0..PRIME_ATTEMPTS {
-            crate::security_audit_event(
-                crate::AuditKind::ServiceStart,
-                None,
-                "prime",
-                "capture warmup probe",
-            );
-            if !capture.events().is_empty() {
-                break;
+            tracing::callsite::rebuild_interest_cache();
+            if capture.probe() {
+                // Give a registration still in flight time to finish, then
+                // confirm the callsite survives one more rebuild.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                tracing::callsite::rebuild_interest_cache();
+                if capture.probe() {
+                    break;
+                }
             }
-            std::thread::yield_now();
+            capture.prime(PRIME_ATTEMPTS);
         }
         assert!(
-            !capture.events().is_empty(),
+            capture.probe(),
             "audit callsite never became live under capture"
         );
         capture.collector.0.lock().expect("capture lock").clear();
         capture
+    }
+
+    /// Emit probes until one arrives.
+    fn prime(&self, attempts: usize) {
+        for _ in 0..attempts {
+            if self.probe() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Emit one probe; true if it was captured.
+    fn probe(&self) -> bool {
+        let before = self.events().len();
+        crate::security_audit_event(
+            crate::AuditKind::ServiceStart,
+            None,
+            "prime",
+            "capture warmup probe",
+        );
+        self.events().len() > before
     }
 
     pub fn events(&self) -> Vec<CapturedAudit> {
