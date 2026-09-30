@@ -28,6 +28,28 @@ export type WorkerRequest =
   | { id: number; op: "download"; objectId: string }
   | { id: number; op: "remove"; objectId: string };
 
+/** Validate an untrusted message as a `WorkerRequest`; anything else is null. */
+export function parseWorkerRequest(data: unknown): WorkerRequest | null {
+  if (typeof data !== "object" || data === null) return null;
+  const req = data as Record<string, unknown>;
+  if (!Number.isSafeInteger(req.id)) return null;
+  const id = req.id as number;
+  switch (req.op) {
+    case "init":
+    case "list":
+      return { id, op: req.op };
+    case "upload":
+      return req.file instanceof File ? { id, op: "upload", file: req.file } : null;
+    case "download":
+    case "remove":
+      return typeof req.objectId === "string" && req.objectId.length > 0
+        ? { id, op: req.op, objectId: req.objectId }
+        : null;
+    default:
+      return null;
+  }
+}
+
 export interface DownloadResult {
   summary: DriveFileSummary;
   blob: Blob;

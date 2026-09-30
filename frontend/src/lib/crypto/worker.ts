@@ -12,11 +12,13 @@ import type { VaultClient } from "../vault/types";
 import { generateHpkeKeypair, generateMasterKey, isX25519Supported, keyFingerprint } from "./core";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
 import { loadDeviceKeys, saveDeviceKeys, type DeviceKeys } from "./keystore";
+import { parseWorkerRequest } from "./protocol";
 import type { InitResult, WorkerRequest, WorkerResponse } from "./protocol";
 
 type WorkerScope = {
   addEventListener(type: "message", cb: (ev: MessageEvent) => void): void;
   postMessage(msg: unknown): void;
+  location: { origin: string };
 };
 
 const scope = globalThis as unknown as WorkerScope;
@@ -120,7 +122,11 @@ async function dispatch(req: WorkerRequest): Promise<unknown> {
 }
 
 scope.addEventListener("message", (ev: MessageEvent) => {
-  const req = ev.data as WorkerRequest;
+  // A dedicated worker only receives messages from the page that created it,
+  // which arrive with an empty origin; refuse anything else.
+  if (ev.origin !== "" && ev.origin !== scope.location.origin) return;
+  const req = parseWorkerRequest(ev.data);
+  if (!req) return;
   void dispatch(req)
     .then((result) => respond({ id: req.id, type: "result", result }))
     .catch((err: unknown) => {
