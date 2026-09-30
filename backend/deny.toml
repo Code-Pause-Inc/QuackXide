@@ -8,10 +8,11 @@ version = 2
 yanked = "deny"
 # Each exception names why it does not apply and when it is revisited.
 ignore = [
-    # rsa (Marvin timing attack): used only by the offline `keygen` binary to
-    # generate keys; no private-key operation handles attacker-timed input.
-    # Removed with RS256 by ADR 0001.
-    { id = "RUSTSEC-2023-0071", reason = "rsa used only for offline key generation; RS256 retired by ADR 0001" },
+    # rsa (Marvin timing attack on private-key operations): used for offline
+    # key generation and public-key RS256 verification; no network-facing
+    # service performs RSA private-key operations. RS256 is retired by
+    # ADR 0001.
+    { id = "RUSTSEC-2023-0071", reason = "no network-facing RSA private-key operations; RS256 retired by ADR 0001" },
     # quick-xml DoS: parsed only from the operator's object-store responses
     # (via object_store 0.12, pinned by DataFusion 49). Fixed by the DataFusion
     # upgrade tracked in docs/PROJECT_SCOPE.md.

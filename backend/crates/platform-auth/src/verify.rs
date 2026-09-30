@@ -84,6 +84,7 @@ fn validation_for(alg: Algorithm, issuer: &str, audience: &str) -> Validation {
     validation.set_issuer(&[issuer]);
     validation.set_audience(&[audience]);
     validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    validation.validate_nbf = true;
     validation
 }
 
@@ -188,6 +189,46 @@ mod tests {
         .expect("encode");
         assert_eq!(
             JwtVerifier::hs256("secret", ISS, AUD).verify(&token),
+            Err(AuthError::TokenRejected)
+        );
+    }
+
+    fn hs256_token(claims: serde_json::Value) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("encode")
+    }
+
+    #[test]
+    fn hs256_mistyped_time_claims_are_rejected() {
+        let tenant = TenantId::generate().to_string();
+        let far = crate::unix_now() + 3600;
+        let cases = [
+            json!({ "sub": "u", "tid": tenant, "iss": ISS, "aud": AUD, "exp": far.to_string() }),
+            json!({ "sub": "u", "tid": tenant, "iss": ISS, "aud": AUD, "exp": far, "nbf": far.to_string() }),
+        ];
+        let verifier = JwtVerifier::hs256("secret", ISS, AUD);
+        for claims in cases {
+            assert_eq!(
+                verifier.verify(&hs256_token(claims.clone())),
+                Err(AuthError::TokenRejected),
+                "{claims}"
+            );
+        }
+    }
+
+    #[test]
+    fn hs256_not_yet_valid_token_is_rejected() {
+        let far = crate::unix_now() + 3600;
+        let claims = json!({
+            "sub": "u", "tid": TenantId::generate().to_string(), "iss": ISS, "aud": AUD,
+            "exp": far + 3600, "nbf": far,
+        });
+        assert_eq!(
+            JwtVerifier::hs256("secret", ISS, AUD).verify(&hs256_token(claims)),
             Err(AuthError::TokenRejected)
         );
     }

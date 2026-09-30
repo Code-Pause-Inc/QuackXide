@@ -89,12 +89,10 @@ base64 = "0.22"
 rand = "0.8"
 
 # ── auth + storage backends ─────────────────────────────────────────────────
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 object_store = { version = "0.12", features = ["gcp"] }
-# RSA keypair generation for the `keygen` binary (auth hardening). jsonwebtoken
-# itself signs/verifies RS256 fine via `ring` — `ring` deliberately does not
-# generate RSA keys, so this pure-Rust RustCrypto crate (same family as the
-# sha2/hmac/aes-gcm/hpke already in the workspace) covers just that gap.
+# RSA key generation for the `keygen` binary; jsonwebtoken's RustCrypto
+# backend uses the same crate for RS256.
 rsa = "0.9"
 http-body-util = "0.1"                                            # API integration tests
 
