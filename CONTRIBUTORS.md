@@ -11,7 +11,7 @@ first contribution.
 
 ## USF core contribution team
 
-University of South Florida, CS 490, Fall 2026.
+University of San Francisco, CS 490, Fall 2026.
 
 * **Jake Abendroth**
 * **William Shenker**
