@@ -16,7 +16,7 @@ nothing to `CONTRIBUTING.md`, which every change must follow.
 * Synthetic or public data only (`docs/DATA_POLICY.md`).
 * Conventional, short commit messages. Docs describe the current system,
   not its history.
-* The human who submits a change is its author. Tools are never credited:
-  no tool names, trailers, co-author lines, or "generated" footers in
-  files, commits, or pull requests. `scripts/attribution-guard.sh` enforces
-  this.
+* The human who submits a change is its author. AI tools are never
+  credited: no AI tool names, Assisted-by trailers, AI co-author lines, or
+  "generated" footers in files, commits, or pull requests.
+  `scripts/attribution-guard.sh` enforces this.

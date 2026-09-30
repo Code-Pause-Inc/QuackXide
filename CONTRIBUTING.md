@@ -62,9 +62,10 @@ the repository's supply-chain posture. Tagged releases are built from
   `docs:`, `test:`, `refactor:`, `chore:`) and are short.
 * **Authorship.** The developer who submits a change is its author and is
   accountable for it, including the accuracy, security, and licensing of
-  any code a tool helped produce. Tools are never credited: no tool names,
-  tool trailers, co-author lines for tools, or "generated" footers in
-  files, commit messages, or pull requests.
+  any code a tool helped produce. AI tools are never credited: no AI tool
+  names, Assisted-by trailers, AI co-author lines, or "generated" footers
+  in files, commit messages, or pull requests. `Co-authored-by:` lines for
+  teammates who paired on a change are welcome.
 * **Pull requests** target `main`, describe what changed and why, and are
   squash-merged after review and a passing `scripts/check.sh`.
 * **Design decisions** that change a trust boundary, a cryptographic

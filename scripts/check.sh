@@ -65,6 +65,7 @@ if git -C "$ROOT" ls-files \
 fi
 
 echo "== attribution guard: tools are never credited =="
+"$ROOT/scripts/attribution-guard.sh" selftest
 "$ROOT/scripts/attribution-guard.sh" tree
 
 echo "ALL CHECKS PASSED"
