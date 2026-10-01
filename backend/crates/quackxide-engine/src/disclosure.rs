@@ -12,6 +12,8 @@
 //! guarantees every other aggregate reads exactly the rows `n` counts:
 //! nothing can inflate a cohort or isolate an individual in it.
 //!
+//! Each input row belongs to exactly one released group: the allowlist
+//! refuses grouping sets, so no result holds a subtotal beside its parts.
 //! Thresholds bound single-query disclosure only; differencing across
 //! overlapping queries is limited by the per-grant query budget.
 
