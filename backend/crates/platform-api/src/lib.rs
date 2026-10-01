@@ -190,7 +190,17 @@ fn authenticate(
         .and_then(|value| value.strip_prefix("Bearer "));
 
     match token.map(|t| verifier.verify(t)) {
-        Some(Ok(claims)) => Ok(claims),
+        Some(Ok(claims)) if claims.token_type == platform_auth::TokenType::Access => Ok(claims),
+        Some(Ok(_)) => {
+            // A pre-MFA or refresh token verified but does not grant access.
+            security_audit_event(
+                AuditKind::AuthDecision,
+                None,
+                "denied",
+                "token type not accepted on this route",
+            );
+            Err(ApiError::Unauthorized)
+        }
         _ => {
             security_audit_event(
                 AuditKind::AuthDecision,

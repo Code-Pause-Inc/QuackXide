@@ -6,6 +6,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+* The API accepts only access tokens. It verified a token's signature but
+  not its type, so a verified pre-MFA (`preauth`) or `refresh` token passed
+  every data and admin route, and a token with no `typ` claim counted as an
+  access token. Both are now refused with 401 and an audit event.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added
