@@ -68,13 +68,9 @@ pub(crate) struct RawClaims {
     /// Admin flag. Absent ⇒ non-admin (the safe default).
     #[serde(default)]
     adm: bool,
-    /// Token type. Absent ⇒ `access`.
-    #[serde(default = "default_typ")]
+    /// Token type. Required: a token that does not say what it is for is
+    /// refused rather than treated as an access token.
     typ: String,
-}
-
-fn default_typ() -> String {
-    TokenType::Access.as_str().to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

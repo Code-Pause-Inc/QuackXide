@@ -17,6 +17,10 @@ uses [Semantic Versioning](https://semver.org/).
   `COPY … TO` wrote decrypted rows to the host's disk. DDL, DML, `COPY`
   and session statements are now refused before anything executes, and a
   query scope has no object store.
+* The API accepts only access tokens. It verified a token's signature but
+  not its type, so a verified pre-MFA (`preauth`) or `refresh` token passed
+  every data and admin route, and a token with no `typ` claim counted as an
+  access token. Both are now refused with 401 and an audit event.
 
 ## [0.1.0] - 2026-09-30
 

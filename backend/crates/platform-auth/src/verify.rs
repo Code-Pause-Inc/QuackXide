@@ -207,8 +207,8 @@ mod tests {
         let tenant = TenantId::generate().to_string();
         let far = crate::unix_now() + 3600;
         let cases = [
-            json!({ "sub": "u", "tid": tenant, "iss": ISS, "aud": AUD, "exp": far.to_string() }),
-            json!({ "sub": "u", "tid": tenant, "iss": ISS, "aud": AUD, "exp": far, "nbf": far.to_string() }),
+            json!({ "sub": "u", "tid": tenant, "iss": ISS, "aud": AUD, "typ": "access", "exp": far.to_string() }),
+            json!({ "sub": "u", "tid": tenant, "iss": ISS, "aud": AUD, "typ": "access", "exp": far, "nbf": far.to_string() }),
         ];
         let verifier = JwtVerifier::hs256("secret", ISS, AUD);
         for claims in cases {
@@ -221,11 +221,38 @@ mod tests {
     }
 
     #[test]
+    fn token_without_a_type_is_rejected() {
+        let claims = |typ: Option<&str>| {
+            let mut claims = json!({
+                "sub": "u", "tid": TenantId::generate().to_string(), "iss": ISS, "aud": AUD,
+                "exp": crate::unix_now() + 3600,
+            });
+            if let Some(typ) = typ {
+                claims["typ"] = json!(typ);
+            }
+            hs256_token(claims)
+        };
+        let verifier = JwtVerifier::hs256("secret", ISS, AUD);
+        assert_eq!(
+            verifier.verify(&claims(None)),
+            Err(AuthError::TokenRejected)
+        );
+        assert_eq!(
+            verifier.verify(&claims(Some("bogus"))),
+            Err(AuthError::TokenRejected)
+        );
+        let accepted = verifier
+            .verify(&claims(Some("access")))
+            .expect("typed token");
+        assert_eq!(accepted.token_type, TokenType::Access);
+    }
+
+    #[test]
     fn hs256_not_yet_valid_token_is_rejected() {
         let far = crate::unix_now() + 3600;
         let claims = json!({
             "sub": "u", "tid": TenantId::generate().to_string(), "iss": ISS, "aud": AUD,
-            "exp": far + 3600, "nbf": far,
+            "typ": "access", "exp": far + 3600, "nbf": far,
         });
         assert_eq!(
             JwtVerifier::hs256("secret", ISS, AUD).verify(&hs256_token(claims)),
