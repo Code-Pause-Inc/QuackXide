@@ -25,7 +25,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutPayload};
-use platform_core::{ConnectorSlug, ObjectId, TenantId};
+use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 
 /// A storage path that can only be constructed through [`TenantPaths`] (or
 /// returned from a listing).
@@ -76,14 +76,38 @@ impl TenantPaths {
     }
 
     /// An enclave-encrypted Parquet object produced by a connector sync.
-    pub fn connector_object(
+    /// One sealed object of a connector snapshot. A snapshot is complete
+    /// only once its manifest exists.
+    pub fn connector_snapshot_object(
         tenant: TenantId,
         connector: &ConnectorSlug,
+        version: &SnapshotVersion,
         object: ObjectId,
     ) -> VaultPath {
         VaultPath(format!(
-            "tenants/{tenant}/connectors/{connector}/{object}.parquet"
+            "tenants/{tenant}/connectors/{connector}/snapshots/{version}/{object}.parquet"
         ))
+    }
+
+    /// Every snapshot's objects for one tenant-connector pair.
+    pub fn connector_snapshots_prefix(tenant: TenantId, connector: &ConnectorSlug) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/connectors/{connector}/snapshots"))
+    }
+
+    /// The sealed manifest that commits a snapshot, written last.
+    pub fn connector_manifest(
+        tenant: TenantId,
+        connector: &ConnectorSlug,
+        version: &SnapshotVersion,
+    ) -> VaultPath {
+        VaultPath(format!(
+            "tenants/{tenant}/connectors/{connector}/manifests/{version}.manifest"
+        ))
+    }
+
+    /// Every committed snapshot's manifest for one tenant-connector pair.
+    pub fn connector_manifests_prefix(tenant: TenantId, connector: &ConnectorSlug) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/connectors/{connector}/manifests"))
     }
 
     /// Prefix of all objects for one tenant-connector pair (query listing).
@@ -104,20 +128,38 @@ impl TenantPaths {
         VaultPath(format!("control/enrollments/{tenant}.json"))
     }
 
-    /// Recover the `ObjectId` from a [`connector_object`](Self::connector_object)
-    /// path; `None` if it is not one for this tenant and connector.
-    pub fn connector_object_id(
+    /// Recover the snapshot version from a
+    /// [`connector_manifest`](Self::connector_manifest) path; `None` if it is
+    /// not one for this tenant and connector.
+    pub fn connector_manifest_version(
         tenant: TenantId,
         connector: &ConnectorSlug,
         path: &VaultPath,
-    ) -> Option<ObjectId> {
-        let prefix = Self::connector_prefix(tenant, connector);
+    ) -> Option<SnapshotVersion> {
+        let prefix = Self::connector_manifests_prefix(tenant, connector);
         path.as_str()
             .strip_prefix(prefix.as_str())?
             .strip_prefix('/')?
-            .strip_suffix(".parquet")?
+            .strip_suffix(".manifest")?
             .parse()
             .ok()
+    }
+
+    /// Recover the snapshot version and object of a
+    /// [`connector_snapshot_object`](Self::connector_snapshot_object) path.
+    pub fn connector_snapshot_object_parts(
+        tenant: TenantId,
+        connector: &ConnectorSlug,
+        path: &VaultPath,
+    ) -> Option<(SnapshotVersion, ObjectId)> {
+        let prefix = Self::connector_snapshots_prefix(tenant, connector);
+        let (version, object) = path
+            .as_str()
+            .strip_prefix(prefix.as_str())?
+            .strip_prefix('/')?
+            .strip_suffix(".parquet")?
+            .split_once('/')?;
+        Some((version.parse().ok()?, object.parse().ok()?))
     }
 }
 
@@ -268,12 +310,64 @@ mod tests {
         );
     }
 
+    fn version_1() -> SnapshotVersion {
+        "00000000000000000001-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid version")
+    }
+
     #[test]
-    fn connector_paths_include_validated_slug_and_parquet_suffix() {
+    fn connector_snapshot_paths_are_canonical_and_round_trip() {
         let slug = ConnectorSlug::new("quickbooks").expect("valid slug");
+        let object =
+            TenantPaths::connector_snapshot_object(tenant_a(), &slug, &version_1(), object_1());
         assert_eq!(
-            TenantPaths::connector_object(tenant_a(), &slug, object_1()).as_str(),
-            "tenants/6f2c8a2e-1111-4222-8333-444455556666/connectors/quickbooks/00000000-aaaa-4bbb-8ccc-000000000001.parquet"
+            object.as_str(),
+            "tenants/6f2c8a2e-1111-4222-8333-444455556666/connectors/quickbooks/snapshots/00000000000000000001-0123456789abcdef0123456789abcdef/00000000-aaaa-4bbb-8ccc-000000000001.parquet"
+        );
+        assert_eq!(
+            TenantPaths::connector_snapshot_object_parts(tenant_a(), &slug, &object),
+            Some((version_1(), object_1()))
+        );
+        let manifest = TenantPaths::connector_manifest(tenant_a(), &slug, &version_1());
+        assert_eq!(
+            manifest.as_str(),
+            "tenants/6f2c8a2e-1111-4222-8333-444455556666/connectors/quickbooks/manifests/00000000000000000001-0123456789abcdef0123456789abcdef.manifest"
+        );
+        assert_eq!(
+            TenantPaths::connector_manifest_version(tenant_a(), &slug, &manifest),
+            Some(version_1())
+        );
+        for path in [&object, &manifest] {
+            assert!(
+                path.as_str()
+                    .starts_with(TenantPaths::connector_prefix(tenant_a(), &slug).as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_or_malformed_connector_paths_do_not_parse() {
+        let slug = ConnectorSlug::new("quickbooks").expect("valid slug");
+        let other = ConnectorSlug::new("stripe").expect("valid slug");
+        let object =
+            TenantPaths::connector_snapshot_object(tenant_a(), &slug, &version_1(), object_1());
+        let manifest = TenantPaths::connector_manifest(tenant_a(), &slug, &version_1());
+        assert_eq!(
+            TenantPaths::connector_snapshot_object_parts(tenant_a(), &other, &object),
+            None
+        );
+        assert_eq!(
+            TenantPaths::connector_manifest_version(tenant_a(), &other, &manifest),
+            None
+        );
+        assert_eq!(
+            TenantPaths::connector_manifest_version(tenant_a(), &slug, &object),
+            None
+        );
+        assert_eq!(
+            TenantPaths::connector_snapshot_object_parts(tenant_a(), &slug, &manifest),
+            None
         );
     }
 

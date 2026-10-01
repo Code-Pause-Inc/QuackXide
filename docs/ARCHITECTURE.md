@@ -75,8 +75,9 @@ it does not know filenames, content, or keys.
 External APIs      TEE enclave (SEV-SNP, attested)                Object store
 ─────────────      ─────────────────────────────────              ────────────
 OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (RAM only)
-                   HPKE seal to tenant public key ───────────────▶ tenants/{t}/connectors/{slug}/{obj}.parquet
+                   HPKE seal to tenant public key ───────────────▶ tenants/{t}/connectors/{slug}/snapshots/{v}/{obj}.parquet
                    zeroize plaintext buffers
+                   seal manifest, written last ──────────────────▶ tenants/{t}/connectors/{slug}/manifests/{v}.manifest
 ```
 
 `platform-connectors`:
@@ -107,6 +108,14 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   a different object id does not open (tested). Framing is versioned
   (`HPK1 || encapped_key || ciphertext`) so cipher suites can migrate
   without redesigning storage.
+* **Snapshots** ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)):
+  every sync is a full sync, so each one writes a complete snapshot under
+  a new time-ordered version and commits it by writing a sealed manifest
+  last. Queries read only the newest committed snapshot, so repeated syncs
+  never multiply rows (which would inflate cohort counts past *k*) and a
+  sync that stops partway changes nothing a query sees. Superseded
+  snapshots are deleted after the commit. The manifest's HPKE `info` is
+  `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`.
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
   aborts siblings. The `connector-worker` binary runs fixture jobs
   end-to-end without live credentials; `HttpJsonSource` (OAuth refresh →
@@ -115,8 +124,8 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 ### 3. Query (zero-trust analytics)
 
 ```
-POST /api/v1/query ──▶ attestation gate ──▶ list tenant connector objects
-   (JWT tenant)        (gate_execution)       tenants/{t}/connectors/{slug}/*
+POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapshot
+   (JWT tenant)        (gate_execution)       tenants/{t}/connectors/{slug}/manifests/*
                                               │
                           key released into enclave (EnclaveKeyProvider)
                           open HPKE envelopes → Parquet in RAM
@@ -301,7 +310,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles, grants |
 | `data.access` | Every vault read, write, delete, and list — including misses |
-| `connector.sync` | Each sealed dataset flush |
+| `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
 | `engine.query` | Every confidential query, with metering fields |
 | `auth.decision` | Every rejected token, admin denial, signature rejection |
 | `research.budget` | Budget top-ups and exhaustion refusals |

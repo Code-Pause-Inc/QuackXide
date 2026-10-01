@@ -21,6 +21,10 @@ uses [Semantic Versioning](https://semver.org/).
   not its type, so a verified pre-MFA (`preauth`) or `refresh` token passed
   every data and admin route, and a token with no `typ` claim counted as an
   access token. Both are now refused with 401 and an audit event.
+* Connector data is stored as versioned snapshots, and a query reads only
+  the newest committed one. Every sync wrote a new copy of its data and
+  queries read all of them, so repeated syncs multiplied each row and
+  could lift a small cohort past the disclosure threshold. See ADR 0003.
 
 ## [0.1.0] - 2026-09-30
 

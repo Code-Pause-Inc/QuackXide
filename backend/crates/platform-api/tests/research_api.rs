@@ -18,11 +18,11 @@ use platform_api::research::ResearchStores;
 use platform_api::{AppState, build_app};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
-use platform_connectors::pipeline::envelope_info;
-use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
-use platform_crypto::{TenantKeypair, hpke_seal_to_tenant};
+use platform_connectors::snapshot::SnapshotWriter;
+use platform_core::{ConnectorSlug, TenantId, ZkMode};
+use platform_crypto::TenantKeypair;
 use platform_enclave::DevAttestation;
-use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
+use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::{InMemoryBudgetLedger, InMemoryCatalogRegistry, InMemoryGrantRegistry};
 use quackxide_engine::EngineSettings;
 use tower::ServiceExt;
@@ -58,19 +58,16 @@ fn cohorts_parquet() -> Vec<u8> {
 async fn research_app(steward: TenantId, steward_keypair: TenantKeypair) -> Router {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let connector = ConnectorSlug::new("health").expect("slug");
-    let object = ObjectId::generate();
-
-    // Seal the cohort dataset to the steward's key (as the pipeline would).
-    let info = envelope_info(&steward, &connector, &object);
-    let envelope = hpke_seal_to_tenant(&steward_keypair.public_key(), &info, &cohorts_parquet())
-        .expect("seal");
-    vault
-        .put(
-            &TenantPaths::connector_object(steward, &connector, object),
-            envelope.into(),
-        )
+    // Commit the cohort dataset as a snapshot sealed to the steward's key
+    // (as the pipeline would).
+    let steward_public_key = steward_keypair.public_key();
+    let mut snapshot =
+        SnapshotWriter::begin(&*vault, steward, &steward_public_key, connector.clone());
+    snapshot
+        .put("cohorts", &cohorts_parquet())
         .await
         .expect("put");
+    snapshot.commit().await.expect("commit");
 
     let mut keys = MultiTenantDevKeyProvider::new();
     keys.insert(steward, steward_keypair);
