@@ -8,6 +8,11 @@
 //! label, or small-cohort salary. `CASES` target the research gate,
 //! `ZK_CASES` the own-data query endpoint.
 //!
+//! `leak()` checks each released row on its own, so it cannot see a leak
+//! that needs two rows of one result (a subtotal beside its parts). Any
+//! accepted shape whose groups overlap is therefore a defect; grouping sets
+//! are refused for that reason.
+//!
 //! Differencing across overlapping queries is out of scope; the per-grant
 //! budget bounds it.
 
@@ -70,7 +75,6 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("from_subquery_columns", "SELECT dept, COUNT(*) AS n FROM (SELECT dept, salary FROM people) t GROUP BY dept", Rows(2)),
     ("cte_aggregate", "WITH c AS (SELECT dept, COUNT(*) AS n FROM people GROUP BY dept) SELECT dept, n FROM c", Rows(2)),
     ("group_by_expression", "SELECT salary / 100 AS band, COUNT(*) AS n FROM people GROUP BY salary / 100", Rows(2)),
-    ("rollup", "SELECT dept, COUNT(*) AS n FROM people GROUP BY ROLLUP(dept)", Rows(3)),
     ("count_arithmetic", "SELECT dept, COUNT(*) AS n, SUM(salary) / COUNT(*) AS mean FROM people GROUP BY dept", Rows(2)),
     ("count_ratio", "SELECT dept, COUNT(*) AS n, COUNT(*) * 100 / 15 AS pct FROM people GROUP BY dept", Rows(2)),
     // Row-level egress.
@@ -101,7 +105,14 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("group_by_salary", "SELECT salary, COUNT(*) AS n FROM people GROUP BY salary", Rows(0)),
     ("group_by_substr_id", "SELECT SUBSTR(id, 2, 2) AS k, COUNT(*) AS n FROM people GROUP BY SUBSTR(id, 2, 2)", Rows(0)),
     ("group_by_case_isolates", "SELECT CASE WHEN dept = 'ceo' THEN salary ELSE 0 END AS s, COUNT(*) AS n FROM people GROUP BY 1", Rows(1)),
-    ("cube_with_id", "SELECT dept, id, COUNT(*) AS n FROM people GROUP BY CUBE(dept, id)", Rows(3)),
+    // Grouping sets: subtotal rows beside group rows let one query subtract
+    // published groups from a total and recover a suppressed cohort.
+    ("rollup", "SELECT dept, COUNT(*) AS n FROM people GROUP BY ROLLUP(dept)", Rejected),
+    ("rollup_complement", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept <> 'legal' GROUP BY ROLLUP(dept)", Rejected),
+    ("cube_with_id", "SELECT dept, id, COUNT(*) AS n FROM people GROUP BY CUBE(dept, id)", Rejected),
+    ("grouping_sets", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people GROUP BY GROUPING SETS ((dept), ())", Rejected),
+    ("grouping_sets_in_subquery", "SELECT dept, n FROM (SELECT dept, COUNT(*) AS n FROM people GROUP BY ROLLUP(dept)) t", Rejected),
+    ("grouping_sets_in_cte", "WITH c AS (SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people GROUP BY CUBE(dept)) SELECT dept, n, s FROM c", Rejected),
     // COUNT variants as n.
     ("count_case", "SELECT dept, COUNT(CASE WHEN dept <> 'ceo' THEN 1 END) AS n FROM people GROUP BY dept", Rejected),
     ("count_distinct", "SELECT dept, COUNT(DISTINCT id) AS n FROM people GROUP BY dept", Rejected),
@@ -149,6 +160,14 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("aggregate_over_aggregate", "SELECT COUNT(*) AS n, MAX(dept) AS d FROM (SELECT dept, COUNT(*) AS c FROM people GROUP BY dept) t", Rejected),
     ("regroup_counts", "SELECT c, COUNT(*) AS n FROM (SELECT id, COUNT(*) AS c FROM people GROUP BY id) t GROUP BY c", Rejected),
     ("inner_group_by_id", "SELECT d, COUNT(*) AS n FROM (SELECT id, MAX(dept) AS d FROM people GROUP BY id) t GROUP BY d", Rejected),
+    // Sort or limit below the aggregate: only filters and column renames may
+    // sit under it, so the aggregate always reads every matching row.
+    ("limit_below_min", "SELECT COUNT(*) AS n, MIN(salary) AS lo FROM (SELECT * FROM people ORDER BY salary DESC LIMIT 5) t", Rejected),
+    ("limit_below_cte", "WITH top AS (SELECT * FROM people ORDER BY salary DESC LIMIT 5) SELECT COUNT(*) AS n, MIN(salary) AS lo FROM top", Rejected),
+    ("offset_below_max", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM (SELECT * FROM people ORDER BY id LIMIT 5 OFFSET 10) t", Rejected),
+    ("plain_limit_below", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM (SELECT * FROM people LIMIT 5) t", Rejected),
+    // A sort with no limit selects no rows; DataFusion drops it while planning.
+    ("sort_only_below", "SELECT dept, COUNT(*) AS n FROM (SELECT * FROM people ORDER BY salary) t GROUP BY dept", Rows(2)),
     // Min/max leakage via ordering.
     ("min_rare_first", "SELECT dept, COUNT(*) AS n, MIN(salary) AS lo FROM people GROUP BY dept ORDER BY lo DESC LIMIT 1", Rows(0)),
     ("max_rare_first", "SELECT dept, COUNT(*) AS n, MAX(salary) AS hi FROM people GROUP BY dept ORDER BY n ASC LIMIT 2", Rows(0)),
@@ -173,6 +192,11 @@ const ZK_CASES: &[(&str, &str, Expect)] = &[
     ("group_by_id_per_column", "SELECT id, COUNT(*) AS n, MAX(dept) AS d FROM people GROUP BY id", Rows(0)),
     ("group_by_unique_expr", "SELECT id || '/' || dept AS k, COUNT(*) AS n FROM people GROUP BY id || '/' || dept", Rows(0)),
     ("group_by_id_and_value", "SELECT id, salary, COUNT(*) AS n FROM people GROUP BY id, salary", Rows(0)),
+    ("rollup_complement", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept <> 'legal' GROUP BY ROLLUP(dept)", Rejected),
+    ("grouping_sets", "SELECT dept, COUNT(*) AS n, MAX(salary) AS hi FROM people GROUP BY GROUPING SETS ((dept), ())", Rejected),
+    ("cube_in_subquery", "SELECT dept, n FROM (SELECT dept, COUNT(*) AS n FROM people GROUP BY CUBE(dept)) t", Rejected),
+    ("limit_below_max", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM (SELECT * FROM people ORDER BY id LIMIT 5) t", Rejected),
+    ("offset_below_min", "WITH w AS (SELECT * FROM people ORDER BY salary LIMIT 5 OFFSET 10) SELECT COUNT(*) AS n, MIN(salary) AS lo FROM w", Rejected),
     ("missing_n", "SELECT dept, SUM(salary) AS s FROM people GROUP BY dept", Rejected),
     ("missing_n_by_id", "SELECT id, MAX(salary) AS s FROM people GROUP BY id", Rejected),
     ("spoofed_n", "SELECT id, 9999 AS n, MAX(salary) AS s FROM people GROUP BY id", Rejected),

@@ -32,3 +32,4 @@ What becomes easier or harder, and what must now be true.
 ## Records
 
 * [0001. Hybrid post-quantum cryptographic suites](0001-hybrid-post-quantum-suites.md)
+* [0002. Refuse grouping sets and positional subsets in the disclosure gate](0002-refuse-grouping-sets-and-positional-subsets.md)

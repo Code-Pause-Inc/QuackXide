@@ -6,6 +6,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+* The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A
+  subtotal row beside its group rows let one query recover a suppressed
+  cohort's count and values. Sorts and limits below the aggregate are
+  refused too. See ADR 0002.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

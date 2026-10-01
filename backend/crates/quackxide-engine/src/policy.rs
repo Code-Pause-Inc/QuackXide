@@ -3,10 +3,14 @@
 //! With `ZkMode::Enabled` the engine permits only aggregate-shaped results.
 //! The check inspects the DataFusion logical plan, not the SQL text, and is
 //! an allowlist: one `Aggregate` over one table scan, wrapped in
-//! projections, filters, sorts, limits, and aliases. Joins, set operations,
-//! windows, `DISTINCT`, `VALUES`, subquery expressions, and aggregates that
-//! return member values (`array_agg`, `string_agg`, `first_value`, …) are
-//! refused rather than analysed. The `COUNT(*) AS n` and minimum-cohort
+//! projections, filters, sorts, limits, and aliases. Below the aggregate
+//! only filters and column renames may appear, so it reads every matching
+//! row. Joins, set operations, windows, grouping sets (`ROLLUP`, `CUBE`,
+//! `GROUPING SETS`), sorts or limits below the aggregate, `DISTINCT`,
+//! `VALUES`, subquery expressions, and aggregates that return member values
+//! (`array_agg`, `string_agg`, `first_value`, …) are refused rather than
+//! analysed. Grouping sets put subtotal rows beside group rows, so one
+//! result could be differenced to recover a suppressed cohort. The `COUNT(*) AS n` and minimum-cohort
 //! gates in [`crate::disclosure`] apply on top of this one.
 //!
 //! It bounds what leaves the enclave; it complements, not replaces,
@@ -25,7 +29,8 @@ pub fn is_aggregate_only(plan: &LogicalPlan) -> bool {
     !has_subqueries(plan)
         && match plan {
             LogicalPlan::Aggregate(aggregate) => {
-                aggregate.aggr_expr.iter().all(is_permitted_aggregate)
+                !aggregate.group_expr.iter().any(is_grouping_set)
+                    && aggregate.aggr_expr.iter().all(is_permitted_aggregate)
                     && rows_reach_unchanged(&aggregate.input)
             }
             LogicalPlan::Projection(_)
@@ -38,7 +43,8 @@ pub fn is_aggregate_only(plan: &LogicalPlan) -> bool {
 }
 
 /// Below the aggregate every row reaches it unchanged: filters may drop
-/// rows, projections may only rename columns, and nothing may add rows.
+/// rows, projections may only rename columns, and nothing may add rows or
+/// pick rows by position (no sort or limit).
 fn rows_reach_unchanged(plan: &LogicalPlan) -> bool {
     !has_subqueries(plan)
         && match plan {
@@ -46,12 +52,20 @@ fn rows_reach_unchanged(plan: &LogicalPlan) -> bool {
             LogicalPlan::Projection(projection) => {
                 projection.expr.iter().all(is_column) && rows_reach_unchanged(&projection.input)
             }
-            LogicalPlan::Filter(_)
-            | LogicalPlan::Sort(_)
-            | LogicalPlan::Limit(_)
-            | LogicalPlan::SubqueryAlias(_) => single_input(plan).is_some_and(rows_reach_unchanged),
+            LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => {
+                single_input(plan).is_some_and(rows_reach_unchanged)
+            }
             _ => false,
         }
+}
+
+/// `ROLLUP`, `CUBE` and `GROUPING SETS` group the same rows more than once.
+fn is_grouping_set(expr: &Expr) -> bool {
+    match expr {
+        Expr::Alias(alias) => is_grouping_set(&alias.expr),
+        Expr::GroupingSet(_) => true,
+        _ => false,
+    }
 }
 
 /// A permitted function over plain columns or literals, with no `FILTER`
