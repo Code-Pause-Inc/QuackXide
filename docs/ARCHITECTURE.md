@@ -193,14 +193,17 @@ Three enforcement layers at one choke point, all in code:
 
 * **Plan level** (`policy::is_aggregate_only` + `disclosure::verify_count_column`,
   shared with ZK mode): an allowlist, not a denylist. A plan is a single
-  table scan, optionally filtered or
-  column-renamed, feeding exactly one `Aggregate`, with only projection,
-  filter, sort, and limit above it. Aggregates are limited to `COUNT`,
-  `SUM`, `AVG`, `MIN`, and `MAX` over plain columns, and `n` must be a
-  genuine `COUNT(*)`. Joins, set operations, window functions, subquery
-  expressions, table functions, `VALUES`, computed aggregate arguments, and
-  value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) are
-  refused — each can inflate a cohort count or single out an individual.
+  table scan, optionally filtered or column-renamed (nothing else may sit
+  below the aggregate, so it reads every matching row), feeding exactly
+  one `Aggregate` with plain `GROUP BY`, with only projection, filter,
+  sort, and limit above it. Aggregates are limited to `COUNT`, `SUM`,
+  `AVG`, `MIN`, and `MAX` over plain columns, and `n` must be a genuine
+  `COUNT(*)`. Joins, set operations, window functions, grouping sets
+  (`ROLLUP`, `CUBE`, `GROUPING SETS`), sorts or limits below the aggregate,
+  subquery expressions, table functions, `VALUES`, computed aggregate
+  arguments, and value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`,
+  `FIRST_VALUE`) are refused — each can inflate a cohort count, single out
+  an individual, or put a subtotal beside its parts in one result.
   `tests/bypass.rs` holds the adversarial cases; add to it whenever the
   allowlist changes.
 * **Result level** (`disclosure::DisclosurePolicy`): `MinCountThreshold`

@@ -410,6 +410,17 @@ async fn researcher_cannot_egress_raw_rows_or_skip_count() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
+    // Statements other than a read-only query → 422, and nothing is written.
+    let target = std::env::temp_dir().join(format!("qx-copy-research-{}.csv", std::process::id()));
+    let sql = format!(
+        "COPY (SELECT * FROM health) TO '{}' STORED AS CSV",
+        target.display()
+    );
+    let body = serde_json::json!({ "steward_tenant": steward.to_string(), "connector": "health", "sql": sql });
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &body.to_string()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!target.exists(), "COPY wrote decrypted rows to disk");
+
     // Aggregate without the cohort-size column → 422 (disclosure control).
     let (status, _) = post(
         &app,
