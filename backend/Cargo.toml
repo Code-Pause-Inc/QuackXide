@@ -91,6 +91,7 @@ rand = "0.8"
 # ── auth + storage backends ─────────────────────────────────────────────────
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 object_store = { version = "0.12", features = ["gcp"] }
+url = "2"
 # RSA key generation for the `keygen` binary; jsonwebtoken's RustCrypto
 # backend uses the same crate for RS256.
 rsa = "0.9"

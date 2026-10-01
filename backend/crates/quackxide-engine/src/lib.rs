@@ -20,11 +20,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
+use datafusion::common::{DataFusionError, exec_err};
 use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::object_store::ObjectStoreRegistry;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
+use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use platform_core::ZkMode;
 use platform_crypto::SecretBytes;
+use url::Url;
 
 pub mod blind;
 pub mod disclosure;
@@ -45,6 +50,8 @@ pub enum QueryError {
     ZkPolicy,
     #[error("query rejected by disclosure control: {0}")]
     Disclosure(String),
+    #[error("query rejected: only read-only queries are permitted")]
+    StatementNotAllowed,
 }
 
 #[derive(Debug, Clone)]
@@ -80,8 +87,12 @@ pub struct QueryScope {
 
 impl QueryScope {
     pub fn new(settings: EngineSettings) -> Self {
+        let runtime = RuntimeEnv {
+            object_store_registry: Arc::new(NoObjectStores),
+            ..RuntimeEnv::default()
+        };
         Self {
-            ctx: SessionContext::new(),
+            ctx: SessionContext::new_with_config_rt(SessionConfig::new(), Arc::new(runtime)),
             settings,
             tables: Vec::new(),
             disclosure: None,
@@ -153,9 +164,21 @@ impl QueryScope {
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>, QueryError> {
         self.last_suppressed_rows.store(0, Ordering::Relaxed);
 
+        // Plan without executing, then refuse anything but a read-only query
+        // in every mode: DataFusion runs DDL, `SET` and `PREPARE` while
+        // turning a plan into a DataFrame, before any gate below sees it.
+        let plan = self
+            .ctx
+            .state()
+            .create_logical_plan(query)
+            .await
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        read_only()
+            .verify_plan(&plan)
+            .map_err(|_| QueryError::StatementNotAllowed)?;
         let df = self
             .ctx
-            .sql(query)
+            .execute_logical_plan(plan)
             .await
             .map_err(|e| QueryError::Execution(e.to_string()))?;
 
@@ -238,6 +261,34 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Result<serde_json::Value, Que
     serde_json::from_slice(&buf).map_err(|e| QueryError::Serialize(e.to_string()))
 }
 
+/// Queries only: no DDL, DML, `COPY` or session statements.
+fn read_only() -> SQLOptions {
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
+}
+
+/// An object-store registry that holds nothing. Tables are in-memory, so a
+/// scope never needs a store; DataFusion's default registers `file://`,
+/// which would let a plan read or write the host's disk.
+#[derive(Debug)]
+struct NoObjectStores;
+
+impl ObjectStoreRegistry for NoObjectStores {
+    fn register_store(
+        &self,
+        _url: &Url,
+        _store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        None
+    }
+
+    fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>, DataFusionError> {
+        exec_err!("no object store is available in a query scope: {url}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +298,13 @@ mod tests {
         let scope = QueryScope::new(EngineSettings::default());
         assert!(!scope.settings().zk.is_enabled());
         assert!(scope.settings().max_concurrent_queries >= 1);
+    }
+
+    #[test]
+    fn scope_cannot_reach_the_local_filesystem() {
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        let scope = QueryScope::new(EngineSettings::default());
+        let local = ObjectStoreUrl::local_filesystem();
+        assert!(scope.ctx.runtime_env().object_store(&local).is_err());
     }
 }

@@ -13,6 +13,9 @@
 //! accepted shape whose groups overlap is therefore a defect; grouping sets
 //! are refused for that reason.
 //!
+//! Only read-only queries run: DDL, DML, `COPY` and session statements are
+//! refused in every mode before anything executes.
+//!
 //! Differencing across overlapping queries is out of scope; the per-grant
 //! budget bounds it.
 
@@ -251,6 +254,58 @@ async fn zk_mode_without_a_cohort_threshold_refuses_every_query() {
     assert!(matches!(zero, Err(QueryError::Disclosure(_))), "{zero:?}");
 }
 
+/// Statements other than a read-only query. `{dir}` is a scratch directory.
+#[rustfmt::skip]
+const STATEMENTS: &[(&str, &str)] = &[
+    ("create_external_table", "CREATE EXTERNAL TABLE ext (id VARCHAR) STORED AS CSV LOCATION '{dir}/ext.csv'"),
+    ("create_table_as", "CREATE TABLE ctas AS SELECT * FROM people"),
+    ("create_view", "CREATE VIEW v AS SELECT * FROM people"),
+    ("drop_table", "DROP TABLE people"),
+    ("copy_to", "COPY (SELECT * FROM people) TO '{dir}/out.csv' STORED AS CSV"),
+    ("insert", "INSERT INTO people VALUES ('p99', 'eng', 1)"),
+    ("set", "SET datafusion.execution.batch_size = 1"),
+    ("prepare", "PREPARE p AS SELECT COUNT(*) AS n FROM people"),
+];
+
+/// DDL, DML, `COPY` and session statements are refused before anything
+/// runs, with or without the disclosure gate, and leave no trace.
+#[tokio::test]
+async fn only_read_only_queries_run_in_every_mode() {
+    let dir = std::env::temp_dir().join(format!("qx-statements-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let mut failures = Vec::new();
+    for &(name, template) in STATEMENTS {
+        for gated in [false, true] {
+            let mode = if gated { "gated" } else { "ungated" };
+            let scope = if gated {
+                scope(Some(K))
+            } else {
+                ungated_scope()
+            };
+            let sql = template.replace("{dir}", &dir.display().to_string());
+            let result = scope.sql(&sql).await;
+            if !matches!(result, Err(QueryError::StatementNotAllowed)) {
+                failures.push(format!("{mode}/{name}: {result:?}"));
+            }
+            let total = scope.sql_json("SELECT COUNT(*) AS n FROM people").await;
+            if total.as_ref().ok().map(|rows| rows[0]["n"].clone()) != Some(Value::from(15)) {
+                failures.push(format!("{mode}/{name}: people changed: {total:?}"));
+            }
+            for created in ["ext", "ctas", "v"] {
+                let probe = format!("SELECT COUNT(*) AS n FROM {created}");
+                if scope.sql(&probe).await.is_ok() {
+                    failures.push(format!("{mode}/{name}: created table {created}"));
+                }
+            }
+        }
+    }
+    if dir.join("out.csv").exists() {
+        failures.push("COPY wrote decrypted rows to disk".into());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 async fn run(scope: &QueryScope, cases: &[(&str, &str, Expect)]) {
     let mut failures = Vec::new();
     for &(name, sql, expect) in cases {
@@ -307,6 +362,24 @@ fn is_sensitive(cell: &Value) -> bool {
         Value::Array(items) => items.iter().any(is_sensitive),
         _ => false,
     }
+}
+
+/// A scope without the disclosure gate (own-data queries with ZK off).
+fn ungated_scope() -> QueryScope {
+    let mut scope = QueryScope::new(EngineSettings {
+        zk: ZkMode::Disabled,
+        max_concurrent_queries: 1,
+    });
+    let ids = StringArray::from_iter_values(ROWS.iter().map(|r| r.0));
+    let depts = StringArray::from_iter_values(ROWS.iter().map(|r| r.1));
+    let salaries = Int64Array::from_iter_values(ROWS.iter().map(|r| r.2));
+    scope
+        .register_parquet(
+            "people",
+            &parquet(&[("id", &ids), ("dept", &depts), ("salary", &salaries)]),
+        )
+        .expect("register people");
+    scope
 }
 
 /// A zero-knowledge scope with a `MinCountThreshold` of `k`, if given.
