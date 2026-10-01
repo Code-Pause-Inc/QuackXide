@@ -219,6 +219,34 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// With ZK mode off nothing gates the plan, so the statement check alone
+/// keeps decrypted rows off the host's disk.
+#[tokio::test]
+async fn copy_to_disk_is_refused_without_the_zk_gate() {
+    let tenant = TenantId::generate();
+    let app = app_with_sealed_quickbooks(tenant, ZkMode::Disabled).await;
+    let token = token_for(tenant);
+    let dir = std::env::temp_dir().join(format!("qx-copy-api-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let target = dir.join("out.csv");
+
+    for sql in [
+        format!(
+            "COPY (SELECT * FROM quickbooks) TO '{}' STORED AS CSV",
+            target.display()
+        ),
+        "CREATE TABLE copied AS SELECT * FROM quickbooks".to_owned(),
+        "INSERT INTO quickbooks SELECT * FROM quickbooks".to_owned(),
+    ] {
+        let body = serde_json::json!({ "connector": "quickbooks", "sql": sql }).to_string();
+        let (status, _) = post_query(&app, Some(&token), &body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sql}");
+    }
+    let written = target.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!written, "COPY wrote decrypted rows to disk");
+}
+
 #[tokio::test]
 async fn query_unavailable_when_not_configured_returns_503() {
     let config = PlatformConfig::from_source(|_| None).expect("config");

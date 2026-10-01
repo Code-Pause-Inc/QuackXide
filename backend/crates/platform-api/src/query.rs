@@ -639,6 +639,9 @@ fn map_query_error(err: QueryError) -> ApiError {
         QueryError::Disclosure(_) => {
             ApiError::QueryRejected("query rejected by disclosure control (see cohort-size rules)")
         }
+        QueryError::StatementNotAllowed => {
+            ApiError::QueryRejected("only read-only queries are permitted")
+        }
         // A planning/execution failure is almost always the caller's SQL.
         QueryError::Execution(_) => ApiError::BadRequest("query could not be executed"),
         QueryError::Parquet(_) | QueryError::Serialize(_) => ApiError::Backend,

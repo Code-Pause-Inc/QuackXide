@@ -3118,6 +3118,7 @@ dependencies = [
  "arrow",
  "bytes",
  "datafusion",
+ "object_store",
  "parquet",
  "platform-core",
  "platform-crypto",
@@ -3125,6 +3126,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

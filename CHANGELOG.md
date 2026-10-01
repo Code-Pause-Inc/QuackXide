@@ -6,6 +6,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+* Query SQL is read-only. DataFusion ran DDL, `SET` and `PREPARE` while
+  planning, before the disclosure gate, and with ZK mode off
+  `COPY … TO` wrote decrypted rows to the host's disk. DDL, DML, `COPY`
+  and session statements are now refused before anything executes, and a
+  query scope has no object store.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

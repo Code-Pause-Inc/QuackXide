@@ -52,6 +52,7 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | Inflated cohort counts (self-joins, `UNION ALL`, `UNNEST`, table functions) | Plan allowlist: one table scan under one aggregate; joins and set operations refused | Built, tested (`tests/bypass.rs`) |
 | Singling out one person inside a large group (`SUM(CASE WHEN id = …)`, computed columns, subquery expressions) | Aggregate arguments must be plain columns; subquery expressions refused | Built, tested |
 | Value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) | Aggregate allowlist: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Built, tested |
+| Running statements before the gate (`CREATE TABLE … AS`, `DROP TABLE`, `SET`, `PREPARE`) | Statements are refused before planning finishes, so nothing runs ahead of the plan gate | Built, tested (`tests/bypass.rs`) |
 | Spoofed cohort size (`9999 AS n`) | `disclosure::verify_count_column` requires a genuine `COUNT(*) AS n` | Built, tested |
 | Small-cohort queries that isolate individuals | `MinCountThreshold` drops rows with `n < RESEARCH_MIN_COHORT_SIZE` | Built, tested |
 | Unlimited adaptive probing | `BudgetLedger`: charged before execution, no refunds, monotonic per grant | Built, tested |
@@ -67,6 +68,7 @@ Goal: read dataset content from infrastructure the operator controls.
 | --- | --- | --- |
 | Read the object store | Ciphertext only; envelopes sealed to a key the operator does not hold | Built |
 | Read API host disk or logs | Plaintext never persisted; audit events carry no content, SQL, or filenames | Built, tested |
+| Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
 | Run a query outside a genuine enclave | Attestation gate with `TEE_ATTESTATION_REQUIRED=true` | Seam built; **SEV-SNP report verification to build** — fails closed until then |
 | Obtain the steward's key for a query | Key released only into an attested enclave (`EnclaveKeyProvider`) | Seam built; **production key release to build** — returns 503 until then |
