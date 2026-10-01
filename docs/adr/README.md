@@ -32,3 +32,4 @@ What becomes easier or harder, and what must now be true.
 ## Records
 
 * [0001. Hybrid post-quantum cryptographic suites](0001-hybrid-post-quantum-suites.md)
+* [0003. Connector data as versioned snapshots](0003-connector-data-as-versioned-snapshots.md)

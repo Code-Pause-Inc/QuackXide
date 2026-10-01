@@ -7,12 +7,13 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, StringArray};
 use platform_connectors::parquet_out::read_parquet_batches;
 use platform_connectors::pipeline::{EnclavePipeline, PipelineError, SyncJob, envelope_info};
+use platform_connectors::snapshot::{SnapshotManifest, manifest_info};
 use platform_connectors::source::FixtureSource;
 use platform_connectors::worker::SyncScheduler;
 use platform_core::TenantId;
 use platform_crypto::TenantKeypair;
 use platform_enclave::{DevAttestation, SnpAttestation};
-use platform_storage::{ObjectStoreVault, VaultStore};
+use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 
 fn dev_pipeline(vault: Arc<dyn VaultStore>) -> EnclavePipeline {
     EnclavePipeline::new(Arc::new(DevAttestation::allow_insecure_dev()), vault, false)
@@ -47,18 +48,45 @@ async fn full_confidential_sync_round_trip() {
     );
     assert!(written.path.ends_with(".parquet"));
 
+    let slug = platform_core::ConnectorSlug::new("quickbooks").expect("slug");
     let paths = vault
-        .list(&platform_storage::TenantPaths::tenant_root(tenant))
+        .list(&TenantPaths::tenant_root(tenant))
         .await
         .expect("list");
-    assert_eq!(paths.len(), 1);
-    let envelope = vault.get(&paths[0]).await.expect("get ciphertext");
-
-    let info = envelope_info(
-        &tenant,
-        &platform_core::ConnectorSlug::new("quickbooks").expect("slug"),
-        &written.object,
+    assert_eq!(
+        paths.len(),
+        2,
+        "one sealed object and its snapshot manifest"
     );
+
+    // The manifest commits exactly the object this sync wrote.
+    let manifest = vault
+        .get(&TenantPaths::connector_manifest(
+            tenant,
+            &slug,
+            &report.snapshot,
+        ))
+        .await
+        .expect("get manifest");
+    let manifest = keypair
+        .open_envelope(&manifest_info(&tenant, &slug, &report.snapshot), &manifest)
+        .expect("tenant can open the manifest");
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(manifest.expose()).expect("manifest json");
+    assert_eq!(manifest.version, report.snapshot);
+    assert_eq!(manifest.objects, vec![written.object]);
+
+    let envelope = vault
+        .get(&TenantPaths::connector_snapshot_object(
+            tenant,
+            &slug,
+            &report.snapshot,
+            written.object,
+        ))
+        .await
+        .expect("get ciphertext");
+
+    let info = envelope_info(&tenant, &slug, &written.object);
     let parquet = keypair
         .open_envelope(&info, &envelope)
         .expect("tenant can open the envelope");
@@ -109,15 +137,22 @@ async fn scheduler_tick_runs_all_jobs_and_isolates_results() {
     ];
 
     let scheduler = SyncScheduler::new(Arc::new(dev_pipeline(vault.clone())), jobs);
-    let results = scheduler.tick().await;
-    assert_eq!(results.len(), 3);
-    assert!(results.iter().all(|(_, r)| r.is_ok()));
+    // A second tick replaces each connector's snapshot instead of adding to it.
+    for _ in 0..2 {
+        let results = scheduler.tick().await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
 
-    let stored = vault
-        .list(&platform_storage::TenantPaths::tenant_root(tenant))
-        .await
-        .expect("list");
-    assert_eq!(stored.len(), 3, "one sealed object per connector");
+        let stored = vault
+            .list(&TenantPaths::tenant_root(tenant))
+            .await
+            .expect("list");
+        assert_eq!(
+            stored.len(),
+            6,
+            "one sealed object and one manifest per connector"
+        );
+    }
 }
 
 #[tokio::test]
@@ -136,7 +171,7 @@ async fn required_attestation_fails_closed_without_hardware() {
     assert!(matches!(err, PipelineError::AttestationRefused(_)));
 
     let stored = vault
-        .list(&platform_storage::TenantPaths::tenant_root(job.tenant))
+        .list(&TenantPaths::tenant_root(job.tenant))
         .await
         .expect("list");
     assert!(stored.is_empty(), "nothing may be written on refusal");
@@ -176,13 +211,16 @@ async fn envelopes_are_bound_to_their_object() {
         .expect("sync");
     let written = &report.written[0];
 
-    let paths = vault
-        .list(&platform_storage::TenantPaths::tenant_root(tenant))
-        .await
-        .expect("list");
-    let envelope = vault.get(&paths[0]).await.expect("get");
-
     let slug = platform_core::ConnectorSlug::new("generic_crm").expect("slug");
+    let envelope = vault
+        .get(&TenantPaths::connector_snapshot_object(
+            tenant,
+            &slug,
+            &report.snapshot,
+            written.object,
+        ))
+        .await
+        .expect("get");
     let wrong_info = envelope_info(&tenant, &slug, &platform_core::ObjectId::generate());
     assert!(
         keypair.open_envelope(&wrong_info, &envelope).is_err(),

@@ -17,6 +17,7 @@ pub mod ndjson;
 pub mod oauth;
 pub mod parquet_out;
 pub mod pipeline;
+pub mod snapshot;
 pub mod source;
 pub mod worker;
 

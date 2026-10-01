@@ -15,6 +15,8 @@ pub enum CoreError {
     InvalidObjectId,
     #[error("invalid connector slug (allowed: [a-z0-9_-], 1..=64 chars)")]
     InvalidConnectorSlug,
+    #[error("invalid snapshot version")]
+    InvalidSnapshotVersion,
 }
 
 /// Opaque tenant identifier.
@@ -140,6 +142,74 @@ impl<'de> Deserialize<'de> for ConnectorSlug {
     }
 }
 
+/// Identifies one complete snapshot of a connector's data.
+///
+/// `{unix_nanos:020}-{32 lowercase hex}`: fixed width, so string order is
+/// time order, and the random suffix keeps concurrent writers apart. Used as
+/// a storage path segment, so parsing is strict.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct SnapshotVersion(String);
+
+const SNAPSHOT_TIME_DIGITS: usize = 20;
+const SNAPSHOT_SUFFIX_HEX: usize = 32;
+
+impl SnapshotVersion {
+    pub fn generate() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        Self(format!(
+            "{nanos:0width$}-{}",
+            Uuid::new_v4().simple(),
+            width = SNAPSHOT_TIME_DIGITS
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for SnapshotVersion {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let valid = s.split_once('-').is_some_and(|(time, suffix)| {
+            time.len() == SNAPSHOT_TIME_DIGITS
+                && time.bytes().all(|b| b.is_ascii_digit())
+                && suffix.len() == SNAPSHOT_SUFFIX_HEX
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        if valid {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(CoreError::InvalidSnapshotVersion)
+        }
+    }
+}
+
+impl fmt::Display for SnapshotVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Zero-knowledge feature mode; the platform default comes from
 /// `FEATURE_ZK_ENABLED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -167,6 +237,38 @@ impl ZkMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_versions_round_trip_and_order_by_time() {
+        let first = SnapshotVersion::generate();
+        let second = SnapshotVersion::generate();
+        assert_eq!(first.as_str().parse::<SnapshotVersion>(), Ok(first.clone()));
+        assert!(first < second || first.as_str()[..20] == second.as_str()[..20]);
+        let earlier: SnapshotVersion = "00000000000000000001-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid");
+        assert!(earlier < first);
+    }
+
+    #[test]
+    fn snapshot_versions_reject_anything_but_the_canonical_form() {
+        for bad in [
+            "",
+            "123",
+            "0000000000000000001-0123456789abcdef0123456789abcdef",
+            "00000000000000000001-0123456789ABCDEF0123456789abcdef",
+            "00000000000000000001-0123456789abcdef0123456789abcde",
+            "00000000000000000001_0123456789abcdef0123456789abcdef",
+            "00000000000000000001-0123456789abcdef0123456789abcdef/..",
+            "../0000000000000000001-0123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(
+                bad.parse::<SnapshotVersion>(),
+                Err(CoreError::InvalidSnapshotVersion),
+                "{bad}"
+            );
+        }
+    }
 
     #[test]
     fn tenant_id_round_trips_through_display() {

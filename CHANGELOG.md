@@ -6,6 +6,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+* Connector data is stored as versioned snapshots, and a query reads only
+  the newest committed one. Every sync wrote a new copy of its data and
+  queries read all of them, so repeated syncs multiplied each row and
+  could lift a small cohort past the disclosure threshold. See ADR 0003.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

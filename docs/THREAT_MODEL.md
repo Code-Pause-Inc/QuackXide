@@ -50,6 +50,7 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | `SELECT *`, bare columns, `DISTINCT` row dumps | Logical-plan allowlist (`policy::is_aggregate_only`), applied in ZK and research mode; ZK mode is on unless explicitly disabled | Built, tested |
 | Rebuilding the dataset one group per person (`GROUP BY id`) | Genuine `COUNT(*) AS n` required and cohorts below *k* suppressed, in ZK and research mode | Built, tested (`tests/bypass.rs`) |
 | Inflated cohort counts (self-joins, `UNION ALL`, `UNNEST`, table functions) | Plan allowlist: one table scan under one aggregate; joins and set operations refused | Built, tested (`tests/bypass.rs`) |
+| Inflated cohort counts through storage (repeated connector syncs leaving every row several times) | A query reads one committed snapshot per connector; a manifest that lists an object twice fails closed ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)) | Built, tested (`query_api.rs`, `pipeline_e2e.rs`) |
 | Singling out one person inside a large group (`SUM(CASE WHEN id = …)`, computed columns, subquery expressions) | Aggregate arguments must be plain columns; subquery expressions refused | Built, tested |
 | Value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) | Aggregate allowlist: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Built, tested |
 | Spoofed cohort size (`9999 AS n`) | `disclosure::verify_count_column` requires a genuine `COUNT(*) AS n` | Built, tested |
@@ -135,6 +136,15 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   release; removing them from the allowlist, or applying a dominance rule,
   is a policy decision.
 * **Metadata.** The server sees tenant ids, object ids, ciphertext lengths,
-  and timestamps.
+  and timestamps, including when each connector snapshot was written.
+* **Forged or rolled-back snapshots.** Connector objects and snapshot
+  manifests are sealed to the tenant's public key, which binds them to
+  tenant, connector and object or version but does not authenticate the
+  writer. An operator can therefore write a fabricated snapshot, or delete
+  the newest manifest so queries read an older one. Closing this needs
+  an enclave signing key bound to attestation.
+* **Differencing across snapshots.** Querying before and after a dataset
+  update can reveal the rows that changed, bounded by the budget like any
+  other overlapping-query differencing.
 * **Unfinished controls.** Every item marked "to build" above is a gap, and
   the corresponding path fails closed until it is built.

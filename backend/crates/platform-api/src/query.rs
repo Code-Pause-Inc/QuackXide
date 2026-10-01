@@ -12,11 +12,12 @@
 //! providers here hold keys in ordinary process memory and are for local use
 //! only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use platform_connectors::pipeline::envelope_info;
+use platform_connectors::snapshot::{SnapshotManifest, manifest_info};
 use platform_core::{ConnectorSlug, TenantId};
 use platform_crypto::{SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, gate_execution};
@@ -244,25 +245,52 @@ impl ConnectorQueryService {
             .map_err(|_| ApiError::QueryUnavailable)
     }
 
-    /// Decrypt every object of `owner`'s connector to plaintext Parquet.
-    /// The blobs zeroize on drop, so an error partway through wipes the
-    /// objects already opened.
+    /// Decrypt `owner`'s current connector snapshot to plaintext Parquet:
+    /// the objects listed by the newest manifest, and nothing else, so
+    /// repeated or interrupted syncs never add rows. The blobs zeroize on
+    /// drop, so an error partway through wipes the objects already opened.
     async fn decrypt_connector(
         &self,
         owner: TenantId,
         connector: &ConnectorSlug,
     ) -> Result<DecryptedObjects, ApiError> {
-        let paths = self
+        let manifests = self
             .vault
-            .list(&TenantPaths::connector_prefix(owner, connector))
+            .list(&TenantPaths::connector_manifests_prefix(owner, connector))
             .await?;
-        let mut blobs = Vec::with_capacity(paths.len());
-        for path in &paths {
-            let Some(object) = TenantPaths::connector_object_id(owner, connector, path) else {
-                continue;
-            };
-            let envelope = self.vault.get(path).await?;
-            let info = envelope_info(&owner, connector, &object);
+        let Some((version, path)) = manifests
+            .iter()
+            .filter_map(|path| {
+                TenantPaths::connector_manifest_version(owner, connector, path)
+                    .map(|version| (version, path))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0))
+        else {
+            return Ok(Vec::new());
+        };
+
+        let envelope = self.vault.get(path).await?;
+        let info = manifest_info(&owner, connector, &version);
+        let plaintext = self.keys.open_envelope(owner, &info, &envelope).await?;
+        let manifest = serde_json::from_slice::<SnapshotManifest>(plaintext.expose())
+            .ok()
+            .filter(|m| m.version == version)
+            .filter(|m| m.objects.iter().collect::<HashSet<_>>().len() == m.objects.len());
+        let Some(manifest) = manifest else {
+            security_audit_event(
+                AuditKind::DataAccess,
+                Some(owner),
+                "failed",
+                "connector snapshot manifest is malformed, mismatched or lists an object twice",
+            );
+            return Err(ApiError::Backend);
+        };
+
+        let mut blobs = Vec::with_capacity(manifest.objects.len());
+        for object in &manifest.objects {
+            let path = TenantPaths::connector_snapshot_object(owner, connector, &version, *object);
+            let envelope = self.vault.get(&path).await?;
+            let info = envelope_info(&owner, connector, object);
             let plaintext = self.keys.open_envelope(owner, &info, &envelope).await?;
             blobs.push(plaintext);
         }

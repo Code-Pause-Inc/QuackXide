@@ -1,5 +1,6 @@
 //! The confidential sync pipeline: attestation gate → fetch → Parquet →
-//! HPKE seal to the tenant public key → flush ciphertext to the vault.
+//! HPKE seal to the tenant public key → flush ciphertext to the vault as one
+//! complete snapshot (see [`crate::snapshot`]).
 //!
 //! Plaintext exists only in process memory between `fetch` and
 //! `hpke_seal_to_tenant`; the Parquet buffer is zeroized as soon as its
@@ -7,15 +8,16 @@
 
 use std::sync::Arc;
 
-use platform_core::{ConnectorSlug, ObjectId, TenantId};
-use platform_crypto::{TenantPublicKey, hpke_seal_to_tenant};
+use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
+use platform_crypto::TenantPublicKey;
 use platform_enclave::{AttestationProvider, TeePlatform};
-use platform_storage::{TenantPaths, VaultStore};
+use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
 use rand::RngCore;
 
 use crate::ConnectorError;
 use crate::parquet_out::dataset_to_parquet;
+use crate::snapshot::SnapshotWriter;
 use crate::source::{ConnectorSource, SyncContext};
 
 const ATTESTATION_NONCE_BYTES: usize = 32;
@@ -50,6 +52,8 @@ pub struct WrittenObject {
 #[derive(Debug)]
 pub struct SyncReport {
     pub connector: String,
+    /// The snapshot this sync committed; queries now read only it.
+    pub snapshot: SnapshotVersion,
     pub written: Vec<WrittenObject>,
 }
 
@@ -147,45 +151,37 @@ impl EnclavePipeline {
         let datasets = job.source.fetch(&context).await?;
         let slug = job.source.descriptor().slug.clone();
 
+        let mut snapshot = SnapshotWriter::begin(
+            &*self.vault,
+            job.tenant,
+            &job.tenant_public_key,
+            slug.clone(),
+        );
         let mut written = Vec::with_capacity(datasets.len());
         for dataset in &datasets {
-            let object = ObjectId::generate();
-
             let parquet = dataset_to_parquet(dataset)?;
-            let info = envelope_info(&job.tenant, &slug, &object);
-            let envelope = hpke_seal_to_tenant(&job.tenant_public_key, &info, parquet.expose())
-                .map_err(|_| PipelineError::Seal)?;
+            let object = snapshot.put(&dataset.name, parquet.expose()).await?;
             drop(parquet); // zeroize the plaintext immediately
-            let ciphertext_bytes = envelope.len();
-
-            let path = TenantPaths::connector_object(job.tenant, &slug, object);
-            self.vault
-                .put(&path, envelope.into())
-                .await
-                .map_err(|e| PipelineError::Storage(e.to_string()))?;
 
             security_audit_event(
                 AuditKind::ConnectorSync,
                 Some(job.tenant),
                 "ok",
                 &format!(
-                    "dataset={} object={object} rows={} sealed_bytes={}",
+                    "dataset={} object={} rows={} sealed_bytes={}",
                     dataset.name,
+                    object.object,
                     dataset.rows.len(),
-                    ciphertext_bytes
+                    object.ciphertext_bytes
                 ),
             );
-
-            written.push(WrittenObject {
-                dataset: dataset.name.clone(),
-                object,
-                path: path.as_str().to_owned(),
-                ciphertext_bytes,
-            });
+            written.push(object);
         }
+        let snapshot = snapshot.commit().await?;
 
         Ok(SyncReport {
             connector: slug.as_str().to_owned(),
+            snapshot,
             written,
         })
     }
