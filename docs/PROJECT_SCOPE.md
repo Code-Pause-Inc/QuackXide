@@ -107,8 +107,8 @@ The first complete release is done when all of the following hold:
    release scope.
 10. `scripts/check.sh` passes on `main`.
 
-## Team and timeline
+## Team
 
-A core team of four over one 15-week semester (Fall 2026). Team members
+A core team of four. Team members
 are credited in `CONTRIBUTORS.md`, the git history, `README.md`, and the
 release notes in `CHANGELOG.md`.

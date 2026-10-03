@@ -1,22 +1,39 @@
 # QuackXide v1.0 plan
 
-The work that takes QuackXide from v0.1.0 to its first production release (`docs/PROJECT_SCOPE.md`), as plan items P1-P83. Each item is, or will become, one GitHub issue in the `v1.0 - first production release` milestone; [Posted issues](#posted-issues) maps items to issue numbers. Items are posted in waves: wave 1 (team setup, the week 1-3 decisions and small security items) is posted, and the rest follow once the decisions they depend on are recorded. P20-P23 are unused: those four security fixes are merged (see "Security defects found in review"). Every claim cites a repository path and line, or quotes the docs; items that propose new files say so. Record each "Depends on" line as a GitHub "blocked by" relationship when the item is posted.
+The work that takes QuackXide from v0.1.0 to its first production release (`docs/PROJECT_SCOPE.md`), as plan items P1-P85, and the order to do it in. The plan sets no dates: it says what has to be done and what must come first. Each item is, or will become, one GitHub issue in the `v1.0 - first production release` milestone; [Posted issues](#posted-issues) maps items to issue numbers. Items are posted in waves: wave 1 (team setup, the decisions that block build work, the simulated TEE and small security items) is posted, and the rest follow once the decisions they depend on are recorded. P20-P23 are unused: those four security fixes are merged (see "Security defects found in review"). Every claim cites a repository path and line, or quotes the docs; items that propose new files say so. Record each "Depends on" line as a GitHub "blocked by" relationship when the item is posted.
 
-**Milestone.** `v1.0 - first production release`, for all issues in this file except the final section ("Proposed outside v1.0"). Set its due date once the maintainer confirms the calendar and makes the week-3 capacity decision ("Capacity check first"): the blocker work does not fit the Fall 2026 semester (`docs/PROJECT_SCOPE.md`, "Team and timeline"), so the date falls after it.
+**The invariant every item serves.** Data, SQL text and results are plaintext only in the user's browser and inside the attested Confidential VM. They are sealed in the browser before upload, stored sealed, opened only inside the attested enclave after verified key release, and results are sealed to the researcher inside the enclave and opened only in the researcher's browser. The browser verifies the enclave's attestation before it sends a query (P85), and TLS terminates inside the Confidential VM (P15, P67). Where an item cannot meet this, it says so and `docs/THREAT_MODEL.md` records the residual.
+
+**End-to-end flow and the items that build it.**
+
+| Step | Items |
+| --- | --- |
+| Data created (synthetic) | P9 |
+| Data encrypted in the steward's browser | P34, P36, P40 |
+| Data ingested (steward upload; connector ingestion per P19) | P38, P39 |
+| Data secure at rest | P41, ADR 0003 (merged), P76, P77 |
+| Researcher signs in | P16, P28, P29, P30, P32 |
+| Researcher validated (identity, grant, budget) | P27, P33, P45, P62, P63 |
+| Researcher's browser verifies the enclave | P85 |
+| Researcher enters a query, sealed to the enclave | P44, P85 |
+| Query reaches the enclave where the data is opened | P15, P51, P67 |
+| Enclave attested, key released, query run | P14, P47, P48, P49, P50, P52, P53, P54, P57, P58 |
+| Results sealed in the enclave and opened in the browser | P55, P56 |
+| The same flow without hardware | P84 (simulated SEV-SNP), P8, P72 |
+
+**Milestone.** `v1.0 - first production release`, for all issues in this file except the final section ("Proposed outside v1.0").
 
 **Labels.**
 - Work type: `build` (does not exist yet), `harden` (it means "exists, needs production-grade completion", per `docs/PROJECT_SCOPE.md`), area labels `area:auth`, `area:crypto`, `area:enclave`, `area:disclosure`, `area:storage`, `area:frontend`, `area:ops`, plus `area:engine` (query execution and the DataFusion stack, as opposed to the disclosure gate), `needs-adr` (the change must record a decision in `docs/adr/` in the same PR, per `CONTRIBUTING.md:71-73` and `docs/adr/README.md:7-9`), and `tracking` (checklist issues that close at release).
 - Existing, reused: `rust`, `javascript`, `good first issue`, `documentation`.
 
 **Conventions in every issue.**
-- **Size:** S = one person up to about 2 weeks; M = one or two people for 2-5 weeks; L = larger (none in this revision; anything that size is split). "Pair" marks issues that need two people.
+- **Size** is relative scope, not time: S = one person, one or a few focused pull requests; M = one or two people, several pull requests; L = larger (none in this revision; anything that size is split). "Pair" marks issues that need two people.
 - **Depends on** lists hard dependencies only (the issue cannot close without them); **Sequencing** holds soft ordering and coordination notes.
-- **Priority:** *v1 blocker* (delivers a definition-of-done item directly, including a lifecycle step that DoD item 3 requires to be Built, or is a listed hard dependency of a v1 blocker), *v1 needed* (needed for a production-grade v1.0 per the engineering goals), *team enablement* (setup, tooling, process; these keep their label when a blocker depends on them, and are scheduled in weeks 1-3).
-- **Target:** semester weeks; P5 converts them to calendar dates.
+- **Priority:** *v1 blocker* (delivers a definition-of-done item directly, including a lifecycle step that DoD item 3 requires to be Built, or is a listed hard dependency of a v1 blocker), *v1 needed* (needed for a production-grade v1.0 per the engineering goals), *team enablement* (setup, tooling, process; these keep their label when a blocker depends on them, and come first in the order).
 - **Security impact** names the invariant touched; **ADR** says whether a decision record is required.
 - Every pull request completes the checklist in `.github/pull_request_template.md` (negative tests, `audit_coverage.rs`, fail closed, no new cryptographic primitives, docs and `CHANGELOG.md`, ADR, synthetic data only; `CONTRIBUTING.md:76-77` puts the CHANGELOG line under "Unreleased"). Issues list only what is specific to them.
 - Code-owned paths (`.github/CODEOWNERS`) need @AxolDad's review; P4 sets the process.
-
 
 ## Posted issues
 
@@ -45,74 +62,88 @@ The work that takes QuackXide from v0.1.0 to its first production release (`docs
 | P25 | #45 | Audit stream always on; no SQL or data values in operational logs |
 | P26 | #46 | Zeroize platform credentials held in configuration |
 | P27 | #47 | Access-request approval converges after a partial failure, and never fails open |
+| P84 | #49 | Simulated SEV-SNP mode for development and CI |
 
 Items not listed are not posted yet.
 
 ---
 
-## Suggested order
+## Order of work
 
-### Capacity check first
+The plan has no dates. Work proceeds in the steps below; an item starts when its "Depends on" items are done, and anything with no open dependency can start at once.
 
-Summing the sizes in this file gives roughly 187-237 person-weeks of work (S about 1.5, S-M about 2-3, M about 3-4, M-L about 5-6), of which the v1-blocker issues alone are about 142-187. Four people over one 15-week semester is about 60 person-weeks before reviews, coursework and onboarding, and the repository went public on 2026-09-30, so fewer than 15 weeks may remain. Blocker work alone is about 2.4 to 3.1 times the semester's capacity, so the definition of done does not fit one semester for four students. That is a planning fact, not a reason to cut security work silently. The maintainer decides by the end of week 3, and records in P5:
-- **Required:** extend the v1.0 milestone past the semester, with this semester's target being definition-of-done items 1-2 demonstrated on staging hardware. Do not trim DoD items 5-9 by deferring their issues; descoping any of them needs a maintainer-approved change to `docs/PROJECT_SCOPE.md`.
-- **Optional:** move named v1-needed issues to a v1.1 milestone. Candidates that no definition-of-done item depends on: P42, P60, P71 (with its manual fallback), P37 (via the superseding-ADR option in P16) and P53, about 12-17 person-weeks. Three more can move only with matching edits, together about 7-10 person-weeks:
+### Step 0: scope review
+
+Before build work starts, the maintainer reviews the scope and records the outcome in P5:
+- **Required:** definition-of-done items are not trimmed by deferring their issues; descoping any of them needs a maintainer-approved change to `docs/PROJECT_SCOPE.md`.
+- **Optional:** move named v1-needed issues to a v1.1 milestone. Candidates that no definition-of-done item depends on: P42, P60, P71 (with its manual fallback), P37 (via the superseding-ADR option in P16) and P53. Three more can move only with matching edits:
   - P59: P44 shows only the SQL table name (the connector slug, double-quoted where needed) and a `SELECT COUNT(*) AS n` example, and P62 drops the dictionary fields.
   - P72: P82's evidence for items 1-2 becomes a manual browser run on staging, recorded under the acceptance checklist, and P6 names that manual run as the acceptance test.
   - P81: P83 drops it, and P68 takes the item "the release artifact list includes every binary P68 runs".
-- **Not candidates:** P65 and P66 are v1 blockers because P68 depends on them. P65's timeouts and panic handling may be split off and deferred, but its CSP, security headers and any CORS allowlist stay in v1. P66 leaves the milestone only if the maintainer chooses per-deployment frontend builds, recorded in `docs/`, with P68's dependency changed to that decision in the same edit.
+- **Not candidates:** P84 and P85, which the plaintext-only-in-the-TEE invariant depends on. P65 and P66 are v1 blockers because P68 depends on them. P65's timeouts and panic handling may be split off and deferred, but its CSP, security headers and any CORS allowlist stay in v1. P66 leaves the milestone only if the maintainer chooses per-deployment frontend builds, recorded in `docs/`, with P68's dependency changed to that decision in the same edit.
 - **Optional:** have the maintainer own critical-path items directly (for example P12, P14, P49, P68).
 
 ### Critical path
 
 The longest chain is hardware and key custody, and it starts with decisions only the maintainer can make:
 
-P12 phase A (week 2) → P14 (accepted by week 3; includes the workload-identity decision) → P47 (from week 2, off-hardware; closes on P12 phase B's fixtures) → P48 (also needs P12's hardware) → P50 → P51 → P68 → P82 → P83. P49 (after P12, P14 and P15) feeds P68 directly; P15 (accepted by week 3) feeds P49, P55, P65, P67 and P68.
+P12 phase A → P14 (includes the workload-identity decision) → P47 (starts off-hardware; closes on P12 phase B's fixtures) → P48 (also needs P12's hardware) → P50 → P51 → P68 → P82 → P83. P49 (after P12, P14 and P15) feeds P68 directly; P15 feeds P49, P55, P65, P67, P68 and P85.
 
-Chains that feed it and must finish by about week 12:
-- Sealed results: P14 → P33 → P55 → P56. P33 needs P31 (the session token and `tid` in the crypto worker) and P41's conditional-write PR (week 3-4), not the identity service, so this chain runs in parallel with P29.
-- Hybrid suite for DoD item 1: P17 → P34 (seal by week 5) and P35 (after P73's `HPK1` baseline) → P36 → P40 closes. P36 also needs P33, so it too waits on P14, P31 and P41's conditional-write PR, not on the identity service. P35 also feeds the main path at P50, which must wrap released keys with the hybrid suite before it closes.
+Chains that feed it:
+- Simulated TEE: P8 → P84 stage 1; P47 → P84 stage 2. Every later enclave, sealing and browser item is developed and tested against P84 before it runs on hardware.
+- Browser-verified enclave and sealed queries: P14, P15, P47, P34 checkpoint B and P84 → P85 (the attestation endpoint and the browser verifier), with P49's published values and P67's TLS-key binding for the production run → P55 → P56.
+- Sealed results: P14 → P33 → P55 → P56. P33 needs P31 (the session token and `tid` in the crypto worker) and P41's conditional-write PR, not the identity service, so this chain runs in parallel with P29.
+- Hybrid suite for DoD item 1: P17 → P34 (seal first) and P35 (after P73's `HPK1` baseline) → P36 → P40 closes. P36 also needs P33, so it too waits on P14, P31 and P41's conditional-write PR, not on the identity service. P35 also feeds the main path at P50, which must wrap released keys with the hybrid suite before it closes.
 - Steward upload for DoD item 1: P38 → P39 → P40. P38 reuses the versioned-snapshot layout already merged on `main` (ADR 0003); its remaining hard dependencies are P14 and P69.
-- Sign-in, which DoD items 1 and 2 both begin with: P16 and P13 (provider development tenant by week 4) → P29 → P30 → P32, which P40 needs to close and P82 runs end to end; P29 and P30 → P63 → P68. A dated week-7 checkpoint in P5 watches P29.
-- Durable state: P61 and P27 → P62 → P51; P62's first PR, P29 and P30 → P63 → P68. Sign-in (P29, P30, P63, P32) still gates P68 and P82 directly, so the split frees P51's integration, not the release date.
-- HTTP edge: P15 → P65 → P67 (which also needs P18, and P75 if TLS terminates in the VM) → P68, with P66's bundle and the staging domain from P13 by week 8.
+- Sign-in, which DoD items 1 and 2 both begin with: P16 and P13 (provider development tenant) → P29 → P30 → P32, which P40 needs to close and P82 runs end to end; P29 and P30 → P63 → P68. A checkpoint in P5 follows P29's first attempt at the token exchange against the provider's development tenant.
+- Durable state: P61 and P27 → P62 → P51; P62's first PR, P29 and P30 → P63 → P68. Sign-in (P29, P30, P63, P32) still gates P68 and P82 directly, so the split frees P51's integration, not the release.
+- HTTP edge: P15 → P65 → P67 (which also needs P18 and P75) → P68, with P66's bundle and the staging domain from P13.
 
-### Weeks 1-3: unblocked work for all four people from day one
+### Step 1: foundations (unblocked; all four people from the start)
 
-Everyone, week 1: P2 (one small PR each through the full ruleset).
+Everyone first: P2 (one small PR each through the full ruleset).
 
-- **Student A (identity and frontend):** P1, P7, P11, then drafts P16; P31 from week 3.
-- **Student B (crypto and sealing):** drafts P17; starts P34 checkpoint A (seal on the current `HPK1` suite needs no decision); P41's conditional-write PR, merged by week 3-4 (needed by P33); P10.
-- **Student C (enclave and operations):** P46; drafts P15 and the options memo for P14 with the maintainer; starts P47 against a synthetic certificate chain; the scripts and the attestation-fixture capture in P12 phase B (by week 4).
-- **Student D (data and disclosure):** P9, P8; pairs with another student on P69 from week 2.
-- **Maintainer:** P4 (the CODEOWNERS fix and the private-fix procedure first), P5 (including the week-3 capacity decision), P19, P12 phase A (including vTPM and attestation-service support for P14), P13's team secret store (weeks 1-2) and the rest of P13 once P16 names the provider, co-owning P14, reserving ADR numbers, the review rota and the weekly Dependabot rotation (P4).
-- Also unblocked, for whoever finishes early: P3, P6 (with the maintainer), P80, P24, P25, P26, P70, P45, P79, P43, P18, P61, P27, P75, P57 (the ADR part).
+- **Student A (identity and frontend):** P1, P7, P11, then drafts P16; then P31.
+- **Student B (crypto and sealing):** drafts P17; starts P34 checkpoint A (seal on the current `HPK1` suite needs no decision); P41's conditional-write PR (needed by P33); P10.
+- **Student C (enclave and operations):** P46; drafts P15 and the options memo for P14 with the maintainer; starts P47 against the synthetic certificate chain from P84; the scripts and the attestation-fixture capture in P12 phase B.
+- **Student D (data and disclosure):** P9, P8, then P84 stage 1 on the dev server from P8; pairs with another student on P69.
+- **Maintainer:** P4 (the CODEOWNERS fix and the private-fix procedure first), P5 (including the scope review), P19, P12 phase A (including vTPM and attestation-service support for P14), P13's team secret store and the rest of P13 once P16 names the provider, co-owning P14, reserving ADR numbers, the review rota and the Dependabot rotation (P4).
+- Also unblocked, for whoever is free: P3, P6 (with the maintainer), P80, P24, P25, P26, P70, P45, P79, P43, P18, P61, P27, P75, P57 (the ADR part).
 
-### Phase plan
+### Step 2: decisions
 
-- **Weeks 1-3, foundations and decisions.** Everything above. All five ADRs (P14 with its workload-identity decision, P15, P16, P17, and the mechanism in P18) accepted by the end of week 3; ADR-only PRs may merge ahead of code. The maintainer records the capacity decision in P5.
-- **Weeks 4-8, build the parts.** P12 phase B's fixtures (week 4), the P13 development tenant (week 4), P18, P43, P31, P61 then P62, P28, P29, P34, P35 (after P69 merges, never concurrently), P47, P48, P49, P44 on the local stack, P38, P41, P54, P57, P75, the P73 baseline before P35 merges, P72 stage A, and P65 and P67 from week 6.
-- **Week 6 checkpoint (dated in P5).** Does P47 verify P12's recorded reports (and the synthetic chain), and does a Confidential VM from P12 reach the "device present" branch? If not, the maintainer decides the fallback then, not in week 12.
-- **Week 7 checkpoint (dated in P5).** Do P29's token exchange and tenant membership work against the provider's development tenant from P13? If not, the maintainer decides the fallback then (for example moving MFA to the provider to shrink P30, or co-owning P29).
-- **Weeks 8-12, integrate.** The P13 staging domain (week 8), P50, P33, P30, P63, P32, P36, P39, P40, P55, P56, P58, P52 then P53, P60, P59, P66, P37, P42, P71, P81.
-- **Weeks 11-15, deploy, operate, accept.** P51, P68 (with the independent deploy run for DoD item 5 by week 13), P64, P76, P77 (with the restart-and-failure drill), P74, P72 stage B on staging, P82, P83. P78 closes with P82.
+All five ADRs (P14 with its workload-identity decision, P15, P16, P17, and the mechanism in P18) are accepted before the build items that depend on them start; ADR-only PRs may merge ahead of code. The maintainer records the scope review in P5.
+
+### Step 3: build the parts
+
+P12 phase B's fixtures, the P13 development tenant, P18, P43, P31, P61 then P62, P28, P29, P34, P35 (after P69 merges, never concurrently), P47, P84 stage 2, P48, P49, P44 on the local stack, P38, P41, P54, P57, P75, the P73 baseline before P35 merges, P72 stage A, P65 and P67.
+
+**Checkpoint A (recorded in P5), once P47 and P12 phase B are in place.** Does P47 verify P12's recorded reports (and the synthetic chain), and does a Confidential VM from P12 reach the "device present" branch? If not, the maintainer decides the fallback before Step 4.
+
+**Checkpoint B (recorded in P5), once P29's token exchange is attempted.** Do P29's token exchange and tenant membership work against the provider's development tenant from P13? If not, the maintainer decides the fallback before Step 4 (for example moving MFA to the provider to shrink P30, or co-owning P29).
+
+### Step 4: integrate
+
+The P13 staging domain, P50, P33, P30, P63, P32, P36, P39, P40, P85, P55, P56, P58, P52 then P53, P60, P59, P66, P37, P42, P71, P81. Each runs first on the simulated TEE (P84), then on hardware.
+
+### Step 5: deploy, operate, accept
+
+P51, P68 (with the independent deploy run for DoD item 5), P64, P76, P77 (with the restart-and-failure drill), P74, P72 stage B on staging, P82, P83. P78 closes with P82.
 
 ### Work streams (one primary student owner each, plus a named secondary reviewer)
 
 1. **Identity and frontend:** P1, P3, P7, P11, P16, P18, P28, P29, P30, P31, P32, P63, P44, P66, P72.
-2. **Crypto and sealing:** P10, P6 (with the maintainer), P26, P70, P17, P34, P35, P36, P37, P33, P40, P55, P56, P41, P39, P42.
+2. **Crypto and sealing:** P10, P6 (with the maintainer), P26, P70, P17, P34, P35, P36, P37, P33, P40, P55, P56, P85, P41, P39, P42.
 3. **Enclave and operations:** P46, P15, P47, P48, P49, P50, P51, P68, P67, P71, P75, P76, P77, P64, P74, P65, P81.
-4. **Data and disclosure:** P9, P8, P24, P25, P27, P43, P38, P45, P52, P53, P54, P57, P58, P59, P60, P61, P62, P69, P73.
+4. **Data and disclosure:** P9, P8, P84, P24, P25, P27, P43, P38, P45, P52, P53, P54, P57, P58, P59, P60, P61, P62, P69, P73.
 
-Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failure drill are paired work and should borrow a second person, and P63 pairs stream 1 with whoever built P62. Shared by all streams: P2 (everyone, week 1), P78 and P79 (each stream adds tests for its own refusals), P80, and the docs each PR changes. Maintainer: P4, P5, P19, P12 phase A, P13, P14 (co-owned with stream 3), ADR acceptance, all code-owner reviews, P82 with a release owner, and P83.
-
----
+Streams 3 and 4 are the largest; P69, P62, P29, P50, P85 and P77's restart-and-failure drill are paired work and should borrow a second person (P85 pairs stream 2 with stream 3), P84 has a stream 3 secondary reviewer, and P63 pairs stream 1 with whoever built P62. Shared by all streams: P2 (everyone first), P78 and P79 (each stream adds tests for its own refusals), P80, and the docs each PR changes. Maintainer: P4, P5, P19, P12 phase A, P13, P14 (co-owned with stream 3), ADR acceptance, all code-owner reviews, P82 with a release owner, and P83.
 
 ## Start here: team setup, process and environments
 
 ### P1. Fix the documented backend run commands
 **Labels:** harden · area:ops · rust · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** week 1
+**Size:** S · **Priority:** team enablement
 
 **Summary.** The first backend command a new contributor runs fails on a clean checkout. `cargo run -p platform-api` (`README.md:115` and `:129`) stops with "could not determine which binary to run", because the package has three binaries (`src/main.rs`, `src/bin/devtoken.rs`, `src/bin/query-demo.rs`) and no `default-run`. The end-to-end steps also export `JWT_HS256_SECRET` in terminal 1 and run `devtoken` in terminal 2; the new shell reads `backend/.env`, where the template ships the secret empty (`backend/.env.example:55`), so `devtoken` refuses.
 
@@ -132,7 +163,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P2. Core-team onboarding (one copy per team member)
 **Labels:** documentation · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** week 1
+**Size:** S · **Priority:** team enablement
 
 **Summary.** Each of the four core-team members gets a working toolchain and lands one small pull request through the full ruleset (peer approval, CI, squash merge) before feature work starts. `CONTRIBUTORS.md:16-19` lists the four members without the GitHub handle that its own entry format requires (`CONTRIBUTORS.md:23`).
 
@@ -160,7 +191,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P3. Developer setup guide and "why check.sh failed"
 **Labels:** documentation · area:ops · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-2
+**Size:** S · **Priority:** team enablement
 
 **Summary.** The setup section of `CONTRIBUTING.md` (lines 7-18) is three bullets that point to the README, and `docs/` has no development guide. CI never runs on Windows and the scripts are bash. `cargo deny` and `npm audit` run only in CI (the `dependencies` job, `.github/workflows/ci.yml:56-70`), so licence and advisory failures appear only after a push. Several `scripts/check.sh` guards are easy to trip by accident.
 
@@ -190,7 +221,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P4. Review process and code-owner coverage
 **Labels:** harden · area:ops
-**Size:** S · **Priority:** team enablement · **Owner:** @AxolDad · **Target:** week 1
+**Size:** S · **Priority:** team enablement · **Owner:** @AxolDad
 
 **Summary.** The `main` ruleset requires code-owner review, approval from someone other than the last pusher, dismissal of stale approvals on push, strict up-to-date status checks and resolved review threads, with squash merges only. @AxolDad is the only code owner, and roughly half of this milestone touches code-owned paths, so without a written process reviews will be the bottleneck. Separately, `.github/CODEOWNERS:12` names `/deny.toml`, which matches no file (the file is `backend/deny.toml`), and several files that make security decisions have no owner: the gating decision in `backend/crates/quackxide-engine/src/lib.rs`, `EnclaveKeyProvider` and the grant/budget path in `backend/crates/platform-api/src/query.rs`, `backend/crates/platform-tenancy/src/grants.rs` and `budget.rs`, `main.rs`, which decides what production runs with, the auth middleware in `platform-api/src/lib.rs`, `docs/THREAT_MODEL.md` and `docs/adr/`. Finally, `SECURITY.md:8-9` bars public issues, discussions and pull requests for a vulnerability, but `CONTRIBUTING.md` ("Security issues", lines 89-91) only points to `SECURITY.md`, so the team has no written path for fixing privately a vulnerability it finds.
 
@@ -200,21 +231,21 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 - Every CODEOWNERS pattern matches at least one tracked path, checked against `git ls-files` (by hand or as a small `scripts/check.sh` step). GitHub's CODEOWNERS error view does not flag patterns that match nothing.
 - `/deploy/` will hold the workload image definition (P49), the deployment procedure and secret wiring (P68) and the audit-sink routing (P64); the published attestation values come from `.github/workflows/release.yml`, which `/.github/` already covers. Because every pattern must match a tracked path, the `/deploy/ @AxolDad` line lands in the P12 phase B PR that creates the directory. If review load on the dev-VM scripts is a concern, the maintainer may defer it to the first P49 PR, which adds the image definition.
 - `CONTRIBUTING.md` gains a "Reviews" section that the repository settings match:
-  - Two-stage review: a core-team peer first (correctness, tests, docs), then @AxolDad for code-owned paths. The maintainer states a turnaround (for example two working days) and a weekly review block.
-  - The approving peer review comes from a core-team member who authored no commits in the PR; a co-author's approval does not count toward the peer stage. (The ruleset only excludes the last pusher, so a pair partner could otherwise approve their own pair's work on P29, P50, P62, P69 or P77.) If the maintainer co-authors a PR, for example under P5's week-7 fallback for P29, the maintainer-authored rule below applies: a core-team non-author approves before merge, and the maintainer's code-owner approval alone does not count.
+  - Two-stage review: a core-team peer first (correctness, tests, docs), then @AxolDad for code-owned paths.
+  - The approving peer review comes from a core-team member who authored no commits in the PR; a co-author's approval does not count toward the peer stage. (The ruleset only excludes the last pusher, so a pair partner could otherwise approve their own pair's work on P29, P50, P62, P69 or P77.) If the maintainer co-authors a PR, for example under P5's fallback for P29, the maintainer-authored rule below applies: a core-team non-author approves before merge, and the maintainer's code-owner approval alone does not count.
   - Code owners leave review comments instead of pushing to a contributor's branch, because a push by the only code owner then needs a second approver (`require_last_push_approval`).
   - Maintainer-authored PRs to code-owned paths: a core-team member reviews and approves first; the maintainer merges with the admin bypass only after that approval and says so in the PR. Bypass is never used to skip a failing check, an unresolved thread or a missing peer review. The alternative, a second code owner for non-security paths, is recorded if chosen.
-  - Strict up-to-date checks: either document the "update branch, wait for CI, re-request review" loop, or enable a merge queue. A merge queue first needs a `merge_group:` trigger in every workflow behind a required check (`ci.yml`, `codeql.yml`, `dependency-review.yml`, `attribution-guard.yml`; none has one today) and confirmation that each required check reports on a merge-group run. Decide after the first week's PRs.
+  - Strict up-to-date checks: either document the "update branch, wait for CI, re-request review" loop, or enable a merge queue. A merge queue first needs a `merge_group:` trigger in every workflow behind a required check (`ci.yml`, `codeql.yml`, `dependency-review.yml`, `attribution-guard.yml`; none has one today) and confirmation that each required check reports on a merge-group run. Decide after the first batch of PRs.
   - Security changes are kept in small PRs so the code-owned part can be reviewed on its own.
   - CHANGELOG: per-PR changelog fragments compiled at release, or the PR title as the changelog line with a periodic non-code-owned PR updating `CHANGELOG.md`. Update `CONTRIBUTING.md:76-77` and the checkbox in `.github/pull_request_template.md` to match. (A maintainer edit at merge time is a push, which triggers last-push approval.)
   - ADR numbers are reserved in the issue before drafting starts, so parallel ADR PRs do not collide.
   - Each work stream in P5 has a named primary and secondary student reviewer.
-  - Dependabot opens weekly PRs for `/backend`, `/backend/fuzz`, `/frontend` and GitHub Actions (`.github/dependabot.yml`). One named person per week (a rotation listed in P5 next to the review rota):
-    - reviews and merges the grouped minor and patch PRs (the `rust`, `rust-fuzz` and `npm` groups) once CI passes. They ask for an update with `@dependabot rebase`, not the "Update branch" button: whoever clicks "Update branch" becomes the last pusher, and under last-push approval their own approval stops counting;
+  - Dependabot opens weekly PRs for `/backend`, `/backend/fuzz`, `/frontend` and GitHub Actions (`.github/dependabot.yml`). One named person per Dependabot batch, on a rotation (listed in P5 next to the review rota):
+    - reviews and merges the grouped minor and patch PRs (the `rust`, `rust-fuzz` and `npm` groups) once CI passes. They ask Dependabot to update the PR with its `rebase` comment command, not the "Update branch" button: whoever clicks "Update branch" becomes the last pusher, and under last-push approval their own approval stops counting;
     - leaves `actions`-group PRs, which touch the code-owned `.github/`, for @AxolDad's code-owner review after a peer approval;
     - does not merge a semver-major update, whether it arrives in its own PR "for deliberate review" (`.github/dependabot.yml:3-5`) or inside the `query-engine` or `vitest` groups, which have no update-type filter; each goes to the owning stream's primary reviewer, and the maintainer decides;
     - closes any PR that bumps `datafusion*`, `arrow*`, `parquet` or `object_store` across a major version while P69 is open, and any `hpke` major while P35 is open, with a link to that issue (optionally commenting `@dependabot ignore <name> major version`, undone after the issue merges). `.github/dependabot.yml` itself is not edited for this.
-- The "Security issues" section of `CONTRIBUTING.md` (lines 89-91) gains a general procedure for fixing a vulnerability privately. It applies to anything the team finds during the semester, names no specific vulnerability, and does not go under "Reviews". It covers:
+- The "Security issues" section of `CONTRIBUTING.md` (lines 89-91) gains a general procedure for fixing a vulnerability privately. It applies to anything the team finds, names no specific vulnerability, and does not go under "Reviews". It covers:
   - the maintainer opens a draft repository security advisory and adds the assignee as an advisory collaborator, who works in the advisory's temporary private fork; the advisory description holds the issue's Summary and Done when;
   - whether the required checks run in that fork, confirmed once and recorded in the procedure. If they do not: the PR attaches local output of `scripts/check.sh`, `cargo deny check` (from `backend/`) and `npm audit --omit=dev --audit-level=high` (from `frontend/`); a second core-team member reviews in the fork; the maintainer merges; and the maintainer confirms that the `ci` run triggered by the push to `main` (`.github/workflows/ci.yml:3-5`) passes, fixing any failure at once;
   - the advisory is published when the fix merges, and the reporter is credited in `CHANGELOG.md` (`SECURITY.md:23-24`).
@@ -231,17 +262,17 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P5. v1.0 plan and dependency graph (pinned tracking issue)
 **Labels:** tracking
-**Size:** S (ongoing) · **Priority:** team enablement · **Owner:** @AxolDad · **Target:** week 1, then weekly
+**Size:** S (ongoing) · **Priority:** team enablement · **Owner:** @AxolDad
 
-**Summary.** One pinned issue that holds the plan from the "Suggested order" section of this document, with real issue numbers, so slippage on the hardware and key-release path shows early.
+**Summary.** One pinned issue that holds the plan from the "Order of work" section of this document, with real issue numbers, so a blocked hardware or key-release path shows before the work that depends on it.
 
 **Done when**
-- The issue holds a task list of every issue in the milestone, grouped by work stream, each with an assignee and a target week written as a calendar date. The milestone due date comes from the week-3 capacity decision below. The semester's own end (the last week of Fall 2026, confirmed with the maintainer; the repository went public on 2026-09-30, so fewer than 15 weeks may remain) is recorded next to it as this semester's target for definition-of-done items 1-2.
-- Every "Depends on" line in this milestone is also recorded as a GitHub "blocked by" relationship or sub-issue link. Where a Depends line names only one item or PR of another issue (for example P41's conditional-write PR, or "P38 (its ADR ...)"), that item gets its own sub-issue and the "blocked by" link points at it, so the graph shows work that can close on time.
-- A dated week-6 checkpoint records whether P47 verifies P12's recorded reports (and the synthetic chain) and a Confidential VM boots with `/dev/sev-guest` (P12), and any scope fallback the maintainer decides.
-- A dated week-7 checkpoint records whether P29's token exchange and tenant membership work against the provider's development tenant (P13), and the fallback the maintainer decides if they do not (for example moving MFA to the provider to shrink P30, or the maintainer co-owning P29).
-- By the end of week 3 the issue records the capacity decision from "Capacity check first": the extended milestone date, and any v1-needed issue moved to v1.1 together with its matching edits.
-- The review rota and the weekly Dependabot rotation from P4 are listed with names.
+- The issue holds a task list of every issue in the milestone, grouped by work stream, each with an assignee, in dependency order.
+- Every "Depends on" line in this milestone is also recorded as a GitHub "blocked by" relationship or sub-issue link. Where a Depends line names only one item or PR of another issue (for example P41's conditional-write PR, or "P38 (its ADR ...)"), that item gets its own sub-issue and the "blocked by" link points at it, so the graph shows work that can close on its own.
+- A checkpoint, once P12 phase B is attempted, records whether P47 verifies P12's recorded reports (and the synthetic chain) and a Confidential VM boots with `/dev/sev-guest` (P12), and any scope fallback the maintainer decides.
+- A checkpoint, once P29's token exchange and tenant membership are attempted against the provider's development tenant (P13), records whether they work, and the fallback the maintainer decides if they do not (for example moving MFA to the provider to shrink P30, or the maintainer co-owning P29).
+- First, the issue records the scope review from "Step 0: scope review": any v1-needed issue moved to v1.1 together with its matching edits.
+- The review rota and the Dependabot rotation from P4 are listed with names.
 - The plan is updated when an issue is split, merged or moved out of the milestone.
 
 **Where.** GitHub only (issue, milestone description).
@@ -255,7 +286,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P6. Testing guide: layers, conventions, and what CI cannot exercise
 **Labels:** documentation · area:ops
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-2 (drafted with the maintainer)
+**Size:** S · **Priority:** team enablement · drafted with the maintainer
 
 **Summary.** The test layers exist but are not written down, and four people need one convention for the negative tests and audit assertions that definition-of-done item 8 requires. Some things cannot run in CI (SEV-SNP hardware, the managed sign-in service, GCS), and the substitute for each should be decided once.
 
@@ -283,7 +314,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P7. Same-origin API access from the browser in development
 **Labels:** build · area:frontend · javascript · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-2
+**Size:** S · **Priority:** team enablement
 
 **Summary.** By default the frontend calls `http://127.0.0.1:8080` (`frontend/src/config/brand.ts:39`, `frontend/.env.example`) from the Vite dev server on `localhost:5173`, which is a different origin. `HttpVault`, `ResearchClient` and `AdminClient` all send an `Authorization` header, which forces a CORS preflight, and the API has no CORS layer (`build_app` adds only `TraceLayer`, `backend/crates/platform-api/src/lib.rs:322`). Browsers therefore block the README's "End-to-end locally" flow in `http` vault mode.
 
@@ -304,9 +335,9 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P8. Local research stack: one dev-only server with research routes wired and seeded data
 **Labels:** build · area:ops · rust
-**Size:** S-M · **Priority:** team enablement · **Target:** weeks 1-3
+**Size:** S-M · **Priority:** team enablement
 
-**Summary.** Nobody can run the research lifecycle locally today. `platform-api` passes `query: None` (`backend/crates/platform-api/src/main.rs:68`), so catalog, grant, request and research-query routes all return 503 (`lib.rs:423-425`), and the portal shows "research access is not enabled on this deployment" (`frontend/src/lib/research/client.ts:148`). The full research wiring exists only in `backend/crates/platform-api/tests/research_api.rs:58-99`. Production key release needs SEV-SNP hardware, so this dev mode is how most contributors will run research routes all semester. It is not a stopgap.
+**Summary.** Nobody can run the research lifecycle locally today. `platform-api` passes `query: None` (`backend/crates/platform-api/src/main.rs:68`), so catalog, grant, request and research-query routes all return 503 (`lib.rs:423-425`), and the portal shows "research access is not enabled on this deployment" (`frontend/src/lib/research/client.ts:148`). The full research wiring exists only in `backend/crates/platform-api/tests/research_api.rs:58-99`. Production key release needs SEV-SNP hardware, so this dev mode is how most contributors will run research routes. It is not a stopgap.
 
 **Done when**
 - A dev-only binary (for example `src/bin/devstack.rs`) is declared with `required-features = ["dev"]` behind a new non-default feature in `backend/crates/platform-api/Cargo.toml`, so `cargo build --release -p platform-api` (`.github/workflows/release.yml`) never builds it. It refuses to start unless `JWT_HS256_SECRET` and an explicit dev flag are both set, and logs a loud "insecure, development only" warning.
@@ -321,7 +352,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 **Sequencing.** The browser half uses the proxy from P7.
 
-**Security impact.** Adds a binary that runs without attestation; it must be impossible to build or start in production (feature-gated, refuses without explicit opt-in). P18 later moves `devtoken` and `query-demo` behind the same mechanism.
+**Security impact.** Adds a binary that runs without hardware attestation; it must be impossible to build or start in production (feature-gated, refuses without explicit opt-in). P18 later moves `devtoken` and `query-demo` behind the same mechanism, and P84 replaces `DevAttestation::allow_insecure_dev()` in this server with the simulated SEV-SNP mode, so the dev server runs the real attestation protocol.
 **ADR.** Not required.
 
 **Notes.** A one-command wrapper script under `scripts/` (code-owned) and a filesystem vault shared with `connector-worker` are out of scope.
@@ -330,7 +361,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P9. Seeded synthetic research-dataset generator
 **Labels:** build · area:ops · rust · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-3
+**Size:** S · **Priority:** team enablement
 
 **Summary.** `docs/DATA_POLICY.md` (lines 38-43) says to generate synthetic data with a fixed seed, keep the generator in the repository, and use fixture cohort sizes on both sides of `RESEARCH_MIN_COHORT_SIZE`. No generator exists; the only research-shaped data is a hand-built 7-row cohort Parquet copied into `backend/crates/platform-api/tests/research_api.rs`, `catalog_api.rs` and `backend/crates/quackxide-engine/tests/disclosure.rs`. The local stack (P8), upload (P38), disclosure work (P54, P58), benchmarks (P73) and the acceptance run (P82) all need shared synthetic data, some of it larger than rule 5 allows in commits (enforced by the data guard in `scripts/check.sh`).
 
@@ -354,7 +385,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P10. Shared API test helpers
 **Labels:** harden · rust · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-3
+**Size:** S · **Priority:** team enablement
 
 **Summary.** Each `platform-api` integration test file writes its own token minter, request helpers (`send`, `call`, `post`, `post_query`, `admin_auth`) and app builder. Every security issue in this milestone adds tests to these files, so shared helpers save time and keep the negative tests consistent.
 
@@ -376,7 +407,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P11. Frontend lint in check.sh
 **Labels:** build · area:frontend · javascript · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-3
+**Size:** S · **Priority:** team enablement
 
 **Summary.** The frontend has no linter. `scripts/check.sh` (lines 22-32) runs only `npm ci`, typecheck, unit tests and build, and `frontend/package.json` has no lint script. The sign-in, upload and portal work (P32, P40, P44) should land lint-clean from the start.
 
@@ -401,18 +432,18 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P12. SEV-SNP cloud environment, team access and budget
 **Labels:** build · area:enclave · area:ops
-**Size:** M · **Priority:** v1 blocker · **Owner:** @AxolDad (account, billing, IAM), one student for the scripts · **Target:** phase A by week 2; phase B, including the attestation fixtures, by week 4
+**Size:** M · **Priority:** v1 blocker · **Owner:** @AxolDad (account, billing, IAM), one student for the scripts
 
 **Summary.** Attestation on hardware (P48), key release (P50), deployment (P68), the hardware test job (P71), enclave-overhead benchmarks (P74) and definition-of-done item 2 all need genuine AMD SEV-SNP hardware and a cloud project. The code targets GCP Confidential VMs (`backend/crates/platform-enclave/src/lib.rs:1-2, 84-85`, which probes `/dev/sev-guest`) and a GCS vault (`ObjectStoreVault::new_gcs`). GitHub-hosted runners have no SEV-SNP, and nothing in the repository says how a contributor gets access. This is the first item on the critical path.
 
 **Done when**
-- **Phase A (maintainer, by week 2):**
+- **Phase A (maintainer):**
   - A development project and billing account owned by the maintainer, with a budget alert at an agreed monthly cap wired to the maintainer. Education or research credits are applied for and the outcome recorded.
   - A machine type and zone that support SEV-SNP are checked against current provider documentation, and a booted VM shows `/dev/sev-guest`. If the image exposes only configfs-tsm, that is recorded as a requirement for P48.
   - Whether the chosen machine type and image expose a vTPM and support the provider's attestation service is recorded, as input to P14's workload-identity decision.
   - Budget alerts alone do not stop spending, so at least one hard control is in place: a per-project VM or CPU quota, automatic shutdown of idle VMs (instance schedule or TTL label), or a budget-triggered billing disable.
-  - Each team member has their own least-privilege identity, revoked at the end of the semester: create, stop and delete VMs in this one project; no access to production secrets, key material, other projects, project-owner or billing roles. If P13 puts the team secret store in Secret Manager in this project, the role also reads those team secrets, and only those. No shared accounts. No service-account key files are issued (enable the organization policy that blocks key creation if available); locally, use application-default user credentials; on the VM, the attached service account.
-- **Phase B (student, by week 4, before P48 starts on hardware):**
+  - Each team member has their own least-privilege identity, revoked when the member leaves the project: create, stop and delete VMs in this one project; no access to production secrets, key material, other projects, project-owner or billing roles. If P13 puts the team secret store in Secret Manager in this project, the role also reads those team secrets, and only those. No shared accounts. No service-account key files are issued (enable the organization policy that blocks key creation if available); locally, use application-default user credentials; on the VM, the attached service account.
+- **Phase B (student, before P48 starts on hardware):**
   - A script in a new `deploy/` directory (for example `deploy/dev-cvm.sh up|down`) creates and destroys a dev Confidential VM, and VMs stop or delete themselves after a set run time. It is the seed that P68 extends, not a parallel deployment path.
   - The PR that creates `deploy/` adds `/deploy/ @AxolDad` to `.github/CODEOWNERS` (P4).
   - A development GCS bucket wired through the existing `GCP_PROJECT_ID` and `STORAGE_BUCKET` settings (`backend/.env.example`).
@@ -420,7 +451,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
   - Two or more attestation reports are captured on the VM, each with a fixed synthetic REPORT_DATA (nonce), plus the AMD certificate chain (VCEK or VLEK, whichever the platform uses, its ASK or ASVK intermediate, and the ARK, matching P47). Today `SnpAttestation::produce_evidence` refuses even on hardware (`backend/crates/platform-enclave/src/lib.rs:116-120`), so project code cannot do this capture: use an established off-the-shelf SEV-SNP guest tool run on the VM, named with its version, source and licence in the PR. The tool is not vendored or added as a project dependency, so CI does not check it. The captures go into `backend/crates/platform-enclave/tests/fixtures/` (the path P48's recorder later writes) with a README recording machine type, zone, firmware/TCB, date, the tool's name, version and source, and the source and terms of the AMD certificates. Fixtures contain no keys, credentials, project IDs or VM addresses.
   - `CONTRIBUTING.md` ("Setup") or `docs/DEVELOPMENT.md` explains how a contributor requests access and tears resources down. The machine type, zone, image and estimated cost per hour are recorded in one doc that P68 reuses.
 - Project IDs, billing details, member emails and VM addresses stay out of public issues, docs and fixtures. `.gitignore` covers key-file patterns.
-- End of semester: no VMs are left running.
+- When the core team's work ends, no VMs are left running.
 
 **Where.** New `deploy/`; `.github/CODEOWNERS`; `docs/`; `CONTRIBUTING.md`; `.gitignore`; `backend/crates/platform-enclave/tests/fixtures/` (new).
 
@@ -435,13 +466,13 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 ### P13. Accounts beyond GCP: sign-in provider, staging domain and synthetic test identities
 **Labels:** build · area:auth · area:ops
-**Size:** S · **Priority:** v1 blocker · **Owner:** @AxolDad · **Target:** team secret store by week 2; provider development tenant by week 4 (before P29 integrates); staging domain by week 8 (before P68)
+**Size:** S · **Priority:** v1 blocker · **Owner:** @AxolDad
 
 **Summary.** P12 provisions GCP only. P29, P32, P65, P68 and P82 need a tenant at the managed sign-in provider that P16 chooses, and P68 needs a domain for HTTPS (P67) and for the provider's redirect URIs. `APP_DOMAIN_NAME` defaults to `localhost` (`backend/crates/platform-config/src/lib.rs:157`). `docs/DATA_POLICY.md` applies to "every development and test environment" (lines 3-4), and rule 2 (lines 13-16) forbids real email addresses and uses fake addresses on reserved `.example` domains, which cannot receive the verification, reset or enrolment email a real provider sends. Without a decision, team members will register their personal addresses as test users.
 
 **Done when**
-- **Team secret store (maintainer, by week 2; does not wait for P16).** It exists before the first shared value is created (the development tenant, week 4). Either a shared vault in an organization-owned password manager with per-member accounts and MFA, which suits values people read and type (test-user passwords, TOTP seeds, tenant URLs, client IDs); or Secret Manager in the P12 development project, in which case P12 phase A's per-member role adds read access to those team secrets only. Each core-team member has individual access with MFA. Members can read development values only: the P12 development project settings, the development tenant's client values, and test users' passwords and TOTP seeds. Staging-tenant secrets are readable only by the maintainer, and production secrets live only in P68's secret store, which no team identity accesses as a matter of course. `docs/DEVELOPMENT.md` (P3) names the store and how to request access. Values from it are never pasted into issues, PRs, commits or chat. Access is revoked at the end of the semester on the same checklist as the P12 and provider-tenant revocations.
-- **Provider tenants.** The organization owns a development tenant and a staging tenant at the provider P16 chose; a production tenant, if one is needed, is created by P68's documented procedure. Team members get least-privilege admin on the development tenant only, with MFA on their admin accounts, and lose it at the end of the semester. No provider client secret is in the repository; provider secrets live in the team secret store (development and staging, with the access rules above) or in P68's secret store (production). Cost and free-tier limits are recorded.
+- **Team secret store (maintainer; does not wait for P16).** It exists before the first shared value is created (the development tenant). Either a shared vault in an organization-owned password manager with per-member accounts and MFA, which suits values people read and type (test-user passwords, TOTP seeds, tenant URLs, client IDs); or Secret Manager in the P12 development project, in which case P12 phase A's per-member role adds read access to those team secrets only. Each core-team member has individual access with MFA. Members can read development values only: the P12 development project settings, the development tenant's client values, and test users' passwords and TOTP seeds. Staging-tenant secrets are readable only by the maintainer, and production secrets live only in P68's secret store, which no team identity accesses as a matter of course. `docs/DEVELOPMENT.md` (P3) names the store and how to request access. Values from it are never pasted into issues, PRs, commits or chat. Access is revoked when a member leaves the project, on the same checklist as the P12 and provider-tenant revocations.
+- **Provider tenants.** The organization owns a development tenant and a staging tenant at the provider P16 chose; a production tenant, if one is needed, is created by P68's documented procedure. Team members get least-privilege admin on the development tenant only, with MFA on their admin accounts, and lose it when they leave the project. No provider client secret is in the repository; provider secrets live in the team secret store (development and staging, with the access rules above) or in P68's secret store (production). Cost and free-tier limits are recorded.
 - **App registrations.** Redirect URIs cover `http://localhost:5173` (`frontend/vite.config.ts:10`) and the staging origin, and are exact-match with no wildcards. The implicit and hybrid grants are disabled and PKCE is required for the public client (P16). These settings are listed in the PR and in the P68 deployment doc. The configuration keys for the issuer, JWKS URL and client ID are added to `backend/.env.example` and `frontend/.env.example` with empty values. `docs/DEVELOPMENT.md` (P3) says how a team member gets access and where the values live. The tenant-specific values (tenant URLs, client IDs, the staging domain) stay in the team secret store and the gitignored `.env`, never in public docs or issues: the same rule P12 applies to project IDs.
 - **Synthetic test identities.** The decision is recorded as an amendment to `docs/DATA_POLICY.md`: either provider test users with email verification off, or addresses on a maintainer-controlled test subdomain with a catch-all mailbox. No team member's personal email address or phone number is a test identity. Test users' passwords and TOTP seeds live in the team secret store and are never committed.
 - **Staging domain.** The maintainer delegates a staging domain or subdomain, or P15 records a provider-managed hostname instead. DNS records come from `deploy/` templates and the name is never committed, as P68 requires. The `scripts/check.sh` domain guard (lines 40-46) only looks for the `yourdomain` placeholder in `backend/crates` and `frontend/src`, so it does not enforce this: review does, or this issue extends the guard to `deploy/`.
@@ -451,22 +482,52 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50 and P77's restart-and-failur
 
 **Depends on:** P16 (provider choice; the team secret store and the staging domain do not wait for it).
 
-**Sequencing.** The development tenant exists before P29 integrates against the provider; the week-7 checkpoint in P5 uses it.
+**Sequencing.** The development tenant exists before P29 integrates against the provider, and the staging domain exists before P68; the P29 checkpoint in P5 uses the development tenant.
 
 **Security impact.** Keeps real personal data out of test environments, and keeps provider secrets and tenant identifiers out of the public repository.
 **ADR.** Not required.
 
-**Notes.** Open decisions for the maintainer: the team secret store's tool, the test-identity approach and who owns the staging domain. "Team secret store" is used instead of "team vault" because "vault" already means the product's encrypted storage (`VaultStore`, `ObjectStoreVault`, `HttpVault`, `VITE_VAULT_MODE`). The maintainer may fold this into P12 as a "phase C" instead of a separate issue; if so, keep the three targets.
+**Notes.** Open decisions for the maintainer: the team secret store's tool, the test-identity approach and who owns the staging domain. "Team secret store" is used instead of "team vault" because "vault" already means the product's encrypted storage (`VaultStore`, `ObjectStoreVault`, `HttpVault`, `VITE_VAULT_MODE`). The maintainer may fold this into P12 as a "phase C" instead of a separate issue; if so, keep the three parts and their ordering.
 
 ---
 
-## Decisions that block build work (weeks 1-3)
+### P84. Simulated SEV-SNP mode for development and CI
+**Labels:** build · area:enclave · area:ops · rust
+**Size:** M · **Priority:** team enablement · **Owner:** stream 4, with a stream 3 secondary reviewer
+
+**Summary.** Without hardware, the research flow runs with no TEE steps at all. The dev wiring uses `DevAttestation::allow_insecure_dev()` (`backend/crates/platform-enclave/src/lib.rs:45-80`), which fabricates `Development` evidence that `gate_execution` accepts without verification when attestation is not required (`lib.rs:130-144`), and keys come from in-process dev providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`, `backend/crates/platform-api/src/query.rs:49-113`). So contributors build sealing, key release and browser verification against a path that skips all of them, and nothing exercises the protocol until hardware is available (P12, P48). A simulated SEV-SNP mode runs the same protocol the production path runs (SNP-format evidence, the real verifier, attested key release) on any machine. It simulates the protocol, not the protection: the host can read the simulated enclave's memory, and the docs say so.
+
+**Done when**
+- **Stage 1: simulated evidence.**
+  - A dev-only `SimulatedSnp` `AttestationProvider` in `platform-enclave`, reachable only through the dev mechanism from P18 (until P18 lands, the `dev` feature from P8), produces evidence in the format P48 produces on hardware: SNP attestation-report bytes with caller-supplied 64-byte REPORT_DATA, plus the certificate chain.
+  - Reports are signed by a throwaway ARK to ASK to VCEK chain generated at process start, with an established, maintained library (no hand-written signature or certificate code; `unsafe` stays denied, `backend/Cargo.toml:27-28`). No key is committed (`docs/DATA_POLICY.md` rule 3). This is the one synthetic-chain generator in the repository: P47's `test-support` tests use it, or, if P47 builds it first, this issue reuses P47's.
+  - Measurement, guest policy, TCB and REPORT_DATA are set from dev configuration, so the negative cases (debug policy, wrong measurement, TCB below minimum, wrong REPORT_DATA) can be produced on demand.
+  - A new `TeePlatform::Simulated` variant (or an equivalent marker) travels with the evidence. `gate_execution`, `ConnectorQueryService::gate` (`query.rs:201-234`) and `EnclavePipeline::attestation_gate` (`backend/crates/platform-connectors/src/pipeline.rs:87-141`) accept it only in development mode and never treat it as `SevSnp`.
+- **Stage 2: the real verifier.** Once P47 lands, the dev server verifies simulated reports with P47's `AttestationVerifier`, configured in development mode with the simulated root as its trust root. A test shows the production verifier configuration rejects a report signed by the simulated chain.
+- **Dev server.** P8's dev server uses `SimulatedSnp` in place of `DevAttestation::allow_insecure_dev()`. When P50 lands, its key release goes through P50's release-service stand-in with the same protocol (relying-party nonce, verified report, key wrapped to the enclave's ephemeral key), and the dev server stops using `MultiTenantDevKeyProvider` (recorded in P50).
+- **Visibly simulated.** `tee.attestation` audit events record the platform as simulated; research and query responses carry a marker the portal reads; and the portal shows a persistent "Simulated TEE: development only, no hardware protection" notice whenever the marker is present. `audit_coverage.rs` asserts the simulated outcome.
+- **Never in production.** P18's production check refuses to start when `SimulatedSnp` or the simulated trust root would be used, with a test. A CI step shows a default-feature release build contains neither.
+- **Negative tests.** A tampered report, wrong REPORT_DATA, a debug policy, a wrong measurement and a report from a different simulated chain are each refused on the query path and the sync path.
+- `README.md` "Development" and the guide from P3 explain what the simulation proves (the protocol, the verifier, key release, sealing and browser verification run end to end) and what it does not (confidentiality from the host), and `docs/THREAT_MODEL.md` lists it as a development-only path.
+
+**Where.** `backend/crates/platform-enclave/src/lib.rs`, `backend/crates/platform-enclave/Cargo.toml`, `backend/crates/platform-api/src/query.rs`, the dev server from P8, `backend/crates/platform-connectors/src/pipeline.rs`, `backend/crates/platform-api/tests/audit_coverage.rs`, `frontend/src/components/research/`, `README.md`, `docs/THREAT_MODEL.md`.
+
+**Depends on:** P8 (the dev server it plugs into); P47 (stage 2 only).
+
+**Sequencing.** Stage 1 starts as soon as P8's dev server exists. P85, P55, P56 and P72 stage B are developed against this mode first; P48, P50 and P68 then run the same protocol on hardware.
+
+**Security impact.** Lets every enclave, sealing and browser-verification control be built and tested against the real protocol before hardware exists, without adding any path that production can reach.
+**ADR.** Not required (P18's mechanism gates it).
+
+---
+
+## Decisions that block build work
 
 Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR may merge ahead of the implementation; the implementing PR links it (`CONTRIBUTING.md:71-73`, `docs/adr/README.md:7-9`). Reserve each ADR number in its issue before drafting (P4). ADRs 0001-0003 are already taken on `main`, so the four numbered here are 0004-0007.
 
 ### P14. ADR 0004: key custody and attested key release
 **Labels:** build · area:crypto · area:enclave · needs-adr
-**Size:** M · **Priority:** v1 blocker · **Owner:** @AxolDad with one student · **Target:** accepted by end of week 3
+**Size:** M · **Priority:** v1 blocker · **Owner:** @AxolDad with one student
 
 **Summary.** The documents contradict each other on the key that opens a research dataset, and the code sides with one of them. `docs/THREAT_MODEL.md:25` says steward private keys are non-extractable in the browser and never sent to the server; the browser generates the X25519 HPKE private key with `extractable: false` and exports only the public half (`frontend/src/lib/crypto/core.ts:171-180`), and every server-side `TenantKeypair` is test or dev only (`backend/crates/platform-crypto/src/lib.rs:203-204`). Yet `docs/THREAT_MODEL.md:77`, `docs/ARCHITECTURE.md:159-165` and `docs/PROJECT_SCOPE.md` say the steward's key is released into the enclave for each research query, which runs on the researcher's request with the steward offline. A non-extractable browser key cannot be released anywhere, and no key broker or KMS exists, so a production `EnclaveKeyProvider` (`backend/crates/platform-api/src/query.rs:37-47`) has nothing to release. Drive uploads are wrapped under a browser-only key-encryption key (`frontend/src/lib/crypto/drive.ts`, `docs/ARCHITECTURE.md:34-49`), so no enclave can open them either. Decide how an attested enclave gains the ability to open a steward's dataset while the operator cannot.
 
@@ -475,8 +536,8 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 - It specifies, in full (these block P50 and P55):
   - the decryption root for connector-sealed and steward-uploaded datasets, and therefore what P38 seals to;
   - the relying party that verifies SEV-SNP reports before release, and why it is outside the operator's control (if nothing is, `THREAT_MODEL.md` A2 says so);
-  - who issues the nonce and the 64-byte REPORT_DATA layout (at least the nonce and an enclave ephemeral public key that released keys are wrapped to; optionally a digest of the effective disclosure configuration). Today `produce_evidence` takes only a nonce (`platform-enclave/src/lib.rs:41`), and `gate_execution` (`lib.rs:130-144`) and `EnclavePipeline::attestation_gate` (`platform-connectors/src/pipeline.rs:92`) check only the platform tag of evidence the same process produced;
-  - where the researcher's result key (P55) is generated and stored, and how the enclave gets an authentic copy of its public key when the operator controls the vault that holds enrollments.
+  - who issues the nonce and the 64-byte REPORT_DATA layout (at least the nonce and an enclave ephemeral public key that released keys are wrapped to; a digest of the browser-facing enclave keys from P85, the request-decryption and result-signing public keys, and of the TLS public key from P67; optionally a digest of the effective disclosure configuration). Today `produce_evidence` takes only a nonce (`platform-enclave/src/lib.rs:41`), and `gate_execution` (`lib.rs:130-144`) and `EnclavePipeline::attestation_gate` (`platform-connectors/src/pipeline.rs:92`) check only the platform tag of evidence the same process produced;
+  - where the researcher's result key (P55) is generated and stored. The enclave takes the recipient public key from the researcher's request sealed to it after the browser verified the enclave (P85), checked against the enrolled key's fingerprint, so the operator-controlled enrollment record is never the only source.
 - **Workload identity.** It decides how attestation evidence proves *which binary* runs, not only that it runs in a GCP SEV-SNP VM. On GCP Confidential VMs the SNP MEASUREMENT covers only Google-supplied firmware (P49), and the guest chooses REPORT_DATA itself, so a report with a valid AMD chain, a fresh nonce and a REPORT_DATA-bound key can come from any guest on that firmware, including an operator-modified `platform-api` that would then obtain dataset keys. It compares at least:
   1. a vTPM measured-boot quote checked alongside the SNP report: whose root of trust the vTPM's attestation key chains to (AMD, or the cloud provider), and whether and how the quote is bound to the SNP report. If the vTPM is hosted by the hypervisor rather than rooted in the SNP report, the cloud provider is in the trusted computing base for this property;
   2. an attestation token that the provider issues for a hardened workload runtime, and whom the relying party then trusts;
@@ -488,27 +549,27 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 **Where.** New `docs/adr/0004-key-custody.md`; `docs/adr/README.md`; `docs/THREAT_MODEL.md`; `docs/ARCHITECTURE.md`; `docs/PROJECT_SCOPE.md`.
 
-**Depends on:** P12 (phase A facts only: vTPM and attestation-service support, by week 2).
+**Depends on:** P12 (phase A facts only: vTPM and attestation-service support).
 
-**Sequencing.** Drafted together with P15. P12 phase A supplies the vTPM and attestation-service facts for the workload-identity decision by week 2.
+**Sequencing.** Drafted together with P15. P12 phase A supplies the vTPM and attestation-service facts for the workload-identity decision.
 
 **Security impact.** Defines the central trust boundary of the system (A2: who can ever hold a dataset key).
 **ADR.** This is the ADR.
 
-**Notes.** Blocks P50, P55, P38, P33, P48, P49, P77 and P34's checkpoint B; partly blocks P47 (only the relying-party placement, nonce source, REPORT_DATA layout and workload-identity mechanism wait for it; report parsing and AMD chain verification do not); informs P35 (whether the browser holds a tenant private key at all) and P68. If acceptance slips past week 4, the maintainer re-plans the critical path in P5.
+**Notes.** Blocks P50, P55, P38, P33, P48, P49, P77 and P34's checkpoint B; partly blocks P47 (only the relying-party placement, nonce source, REPORT_DATA layout and workload-identity mechanism wait for it; report parsing and AMD chain verification do not); informs P35 (whether the browser holds a tenant private key at all) and P68. If acceptance is blocked, the maintainer re-plans the critical path in P5.
 
 ---
 
 ### P15. ADR 0005: query and deployment topology
 **Labels:** build · area:enclave · area:ops · needs-adr
-**Size:** S · **Priority:** v1 blocker · **Owner:** one student, @AxolDad accepts · **Target:** accepted by end of week 3
+**Size:** S · **Priority:** v1 blocker · **Owner:** one student, @AxolDad accepts
 
 **Summary.** Queries run inside the `platform-api` process: `ConnectorQueryService` sits on the same Axum router (`backend/crates/platform-api/src/lib.rs:266-268, 312-323`) and gates on that process's own SEV-SNP probe (`query.rs:201-234`). The release workflow builds and ships only `platform-api` and `connector-worker` (`.github/workflows/release.yml`). `docs/PROJECT_SCOPE.md` speaks of "the API and enclave workers", and the first draft of sealed results said "the API never sees result plaintext"; neither has a defined meaning until the process boundary is decided.
 
 **Done when**
 - `docs/adr/0005-query-topology.md` is Accepted and records:
-  - whether `platform-api` as a whole runs inside the SEV-SNP Confidential VM, or a separate enclave query worker sits behind an API that never handles plaintext; if a worker, the RPC between them, its authentication, how the API verifies the worker's attestation, and that `release.yml` builds the new binary;
-  - where TLS terminates, and therefore what "results sealed to the researcher" (P55) protects against (for example a TLS-terminating load balancer, or an API outside the enclave). If TLS terminates inside the VM, it also names the component that holds the TLS private key, with its version and licence: a named server TLS crate on rustls in `platform-api` (rustls 0.23 and tokio-rustls 0.26 are already in `backend/Cargo.lock`, today only on the client side through `reqwest`), or a named proxy in the image (P49). That satisfies `docs/adr/README.md:7-9` for a dependency that handles keys;
+  - that `platform-api` runs inside the SEV-SNP Confidential VM, as the plan's invariant requires (data, SQL text and results are plaintext only in the browser and inside the attested VM). If the ADR also splits out a separate enclave query worker inside the VM, it records the RPC between them, its authentication, and that `release.yml` builds the new binary;
+  - that TLS terminates inside the Confidential VM, with any load balancer passing TCP through, so no component outside the VM sees bearer tokens, SQL text or results. It names the component that holds the TLS private key, with its version and licence: a named server TLS crate on rustls in `platform-api` (rustls 0.23 and tokio-rustls 0.26 are already in `backend/Cargo.lock`, today only on the client side through `reqwest`), or a named proxy in the image (P49). That satisfies `docs/adr/README.md:7-9` for a dependency that handles keys;
   - whether `connector-worker` runs in its own Confidential VM, and how it reaches the vault (depends on P19);
   - same-origin serving of the frontend and API (built in P67), or an allowlisted CORS configuration (P65);
   - how the operator's environment (variables, `.env`) is or is not trusted inside the VM (P18).
@@ -520,16 +581,16 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 **Sequencing.** Drafted together with P14.
 
-**Security impact.** Decides which processes ever hold plaintext, and therefore what sealed results and the attestation gate protect.
+**Security impact.** Fixes the boundary of the invariant: only processes inside the attested Confidential VM ever hold plaintext.
 **ADR.** This is the ADR.
 
-**Notes.** Blocks P68, P49 (what the measured image contains), P55, P65 and P67. The measured-workload mechanism is decided in P14; this ADR fixes only what the image contains.
+**Notes.** Blocks P68, P49 (what the measured image contains), P55, P65, P67 and P85. The measured-workload mechanism is decided in P14; this ADR fixes only what the image contains.
 
 ---
 
 ### P16. ADR 0006: sign-in, identity and token signatures
 **Labels:** build · area:auth · needs-adr
-**Size:** S-M · **Priority:** v1 blocker · **Owner:** one student, @AxolDad accepts · **Target:** accepted by end of week 3
+**Size:** S-M · **Priority:** v1 blocker · **Owner:** one student, @AxolDad accepts
 
 **Summary.** Accepted ADR 0001 moves token signatures to Ed25519 + ML-DSA-65 and keeps the RS256 verifier "only as long as migration requires" (`docs/adr/0001-hybrid-post-quantum-suites.md:24, 28, 43-44`); `backend/deny.toml:11-15` justifies ignoring RUSTSEC-2023-0071 with "RS256 retired by ADR 0001". A managed identity provider issues classical tokens, and `jsonwebtoken` 10.x has no ML-DSA. The code already implies a platform token service between the provider and the API: `TokenType::Preauth` "issued after IdP sign-in, before the TOTP challenge", then `Access` plus a rotating `Refresh` (`backend/crates/platform-auth/src/lib.rs:24-36`), minted by `TokenSigner`, which "runs on the identity-service signer" (`sign.rs:1-4`). That service does not exist, and nothing models users: tenants are created only by the Paddle webhook (`backend/crates/platform-api/src/admin.rs:64-108`) and `TenantRecord` (`backend/crates/platform-tenancy/src/lib.rs:40-52`) has no members. Trusting provider tokens directly needs care: since Code-Pause-Inc/QuackXide#23 the verifier requires a `typ` claim (`platform-auth/src/lib.rs:71-73`) and `authenticate` (`backend/crates/platform-api/src/lib.rs:172-214`) accepts only `access` tokens, so any direct trust must map the provider token to a platform token type without letting a pre-MFA provider token count as fully authenticated.
 
@@ -555,7 +616,7 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 ### P17. ADR 0007: hybrid suite construction, libraries, browser key storage and migration
 **Labels:** build · area:crypto · needs-adr
-**Size:** S · **Priority:** v1 blocker · **Owner:** one student, @AxolDad accepts · **Target:** accepted by end of week 3
+**Size:** S · **Priority:** v1 blocker · **Owner:** one student, @AxolDad accepts
 
 **Summary.** ADR 0001 fixes the target suites (X25519 + ML-KEM-768; Ed25519 + ML-DSA-65; AES-256-GCM) and the seams, but leaves the concrete construction open. The pinned `hpke` 0.12 (`backend/Cargo.toml:73`) has only DHKEMs. `hpke` 0.14.x provides `hpke::kem::XWing` (X25519 + ML-KEM-768, HPKE KEM id 0x647a) behind an `mlkem` feature, and moves to `rand_core` 0.10, `aes-gcm` 0.11 (the `aes` feature must be enabled explicitly) and `x25519-dalek` 3; `single_shot_seal` no longer takes an RNG. Its X-Wing public key is 1216 bytes and its encapsulated key 1120 bytes, against 32 bytes today (`backend/crates/platform-crypto/src/lib.rs:136-142`). Web Crypto has no ML-KEM. An X-Wing private key is a 32-byte seed, so it cannot be held as a non-extractable Web Crypto key, and the current KEK can only wrap and unwrap `CryptoKey`s (`frontend/src/lib/crypto/core.ts:56-62`). The candidate libraries are not independently audited: the `ml-kem` 0.3.2, `x-wing` 0.1.0 and `ml-dsa` 0.1.1 READMEs say so, `@noble/post-quantum`'s README says it has not been independently audited yet, and `hpke` has had no paid audit. So the first draft's "audited libraries only" bar cannot be met and must be replaced with a stated definition of "established" (`docs/PROJECT_SCOPE.md`, "Established libraries only").
 
@@ -572,7 +633,7 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 **Depends on:** none.
 
-**Sequencing.** Informed by P14 (whether the browser holds a tenant private key at all); both are accepted by week 3.
+**Sequencing.** Informed by P14 (whether the browser holds a tenant private key at all); both are accepted before the build items that depend on them start.
 
 **Security impact.** Fixes the exact post-quantum construction and the library risk the project accepts.
 **ADR.** This is the ADR.
@@ -581,7 +642,7 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 ### P18. Production mode: one switch, and refuse dev-only paths at startup
 **Labels:** build · area:ops · rust · javascript · needs-adr
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 1-4
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** Definition-of-done item 3 (`docs/PROJECT_SCOPE.md`), `README.md:153` and several issues say "production build", but nothing defines one: no crate declares Cargo features, the only `cfg` gates are `#[cfg(test)]`, and `release.yml` runs the same `cargo build --release` developers run. Dev-only paths reach the shipped binaries, selected by environment variables with at most a warning:
 - `platform-api` and `connector-worker` fall back to an in-memory vault when `STORAGE_BUCKET` is unset (`backend/crates/platform-api/src/main.rs:16-28`, `backend/crates/platform-connectors/src/bin/connector-worker.rs:34-46`);
@@ -595,7 +656,7 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 **Done when**
 - An ADR records one mechanism. Recommended: a runtime switch such as `APP_ENV=production|development`, where unset or unknown means production, read from the process environment before `.env` is loaded, with `.env` not loaded at all in production; optionally plus a non-default Cargo feature that gates `DevKeyProvider`, `MultiTenantDevKeyProvider` (`platform-api/src/query.rs:49-113`), `DevAttestation::allow_insecure_dev` and the `devtoken`/`query-demo` binaries (`[[bin]] required-features`). If a feature is chosen, the integration tests that use these paths (`platform-api/tests/{audit_coverage,drive_api,admin_api,research_api,query_api,catalog_api}.rs`, `platform-connectors/tests/pipeline_e2e.rs`, and `backend/fuzz`) enable it, and `scripts/check.sh` also builds and lints the default (production) feature set. `backend/.env.example` opts into development explicitly.
 - Startup in `platform-api` and `connector-worker` is factored out of `main()` into a testable function that calls one validation function (for example `PlatformConfig::check_production`), which later issues extend. Not inside `from_source`, so tests can still build any config.
-- In production mode each binary refuses to start, with a clear error and a `service.start` audit event recording the refusal, when: `JWT_HS256_SECRET` is set; `STORAGE_BUCKET` is unset; `TEE_ATTESTATION_REQUIRED=false`; `provider_for` would return the dev provider; or (for `connector-worker`) the demo tenant or fixture sources would be used. Each refusal has a test that drives `PlatformConfig::from_source`.
+- In production mode each binary refuses to start, with a clear error and a `service.start` audit event recording the refusal, when: `JWT_HS256_SECRET` is set; `STORAGE_BUCKET` is unset; `TEE_ATTESTATION_REQUIRED=false`; `provider_for` would return the dev provider; the simulated SEV-SNP provider or its trust root (P84) would be used; or (for `connector-worker`) the demo tenant or fixture sources would be used. Each refusal has a test that drives `PlatformConfig::from_source`.
 - Later issues add their own refusals through this function: no verification keys (P28); no production key provider or research stores (P51); in-memory registries (P62) and in-memory identity and session stores (P63); no TLS certificate when TLS terminates in-process (P67). Until those land, production mode cannot boot; development mode is used, and the PR says so.
 - Frontend: a release build mode (for example `vite build --mode release` or `VITE_PLATFORM_ENV=production`) fails unless `VITE_VAULT_MODE` is explicitly `http`, and fails if `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is non-empty. It runs as a dedicated step in `release.yml`, not in `check.sh`'s dev build. (Runtime configuration of the bundle is P66.)
 - `docs/ARCHITECTURE.md` defines production mode; `README.md:153` and definition-of-done item 3 use the defined term (with P80).
@@ -615,7 +676,7 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 ### P19. Record what is not in v1.0: connector ingestion, billing lifecycle, admin toggles and other documented features
 **Labels:** area:ops · documentation
-**Size:** S · **Priority:** team enablement · **Owner:** @AxolDad (decision), one student for the doc edits · **Target:** week 1-2
+**Size:** S · **Priority:** team enablement · **Owner:** @AxolDad (decision), one student for the doc edits
 
 **Summary.** Several things ship or are documented but have no row in `docs/PROJECT_SCOPE.md`: `connector-worker` is a release artifact (`.github/workflows/release.yml:29-34`) but runs only three fixture jobs for one demo tenant, or an ephemeral key (`backend/crates/platform-connectors/src/bin/connector-worker.rs:54-70, 89-118`), and `HttpJsonSource` keeps OAuth refresh tokens in memory only (`source.rs:82-85`); the Paddle (MoR) webhook is live and is the only path that provisions tenants (`backend/crates/platform-api/src/admin.rs`); the webhook sets `TenantStatus::Suspended`, and admin connector toggles write `TenantRecord.connectors`, but nothing reads either; blind-index equality search has no producer of the column and no key management; the differencing closure is already a documented residual (`docs/THREAT_MODEL.md:127-132`); catalog prices are recorded but not charged. Connectors are not a separable add-on: research datasets are stored under `tenants/{t}/connectors/{slug}/`, and grants, listings and the query path are keyed by connector slug (`backend/crates/platform-api/src/query.rs:248-298`, `backend/crates/platform-tenancy/src/catalog.rs`), so "connectors out of v1" can only mean the worker binary, live ingestion and the toggles, never that storage and grant model.
 
@@ -629,20 +690,20 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 
 **Depends on:** none.
 
-**Sequencing.** Decide in weeks 1-2; informs P38, P61, P68, P18 and P82.
+**Sequencing.** Decide first; informs P38, P61, P68, P18 and P82.
 
 **Security impact.** Removes or fails closed every shipped path the threat model does not cover.
 **ADR.** Not required (a scope decision), unless a mounted public API is removed.
 
 ---
 
-## Security defects found in review (small, land early)
+## Security defects found in review (small, land first)
 
 Four defects found in review are fixed and merged on `main`: Code-Pause-Inc/QuackXide#21 refuses `ROLLUP`, `CUBE` and `GROUPING SETS`, and sort or limit below the aggregate (ADR 0002, `docs/adr/0002-refuse-grouping-sets-and-positional-subsets.md`); Code-Pause-Inc/QuackXide#22 allows only read-only queries (no DDL, DML, `COPY` or session statements) and gives a query scope no object store; Code-Pause-Inc/QuackXide#23 refuses `preauth`, `refresh` and untyped tokens on data and admin routes; Code-Pause-Inc/QuackXide#24 stores connector data as versioned snapshots, so a query reads exactly one committed snapshot of each dataset (ADR 0003, `docs/adr/0003-connector-data-as-versioned-snapshots.md`). Their `docs/THREAT_MODEL.md` rows are in place. The items below remain.
 
 ### P24. `EngineSettings::default()` and `ZkMode::default()` must fail closed
 **Labels:** harden · area:disclosure · rust · good first issue
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 1-4
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** `EngineSettings::default()` turns ZK mode off (`backend/crates/quackxide-engine/src/lib.rs:65-72`), `ZkMode` derives `Default` as `Disabled` (`backend/crates/platform-core/src/lib.rs:215-220`), and `default_settings_are_conservative` (`quackxide-engine/src/lib.rs:296-301`) asserts that ZK is off. That contradicts `FEATURE_ZK_ENABLED` defaulting to true ("disabling the gate must be an explicit choice", `platform-config/src/lib.rs:130-131, 207`). With ZK off and no policy, `QueryScope::sql` returns rows unfiltered, so a production wiring that uses `Default` (P51) would silently allow row-level egress on the own-data path. Research mode already forces ZK on (`platform-api/src/query.rs:572-573`).
 
@@ -665,7 +726,7 @@ Four defects found in review are fixed and merged on `main`: Code-Pause-Inc/Quac
 
 ### P25. Audit stream always on; no SQL or data values in operational logs
 **Labels:** harden · area:ops · rust
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 1-4
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** `SECURITY_AUDIT_EVENT` records go through the same global `RUST_LOG` `EnvFilter` as operational logs (`backend/crates/platform-telemetry/src/lib.rs:17-28`), so `RUST_LOG=warn` silently drops all of them. `tracing-subscriber` keeps its default features (`backend/Cargo.toml:65`), so `try_init()` installs a `log` bridge, and at `debug` DataFusion logs whole logical plans and `sqlparser` logs SQL text and parsed expressions, both including the literals of a researcher's `WHERE` clause. The engine runs inside `platform-api`, so these reach the host's logs. `QueryError::Execution` and `QueryError::Parquet` keep upstream message text, and Arrow cast errors quote cell values; `map_query_error` drops that text today, but nothing stops a future log line from leaking it. `docs/THREAT_MODEL.md:73` marks "Read API host disk or logs" as "Built, tested".
 
@@ -692,7 +753,7 @@ Four defects found in review are fixed and merged on `main`: Code-Pause-Inc/Quac
 
 ### P26. Zeroize platform credentials held in configuration
 **Labels:** harden · rust · good first issue
-**Size:** S · **Priority:** v1 needed · **Target:** weeks 2-5
+**Size:** S · **Priority:** v1 needed
 
 **Summary.** `docs/THREAT_MODEL.md:29` says platform credentials are "zeroize-on-drop; redacted `Debug`". `JWT_HS256_SECRET` (`AuthConfig::hs256_secret`, `backend/crates/platform-config/src/lib.rs:108`) and `MOR_WEBHOOK_SECRET` (`BillingConfig::paddle_webhook_secret`, `lib.rs:37`) are plain `Option<String>`; only their hand-written `Debug` impls redact them. A zeroizing, redacted `SecretString` already exists in `backend/crates/platform-connectors/src/oauth.rs`.
 
@@ -716,7 +777,7 @@ Four defects found in review are fixed and merged on `main`: Code-Pause-Inc/Quac
 
 ### P27. Access-request approval converges after a partial failure, and never fails open
 **Labels:** harden · area:disclosure · rust
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 3-6
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** `resolve_access_request` marks the request Approved (`catalog.resolve`) before it fetches the listing and mints the grant and budget (`backend/crates/platform-api/src/research.rs:172-218`). If a later step fails (a registry error becomes a 502), the request is stuck Approved with no grant, and a retry gets 404 because `resolve` acts only on Pending requests. The comment at `research.rs:172-174` says retries converge; they do not. In-memory stores hide this; durable or networked stores (P62) make it realistic. Reordering naively creates the opposite fault: a grant minted, `resolve` failing, then a steward's Deny leaving the grant live.
 
@@ -745,7 +806,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 ### P28. API: production token verification from configuration
 **Labels:** build · area:auth · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 4-7
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** RS256/JWKS verification and TOTP exist only as library code. `AuthConfig` (`backend/crates/platform-config/src/lib.rs:103-113`) has only `hs256_secret`, `issuer` and `audience`; `platform-api` builds only an HS256 verifier (`backend/crates/platform-api/src/main.rs:30-36`); the `JWT_JWKS_JSON` value that `keygen` prints is read nowhere. So the API cannot verify a production token today. The RS256 verifier takes a static JWKS document (rotation only by overlap and restart, `backend/crates/platform-auth/src/verify.rs:332-369`), accepts RSA keys only (`jwks.rs:35-37`) and pins RS256 (`verify.rs:44`). Library-level refusal tests exist (`verify.rs:133-438`); every `platform-api` integration test builds an HS256 verifier.
 
@@ -768,7 +829,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 ### P29. Identity service: sign-in exchange, tenant membership and roles
 **Labels:** build · area:auth · rust
-**Size:** M-L (pair) · **Priority:** v1 blocker · **Target:** weeks 4-10
+**Size:** M-L (pair) · **Priority:** v1 blocker
 
 **Summary.** Implements the identity and tenancy half of ADR 0006. Nothing models users: tenants are created only by a Paddle `subscription.created`/`subscription.activated` webhook (`backend/crates/platform-api/src/admin.rs:64-108`), `TenantRecord` has no members, and `require_tenant` accepts any validly signed `tid` without checking the registry (`backend/crates/platform-api/src/lib.rs:216-224`). A tenant suspended by a cancel webhook keeps full access, because nothing reads `TenantStatus`. Under the token-exchange design the platform service verifies the provider's token and mints platform tokens with `TokenSigner` (`backend/crates/platform-auth/src/sign.rs`, used only in tests today).
 
@@ -786,18 +847,18 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 **Depends on:** P16, P13 (provider development tenant).
 
-**Sequencing.** Integrates with P28. A dated week-7 checkpoint in P5 checks the token exchange and tenant membership against the provider's development tenant.
+**Sequencing.** Integrates with P28. A checkpoint in P5 checks the token exchange and tenant membership against the provider's development tenant.
 
 **Security impact.** Defines who can obtain a token for which tenant (A3) and makes suspension effective.
 **ADR.** Covered by P16.
 
-**Notes.** About a semester of work for one person if the token exchange is in-house; co-own it or split it again (exchange, membership) when it is picked up.
+**Notes.** Too large for one person if the token exchange is in-house; co-own it or split it again (exchange, membership) when it is picked up.
 
 ---
 
 ### P30. Second factor and session lifecycle
 **Labels:** build · area:auth · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 6-10
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The code makes the second factor mandatory ("the platform's mandatory second factor", `backend/crates/platform-crypto/src/totp.rs:1-2`; `docs/THREAT_MODEL.md:93`), and `TokenType::Refresh` "rotates on use" (`backend/crates/platform-auth/src/lib.rs:34`). The TOTP module leaves replay protection to the caller (`totp.rs:8-10, 66-69`) and storage of secrets to the caller (`totp.rs:36-41`), and no refresh rotation exists. If ADR 0006 moves MFA to the provider, this issue shrinks to requiring and auditing the provider's MFA assertion for stewards, researchers and admins, minting `access` and `refresh` after it, plus revocation and the negative tests.
 
@@ -824,7 +885,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 ### P31. Session token and verified identity in the crypto worker
 **Labels:** build · area:frontend · area:auth · javascript
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 3-5
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** The crypto worker reads a build-time `VITE_DEV_JWT` (`frontend/src/lib/crypto/worker.ts:31-39`, `frontend/src/config/vault.ts:21`), caches a never-refreshed vault instance (`worker.ts:29-43`), and invents a random tenant id (`worker.ts:62`) that is used in every drive AAD. Binding browser keys to the signed-in identity (P33), and through it the hybrid suite (P36), steward upload (P40) and sealed results (P56), needs the session's identity inside the worker, not the sign-in UI. Development HS256 tokens from the `devtoken` binary already carry `iss`, `sub` and `tid` (`RawClaims`, `backend/crates/platform-auth/src/lib.rs:62-66`), so this work does not wait for the identity service (P29).
 
@@ -850,7 +911,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 ### P32. Frontend session: sign-in, sign-out, refresh, and no pasted tokens
 **Labels:** build · area:frontend · area:auth · javascript
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 6-11
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The frontend has no sign-in. The research portal and admin console use pasted bearer tokens prefilled from `VITE_DEV_JWT` and `VITE_ADMIN_JWT` (`frontend/src/components/research/ResearchPortal.tsx:44`, `frontend/src/components/admin/AdminConsole.tsx:9`), and a rejected token produces "mint a fresh dev token" (`frontend/src/lib/vault/httpVault.ts:48`). P31 delivers the token to the crypto worker; this issue obtains, refreshes and ends the session that DoD items 1 and 2 begin with ("can sign in").
 
@@ -869,7 +930,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 **Depends on:** P16, P29, P30, P31.
 
-**Sequencing.** UI work can start against dev tokens and the local stack (P8). The week-7 checkpoint in P5 decides the fallback if P29 slips.
+**Sequencing.** UI work can start against dev tokens and the local stack (P8). The checkpoint in P5 on P29's token exchange decides the fallback if P29 is blocked.
 
 **Security impact.** Removes long-lived build-time tokens from the browser and keeps tokens out of persistent storage.
 **ADR.** Covered by P16.
@@ -880,7 +941,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 ### P33. Bind browser keys and enrollment to the signed-in identity (no silent re-keying)
 **Labels:** build · area:crypto · area:frontend · rust · javascript
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 5-10
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The browser keeps one `device` key row (`frontend/src/lib/crypto/keystore.ts:9-19`) whose tenant id is a random local UUID (`worker.ts:62`). Every drive load re-runs enrollment (`worker.ts:78-86`), and the server overwrites `control/enrollments/{tenant}.json` unconditionally (`backend/crates/platform-api/src/lib.rs:715-777`; `backend/crates/platform-storage/src/lib.rs:125-129`). The record has no key id, suite, creation time or history, and the audit event does not distinguish a replacement from a first enrollment. A second device or a cleared browser therefore silently re-keys the tenant, and data sealed earlier stays under the old key. `VaultStore` has only an unconditional `put`.
 
@@ -896,7 +957,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 
 **Depends on:** P14, P31, P41 (conditional-write PR only).
 
-**Sequencing.** P41's conditional-write PR lands by week 3-4. P30 wires the fresh-second-factor check into the rotation call; the rest of this issue does not wait for sign-in (P32).
+**Sequencing.** P41's conditional-write PR lands first. P30 wires the fresh-second-factor check into the rotation call; the rest of this issue does not wait for sign-in (P32).
 
 **Security impact.** Prevents silent key substitution by a second device, a stolen token or worker restarts (A2/A3); makes enrolled keys auditable.
 **ADR.** Covered by P14; record any change to the enrollment format there.
@@ -911,19 +972,19 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P34. Browser HPKE seal and open: wasm32 build of the backend envelope code
 **Labels:** build · area:crypto · area:frontend · rust · javascript
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 2-8 (seal by week 5)
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The browser cannot do HPKE. It only generates a non-extractable X25519 keypair whose private key is never used (`frontend/src/lib/crypto/core.ts:171-180`), yet the backend expects a browser-side reader ("The browser-side reader must derive the identical string", `backend/crates/platform-connectors/src/pipeline.rs:59-63`), and steward upload (P40) and sealed results (P55) need seal and open in the browser. `docs/ARCHITECTURE.md:56-58` plans a Rust-to-wasm32 build of the backend `hpke` code behind `core.ts`. Nothing in the repository can build or test wasm today (`rust-toolchain.toml` lists only rustfmt and clippy; `frontend/package.json` depends only on react and react-dom).
 
 **Done when**
-- **Checkpoint A, seal (by week 5; unblocks P40).** A thin wrapper crate (neutral name, no I/O or logging dependencies, not all of `platform-crypto`: no TOTP or blind index) exports envelope seal for the current suite (`HPK1 || encapped_key || ciphertext`, `platform-crypto/src/lib.rs:132-201`). It runs only inside the crypto worker, behind `core.ts` and the worker protocol, never on the UI thread. Seal uses only the recipient's public key, so no private key enters wasm memory, and the module never handles the drive KEK or per-file keys.
+- **Checkpoint A, seal (unblocks P40).** A thin wrapper crate (neutral name, no I/O or logging dependencies, not all of `platform-crypto`: no TOTP or blind index) exports envelope seal for the current suite (`HPK1 || encapped_key || ciphertext`, `platform-crypto/src/lib.rs:132-201`). It runs only inside the crypto worker, behind `core.ts` and the worker protocol, never on the UI thread. Seal uses only the recipient's public key, so no private key enters wasm memory, and the module never handles the drive KEK or per-file keys.
 - **Checkpoint B, open (for P55).** Open is added once P17 and P14 have decided private-key custody; where a private key cannot stay in Web Crypto's non-extractable store, the ADR says so and `docs/THREAT_MODEL.md` gains a row for researcher private keys. `TenantKeypair` (`lib.rs:203-217`) stays dev/test-only; the browser-facing open API is new.
 - Seal and open choose the suite from the frame magic (with `HPK1` as the first suite), so P35's new frame drops in without an API change, and seal takes a caller-supplied `info` string.
 - `info` bindings are defined once and shared by Rust and TypeScript: move `envelope_info` from `platform-connectors` into `platform-crypto`, or pin it with shared vectors, and add the new kinds for uploaded datasets and sealed results.
 - Cross-implementation vectors: a committed vector file under a `fixtures/` directory, written by a seeded generator kept in the repository, is checked by both a Rust test and a vitest test. It covers raw public-key enrollment (valid, wrong length, bad base64), `envelope_info` strings, the frame layout, a browser-sealed envelope opening in Rust and (after B) the reverse, and negative vectors (tampered ciphertext, wrong `info`, wrong recipient, wrong frame magic). Keys are derived from documented public seeds and labelled test-only; before the first such PR the maintainer amends `docs/DATA_POLICY.md` rule 3 ("No credentials ... private keys") to allow this.
 - Toolchain: `rust-toolchain.toml` adds `wasm32-unknown-unknown`; every `getrandom` major version in the wrapper's wasm dependency tree gets its JavaScript backend for the wasm target only (`js` for 0.2, which `rand` 0.8's `OsRng` in `platform-crypto` uses today; `wasm_js` for 0.3 and 0.4, which the `hpke` upgrade in P35 brings in); `wasm-bindgen-cli` is pinned to the `wasm-bindgen` crate version. The module is built by `scripts/check.sh` and by the CI jobs that run the frontend tests outside it (the portability job's `npm test` and the coverage job's `npx vitest run` in `.github/workflows/ci.yml`). New dependencies pass `cargo deny check`, dependency review and `npm audit`.
 - White-label: the build uses release mode without debuginfo and `--remap-path-prefix`, so no path containing the repository name reaches `frontend/dist`; the guard in `scripts/check.sh:34-38` passes on the built bundle. Bundle-size and load-time figures are recorded in `docs/BENCHMARKS.md` (P73).
-- **Checkpoint A benchmark (by week 5).** Wasm seal throughput and peak memory in the crypto worker are measured in a real browser (Chromium, through P72 stage A's browser runner or a documented manual run; not a Node Vitest bench) on synthetic data from P9 at 1 MB, 100 MB and one larger size. Today's seal is single-shot (`hpke_seal_to_tenant` calls `hpke::single_shot_seal`, `backend/crates/platform-crypto/src/lib.rs:172-191`), so plaintext, ciphertext and the framed envelope are all in memory at once. The results go into `docs/BENCHMARKS.md` with a target agreed with @AxolDad, and the benchmark joins P73's harness and regression run (or the PR states why it can run only as a recorded manual run per release candidate). They give P38's ADR a measured bound for the maximum dataset size and for the choice between one object per dataset and a per-object size cap.
+- **Checkpoint A benchmark.** Wasm seal throughput and peak memory in the crypto worker are measured in a real browser (Chromium, through P72 stage A's browser runner or a documented manual run; not a Node Vitest bench) on synthetic data from P9 at 1 MB, 100 MB and one larger size. Today's seal is single-shot (`hpke_seal_to_tenant` calls `hpke::single_shot_seal`, `backend/crates/platform-crypto/src/lib.rs:172-191`), so plaintext, ciphertext and the framed envelope are all in memory at once. The results go into `docs/BENCHMARKS.md` with a target agreed with @AxolDad, and the benchmark joins P73's harness and regression run (or the PR states why it can run only as a recorded manual run per release candidate). They give P38's ADR a measured bound for the maximum dataset size and for the choice between one object per dataset and a per-object size cap.
 - `docs/ARCHITECTURE.md` gains a crate-table row for the wrapper crate, and its "Crypto-agility seam" bullet (lines 56-58) describes what is built instead of a plan. If checkpoint B puts a private key in wasm memory, the KEK note (lines 43-46, "JS *or* WASM") is reconciled with that.
 - Developer setup docs (P3) list the new toolchain steps.
 
@@ -931,7 +992,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P17 and P14 (checkpoint B only).
 
-**Sequencing.** Checkpoint A starts immediately.
+**Sequencing.** Checkpoint A does not wait on P17 or P14.
 
 **Security impact.** Puts dataset sealing in the steward's browser (DoD item 1) with one implementation shared with the enclave; open moves a private key into wasm memory, which must be documented.
 **ADR.** Custody of the open path is recorded in P17.
@@ -942,7 +1003,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P35. Hybrid KEM on the backend (X-Wing, new frame version)
 **Labels:** build · area:crypto · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 4-9
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** Replace `TenantKem = hpke::kem::X25519HkdfSha256` (`backend/crates/platform-crypto/src/lib.rs:30`) with the hybrid KEM chosen in P17, with a new frame version alongside `HPK1` and no silent downgrade (ADR 0001:29-31). The enrollment endpoint validates an X25519 point and records `HPKE_SUITE = "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM"` (`backend/crates/platform-api/src/lib.rs:43, 715-777`).
 
@@ -973,7 +1034,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P36. Browser on the hybrid suite: hybrid keys, seal and open
 **Labels:** build · area:crypto · area:frontend · javascript
-**Size:** S-M · **Priority:** v1 blocker · **Target:** weeks 7-11
+**Size:** S-M · **Priority:** v1 blocker
 
 **Summary.** Definition-of-done item 1 requires the upload to be "encrypted in the browser under the hybrid post-quantum suite". After P34 and P35, the browser crypto core must generate, store and enroll hybrid keys and seal and open the hybrid frame. Today enrollment is gated on X25519 support (`frontend/src/lib/crypto/core.ts:160-168`, `worker.ts:59-60`, `protocol.ts:9-11`, `frontend/src/components/KeySetupGate.tsx:52-54`).
 
@@ -994,7 +1055,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P37. Hybrid token signatures (Ed25519 + ML-DSA-65), if ADR 0006 chooses them
 **Labels:** build · area:crypto · area:auth · rust
-**Size:** M · **Priority:** v1 needed · **Target:** weeks 8-12
+**Size:** M · **Priority:** v1 needed
 
 **Summary.** ADR 0001 moves signatures to Ed25519 + ML-DSA-65 at the `JwtVerifier` construction site. There is no signature type alias: `JwtVerifier` constructors (`backend/crates/platform-auth/src/verify.rs:27-46`) fix the algorithm, `TokenSigner` hardcodes RS256 (`sign.rs:49`), `jwks.rs` keeps RSA keys only (`jwks.rs:35-37`), and `jsonwebtoken` 10.4 has no ML-DSA and there is no standard JOSE algorithm for the hybrid. No definition-of-done item names signatures directly; they are needed so the "Hybrid post-quantum encryption" step can be marked Built (DoD item 3).
 
@@ -1022,7 +1083,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P38. Steward dataset upload: backend route, storage layout and catalog registration
 **Labels:** build · area:storage · area:disclosure · rust · needs-adr
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 4-10
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The first draft pointed this at the drive code, which cannot produce a queryable dataset. Drive files are AES-GCM chunks under per-file keys wrapped by a non-extractable, browser-only KEK (`frontend/src/lib/crypto/drive.ts`, `docs/ARCHITECTURE.md:42-58`), so no enclave can open them. The query path reads only HPKE envelopes of Parquet listed by the newest committed snapshot manifest under `TenantPaths::connector_prefix` (`backend/crates/platform-storage/src/lib.rs:78-116`; ADR 0003), opened with `envelope_info` = `tenant-envelope-v1|{tenant}|{slug}|{object}` (`backend/crates/platform-api/src/query.rs:252-298`, `backend/crates/platform-connectors/src/pipeline.rs:59-64`), and the engine registers only Parquet. So steward upload is a new path, not a hardening of drive. The API sees only ciphertext (`VaultStore`: "opaque bytes"), so it can refuse only what it can check.
 
@@ -1043,7 +1104,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P14 (what the upload is sealed to), P69 (steward-supplied Parquet is parsed only after it merges).
 
-**Sequencing.** Can start on the current `HPK1` frame with dev tokens and the local stack (P8); integrates with P28. Coordinate with P52: P52's input cap on decrypted bytes must be at least this issue's upload maximum, or both are set from one configuration value; P52's check before decryption refuses anything larger either way. P34 checkpoint A's wasm seal measurements (by week 5) give the ADR a measured bound for the maximum dataset size and for the choice between one object per dataset and a per-object size cap; P40 confirms or lowers it. P39 builds the listing route over this layout.
+**Sequencing.** Can start on the current `HPK1` frame with dev tokens and the local stack (P8); integrates with P28. Coordinate with P52: P52's input cap on decrypted bytes must be at least this issue's upload maximum, or both are set from one configuration value; P52's check before decryption refuses anything larger either way. P34 checkpoint A's wasm seal measurements give the ADR a measured bound for the maximum dataset size and for the choice between one object per dataset and a per-object size cap; P40 confirms or lowers it. P39 builds the listing route over this layout.
 
 **Security impact.** Adds a new untrusted-input path into the enclave and a new storage format; keeps the operator unable to read uploads (A2) and keeps one committed snapshot per dataset, as ADR 0003 does for connectors (A1). Records the plaintext metadata the operator sees for every upload.
 **ADR.** Required (storage format and public API).
@@ -1052,7 +1113,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P39. Steward dataset listing route
 **Labels:** build · area:storage · rust
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 7-10
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** Definition-of-done item 1 ends with the steward able to "see it stored as ciphertext", P40's publish form picks from stored datasets, and P42 deletes a dataset by id. No route lists a tenant's research datasets: the router (`backend/crates/platform-api/src/lib.rs:248-324`) has `GET /api/v1/drive/objects`, which lists drive objects only, and `GET /api/v1/catalog`, which lists only published listings. `PublishForm` takes a free-text connector slug (`frontend/src/components/research/PublishForm.tsx:19, 45-47`). Without a listing route the steward cannot see an upload after a reload or pick one to publish. Split from P38 to keep that issue within size M.
 
@@ -1076,7 +1137,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P40. Steward dataset upload: browser sealing and upload UI
 **Labels:** build · area:frontend · area:crypto · javascript · needs-adr
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 6-11
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The browser half of steward upload: a signed-in steward selects a Parquet file, the crypto worker seals it to the key decided by P14 with the server `tid` in the `info` binding (not the worker's random tenant id, `frontend/src/lib/crypto/worker.ts:62`), and the API stores the ciphertext (definition-of-done item 1). The browser has no HPKE seal today (P34).
 
@@ -1106,12 +1167,12 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P41. Encrypted storage: production hardening of `ObjectStoreVault`
 **Labels:** harden · area:storage · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 3-9
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** `VaultStore` is the trait; `ObjectStoreVault` is the GCS and in-memory implementation (`backend/crates/platform-storage/src/lib.rs`). Typed tenant paths and cross-tenant isolation are already Built and tested (`tenant_isolation_is_absolute` in `backend/crates/platform-api/tests/drive_api.rs`, `query_is_tenant_isolated` in `query_api.rs`, and in `platform-storage/src/lib.rs` the path tests at lines 301-384 and `listing_is_isolated_per_tenant_prefix` at lines 444-471); keep those as regression tests rather than new work. The real gaps: `new_gcs` silently inherits the `object_store` 0.12 defaults (10 retries within a 3-minute window, 30 s request and 5 s connect timeouts); every error other than `NotFound` becomes 502 (`StorageError`, `platform-storage/src/lib.rs:167-172`; `platform-api/src/lib.rs:112-118`); every `put` overwrites; an aborted drive upload leaves chunks with no manifest (chunks are written first and the manifest last, `frontend/src/lib/crypto/drive.ts`); and `delete_object` deletes the manifest first (`platform-api/src/lib.rs:699`) and returns on the first chunk error, so a retry gets 404 and the chunks are stranded.
 
 **Done when**
-- **First PR: conditional writes on `VaultStore` (size S, one named owner, merged by week 3-4; it needs nothing from P18).** P33's create-once enrollment needs it. It adds:
+- **First PR: conditional writes on `VaultStore` (size S, one named owner, merged first; it needs nothing from P18).** P33's create-once enrollment needs it. It adds:
   - a create-only method implemented once over `put_opts(.., PutMode::Create)`, which `object_store` 0.12 sends to GCS as `x-goog-if-generation-match: 0` (`object_store` 0.12.5 `src/gcp/client.rs:402`) and which `InMemory` supports natively;
   - an update-if-version-matches method (`PutMode::Update` with the version from a prior read), only if P61's ADR picks versioned records in the vault and needs it. Connector snapshots need neither write: ADR 0003 writes each snapshot under a fresh version and commits it with a manifest written last;
   - `StorageError` variants for already-exists and precondition-failed. Today `map_err` (`backend/crates/platform-storage/src/lib.rs:235-240`) turns both into `Backend`, which `From<StorageError> for ApiError` (`backend/crates/platform-api/src/lib.rs:112-118`) makes a 502; the new variants map to 409;
@@ -1130,7 +1191,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P18 (startup-refusal item only).
 
-**Sequencing.** The conditional-write PR merges first (by week 3-4); P33 waits on it. Everything else starts immediately. P39 uses this issue's listing cap and error classes once they land.
+**Sequencing.** The conditional-write PR merges first; P33 waits on it. Everything else can start in parallel. P39 uses this issue's listing cap and error classes once they land.
 
 **Security impact.** Reliability of ciphertext storage; idempotent deletes; create-once writes that P33 relies on.
 **ADR.** Not required.
@@ -1141,7 +1202,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P42. Steward dataset deletion
 **Labels:** build · area:storage · area:frontend · rust · javascript
-**Size:** M · **Priority:** v1 needed · **Target:** weeks 9-13
+**Size:** M · **Priority:** v1 needed
 
 **Summary.** A steward cannot delete a research dataset. The only data `DELETE` is `DELETE /api/v1/drive/objects/{id}`, which never touches `tenants/{steward}/connectors/{connector}/`. Unpublishing (`DELETE /api/v1/catalog/{listing_id}`) hides the listing but leaves every grant in place, and research queries check only for an active grant before decrypting the dataset's current snapshot. So a granted researcher can still query a withdrawn dataset, and a steward who uploads the wrong file cannot remove it.
 
@@ -1170,9 +1231,9 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P43. Wire research access in the production binary, independently of key release
 **Labels:** harden · area:disclosure · rust
-**Size:** S-M · **Priority:** v1 blocker · **Target:** weeks 2-5
+**Size:** S-M · **Priority:** v1 blocker
 
-**Summary.** Catalog, access requests, grants and budgets need no key material, but they live on `ConnectorQueryService` and their handlers call `query_service(&state)?` (`backend/crates/platform-api/src/lib.rs:423-425`). `main.rs:68` sets `query: None`, so in the shipped binary every catalog, grant, budget and access-request route returns 503 until key release lands, and nothing in the portal past sign-in can run against the real binary for most of the semester.
+**Summary.** Catalog, access requests, grants and budgets need no key material, but they live on `ConnectorQueryService` and their handlers call `query_service(&state)?` (`backend/crates/platform-api/src/lib.rs:423-425`). `main.rs:68` sets `query: None`, so in the shipped binary every catalog, grant, budget and access-request route returns 503 until key release lands, and nothing in the portal past sign-in can run against the real binary.
 
 **Done when**
 - Either a `ResearchService` (grants, budgets, catalog, default budget, min cohort) becomes its own `AppState` field, so catalog, request, grant and budget routes depend only on it and return `ResearchUnavailable` (503) when it is `None`; or `main.rs` builds `ConnectorQueryService` with a key provider that always refuses (`QueryUnavailable`) plus `.with_research(..)`. Either way there is one source of truth: the grant the new routes create is the one `research_query` checks and charges (shared `Arc` stores).
@@ -1194,7 +1255,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P44. Researcher portal: query form, result view and refusal states
 **Labels:** build · area:frontend · javascript
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 3-12
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The portal (`ResearchPortal`, `PublishForm`, `IssuedGrantRow`) already handles the catalog, access requests and their status, and steward approvals, top-ups and revocations. It cannot run a query: `ResearchClient` (`frontend/src/lib/research/client.ts:129-240`) has no method for `POST /api/v1/research/query`, and nothing in `frontend/src` calls it. It authenticates with a pasted token (`ResearchPortal.tsx:44`), and its `get()` helper maps every 503 to one message (`client.ts:148`).
 
@@ -1218,7 +1279,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P45. Grant check: complete the refusal tests and audit coverage
 **Labels:** harden · area:disclosure · rust · good first issue
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 2-5
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** `GrantRegistry` is steward-scoped and revocable. Grants have no expiry: `DatasetGrant` has no expiry field (`backend/crates/platform-tenancy/src/grants.rs:18-30`), so the first draft's "expired" case cannot be tested. Missing and revoked grants are already tested at the API (`backend/crates/platform-api/tests/research_api.rs`). What is missing: other-steward and other-connector refusals, byte-identical refusal bodies, and audit coverage. `audit_coverage.rs`'s `full_app` wires no research layer, so research endpoints return `ResearchUnavailable` there; and revoke, top-up and budget reads of an unknown or foreign grant return 404 with no audit event (`revoke_grant`, `top_up_budget`, `budget_state` in `query.rs`).
 
@@ -1246,7 +1307,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P46. Test the attestation-refusal path on query and research routes
 **Labels:** harden · area:enclave · rust · good first issue
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 1-3
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** No test runs the query or research routes with `require_attestation = true`. Every API test passes `DevAttestation::allow_insecure_dev()` with `require_attestation = false`, so the 503 `AttestationUnavailable` response, the `tee.attestation` "denied" event (`backend/crates/platform-api/src/query.rs:201-234`) and the documented claim that the gate runs before the budget charge (`docs/ARCHITECTURE.md:212-218`) are untested, and `gate_execution` (`backend/crates/platform-enclave/src/lib.rs:130-144`) has no unit tests.
 
@@ -1273,7 +1334,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P47. SEV-SNP report verifier (portable, testable without hardware)
 **Labels:** build · area:enclave · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 2-8
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** No verification code exists. `SnpAttestation` probes `/dev/sev-guest` and refuses (`backend/crates/platform-enclave/src/lib.rs:108-122`), and both gates accept any evidence whose self-reported `platform` is `SevSnp` without reading `report` or `nonce`: `gate_execution` (`lib.rs:130-144`, line 136) and `EnclavePipeline::attestation_gate` (`backend/crates/platform-connectors/src/pipeline.rs:87-141`, line 92). The nonce is generated by the attesting process itself (`backend/crates/platform-api/src/query.rs:201-203`). A check in the same process the operator runs does not by itself meet `THREAT_MODEL.md` A2 (lines 76-77), so the verifier must be reusable by the key-release relying party (P50).
 
@@ -1281,8 +1342,8 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - An `AttestationVerifier` seam in `platform-enclave`, separate from `AttestationProvider` (which today has only `produce_evidence`, `lib.rs:37-42`), built on an established, maintained SEV-SNP library (no hand-written parsing or signature code; `unsafe` is denied workspace-wide, `backend/Cargo.toml:27-28`; new crates pass `cargo deny check` and dependency review). Input: report bytes, certificate chain, expected nonce or REPORT_DATA, and policy. Output: a `VerifiedReport` (measurement, TCB, report data) that only the verifier can construct, or an error.
 - It checks: the VCEK (or VLEK, whichever the platform uses) to ASK to ARK chain to pinned AMD roots; the report signature; revocation (CRL); REPORT_DATA against the layout from P14; guest policy (debug disallowed, migration agent off); a minimum reported TCB; and the measurement or workload policy through an interface whose expected values come from configuration (`platform-config`) and fail closed when missing. Tests use fixture values; P49 supplies production values.
 - How AMD certificates are fetched, provisioned and cached is defined; an unreachable, expired or revoked chain fails closed, with tests.
-- Hardware-free test support: a `test-support` Cargo feature on `platform-enclave`, enabled only from `[dev-dependencies]` (resolver 2 keeps it out of normal builds; not `cfg(test)`, which other crates' integration tests cannot see), generates a throwaway ARK to ASK to VCEK chain at test time (no key committed, `docs/DATA_POLICY.md` rule 3) and signs reports with chosen measurement, policy, TCB and REPORT_DATA. The trust root is a parameter only under `test-support`; a test shows a production verifier rejects a report signed by the synthetic chain. A CI step proves release binaries build without the feature.
-- Negative tests (the synthetic chain first, then P12 phase B's recorded reports once captured (target week 4), and public sample reports whose source and licence are recorded per DATA_POLICY rule 4; P48 adds its own recorded reports to these tests when it lands, since it depends on this issue): valid; wrong nonce; wrong measurement; debug policy; TCB below minimum; bad signature; wrong or revoked chain. All pass under `cargo test --workspace` on `ubuntu-24.04-arm` and macOS.
+- Hardware-free test support: a `test-support` Cargo feature on `platform-enclave`, enabled only from `[dev-dependencies]` (resolver 2 keeps it out of normal builds; not `cfg(test)`, which other crates' integration tests cannot see), generates a throwaway ARK to ASK to VCEK chain at test time with the one synthetic-chain generator shared with P84 (no key committed, `docs/DATA_POLICY.md` rule 3) and signs reports with chosen measurement, policy, TCB and REPORT_DATA. The trust root is a parameter only under `test-support` and P84's development mode; a test shows a production verifier rejects a report signed by the synthetic chain. A CI step proves release binaries build without the feature.
+- Negative tests (the synthetic chain first, then P12 phase B's recorded reports once captured, and public sample reports whose source and licence are recorded per DATA_POLICY rule 4; P48 adds its own recorded reports to these tests when it lands, since it depends on this issue): valid; wrong nonce; wrong measurement; debug policy; TCB below minimum; bad signature; wrong or revoked chain. All pass under `cargo test --workspace` on `ubuntu-24.04-arm` and macOS.
 - An `snp_report` fuzz target: a file in `backend/fuzz/fuzz_targets/`, a `[[bin]]` entry and a `platform-enclave` path dependency in `backend/fuzz/Cargo.toml`, and an entry in the matrix in `.github/workflows/fuzz.yml`.
 - The SEV-SNP glossary terms (VCEK, launch measurement, TCB) are added to the guide from P3.
 - The SEV-SNP verification library and the pinned AMD root certificates are named as trusted in `docs/THREAT_MODEL.md` "Out of scope: Correctness of the underlying libraries" (lines 119-121), next to the side-channels bullet that already relies on "the attestation chain" (lines 108-110). If the library's signature or certificate checks use a backend other than RustCrypto (for example OpenSSL), either configure it to use RustCrypto or name that backend in `CONTRIBUTING.md:45` in the same PR.
@@ -1291,7 +1352,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P14 (REPORT_DATA layout, relying-party interface and workload-identity mechanism), and P12's phase B recorded reports to close.
 
-**Sequencing.** Report parsing, AMD chain and signature checks start in week 2; the workload-policy interface and anything specific to a provider token wait for the workload-identity decision in P14.
+**Sequencing.** Report parsing, AMD chain and signature checks do not wait on P14; the workload-policy interface and anything specific to a provider token wait for the workload-identity decision in P14.
 
 **Security impact.** Replaces "trust the platform tag" with verified hardware evidence (A2, "Run a query outside a genuine enclave").
 **ADR.** Covered by P14 (relying party, REPORT_DATA, workload identity).
@@ -1300,7 +1361,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P48. SEV-SNP report acquisition on hardware and verified gates
 **Labels:** build · area:enclave · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 4-10
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** Implement report acquisition inside a Confidential VM, record real fixtures, and make both gates act on verified evidence. Definition-of-done item 2 requires a query that "passes attestation on genuine SEV-SNP hardware".
 
@@ -1326,7 +1387,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P49. Enclave workload image and published attestation values
 **Labels:** build · area:enclave · area:ops
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 4-9
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The first draft made deployment depend on attestation while attestation's measurement policy needed deployment's image, a cycle. Split out the image: build the workload that runs inside the Confidential VM deterministically, and publish the values the measurement policy pins. Today `.github/workflows/release.yml` (lines 12, 26-43) builds bare binaries on `ubuntu-latest` and attests their provenance; the repository has no image definition or `deploy/` directory. On GCP Confidential VMs the SNP launch MEASUREMENT covers Google-supplied firmware, so a reproducible image digest does not equal MEASUREMENT; the workload is bound separately (for example measured boot or vTPM, or a key bound in REPORT_DATA), as P14 decides (P15 fixes what the image contains).
 
@@ -1350,7 +1411,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P50. Production key release into the attested enclave
 **Labels:** build · area:enclave · area:crypto · rust
-**Size:** M-L (pair) · **Priority:** v1 blocker · **Target:** weeks 6-12
+**Size:** M-L (pair) · **Priority:** v1 blocker
 
 **Summary.** Implements the custody and release design accepted in P14. Today no tenant private key exists outside the steward's browser: it is generated non-extractable (`frontend/src/lib/crypto/core.ts:171-180`), only its public half is enrolled, and `TenantKeypair` is dev/test only (`backend/crates/platform-crypto/src/lib.rs:203-217`). The only non-test `EnclaveKeyProvider` implementations keep keys in process memory (`DevKeyProvider`, `MultiTenantDevKeyProvider`, `backend/crates/platform-api/src/query.rs:49-113`). `gate()` discards the evidence (`query.rs:201-234`), so release cannot depend on it today. Key-release failures would surface as `ApiError::Backend`, a 502 "storage backend error" (`backend/crates/platform-api/src/lib.rs:132`).
 
@@ -1361,7 +1422,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - Key material is fetched once per query, not once per envelope (today `decrypt_connector` calls `open_envelope` per object, `query.rs:252-298`), held only in zeroize-on-drop types, and dropped when the query ends; any cache lifetime is set by the ADR. The `ObservedKeys` test wrapper (`backend/crates/platform-api/tests/query_api.rs`) is reworked for the new trait shape.
 - Key-release failures map to a dedicated 503 `ApiError` variant (or `AttestationUnavailable`/`QueryUnavailable`), never `Backend`/502.
 - Each release decision emits a new audit kind (for example `crypto.key_release`, ok, denied or failed, identifiers only), asserted in `audit_coverage.rs` with a production-provider test double; the audit table and coverage list in `docs/ARCHITECTURE.md` are updated.
-- An in-process stand-in of the release service implements the recorded protocol for tests (issues nonces, checks reports with the P47 verifier, releases only on success).
+- An in-process stand-in of the release service implements the recorded protocol for tests and for the dev server on the simulated TEE (P84) (issues nonces, checks reports with the P47 verifier, releases only on success); the dev server then stops using `MultiTenantDevKeyProvider`.
 - `DevKeyProvider` and `MultiTenantDevKeyProvider` sit behind the dev mechanism from P18 (not `#[cfg(test)]`: `query-demo` and the integration tests construct them), so the production binary cannot construct them.
 - The key-release trait and production provider are code-owned (moved to `platform-enclave`, or covered by a CODEOWNERS entry from P4).
 - Wrapping uses `TenantKem`, so the hybrid suite from P35 drops in; it uses the hybrid suite before this issue closes.
@@ -1379,7 +1440,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P51. Wire the production query service and engine settings in `platform-api`
 **Labels:** build · area:enclave · area:ops · rust
-**Size:** S-M · **Priority:** v1 blocker · **Target:** weeks 10-13
+**Size:** S-M · **Priority:** v1 blocker
 
 **Summary.** The integration step at the end of the enclave chain. `main.rs` sets `query: None` (`backend/crates/platform-api/src/main.rs:41-45, 64-70`), so query routes return 503. Engine settings must come from configuration, never from `EngineSettings::default()` (which is `ZkMode::Disabled` until P24), and `max_concurrent_queries` is hard-coded at 4 (`backend/crates/quackxide-engine/src/lib.rs:65-72`).
 
@@ -1401,7 +1462,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P52. Per-query resource limits that never spill plaintext
 **Labels:** harden · area:engine · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 6-11
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** DataFusion runs inside `QueryScope`. Decrypted Parquet is held in zeroize-on-drop buffers (`SecretBytes`, and a wiped copy for the engine), but decoded Arrow arrays are not zeroized; `docs/THREAT_MODEL.md` records that as the residual "Unzeroized working memory", because clearing them would need `unsafe` (denied workspace-wide). So the first draft's "plaintext zeroized on every exit path" cannot be met as written. Every object of the dataset's current snapshot is decrypted (`backend/crates/platform-api/src/query.rs:252-298`) and eagerly decoded into a `MemTable` (`backend/crates/quackxide-engine/src/lib.rs:118-158`), then the query runs on a `SessionContext` whose `RuntimeEnv` replaces only the object-store registry (`NoObjectStores`, added by Code-Pause-Inc/QuackXide#22; `lib.rs:89-95`) and otherwise keeps DataFusion 49's defaults: an unbounded memory pool and an OS-temp disk manager. A memory limit without disabling the disk manager would spill plaintext to disk, against "Plaintext never persisted" (`THREAT_MODEL.md:73`). A global concurrency bound already exists (`max_concurrent_queries`, `plaintext_slot`).
 
@@ -1431,7 +1492,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P53. Decode only what the query needs: gate before decode, projected Parquet decode in `QueryScope`
 **Labels:** harden · area:engine · rust
-**Size:** S · **Priority:** v1 needed · **Owner:** P52's owner, as a follow-up PR · **Target:** weeks 9-12
+**Size:** S · **Priority:** v1 needed · **Owner:** P52's owner, as a follow-up PR
 
 **Summary.** `register_parquet_many` (`backend/crates/quackxide-engine/src/lib.rs:126-158`) decodes every column and row group of every object into a `MemTable`, and it runs before `sql()` plans or gates the query (`lib.rs:164-191`; called from `backend/crates/platform-api/src/query.rs:654-658`). So a query that the plan gate or the count-column check refuses has already decoded the whole dataset into Arrow memory, which is not zeroized (`docs/THREAT_MODEL.md:133-138`), and an accepted query decodes columns it never reads. This conflicts with the Efficiency goal in `docs/PROJECT_SCOPE.md:19` ("columnar storage and query pushdown keep decrypt-and-scan work to what the query needs"). Separately, a schema mismatch between objects surfaces from `MemTable::try_new` as `QueryError::Execution` (`lib.rs:151-152`), which `map_query_error` turns into 400 "query could not be executed" (`query.rs:673-674`), blaming the caller's SQL for a storage fault.
 
@@ -1460,14 +1521,14 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P54. Disclosure control: threat-to-test traceability, budget charge order, k floor and result contract
 **Labels:** harden · area:disclosure · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 3-10
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** The plan gate, genuine-count check, `MinCountThreshold` and budget ledger exist. Four gaps: (1) the first draft asked `tests/bypass.rs` to cover every attack class in the threat model, but grants and budgets live in `platform-tenancy`, which the engine crate does not depend on; (2) the budget is charged after the attestation gate but before the plaintext slot, key release and decryption (`backend/crates/platform-api/src/query.rs:515-550`), so capacity, storage, key-release and decode failures cost a unit, contradicting `docs/ARCHITECTURE.md:212-218` ("infrastructure failures never cost the researcher"); (3) `RESEARCH_MIN_COHORT_SIZE` is parsed with no floor (`backend/crates/platform-config/src/lib.rs:188`) and `MinCountThreshold` refuses only k < 1, so an operator setting k = 1 turns suppression off; (4) own-data and research results have different shapes (`query.rs:349-352` versus `589-597`), and P55 must know which fields are sealed.
 
 **Done when**
 - **Traceability.** `docs/THREAT_MODEL.md`'s A1 table gets a "Test" column (or this issue holds a checklist, if the maintainer prefers not to change the table), and every row names its tests: engine rows in `backend/crates/quackxide-engine/tests/` (`bypass.rs`, `disclosure.rs`, `engine_query.rs`); grant, revocation, budget and no-oracle rows in `backend/crates/platform-api/tests/research_api.rs` and `catalog_api.rs` (P45 owns new grant tests). Any row without a test gets one. Residual rows (differencing; extreme values until P58) are marked residual, not tested. The A1 rows added by Code-Pause-Inc/QuackXide#21, Code-Pause-Inc/QuackXide#22 and Code-Pause-Inc/QuackXide#24 are included. The bypass suite asserts that no accepted query shape produces overlapping groups.
 - **Budget order.** The maintainer chooses and the issue records one of: (a) a read-only pre-check (`BudgetLedger::state`) before the slot refuses an exhausted grant with 429, and the atomic `charge` moves to after the slot, key release and decryption and before planning, so infrastructure failures are free and plan-gate probes still cost; if `charge` refuses after decryption because a concurrent query raced past the pre-check, the plaintext is dropped and the query returns 429 (note the trade-off: concurrent requests on a budget with one unit left can trigger decryption before being refused); or (c) refund on infrastructure error, which needs a ledger method and reverses the documented no-refund, monotonic-spend invariant ("no refunds", "Spend is monotonic per grant id") (`backend/crates/platform-tenancy/src/budget.rs:17-18`, `ARCHITECTURE.md`, `THREAT_MODEL.md` A1), so all three are updated; or (b) keep the current order and correct `docs/ARCHITECTURE.md:212-218`, the comment at `query.rs:517-521` and `THREAT_MODEL.md` to say that only grant, attestation and budget refusals are free. Tests either way: a failing key provider (adapt `ObservedKeys` from `tests/query_api.rs`) and `max_concurrent_queries = 0` each assert the documented budget outcome; a plan-gate rejection spends one unit.
-- **Budget conformance.** A shared `budget_ledger_conformance(Arc<dyn BudgetLedger>)` helper in `platform-tenancy` opens a grant with limit L and spawns N > L concurrent `charge(grant, 1)` tasks on a multi-thread runtime, asserting exactly L successes, `BudgetError::Exhausted` for the rest, and `spent == L <= limit`. It runs against `InMemoryBudgetLedger` now and against the durable ledger in P62. (tokio is a dev-dependency of `platform-tenancy`, so keep it under `#[cfg(test)]` or behind a `test-util` feature.) Land this part as an early small PR.
+- **Budget conformance.** A shared `budget_ledger_conformance(Arc<dyn BudgetLedger>)` helper in `platform-tenancy` opens a grant with limit L and spawns N > L concurrent `charge(grant, 1)` tasks on a multi-thread runtime, asserting exactly L successes, `BudgetError::Exhausted` for the rest, and `spent == L <= limit`. It runs against `InMemoryBudgetLedger` now and against the durable ledger in P62. (tokio is a dev-dependency of `platform-tenancy`, so keep it under `#[cfg(test)]` or behind a `test-util` feature.) Land this part first, as a small PR.
 - **k floor.** Research and ZK mode enforce a compile-time minimum k that configuration cannot lower; startup refuses a lower `RESEARCH_MIN_COHORT_SIZE` with a test, and the floor holds wherever the threshold is built (`ConnectorQueryService::with_min_cohort`/`threshold()`), not only in config parsing. Engine tests that use k = 2 build the threshold directly and are unaffected; `platform-api/tests/query_api.rs` (`.with_min_cohort(2)`) is updated. The floor is recorded in `THREAT_MODEL.md` A1.
 - **Audit.** A refusal emits `engine.query` with outcome `denied` and a reason class (plan, count column, threshold configuration, execution, resource) carrying no SQL text; `failed` is kept for 5xx; `audit_coverage.rs` (which today asserts broken SQL gives `engine.query` failed) is updated. Applies to both own-data and research queries.
 - **Result contract.** The field list for both endpoints is documented in `docs/ARCHITECTURE.md` (or a JSON schema under `docs/`) with an optional `schema_version`, and states which fields travel inside the sealed payload (P55) and which stay cleartext metadata. Agree it before P44 renders results and P55 builds the envelope. Zero-object datasets: either refuse with the same status as other refusals, or document and test the current behaviour (200, empty rows, budget charged); record whether `object_count` stays in research results. `suppressed_rows` stays in research responses: `docs/ARCHITECTURE.md:157,189` and `docs/PROJECT_SCOPE.md:52` specify it, and `research_api.rs:165`, `query_api.rs:190,201` and `catalog_api.rs:239` assert it. The field list records what it discloses. `MinCountThreshold` counts each row it drops (`backend/crates/quackxide-engine/src/disclosure.rs:53-78`), so with `GROUP BY` a non-zero count shows that some cohort below k matched the `WHERE` or `HAVING` predicate. On the bypass fixture with k=5, `SELECT dept, COUNT(*) AS n FROM people WHERE salary > 9000 GROUP BY dept` returns no rows with `suppressed_rows=1`, and `> 9001` returns no rows with `suppressed_rows=0`; at one unit per query (`RESEARCH_QUERY_COST`, `query.rs:141`), a binary search over the threshold recovers the single `ceo` salary in about 14 queries, within the default budget of 100 (`backend/crates/platform-config/src/lib.rs:17`). `docs/THREAT_MODEL.md` gains one sentence under the "Overlapping-query differencing" residual or the "Unlimited adaptive probing" row: suppression metadata leaks one bit per query about cohorts below k, the budget bounds it, and it is weaker than the accepted two-query differencing (a total over `WHERE dept <> 'legal'` minus a `GROUP BY dept` already gives that salary, as ADR 0002 records). A test pins the behaviour. Dropping the field is not offered for v1: it closes nothing while the differencing residual stands.
@@ -1476,7 +1537,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** none.
 
-**Sequencing.** The conformance helper lands early as its own PR.
+**Sequencing.** The conformance helper lands first as its own PR.
 
 **Security impact.** Makes the A1 claims traceable to tests, makes the documented budget semantics true, and stops configuration from disabling suppression.
 **ADR.** Required if the result schema is declared a stable public API (maintainer's call).
@@ -1485,49 +1546,49 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P55. Results sealed to the researcher inside the enclave
 **Labels:** build · area:crypto · area:enclave · rust · needs-adr
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 8-13
+**Size:** M · **Priority:** v1 blocker
 
-**Summary.** Results leave as plaintext JSON (`query.rs:617-625`). Definition-of-done item 2 requires a result "sealed to the researcher's key". The query service runs inside `platform-api` (`query.rs:1-13`), so the boundary is the attested enclave as P15 defines it, not "the API". Three problems the first draft missed: the researcher's public key is read from the unsigned enrollment record that the operator-run API writes (`put_enrollment`, `backend/crates/platform-api/src/lib.rs:715-777`), so it can be substituted; HPKE base mode does not authenticate the sender, so an operator who sees the request could seal a forged result; and nothing binds a result to the request it answers.
+**Summary.** Results leave as plaintext JSON (`query.rs:617-625`). Definition-of-done item 2 requires a result "sealed to the researcher's key". The query service runs inside `platform-api` (`query.rs:1-13`), so the boundary is the attested enclave as P15 defines it, not "the API". Three problems the first draft missed: the researcher's public key is read from the unsigned enrollment record that the operator-run API writes (`put_enrollment`, `backend/crates/platform-api/src/lib.rs:715-777`), so it can be substituted; HPKE base mode does not authenticate the sender, so an operator who sees the request could seal a forged result; and nothing binds a result to the request it answers. The plan requires plaintext only in the browser and inside the attested Confidential VM, so all three are closed in v1 through P85 rather than recorded as residuals.
 
 **Done when**
-- An ADR records the result envelope format and how the recipient key is authenticated. It chooses between: (i) a design in which the browser verifies attestation (for example a per-request key sent to an enclave the browser has verified); or (ii) for v1, recording operator key substitution and result forgery as residual risks in `THREAT_MODEL.md` A2 (row 73) and "Residual risks", with enrollment made non-silent (P33: create-once, audited rotation, fingerprint shown in the portal). Attested sender authentication (an enclave signing key bound in REPORT_DATA and checked by the browser) is proposed outside v1 unless the maintainer pulls it in.
-- The enclave seals each research result through `TenantKem` (so it ships on the current suite and switches with P35) to the researcher's key from the source the ADR names. The HPKE `info` carries a versioned "result" role label (distinct from connector-data sealing), the grant id, a request nonce chosen by the researcher's browser, a hash of the SQL text, and the result schema version from P54, following the `envelope_info` pattern and shared with the browser (P34).
+- An ADR records the result envelope format, its signature, and how the recipient key is authenticated, using the design in which the browser verifies attestation (P85): the researcher's browser verifies the enclave's evidence, then sends its recipient public key and a fresh request nonce inside the query sealed to the enclave's verified request key; the enclave seals the result to that recipient key, which must match the fingerprint of the researcher's enrolled key (P33), and signs the sealed result with its result-signing key, which is bound in REPORT_DATA (P14). The enrollment record alone is never the source of the recipient key.
+- The enclave seals each research result through `TenantKem` (so it ships on the current suite and switches with P35) to the recipient key from the researcher's sealed request, and signs it with the enclave's result-signing key from P85. The HPKE `info` carries a versioned "result" role label (distinct from connector-data sealing), the grant id, the request nonce chosen by the researcher's browser, a hash of the SQL text, and the result schema version from P54, following the `envelope_info` pattern and shared with the browser (P34).
 - No component outside the attested Confidential VM (load balancer, TLS-terminating proxy, operational logs, audit stream, object store) ever holds the result's aggregate row values, with a test on the logs and audit stream. The `engine.query` audit record keeps its count metadata (`rows=`, `suppressed=`, `budget_remaining=`, `query.rs:602-615`), which billing reads.
 - Error responses (400, 401, 403, 404, 422, 429, 502, 503) stay unsealed and carry no result data or SQL echo, with a test.
 - The own-data query endpoint (`POST /api/v1/query`) either seals the same way or the ADR records why not.
-- Tests: a result opens only with the intended key; a different recipient key, a flipped byte, and a valid result replayed against another request nonce are refused; a key substituted in storage, from the source the ADR rules out, yields nothing the substitute can open (or the query is refused).
-- `docs/THREAT_MODEL.md` A2 row "Read results at the API edge" and README "Status" ("Encrypted results") are updated.
+- Tests: a result opens only with the intended key; a different recipient key, a flipped byte, a result signed by any key other than the enclave's verified result-signing key, and a valid result replayed against another request nonce are refused; a recipient key substituted in the enrollment record yields nothing the substitute can open (or the query is refused, because the fingerprint no longer matches).
+- `docs/THREAT_MODEL.md` A2 rows "Read results at the API edge", key substitution and result forgery, and README "Status" ("Encrypted results") are updated.
 - The research diagram in `docs/ARCHITECTURE.md` (lines 177-190, which today ends in "aggregate rows + suppressed_rows + budget_remaining") ends in a result sealed to the researcher's key and states what stays cleartext metadata. The query diagram (lines 117-129, which ends in "JSON result rows") is updated too, or notes that it stays unsealed, as the ADR decides.
 
 **Where.** `backend/crates/platform-api/src/query.rs`, `backend/crates/platform-api/src/lib.rs` (enrollment), `backend/crates/platform-crypto/src/lib.rs`, `docs/adr/`, `docs/THREAT_MODEL.md`, `docs/ARCHITECTURE.md`, `README.md`.
 
-**Depends on:** P14, P15, P54 (result contract), P33, and P35 to close.
+**Depends on:** P14, P15, P85, P54 (result contract), P33, and P35 to close.
 
-**Sequencing.** Developed and tested against the dev key providers; P50 is needed only for the final on-hardware run.
+**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run.
 
-**Security impact.** Closes "Read results at the API edge" (A2) up to the residuals the ADR records.
+**Security impact.** Closes "Read results at the API edge", recipient-key substitution and result forgery (A2).
 **ADR.** Required (wire format and trust boundary).
 
 ---
 
 ### P56. Open sealed results in the researcher's browser
 **Labels:** build · area:crypto · area:frontend · javascript
-**Size:** S-M · **Priority:** v1 blocker · **Target:** weeks 10-13
+**Size:** S-M · **Priority:** v1 blocker
 
 **Summary.** The browser half of sealed results. The portal must show a result only after the crypto worker opens it, with the private key never leaving the worker.
 
 **Done when**
 - The research portal uses the crypto worker's existing tenant-key path (keygen in `frontend/src/lib/crypto/worker.ts`, enrollment through `frontend/src/lib/vault/httpVault.ts` and `PUT /api/v1/drive/enrollment`), on the hybrid suite (P36) and bound to the session `tid` (P33); no second "researcher keypair" is minted unless P14 says so.
 - A researcher who opens the portal without an enrolled key goes through key setup in the crypto worker, with a `KeySetupGate`-style explanation and fingerprint: `ensureKeys` and enrollment are lifted out of the drive-only `init` path (`frontend/src/lib/crypto/worker.ts:73-95`, called from `DrivePanel.tsx`).
-- The worker generates a fresh nonce per query and gains an "open research result" message in `protocol.ts`/`worker.ts`; the private key never leaves the worker. The portal (P44) renders only after a successful open, and a release build refuses to render an unsealed result.
-- Tampered, wrongly addressed, replayed (nonce mismatch), unknown-version and classical-only envelopes are refused, with unit or component tests and the cross-implementation vectors from P34.
+- The worker generates a fresh nonce per query and gains an "open research result" message in `protocol.ts`/`worker.ts`; the private key never leaves the worker. Before opening, the worker checks the result's signature with the enclave result-signing key it verified through P85, and refuses a result whose signature, nonce or grant does not match the request it sent. The portal (P44) renders only after a successful open, and a release build refuses to render an unsealed result.
+- Tampered, unsigned or wrongly signed, wrongly addressed, replayed (nonce mismatch), unknown-version and classical-only envelopes are refused, with unit or component tests and the cross-implementation vectors from P34.
 - A browser without the required key support is refused with a clear error and is never sent plaintext.
 - What device loss means for a researcher's in-flight and future results is documented.
 - Opening a sealed result in the browser is benchmarked; before this issue closes, the benchmark joins P73's harness and regression run (or the PR states why it can run only as a recorded manual run per release candidate), and the result and a target agreed with @AxolDad are recorded in `docs/BENCHMARKS.md`.
 
 **Where.** `frontend/src/lib/crypto/worker.ts`, `protocol.ts`, `core.ts`; `frontend/src/lib/research/client.ts`; `frontend/src/components/research/`; `docs/BENCHMARKS.md`.
 
-**Depends on:** P55, P34 (checkpoint B), P36, P44.
+**Depends on:** P55, P85, P34 (checkpoint B), P36, P44.
 
 **Security impact.** Result plaintext exists only in the researcher's browser (DoD item 2).
 **ADR.** Covered by P55.
@@ -1536,9 +1597,37 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ---
 
+### P85. Browser-verified attestation and queries sealed to the enclave
+**Labels:** build · area:crypto · area:enclave · area:frontend · rust · javascript · needs-adr
+**Size:** M-L (pair: stream 2 with stream 3) · **Priority:** v1 blocker
+
+**Summary.** The plan requires data, SQL text and results to be plaintext only in the user's browser and inside the attested Confidential VM. Today `POST /api/v1/research/query` takes the SQL text as plain JSON (`backend/crates/platform-api/src/query.rs`), the portal's query form is still to be built (P44), and nothing in the browser checks that the endpoint is an attested enclave, so an operator who controls the deployment could read queries or return forged results (P55's summary). TLS ending inside the VM (P15, P67) protects the transport, but the browser still has no evidence of what it is talking to. This issue gives the browser that evidence and seals each query to a key that only the attested enclave holds.
+
+**Done when**
+- **Enclave keys.** At start inside the Confidential VM, the enclave generates a request-decryption key pair (through `TenantKem`, so it moves to the hybrid suite with P35) and a result-signing key pair (the scheme P16 or P17 chooses for signatures; hybrid if they choose it). Both private keys live only in memory, in zeroize-on-drop types, and are never written, logged or exported. A digest of both public keys and of the TLS public key from P67 goes into REPORT_DATA with the layout P14 records.
+- **Evidence endpoint.** `GET /api/v1/attestation` (unauthenticated, rate-limited) returns the evidence bundle: the SNP report, the certificate chain or how to fetch it, the workload-identity evidence P14 chose, the two public keys and the TLS public key hash. The browser supplies a challenge nonce, and the report binds it (or the ADR records a cached report with a bounded lifetime and why that is fresh enough).
+- **Browser verification.** The crypto worker verifies the bundle before any research query is sent: the AMD chain to pinned roots shipped in the release bundle, the report signature, guest policy, minimum TCB, the workload identity against the values P49 publishes (compiled into the release bundle), the challenge nonce, and the REPORT_DATA digest of the keys it is about to use. Verification uses P47's verifier built for wasm32 alongside P34's wasm crate, if the library supports it; otherwise the ADR names an established, maintained library for the browser. No hand-written parsing or signature code. A failed check stops the query with a clear error, and nothing is sent.
+- **Sealed queries.** The research request body is the SQL text, the request nonce and the researcher's recipient public key, sealed by the crypto worker to the verified request key. The HPKE `info` carries a versioned "query" role label, the grant id and the session `tid` (P33). The enclave opens it only inside the VM. In production mode (P18) plaintext SQL on the research route is refused, with a test.
+- **Signed results.** The enclave signs each sealed result with the result-signing key (P55), and the browser accepts a result only under the key it verified (P56).
+- **Key changes.** A restart or a renewed TLS key produces new keys and new evidence; the browser re-verifies when a key it holds no longer matches, and never reuses a key from a previous verification for a different evidence bundle.
+- **Negative tests**, first on the simulated TEE (P84), then with P48's recorded hardware reports: wrong measurement or workload identity, debug policy, TCB below minimum, bad chain, stale or mismatched challenge nonce, a key not bound in REPORT_DATA, and a TLS key hash that does not match. Each makes the browser refuse to send the query. A query sealed to another enclave's key is refused by the enclave, and a result signed by another key is refused by the browser.
+- **The served JavaScript.** The browser's checks run in code the server delivers, so `docs/THREAT_MODEL.md` records that residual and its controls: the frontend bundle is served from inside the measured image (P49, P67), the TLS key is generated in the VM and bound in the evidence (P67), and a small command-line checker in the repository verifies a live deployment's evidence, its TLS key binding and the digest of the served frontend bundle against the release's published values, so anyone can check a deployment independently. The checker reuses P47's verifier.
+- The ADR (with P55's, or as its own record) fixes the evidence-bundle format, the challenge protocol, the request envelope and the result signature, and `docs/ARCHITECTURE.md`'s research flow shows the browser verifying the enclave before sending the query.
+
+**Where.** `backend/crates/platform-enclave/src/lib.rs`, `backend/crates/platform-api/src/{lib.rs,query.rs}`, `backend/crates/platform-crypto/src/lib.rs`, the wasm crate from P34, `frontend/src/lib/crypto/{worker.ts,protocol.ts,core.ts}`, `frontend/src/lib/research/client.ts`, a new checker binary or script, `docs/adr/`, `docs/THREAT_MODEL.md`, `docs/ARCHITECTURE.md`.
+
+**Depends on:** P14 (REPORT_DATA layout), P15, P47, P34 (checkpoint B), P84; P49 and P67 for the production run.
+
+**Sequencing.** Built and tested end to end on the simulated TEE (P84) first; P55 and P56 build on its keys; P72 stage B adds its browser specs; P82 runs it on hardware.
+
+**Security impact.** Makes "plaintext only in the browser and inside the attested enclave" checkable by the browser itself: queries are unreadable outside the enclave, and results cannot be forged or redirected by the operator.
+**ADR.** Required (evidence bundle, challenge protocol, request envelope and result signature).
+
+---
+
 ### P57. Extreme values: decide the dominance and MIN/MAX policy, then apply it to MIN and MAX
 **Labels:** build · area:disclosure · rust · needs-adr
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 3-7
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** `MIN` and `MAX` over a cohort of at least k still return one individual's value, and `docs/THREAT_MODEL.md` ("Extreme values") calls removing them or applying a dominance rule "a policy decision". `DisclosurePolicy::apply` sees only aggregated output batches with user-chosen aliases (`backend/crates/quackxide-engine/src/disclosure.rs:33-37`, called after `collect()`), so a dominance rule needs per-group contributor information the policy does not have today.
 
@@ -1556,7 +1645,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P69 (code part only; its "bypass.rs passes unchanged" criterion must stay meaningful).
 
-**Sequencing.** The ADR starts in week 1.
+**Sequencing.** The ADR starts at once; only the code part waits for P69.
 
 **Security impact.** Closes the MIN/MAX extreme-value residual (A1).
 **ADR.** Required (disclosure gate).
@@ -1565,7 +1654,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P58. Dominance rule for SUM and AVG
 **Labels:** build · area:disclosure · area:engine · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 7-12
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** Implements the SUM/AVG part of the policy from P57.
 
@@ -1586,7 +1675,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P59. Data dictionary on published datasets
 **Labels:** build · area:disclosure · area:frontend · rust · javascript
-**Size:** S-M · **Priority:** v1 needed · **Target:** weeks 6-11
+**Size:** S-M · **Priority:** v1 needed
 
 **Summary.** Researchers cannot see a dataset's columns. A listing carries only its slug, title, description, prices and budget (`DatasetListing`, `backend/crates/platform-tenancy/src/catalog.rs:21-38`); neither `ListingView` (`frontend/src/lib/research/client.ts`) nor `PublishListingRequest` (`backend/crates/platform-api/src/research.rs:38-51`) carries a schema. `DESCRIBE` is refused by the plan gate and still costs a unit. The SQL table name is the dataset slug (`query.rs:654-657`); a slug containing `-` or starting with a digit must be double-quoted. The server cannot derive a schema without decrypting, so the steward declares it.
 
@@ -1612,7 +1701,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P60. Actionable refusals: typed reasons, stable error codes and a researcher SQL guide
 **Labels:** harden · area:disclosure · rust · javascript
-**Size:** M · **Priority:** v1 needed · **Target:** weeks 6-12
+**Size:** M · **Priority:** v1 needed
 
 **Summary.** Every research query costs a unit once it passes the grant check and attestation gate, and rejections come back as one of a few fixed strings (`map_query_error`, `backend/crates/platform-api/src/query.rs:662-677`), so researchers spend budget learning the rules. `policy::is_aggregate_only` returns a bool; planning and runtime errors share `QueryError::Execution`. API error bodies are `{"error": "<message>"}` with no machine-readable code (`backend/crates/platform-api/src/lib.rs:121-158`), so clients must match message text to tell the three 503 causes apart.
 
@@ -1640,7 +1729,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P61. Durable registries, part 1: store ADR, backend-failure errors and conformance suites
 **Labels:** build · area:storage · rust · needs-adr
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 2-6
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** `TenantRegistry`, `GrantRegistry`, `BudgetLedger` and `CatalogRegistry` (`backend/crates/platform-tenancy/src/`) have only in-memory implementations. The first draft said durable backends could be added "without touching call sites" (also `docs/PROJECT_SCOPE.md`, `docs/ARCHITECTURE.md:253-254`); that cannot hold: the error enums cannot report a backend outage, and two call sites match exhaustively: `query.rs` (`BudgetError`; today any charge error becomes 429 `BudgetExhausted` with "no ledger entry") and `research.rs:144-150` (`CatalogError`). The workspace has no database dependency (`backend/Cargo.toml`). Sign-in adds identity and session state (P29, P30); its conformance cases and durable backends are in P63.
 
@@ -1663,7 +1752,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P62. Durable registries, part 2a: tenant, grant, budget and catalog backends
 **Labels:** build · area:storage · rust
-**Size:** M-L (pair; one PR per store) · **Priority:** v1 blocker · **Owner:** stream 4 · **Target:** weeks 5-10
+**Size:** M-L (pair; one PR per store) · **Priority:** v1 blocker · **Owner:** stream 4
 
 **Summary.** Implement the store chosen in P61 for the tenant, grant, budget and catalog registries and wire it into the binaries (definition-of-done items 4 and 7). The identity and session stores are in P63, so key-release integration (P51) does not wait on sign-in (P29, P30).
 
@@ -1691,7 +1780,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P63. Durable registries, part 2b: identity and session stores
 **Labels:** build · area:storage · area:auth · rust
-**Size:** M · **Priority:** v1 blocker · **Owner:** stream 1, paired with whoever built P62 · **Target:** weeks 9-12
+**Size:** M · **Priority:** v1 blocker · **Owner:** stream 1, paired with whoever built P62
 
 **Summary.** ADR 0006 (P16) decides which identity and session state stays in-house: tenant membership and the admin allowlist (P29), TOTP enrollment, the last accepted step and failed-attempt counters, and refresh-token families (P30). P29 and P30 build that state behind traits with in-memory implementations. This issue makes it durable in the store P61 chose, reusing P62's pattern. It is separate from P62 so that the key-release path (P62, then P51) does not wait on sign-in; sign-in (P29, P30, this issue, P32) still gates P68 and P82 directly.
 
@@ -1715,7 +1804,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P64. Deployment observability: audit sink, metrics and alerts
 **Labels:** build · area:ops
-**Size:** S-M · **Priority:** v1 blocker · **Target:** weeks 11-14
+**Size:** S-M · **Priority:** v1 blocker
 
 **Summary.** Audit records go only to stdout through one JSON layer (`backend/crates/platform-telemetry/src/lib.rs:17-28`; the target is `SECURITY_AUDIT_EVENT`, `lib.rs:11-13`). The stream also carries the billing meter (`engine.query` events, `docs/ARCHITECTURE.md:223-224`). Production needs these records stored durably, apart from operational logs. (Making the stream immune to `RUST_LOG` is P25.) P75 builds a readiness check and a metrics endpoint, but nothing collects the metrics or alerts on them, and on a single VM nothing else notices a VM that is not ready.
 
@@ -1741,7 +1830,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P65. HTTP edge hardening: security headers, CSP, timeouts, panic handling, and CORS if chosen
 **Labels:** harden · area:ops · area:frontend · rust · javascript
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 6-11
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** `build_app` adds only `TraceLayer` (`backend/crates/platform-api/src/lib.rs:312-323`) although tower-http's `cors` feature is enabled (`backend/Cargo.toml:48`). There is no CORS policy, request timeout or panic-catching layer, responses carry no security headers, and the frontend has no CSP (`frontend/index.html`). A strict CSP is a primary control here: script injected into the page can drive the crypto worker to decrypt with the steward's non-extractable keys. (Development access is solved by the same-origin proxy in P7.)
 
@@ -1757,7 +1846,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P15.
 
-**Sequencing.** This issue owns the header values and the middleware that sets them; P67 mounts static frontend serving behind that layer, and P68 deploys it. Under the week-3 capacity decision, timeouts and panic handling could be split off and deferred; the CSP, the security headers and any CORS allowlist cannot.
+**Sequencing.** This issue owns the header values and the middleware that sets them; P67 mounts static frontend serving behind that layer, and P68 deploys it. Under the scope review in P5, timeouts and panic handling could be split off and deferred; the CSP, the security headers and any CORS allowlist cannot.
 
 **Security impact.** Limits script injection against key-holding pages (A3) and keeps errors and panics from leaking detail.
 **ADR.** Not required (the origin decision is in P15).
@@ -1768,7 +1857,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P66. Deployable frontend release bundle (runtime configuration)
 **Labels:** build · area:frontend · area:ops · javascript
-**Size:** S-M · **Priority:** v1 blocker · **Target:** weeks 6-10
+**Size:** S-M · **Priority:** v1 blocker
 
 **Summary.** `VITE_*` values are compiled into the bundle (`frontend/src/config/brand.ts`), and `release.yml` builds through `scripts/check.sh` with none set. So the signed `frontend.tar.gz` runs the drive in local IndexedDB mode (`frontend/src/config/vault.ts:20-21`), calls `http://127.0.0.1:8080` (`brand.ts:39`) and carries the neutral brand. Any real deployment would have to rebuild it, which breaks deploying exactly the attested release artifact.
 
@@ -1793,16 +1882,16 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P67. Production HTTP edge: TLS termination and same-origin frontend hosting
 **Labels:** build · area:ops · area:frontend · rust
-**Size:** M if TLS terminates in-process; S if it terminates outside the VM · **Priority:** v1 blocker · **Target:** weeks 6-11
+**Size:** M · **Priority:** v1 blocker
 
-**Summary.** `platform-api` serves plain TCP (`tokio::net::TcpListener` and `axum::serve`, `backend/crates/platform-api/src/main.rs:72-76`). It has no static-file serving (the tower-http features are `trace`, `cors` and `limit`, `backend/Cargo.toml:48`), the router has only API routes (`backend/crates/platform-api/src/lib.rs:312-323`), and configuration has no certificate settings (`backend/crates/platform-config/src/lib.rs`; `BIND_ADDR` defaults to `127.0.0.1:8080`, line 161). The release ships `frontend.tar.gz` (`.github/workflows/release.yml:35`), but nothing serves it. P65, P66 and P68 all assume an HTTPS, same-origin edge that serves the signed frontend bundle with security headers. P15 decides where TLS terminates; this issue builds that edge.
+**Summary.** `platform-api` serves plain TCP (`tokio::net::TcpListener` and `axum::serve`, `backend/crates/platform-api/src/main.rs:72-76`). It has no static-file serving (the tower-http features are `trace`, `cors` and `limit`, `backend/Cargo.toml:48`), the router has only API routes (`backend/crates/platform-api/src/lib.rs:312-323`), and configuration has no certificate settings (`backend/crates/platform-config/src/lib.rs`; `BIND_ADDR` defaults to `127.0.0.1:8080`, line 161). The release ships `frontend.tar.gz` (`.github/workflows/release.yml:35`), but nothing serves it. P65, P66 and P68 all assume an HTTPS, same-origin edge that serves the signed frontend bundle with security headers. TLS terminates inside the Confidential VM (P15), so no load balancer or proxy outside it sees bearer tokens, SQL text or results; this issue builds that edge.
 
-**Maintainer prerequisite.** A domain or DNS name for a publicly trusted certificate on staging (P13), or a provider-managed hostname recorded in P15.
+**Maintainer prerequisite.** A domain or DNS name for a publicly trusted certificate on staging (P13). A provider-managed edge that terminates TLS outside the VM is not used.
 
 **Done when**
-- TLS follows P15.
-  - **If TLS terminates inside the Confidential VM:** `platform-api` serves HTTPS with the rustls-based stack P15 names (rustls is already in `backend/Cargo.lock` through `reqwest`), or a proxy does if P15 and P49 list it as part of the image. The certificate and private key reach the VM only at runtime, from the secret store through the attached service account or from ACME inside the VM, never through the image, the repository or the release. In production mode (P18) the binary refuses to start without a certificate. Plain HTTP is either not bound or only redirects.
-  - **If TLS terminates outside the VM:** the terminator's configuration lives in `deploy/`, and `docs/THREAT_MODEL.md` lists what it sees (bearer tokens, SQL text, request metadata).
+- TLS terminates inside the Confidential VM. `platform-api` serves HTTPS with the rustls-based stack P15 names (rustls is already in `backend/Cargo.lock` through `reqwest`), or a proxy does if P15 and P49 list it as part of the image. Any load balancer in front of the VM passes TCP through and never holds a certificate.
+- The TLS private key is generated inside the VM and never leaves it: the certificate is obtained by ACME from inside the VM, not loaded from the secret store, the image, the repository or the release. The hash of the TLS public key is exposed for P85 to bind into the attested evidence, so a client can check that the TLS endpoint it reached is the attested VM. In production mode (P18) the binary refuses to start without a certificate. Plain HTTP is either not bound or only redirects.
+- `docs/THREAT_MODEL.md` records the residual that the operator controls DNS and could obtain another publicly trusted certificate for the domain, and the control for it: Certificate Transparency monitoring for the domain (alerting through P64) and the attestation-bound TLS key check from P85.
 - The frontend bundle is served same-origin with the API, by `platform-api` or by the proxy above. If `platform-api` serves it, it uses tower-http's `fs` feature (`ServeDir`):
   - `index.html` at `/` with `Cache-Control: no-store`, and hashed assets with immutable caching;
   - correct MIME types for the crypto worker script and, if P34 ships WebAssembly, `application/wasm`;
@@ -1815,25 +1904,25 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
   - an unknown path returns 404, and `/api/*` and `/admin/*` responses are unchanged;
   - the static handler refuses path traversal.
 - Any new test-only dependency (for example `rcgen`) passes `backend/deny.toml` and dependency review.
-- **Certificate renewal.** If TLS terminates inside the VM with self-managed certificates: the binary picks up a renewed certificate on restart without a rebuild (hot reload is not required); a renewal procedure is drafted in `docs/` and its steps are checked locally against a short-lived certificate generated at test time (none committed, `docs/DATA_POLICY.md` rule 3); and certificate expiry is exported as a P75 metric or readiness input. If TLS terminates outside the VM (for example at a provider-managed edge), `docs/` records how the certificate is renewed (for example provider-managed renewal). In both cases P77 adds renewal to the runbook and exercises it on staging.
+- **Certificate renewal.** The binary obtains a renewed certificate by ACME inside the VM and picks it up on restart without a rebuild (hot reload is not required); a renewed key changes the attested TLS key hash, which P85 handles; a renewal procedure is drafted in `docs/` and its steps are checked locally against a short-lived certificate generated at test time (none committed, `docs/DATA_POLICY.md` rule 3); and certificate expiry is exported as a P75 metric or readiness input. P77 adds renewal to the runbook and exercises it on staging.
 
 **Where.** `backend/crates/platform-api/src/{main.rs,lib.rs}`, `backend/Cargo.toml`, `backend/crates/platform-config/src/lib.rs`, `backend/.env.example`, `deploy/` (created by P12), `docs/THREAT_MODEL.md`.
 
-**Depends on:** P15, P18, P65 (the header test only), P75 (the certificate-expiry metric or readiness input, only if TLS terminates in the VM with self-managed certificates).
+**Depends on:** P15, P18, P65 (the header test only), P75 (the certificate-expiry metric or readiness input).
 
 **Sequencing.**
 - Serves the released `frontend.tar.gz` that P66 makes deployable.
-- Feeds P49 (the image contents, if the frontend or a proxy runs inside the VM) and P68.
+- Feeds P49 (the image contents: the frontend bundle and any proxy run inside the VM), P85 (the TLS key hash) and P68.
 - P77 later lists the TLS key and exercises its renewal.
 
-**Security impact.** Decides which component sees tokens and SQL in transit, and keeps the TLS key out of artifacts.
+**Security impact.** Keeps tokens, SQL text and results encrypted until they are inside the attested VM, and keeps the TLS key out of artifacts and out of the operator's hands.
 **ADR.** Covered by P15, which names the component that holds the TLS private key. If P15 is Accepted without naming it, this issue's PR adds a short ADR for it (`docs/adr/README.md:7-9`) and takes the `needs-adr` label.
 
 ---
 
 ### P68. Production deployment on SEV-SNP Confidential VMs from the documentation
 **Labels:** build · area:ops · area:enclave · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 9-14
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** There is no deployment. Deploy the topology decided in P15 onto GCP SEV-SNP Confidential VMs (the platform named in `backend/crates/platform-enclave/src/lib.rs:1-2`) from a clean project, using the scripts seeded in P12 and the image from P49. `platform-api` serves plain TCP today (`main.rs:72`), so anything outside the Confidential VM that terminates TLS would see tokens and SQL. P67 builds the TLS and frontend-serving edge that P15 decides on. Definition-of-done item 5 asks that "the system deploys reproducibly from this repository's documentation"; bit-for-bit reproducible builds are not required for v1.
 
@@ -1847,7 +1936,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - Runtime identities are least-privilege and documented in `deploy/`. The VM's attached service account gets only what the running services need: read, write and delete on its own vault bucket (delete is needed by P42); access to the registry store; read access to its own secrets; write access to logs and metrics (P64 adds the audit-sink grant); and the P50 key-release service if that is IAM-gated. It has no project-level editor or owner role. The vault bucket has public-access prevention and uniform bucket-level access enabled. No human, including the P12 team identities, has standing write or delete access to production buckets, registries or secrets, and the deploy record includes an IAM policy listing that shows it. P77 documents and exercises break-glass access, and every use of it is audited.
 - After deploy, a smoke test signs in a synthetic steward and a synthetic researcher (the test identities from P13, `docs/DATA_POLICY.md`) and loads the portal; a fresh deploy passes attestation and key release end to end on genuine SEV-SNP hardware (recorded through P71 or the manual checklist).
 - Teardown is scripted and documented.
-- **DoD item 5, independent deploy (by week 13, so fixes land before P82).** A core-team member who did not write this procedure, preferably from outside stream 3, deploys into an empty project using only `docs/` and `deploy/`. The maintainer creates that project, its billing link, P12's budget alert and hard cost control, and the sign-in provider tenant or provider access the procedure needs (within the free-tier limits P13 records), and grants the deployer roles scoped to that project and tenant for the run only, revoked at teardown. This is a recorded exception to P12's "no access to other projects"; P12 gives students no project-creation or billing roles. Secrets and tenant values come from the secret stores exactly where the procedure says (P13), or are generated by the procedure; nothing else comes from the author. The deployer records every deviation, undocumented step (console clicks, local environment variables, provider settings) or ambiguity in a dated record under `docs/`. The run ends with this issue's smoke test and the scripted teardown, which leaves no VMs running. If any undocumented step was needed, the docs are fixed in a PR and the run is repeated, by the same or another non-author, until it completes with none. The record is P82's evidence for item 5.
+- **DoD item 5, independent deploy (run before P82, so fixes land before it).** A core-team member who did not write this procedure, preferably from outside stream 3, deploys into an empty project using only `docs/` and `deploy/`. The maintainer creates that project, its billing link, P12's budget alert and hard cost control, and the sign-in provider tenant or provider access the procedure needs (within the free-tier limits P13 records), and grants the deployer roles scoped to that project and tenant for the run only, revoked at teardown. This is a recorded exception to P12's "no access to other projects"; P12 gives students no project-creation or billing roles. Secrets and tenant values come from the secret stores exactly where the procedure says (P13), or are generated by the procedure; nothing else comes from the author. The deployer records every deviation, undocumented step (console clicks, local environment variables, provider settings) or ambiguity in a record under `docs/`. The run ends with this issue's smoke test and the scripted teardown, which leaves no VMs running. If any undocumented step was needed, the docs are fixed in a PR and the run is repeated, by the same or another non-author, until it completes with none. The record is P82's evidence for item 5.
 
 **Where.** `deploy/`, `docs/`, `.github/workflows/release.yml`, `backend/.env.example`.
 
@@ -1862,7 +1951,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P69. DataFusion, Arrow, Parquet and `object_store` upgrade
 **Labels:** harden · area:engine · rust · needs-adr
-**Size:** M (pair) · **Priority:** v1 blocker · **Target:** start weeks 1-2 (paired from week 2, as "Weeks 1-3" assigns it), merge by about week 5
+**Size:** M (pair) · **Priority:** v1 blocker
 
 **Summary.** Move from DataFusion 49 to the current release together with Arrow, Parquet and `object_store` (Dependabot groups them, `.github/dependabot.yml`). This clears the `quick-xml` advisories ignored in `backend/deny.toml:16-20` and the `thrift` advisory allowed in `.github/workflows/dependency-review.yml:18-22`. The upgrade also touches `platform-storage` (`object_store` error mapping) and `platform-connectors`, and the separate fuzz lockfile (`backend/fuzz/Cargo.lock`, outside the workspace, `backend/Cargo.toml:17`) pins arrow/parquet 55, object_store 0.12, quick-xml and thrift independently; Dependabot ignores semver-major updates there.
 
@@ -1889,7 +1978,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P70. CI hygiene: locked builds, secret scanning, and fuzz targets compiled on every PR
 **Labels:** harden · area:ops · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 2-5
+**Size:** S · **Priority:** team enablement
 
 **Summary.** `scripts/check.sh` runs `cargo check`, `clippy` and `test` without `--locked` (lines 14, 17, 20), so it can rewrite `Cargo.lock` before `release.yml`'s `--locked` build (`release.yml:26-30`). The fuzz crate sits outside the workspace (`backend/Cargo.toml:17`) and `fuzz.yml` runs only weekly or on dispatch (`fuzz.yml:3-6`), so a PR that changes `platform-crypto` or `platform-auth` can break the fuzz build unnoticed. `docs/DATA_POLICY.md` rule 3 (no credentials) is enforced only by review.
 
@@ -1908,13 +1997,13 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 **Security impact.** Lockfile integrity in releases; earlier detection of committed secrets and broken fuzz targets.
 **ADR.** Not required.
 
-**Notes.** `scripts/` and `.github/` are code-owned. A coverage floor (`cargo llvm-cov --fail-under-lines`, per-crate floors for the security crates, vitest thresholds) is optional and proposed outside v1 if time is short.
+**Notes.** `scripts/` and `.github/` are code-owned. A coverage floor (`cargo llvm-cov --fail-under-lines`, per-crate floors for the security crates, vitest thresholds) is optional and proposed outside v1.
 
 ---
 
 ### P71. SEV-SNP hardware test job (manual and scheduled)
 **Labels:** build · area:ops · area:enclave
-**Size:** S-M · **Priority:** v1 needed · **Target:** weeks 8-13
+**Size:** S-M · **Priority:** v1 needed
 
 **Summary.** CI uses GitHub-hosted runners only (`.github/workflows/ci.yml`), so no check runs SEV-SNP code. Run the hardware-only tests on a real Confidential VM, safely, from a public repository, so definition-of-done item 2 keeps holding as later changes land.
 
@@ -1938,20 +2027,20 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P72. Browser end-to-end tests in CI
 **Labels:** build · area:frontend · area:ops · javascript · rust
-**Size:** M · **Priority:** v1 needed · **Target:** stage A weeks 3-6, stage B grows to week 14
+**Size:** M · **Priority:** v1 needed
 
 **Summary.** Every frontend test runs under Node or jsdom (`frontend/vite.config.ts:12-28`). No real browser runs the module crypto worker, Web Crypto, or IndexedDB key persistence, and nothing drives the real frontend against the real API binary. Definition-of-done items 1 and 2 are browser flows.
 
 **Done when**
 - **Stage A (no backend changes):** the crypto worker and keystore run in real browsers (Vitest browser mode or Playwright): the module worker starts; a device key is generated and stays non-extractable; it survives a reload through IndexedDB; a drive encrypt/decrypt round trip works; the capability probe reports correctly. Chromium on every PR as its own CI job (not in `scripts/check.sh`); Firefox and WebKit on pushes to `main` or nightly. `README.md` lists the supported browsers.
-- **Stage B (lifecycle specs, added as features land):** a Linux CI job builds and boots the dev server from P8 (dev-only wiring that a production build refuses) and serves the production frontend build, then Playwright covers: steward signs in, uploads, and the stored object read straight from the vault is ciphertext (under the hybrid suite identifier after P36); researcher requests access, steward approves, researcher queries and sees `suppressed_rows` and `budget_remaining`, and (after P56) opens a sealed result; refusal paths (no grant, revoked grant, budget exhausted, expired session). Once P28 lands the job uses a local RS256 test issuer instead of HS256.
+- **Stage B (lifecycle specs, added as features land):** a Linux CI job builds and boots the dev server from P8 on the simulated TEE from P84 (dev-only wiring that a production build refuses) and serves the production frontend build, then Playwright covers: steward signs in, uploads, and the stored object read straight from the vault is ciphertext (under the hybrid suite identifier after P36); researcher requests access, steward approves, researcher queries and sees `suppressed_rows` and `budget_remaining`, and (after P56) opens a sealed result; (after P85) the browser verifies the simulated enclave's evidence before sending the query, the request body on the wire carries no SQL text, and a tampered or wrong-measurement simulated report makes the browser refuse to send the query; refusal paths (no grant, revoked grant, budget exhausted, expired session). Once P28 lands the job uses a local RS256 test issuer instead of HS256.
 - Traces are kept as artifacts; the maintainer adds the jobs to the required checks once stable.
 
 **Where.** `frontend/package.json` (dev dependency), `frontend/vite.config.ts` or a Playwright config, new `frontend/e2e/` (or similar), `.github/workflows/ci.yml`, `README.md`.
 
-**Depends on:** P8, P40, P44, P32, P36, P56 (stage B only; stage A has none).
+**Depends on:** P8, P84, P40, P44, P32, P36, P56, P85 (stage B only; stage A has none).
 
-**Sequencing.** Stage B grows as those issues land. The maintainer may split stage A into its own issue so it closes in weeks 3-6.
+**Sequencing.** Stage B grows as those issues land. The maintainer may split stage A into its own issue so it closes first.
 
 **Security impact.** Proves the browser-side invariants (non-extractable keys, ciphertext-only upload, sealed results) in real browsers.
 **ADR.** Not required.
@@ -1960,7 +2049,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P73. Benchmarks: harness, method, targets and regression tracking (portable)
 **Labels:** build · area:ops · rust · javascript
-**Size:** M · **Priority:** v1 blocker · **Target:** native and query baselines by week 4, P34's figures by week 5, targets by week 8
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** No benchmarks exist. ADR 0001 says "Benchmarks must track the cost" of the hybrid suites (lines 35-36), so the classical baseline must be captured before P35 merges. Shared GitHub-hosted runners are too noisy to gate on absolute numbers.
 
@@ -1968,7 +2057,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - A stable-toolchain harness (for example `criterion` with `[[bench]] harness = false`, so the `--all-targets` check and clippy in `scripts/check.sh` compile it; new dev-dependencies pass `cargo deny check`) with the `HPK1`-era baselines: query latency in `quackxide-engine` at stated dataset sizes and object counts; native HPKE seal/open throughput and envelope size for the `HPK1` frame (`backend/crates/platform-crypto/src/lib.rs:136-201`); browser chunk encryption (`encryptPayload` in `frontend/src/lib/crypto/core.ts`) as a Vitest bench; and P34's bundle-size and load-time figures.
 - The harness is built so later benchmarks plug into the same regression run. Each is added by the issue that enables it, before that issue closes, with its own target: P34 checkpoint A (wasm seal in the browser), P40 (the end-to-end upload path), P35 (the hybrid frame) and P56 (opening a sealed result).
 - Data is generated at run time by the generator from P9 and never committed beyond small `fixtures/`.
-- `docs/BENCHMARKS.md` records the method, results, the machine they were produced on, and the performance targets and regression threshold agreed with @AxolDad for these baselines (by week 8).
+- `docs/BENCHMARKS.md` records the method, results, the machine they were produced on, and the performance targets and regression threshold agreed with @AxolDad for these baselines.
 - Pull-request runs report only and never fail. A scheduled or recorded run on one fixed, described machine (a maintainer-provisioned runner or documented manual runs with committed results) fails or opens an issue when a regression exceeds the threshold; or base and head are compared in the same job with a written threshold.
 - The X25519 baseline is recorded before P35 merges.
 
@@ -1985,7 +2074,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P74. Enclave-overhead benchmark on SEV-SNP hardware
 **Labels:** build · area:ops · area:enclave
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 12-14
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** Definition-of-done item 6 includes enclave overhead, which can only be measured on hardware.
 
@@ -2005,7 +2094,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P75. Readiness, operational metrics and graceful shutdown
 **Labels:** build · area:ops · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 4-10
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** Structured JSON logs and the `SECURITY_AUDIT_EVENT` stream exist and are tested (`backend/crates/platform-telemetry/src/lib.rs`, `platform-api/tests/audit_coverage.rs`). `/healthz` is a static public liveness check (`backend/crates/platform-api/src/lib.rs:328-330`). There is no readiness check or metrics. `platform-api` shuts down only on Ctrl-C (`main.rs:80-82`); `connector-worker` handles no signal and `SyncScheduler::run` loops forever (`backend/crates/platform-connectors/src/worker.rs:32-42`).
 
@@ -2027,7 +2116,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P76. Backup and restore that preserve the security invariants
 **Labels:** build · area:ops · area:storage · rust
-**Size:** M · **Priority:** v1 blocker · **Target:** weeks 11-14
+**Size:** M · **Priority:** v1 blocker
 
 **Summary.** Definition-of-done item 7 requires that the system "can be backed up, restored, and operated from the runbook" without "a weakened invariant". A naive point-in-time restore would roll back budget spend (monotonic per grant, `docs/ARCHITECTURE.md:216-217`), revive revoked grants or reactivate suspended tenants. HPKE `info` binds tenant, slug and object (`docs/ARCHITECTURE.md:106-110`), so ciphertext must be restored to its exact paths.
 
@@ -2048,7 +2137,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P77. Key inventory, key rotation and the runbook
 **Labels:** build · area:ops · area:crypto · documentation
-**Size:** M-L (pair: the restart-and-failure drill can go to a second person, ideally from outside stream 3) · **Priority:** v1 blocker · **Target:** weeks 11-15
+**Size:** M-L (pair: the restart-and-failure drill can go to a second person, ideally from outside stream 3) · **Priority:** v1 blocker
 
 **Summary.** The first draft asked for "a key-rotation procedure" without naming keys. The only rotation test today is the RS256 JWKS overlap (`backend/crates/platform-auth/src/verify.rs:332-369`), and the verifier parses the JWKS once when built. `MOR_WEBHOOK_SECRET` is a single value (`backend/crates/platform-config/src/lib.rs:198`). Unwrapped drive DEKs are non-extractable (`frontend/src/lib/crypto/core.ts:98-113`), so the drive KEK cannot be rotated by re-wrapping. Blind-index keys have no defined source (`backend/crates/platform-crypto/src/lib.rs:118-130`). Definition-of-done item 7 also requires that the system "survives restarts and failures without data loss or a weakened invariant"; per-component failure tests exist across several issues, but nothing confirms them together on staging.
 
@@ -2084,7 +2173,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 **Labels:** harden · tracking · rust · javascript
 **Size:** tracking (closes at release) · **Priority:** v1 blocker · **Owner:** one core-team member keeps the checklist; every stream adds its own tests
 
-**Summary.** Definition-of-done item 8: "Every failure path has a negative test, and the audit-coverage test covers every new security decision". This is a checklist that runs all semester, not a single good first issue. Concrete work items are split out (P46, P45, P79); new refusals are tested in the issue that adds them (`CONTRIBUTING.md:49-51`). The 429 in scope means the research budget is exhausted (`ApiError::BudgetExhausted`); the repository has no request rate limiter.
+**Summary.** Definition-of-done item 8: "Every failure path has a negative test, and the audit-coverage test covers every new security decision". This is a checklist that runs until release, not a single good first issue. Concrete work items are split out (P46, P45, P79); new refusals are tested in the issue that adds them (`CONTRIBUTING.md:49-51`). The 429 in scope means the research budget is exhausted (`ApiError::BudgetExhausted`); the repository has no request rate limiter.
 
 **Done when**
 - A checklist in this issue lists, per route module (drive, query, research/grants, catalog, admin/provisioning, webhook), the `ApiError` variants (`backend/crates/platform-api/src/lib.rs:88-110`) that module can actually return, each ticked when a negative test lands in `backend/crates/platform-api/tests/`. No full cross-product.
@@ -2107,7 +2196,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P79. Emit and assert audit events for refusals that are silent today
 **Labels:** harden · area:disclosure · rust · good first issue
-**Size:** S · **Priority:** v1 blocker · **Target:** weeks 3-7
+**Size:** S · **Priority:** v1 blocker
 
 **Summary.** Several refusals return the right status but emit no audit event, and several emitted events are never asserted. `audit_coverage.rs`'s `full_app` wires no research layer. (Grant create/revoke, the no-grant denial and grant-id refusals belong to P45.)
 
@@ -2130,7 +2219,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P80. Fix current documentation drift
 **Labels:** documentation · good first issue
-**Size:** S · **Priority:** team enablement · **Target:** weeks 1-3
+**Size:** S · **Priority:** team enablement
 
 **Summary.** Some statements in the docs are wrong today, independent of any new work. A newcomer can fix them while learning the system, with @AxolDad reviewing.
 
@@ -2157,7 +2246,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P81. Harden the release workflow
 **Labels:** harden · area:ops
-**Size:** S-M · **Priority:** v1 needed · **Target:** weeks 6-12
+**Size:** S-M · **Priority:** v1 needed
 
 **Summary.** `release.yml` (43 lines) runs `scripts/check.sh` and every dependency's build scripts in the same job that holds `contents: write`, `id-token: write` and `attestations: write`; it publishes notes with `--generate-notes`, ignoring `CHANGELOG.md`; versions are not tied to the tag; there is no SBOM; and nothing verifies the attestations.
 
@@ -2182,13 +2271,13 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P82. v1.0 acceptance run and documentation gate
 **Labels:** build · area:ops · documentation
-**Size:** M · **Priority:** v1 blocker · **Owner:** @AxolDad with one core-team member as release owner · **Target:** weeks 12-15
+**Size:** M · **Priority:** v1 blocker · **Owner:** @AxolDad with one core-team member as release owner
 
 **Summary.** The capstone. Every definition-of-done item is demonstrated with recorded evidence, and the docs describe the system as built (item 9). This issue checks; it does not build. Each feature issue updates its own docs, CHANGELOG line and ADR in its own PR (`CONTRIBUTING.md:71-77`).
 
 **Done when**
 - An acceptance checklist committed under `docs/` maps each definition-of-done item (1-10) to its evidence: test names, the benchmark report (P73, P74), the independent deploy record for item 5 (P68), the restore record (P76), runbook drill records (P77), and CI runs on `main`.
-- Items 1, 2, 3 and 7 are run on the staging deployment on genuine SEV-SNP hardware: the browser end-to-end specs from P72 run once against the deployed system (or, if P72 moved to v1.1, a manual browser run of items 1-3 recorded under the checklist); a researcher's query passes attestation, receives the key only inside the enclave, and returns a disclosure-controlled sealed result opened in the browser; no route returns 503 for missing wiring; the restart-and-failure drill record from P77 is cited, and the scenarios touched by changes merged after it are rerun.
+- Items 1, 2, 3 and 7 are run on the staging deployment on genuine SEV-SNP hardware: the browser end-to-end specs from P72 run once against the deployed system (or, if P72 moved to v1.1, a manual browser run of items 1-3 recorded under the checklist); a researcher's browser verifies the enclave's attestation, sends its query sealed to the enclave, the enclave passes attestation, receives the key only inside the enclave, and returns a disclosure-controlled result sealed and signed inside the enclave and opened in the browser; a capture at the VM's network edge and of the object store, logs and audit stream shows no data, SQL text or result rows in plaintext outside the browser and the VM; no route returns 503 for missing wiring; the restart-and-failure drill record from P77 is cited, and the scenarios touched by changes merged after it are rerun.
 - No "to build" or "not wired" text remains in `README.md`, `docs/ARCHITECTURE.md` or `docs/THREAT_MODEL.md` (including the THREAT_MODEL status column and its "Unfinished controls" residual). Every row in the two lifecycle tables of `docs/PROJECT_SCOPE.md` reads Built; rows in "Across both lifecycles" may be descoped only by a maintainer-approved PR that changes `PROJECT_SCOPE.md`.
 - `docs/ARCHITECTURE.md` matches the built system, not only free of "to build" text. The crate-boundaries table (lines 236-251) has one row for each member in `backend/Cargo.toml` `members`, with dev-only crates marked dev-only, and beside it a short list of the deployed binaries and services, checked against what P68 deploys and P81 releases: `platform-api`, `connector-worker` if P19 keeps it, any query worker from P15, the identity service from P29 if ADR 0006 chose one, and any key-release service from P50. Each dataflow diagram and the "Trust model in one paragraph" section describe the built path: steward upload is its own flow, separate from Drive (P38); sign-in, and token exchange if ADR 0006 chose it, is described (P29); the research flow, and the own-data query flow if P55 seals it, ends in a result sealed to the researcher's key, not plaintext rows (P55); key release and the authorization model match P14, P16, P50 and P51.
 - `SECURITY.md` "Out of scope" (lines 39-43) no longer points at gaps that are now built.
@@ -2196,7 +2285,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Where.** New `docs/` acceptance checklist; `README.md`; `docs/`; `SECURITY.md`.
 
-**Depends on:** every v1-blocker issue, plus every v1-needed issue still in the milestone after the week-3 capacity decision in P5, except P83, which depends on this issue.
+**Depends on:** every v1-blocker issue, plus every v1-needed issue still in the milestone after the scope review in P5, except P83, which depends on this issue.
 
 **Sequencing.** Starts as soon as P68 has a staging environment.
 
@@ -2207,12 +2296,12 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 ### P83. Cut and publish v1.0.0
 **Labels:** harden · area:ops
-**Size:** S · **Priority:** v1 needed · **Owner:** @AxolDad · **Target:** week 15
+**Size:** S · **Priority:** v1 needed · **Owner:** @AxolDad
 
 **Summary.** Versions are 0.1.0 in `backend/Cargo.toml` (`[workspace.package]`, inherited by every crate) and `frontend/package.json`; `SECURITY.md:45-47` says there has been no production release; `CHANGELOG.md` has only `[Unreleased]` and `[0.1.0]`.
 
 **Done when**
-- One release PR, reviewed under the normal rules, sets the version to 1.0.0 in `backend/Cargo.toml` and `frontend/package.json` (`npm version --no-git-tag-version`, so the lockfile stays in sync) and updates both lockfiles; moves `[Unreleased]` into `## [1.0.0] - <date>` with a Contributors subsection crediting the core team and every contributor (`docs/PROJECT_SCOPE.md`, "Team and timeline"); updates the link references at the end of `CHANGELOG.md`; updates `CONTRIBUTORS.md` and the README contributors line; and changes `SECURITY.md` "Supported versions" to name 1.0.x.
+- One release PR, reviewed under the normal rules, sets the version to 1.0.0 in `backend/Cargo.toml` and `frontend/package.json` (`npm version --no-git-tag-version`, so the lockfile stays in sync) and updates both lockfiles; moves `[Unreleased]` into `## [1.0.0] - <date>` with a Contributors subsection crediting the core team and every contributor (`docs/PROJECT_SCOPE.md`, "Team"); updates the link references at the end of `CHANGELOG.md`; updates `CONTRIBUTORS.md` and the README contributors line; and changes `SECURITY.md` "Supported versions" to name 1.0.x.
 - `scripts/check.sh` is green on `main` at the release commit.
 - The maintainer pushes tag `v1.0.0`; `release.yml` publishes the artifacts, and `gh attestation verify` succeeds on each one.
 - The deployed system (P68) runs exactly the released artifacts.
@@ -2233,7 +2322,6 @@ Not in the milestone. Each was raised in review and judged worthwhile but outsid
 - **Enforce connector toggles and the full billing lifecycle.** `TenantRecord.connectors` and the Paddle subscription states are recorded but not enforced beyond what P29 does for suspension. Needs a design for per-tenant worker jobs from the registry and a decision on whether researchers can query a suspended steward's data. (area:auth, rust)
 - **Grammar-based fuzz target for the disclosure gate.** Move the bypass fixture and leak oracle into a shared module and fuzz `QueryScope::sql_json` with a small SQL grammar (aggregates, WHERE, GROUP BY including grouping sets, HAVING, subqueries, joins, statements), asserting no panic and no leak. Best after P69 and P58. (area:disclosure, rust)
 - **Grant expiry.** Not in `docs/PROJECT_SCOPE.md`; would add a `DatasetGrant` field, a check in `find_active`, and a durable format. (needs-adr)
-- **Attested result sender authentication.** An enclave signing key bound in REPORT_DATA, hybrid signatures on results, and verification of the SEV-SNP report and AMD chain in the researcher's browser, closing the forgery residual P55 records. (needs-adr, area:crypto, area:enclave)
 - **Steward-signed grants and top-ups; anti-rollback for the budget ledger.** Closes the operator-forgery residual P61 records, including operator-issued tokens. (needs-adr)
 - **Multi-device keys, key escrow and recovery.** v1 refuses a second device's key (P33); sync and recovery need their own design.
 - **Zeroizing allocator for decoded Arrow memory.** Would need a reviewed `unsafe_code` exception or a vetted third-party allocator; today it is the documented "Unzeroized working memory" residual. (needs-adr)
