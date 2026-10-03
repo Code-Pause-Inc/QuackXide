@@ -79,6 +79,7 @@ Every security decision, including denials, is written to a
 | `docs/ARCHITECTURE.md` | Trust model, dataflows, crate boundaries, cryptography, audit stream |
 | `docs/THREAT_MODEL.md` | Assets, adversaries, controls, residual risk |
 | `docs/PROJECT_SCOPE.md` | Release scope and definition of done |
+| `docs/V1_PLAN.md` | v1.0 plan: work items, order, and the issues they map to |
 | `docs/DATA_POLICY.md` | Synthetic and public data only |
 | `docs/adr/` | Architecture decision records |
 
