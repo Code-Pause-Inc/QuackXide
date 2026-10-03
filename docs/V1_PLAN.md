@@ -2301,7 +2301,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 **Summary.** Versions are 0.1.0 in `backend/Cargo.toml` (`[workspace.package]`, inherited by every crate) and `frontend/package.json`; `SECURITY.md:45-47` says there has been no production release; `CHANGELOG.md` has only `[Unreleased]` and `[0.1.0]`.
 
 **Done when**
-- One release PR, reviewed under the normal rules, sets the version to 1.0.0 in `backend/Cargo.toml` and `frontend/package.json` (`npm version --no-git-tag-version`, so the lockfile stays in sync) and updates both lockfiles; moves `[Unreleased]` into `## [1.0.0] - <date>` with a Contributors subsection crediting the core team and every contributor (`docs/PROJECT_SCOPE.md`, "Team and timeline"); updates the link references at the end of `CHANGELOG.md`; updates `CONTRIBUTORS.md` and the README contributors line; and changes `SECURITY.md` "Supported versions" to name 1.0.x.
+- One release PR, reviewed under the normal rules, sets the version to 1.0.0 in `backend/Cargo.toml` and `frontend/package.json` (`npm version --no-git-tag-version`, so the lockfile stays in sync) and updates both lockfiles; moves `[Unreleased]` into `## [1.0.0] - <date>` with a Contributors subsection crediting the core team and every contributor (`docs/PROJECT_SCOPE.md`, "Team"); updates the link references at the end of `CHANGELOG.md`; updates `CONTRIBUTORS.md` and the README contributors line; and changes `SECURITY.md` "Supported versions" to name 1.0.x.
 - `scripts/check.sh` is green on `main` at the release commit.
 - The maintainer pushes tag `v1.0.0`; `release.yml` publishes the artifacts, and `gh attestation verify` succeeds on each one.
 - The deployed system (P68) runs exactly the released artifacts.
