@@ -13,7 +13,7 @@ first contribution.
 
 University of San Francisco.
 
-* **Jake Abendroth**
+* **Jake Abendroth** (@abendrothj)
 * **William Shenker**
 * **Angelina Tam**
 * **Gabriel Zubovsky**
