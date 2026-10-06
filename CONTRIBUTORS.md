@@ -15,7 +15,7 @@ University of San Francisco.
 
 * **Jake Abendroth** (@abendrothj)
 * **William Shenker**
-* **Angelina Tam**
+* **Angelina Tam** (@angelina0i0)
 * **Gabriel Zubovsky** (@gabrielzubovsky)
 
 ## Contributors
