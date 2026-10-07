@@ -69,7 +69,7 @@ dotenvy = "0.15"
 
 # ── cryptography (server side holds public-key / index material ONLY —
 #     drive master keys are browser-generated and never exist here) ──────────
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 hpke = { version = "0.12", features = ["alloc", "x25519"] }
 hmac = "0.12"
 # SHA-1 only for TOTP (RFC 6238 HMAC): virtually every authenticator app
