@@ -57,7 +57,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Item | State | Notes |
 | --- | --- | --- |
 | Durable registries | **Build** | Tenant, grant, budget, and catalog registries are in-memory behind traits; add durable backends without touching call sites. |
-| Deployment | **Build** | Reproducible deployment of the API and enclave workers onto confidential VMs. |
+| Deployment | **Build** | Reproducible deployment of `platform-api`, with the query engine in-process, into an attested SEV-SNP Confidential VM, with TLS terminating inside the VM and the frontend served from the same origin (ADR 0005). |
 | Benchmarks | **Build** | None exist. Measure query latency, encryption throughput, and enclave overhead against synthetic datasets, and track them for regressions. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
 | DataFusion upgrade | **Harden** | Move from DataFusion 49 to the current release to clear the `quick-xml` advisories recorded in `backend/deny.toml` and the `thrift` advisory allowed in `.github/workflows/dependency-review.yml`; the disclosure allowlist and `tests/bypass.rs` must pass unchanged. |

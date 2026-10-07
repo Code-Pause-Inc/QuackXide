@@ -24,6 +24,18 @@ encrypted Parquet, using blind indexes so equality search never reveals
 values. Compromise of the object store, of the API host's disk, or of an
 operator credential yields ciphertext only.
 
+## Deployment topology (target)
+
+ADR 0005 fixes the boundary. `platform-api`, with the query engine
+in-process, runs inside an attested SEV-SNP Confidential VM; "the enclave"
+in this document means that process inside that VM. TLS terminates in
+`platform-api`, and the frontend is served from the same origin. Every
+setting the operator can pass to the VM is untrusted: security-relevant
+settings are constants, bounded in code, or part of a deployment
+configuration bound into the attestation evidence, and secrets arrive only
+by release to the attested workload. Today `platform-api` serves plain HTTP
+and reads all configuration from the environment.
+
 ## Dataflows
 
 ### 1. Drive (zero-knowledge storage)
