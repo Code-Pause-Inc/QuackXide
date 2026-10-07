@@ -212,10 +212,9 @@ impl<'de> Deserialize<'de> for SnapshotVersion {
 
 /// Zero-knowledge feature mode; the platform default comes from
 /// `FEATURE_ZK_ENABLED`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ZkMode {
-    #[default]
     Disabled,
     Enabled,
 }
@@ -312,6 +311,5 @@ mod tests {
     fn zk_mode_flag_round_trip() {
         assert!(ZkMode::from_flag(true).is_enabled());
         assert!(!ZkMode::from_flag(false).is_enabled());
-        assert_eq!(ZkMode::default(), ZkMode::Disabled);
     }
 }

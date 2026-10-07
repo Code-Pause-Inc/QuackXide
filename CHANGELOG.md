@@ -25,6 +25,9 @@ uses [Semantic Versioning](https://semver.org/).
   the newest committed one. Every sync wrote a new copy of its data and
   queries read all of them, so repeated syncs multiplied each row and
   could lift a small cohort past the disclosure threshold. See ADR 0003.
+* `EngineSettings` and `ZkMode` have no default. Both defaulted to ZK mode
+  off, so a query service built from `Default` would have returned rows
+  unfiltered. Every caller now chooses the mode explicitly.
 
 ## [0.1.0] - 2026-09-30
 
