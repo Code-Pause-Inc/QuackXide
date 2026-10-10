@@ -3929,6 +3929,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "synth-data"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "parquet",
+ "rand_chacha 0.3.1",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

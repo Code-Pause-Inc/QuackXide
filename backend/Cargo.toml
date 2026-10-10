@@ -13,6 +13,7 @@ members = [
     "crates/platform-billing",
     "crates/quackxide-engine",
     "crates/platform-api",
+    "crates/synth-data",
 ]
 exclude = ["fuzz"]
 
@@ -40,6 +41,7 @@ platform-auth = { path = "crates/platform-auth" }
 platform-tenancy = { path = "crates/platform-tenancy" }
 platform-billing = { path = "crates/platform-billing" }
 quackxide-engine = { path = "crates/quackxide-engine" }
+synth-data = { path = "crates/synth-data" }
 
 # ── async runtime + HTTP edge ────────────────────────────────────────────────
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs"] }
@@ -107,6 +109,8 @@ datafusion = "49"                                                 # arrow/parque
 
 # ── testing ─────────────────────────────────────────────────────────────────
 proptest = "1"
+# Seeded RNG for synth-data; 0.3 pairs with rand 0.8 (rand_core 0.6).
+rand_chacha = "0.3"
 
 [profile.release]
 lto = "thin"

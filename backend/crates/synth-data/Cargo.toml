@@ -1,0 +1,28 @@
+[package]
+name = "synth-data"
+description = "Dev-only synthetic data: seeded Parquet generator for test, benchmark and demo datasets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true # publish = false, from [workspace.package]
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Arrow, Parquet and a portable seeded RNG only. No platform-* or
+# quackxide-engine dependency, so the engine and platform-api can take this
+# crate as a dev-dependency without a cycle.
+[dependencies]
+arrow.workspace = true
+parquet.workspace = true
+# ChaCha8Rng is a fixed, portable algorithm; StdRng's may change between
+# rand releases. Re-exports rand_core (SeedableRng, RngCore).
+rand_chacha.workspace = true
+
+[dev-dependencies]
+# Decoding in-memory Parquet in tests: parquet's ChunkReader is implemented
+# for bytes::Bytes and File, not Vec<u8>. Drop this if the determinism test
+# reads files instead.
+bytes.workspace = true

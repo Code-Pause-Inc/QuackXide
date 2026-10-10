@@ -99,6 +99,7 @@ backend/crates/
   platform-billing/       Merchant-of-Record webhook verification
   quackxide-engine/       QueryScope, plan gate, disclosure policies
   platform-api/           HTTP edge (binary) + integration tests
+  synth-data/             Seeded synthetic test and benchmark data (dev-only)
 frontend/src/
   lib/crypto/             Web Crypto worker (keys never touch the UI thread)
   lib/vault/              Ciphertext-only vault clients (local / http)
@@ -132,6 +133,19 @@ cargo run -p platform-api --bin devtoken     # terminal 2: prints a token
 # frontend/.env: VITE_VAULT_MODE="http", VITE_DEV_JWT="<token>"
 cargo run -p platform-api --bin query-demo   # sealed-query round trip
 ```
+
+Synthetic data (dev-only), from `backend/`:
+
+```sh
+cargo run -p synth-data -- --schema cohort --seed 7 --rows 1000
+cargo run -p synth-data -- --schema cohort --seed 7 --rows 200 --k 5
+cargo run --release -p synth-data -- --schema wide --seed 1 --rows 1000000
+cargo run -p synth-data -- --help
+```
+
+Without `--out`, files go to `backend/target/synth-data/`, which is
+gitignored. Each run prints the file's path and the command that writes it
+again.
 
 Before every push, run `scripts/check.sh` and enable the hooks once with
 `git config core.hooksPath scripts/hooks`.
