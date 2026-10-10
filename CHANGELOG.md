@@ -6,6 +6,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+* `synth-data`, a dev-only crate that writes seeded synthetic Parquet for
+  tests, benchmarks and demos: a health-style `cohort` table with groups
+  on both sides of the cohort threshold k and one group dominated by a
+  single person, and a `wide` table for throughput benchmarks. From
+  `backend/`, `cargo run -p synth-data -- --help` lists the options.
+
 ### Security
 
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A

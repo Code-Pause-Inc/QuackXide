@@ -249,6 +249,7 @@ grant. `research.catalog` events carry identifiers only.
 | platform-billing | MoR (Paddle) webhook signature verification, replay guard | Webhook secrets in Debug output |
 | quackxide-engine | `QueryScope` RAII, plan gate, disclosure policies | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
+| synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |
 
 Registries in `platform-tenancy` are in-memory implementations behind
 traits; durable backends replace them without touching call sites.

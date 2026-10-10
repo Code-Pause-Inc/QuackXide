@@ -14,14 +14,18 @@
 //! stdout, and the command that writes the same file again on stderr, ready
 //! to record next to a committed fixture. A bad command line exits with 2
 //! and writes nothing; a failed write exits with 1 and leaves no file behind.
+//! Each run writes its own temporary file beside the output and renames it
+//! into place, so concurrent runs never share or truncate each other's work.
 
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use synth_data::{DEFAULT_K, SchemaName, Spec};
 
@@ -166,7 +170,8 @@ fn default_out(spec: &Spec) -> PathBuf {
 }
 
 /// The command that writes the same file again, for the record
-/// `docs/DATA_POLICY.md` asks for next to a committed fixture.
+/// `docs/DATA_POLICY.md` asks for next to a committed fixture. `--out` is
+/// quoted for a POSIX shell, so a path with spaces can be pasted as it is.
 fn command_line(args: &Args) -> String {
     let spec = &args.spec;
     let mut parts = vec![
@@ -179,30 +184,64 @@ fn command_line(args: &Args) -> String {
         parts.push(format!("--k {}", spec.k));
     }
     if let Some(out) = &args.out {
-        parts.push(format!("--out {}", out.display()));
+        parts.push(format!("--out {}", shell_quote(&out.to_string_lossy())));
     }
     parts.join(" ")
 }
 
-/// Writes `<out>.partial` and renames it to `out`, so a failed or
-/// interrupted run never leaves a truncated file under the real name.
+/// `text` as one POSIX shell word: unchanged if every character is safe,
+/// otherwise in single quotes, with each `'` written as `'\''`.
+fn shell_quote(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./+:@%=,".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// Writes this run's own temporary file beside `out`, then renames it to
+/// `out`. A failed or interrupted run never leaves a truncated file under the
+/// real name, and concurrent runs never share a temporary file.
 fn write_atomically(spec: &Spec, out: &Path) -> Result<(), String> {
     if let Some(dir) = out.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let mut partial = out.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    let written = write_then_rename(spec, &partial, out);
+    let (tmp, file) = create_temp_beside(out)?;
+    let written = write_then_rename(spec, file, &tmp, out);
     if written.is_err() {
-        // Best effort: the partial file may never have been created.
-        let _ = fs::remove_file(partial);
+        // Only this run's file: another run's temporary file is never touched.
+        let _ = fs::remove_file(tmp);
     }
     written
 }
 
-fn write_then_rename(spec: &Spec, tmp: &Path, out: &Path) -> Result<(), String> {
-    let file = File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+/// Creates a temporary file that belongs to this run alone, in the same
+/// directory as `out` so the rename stays on one filesystem. `create_new`
+/// refuses a name that already exists, so no other run's file, and no file
+/// left behind by an earlier run, is ever opened or truncated.
+fn create_temp_beside(out: &Path) -> Result<(PathBuf, File), String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let name = out
+        .file_name()
+        .ok_or_else(|| format!("{} does not name a file", out.display()))?;
+    let pid = process::id();
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_name = OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".{pid}-{n}.partial"));
+        let tmp = out.with_file_name(tmp_name);
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("cannot create {}: {e}", tmp.display())),
+        }
+    }
+    Err(format!("no free temporary name beside {}", out.display()))
+}
+
+fn write_then_rename(spec: &Spec, file: File, tmp: &Path, out: &Path) -> Result<(), String> {
     let mut writer = BufWriter::new(file);
     synth_data::write_parquet(spec, &mut writer).map_err(|e| e.to_string())?;
     // Flushes, then drops the file, so it is closed before the rename.
@@ -214,6 +253,8 @@ fn write_then_rename(spec: &Spec, tmp: &Path, out: &Path) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     fn parse(line: &str) -> Result<Option<Args>, String> {
@@ -221,9 +262,18 @@ mod tests {
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("synth-data-{name}-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("synth-data-{name}-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// Temporary files left in `dir`.
+    fn partial_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .expect("readable directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.to_string_lossy().ends_with(".partial"))
+            .collect()
     }
 
     #[test]
@@ -248,6 +298,36 @@ mod tests {
             command_line(&args),
             "cargo run -p synth-data -- --schema wide --seed 1 --rows 10 --out x/y.parquet"
         );
+    }
+
+    #[test]
+    fn quotes_an_out_path_with_spaces() {
+        let words = "--schema wide --seed 1 --rows 10 --out".split_whitespace();
+        let raw = words.chain(["My Data/it's.parquet"]).map(str::to_owned);
+        let args = parse_args(raw).expect("valid").expect("not help");
+        let expected = concat!(
+            "cargo run -p synth-data -- --schema wide --seed 1 --rows 10 ",
+            r"--out 'My Data/it'\''s.parquet'",
+        );
+        assert_eq!(command_line(&args), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quoted_out_paths_survive_a_shell() {
+        for path in [
+            "plain/out.parquet",
+            "My Data/x.parquet",
+            "it's.parquet",
+            "a\"b$c`d.parquet",
+        ] {
+            let script = format!("printf %s {}", shell_quote(path));
+            let output = process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .expect("sh runs");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), path);
+        }
     }
 
     #[test]
@@ -288,7 +368,7 @@ mod tests {
         let out = dir.join("cohort.parquet");
         write_atomically(&Spec::new(SchemaName::Cohort, 1, 100), &out).expect("written");
         assert!(out.is_file());
-        assert!(!dir.join("cohort.parquet.partial").exists());
+        assert!(partial_files(&dir).is_empty());
         fs::remove_dir_all(dir).expect("cleanup");
     }
 
@@ -299,7 +379,37 @@ mod tests {
         let out = dir.join("taken");
         fs::create_dir_all(out.join("inside")).expect("blocker");
         assert!(write_atomically(&Spec::new(SchemaName::Wide, 1, 10), &out).is_err());
-        assert!(!dir.join("taken.partial").exists());
+        assert!(partial_files(&dir).is_empty());
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_runs_never_share_or_clobber_a_temporary_file() {
+        let dir = scratch_dir("concurrent");
+        let out = dir.join("same.parquet");
+        let specs = [
+            Spec::new(SchemaName::Cohort, 1, 2_000),
+            Spec::new(SchemaName::Cohort, 2, 2_000),
+        ];
+        let results: Vec<Result<(), String>> = thread::scope(|scope| {
+            let mut runs = Vec::new();
+            for &spec in specs.iter().cycle().take(8) {
+                let out = &out;
+                runs.push(scope.spawn(move || write_atomically(&spec, out)));
+            }
+            runs.into_iter()
+                .map(|run| run.join().expect("no panic"))
+                .collect()
+        });
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        // One whole run's file, never a mix: same build, so the bytes match exactly.
+        let written = fs::read(out).expect("output exists");
+        let whole = specs.map(|spec| synth_data::parquet_bytes(&spec).expect("valid spec"));
+        assert!(
+            whole.contains(&written),
+            "the output is not one complete run's file"
+        );
+        assert!(partial_files(&dir).is_empty());
         fs::remove_dir_all(dir).expect("cleanup");
     }
 }
