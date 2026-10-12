@@ -86,10 +86,10 @@ endpoint. One image serves every deployment; deployments differ only in
 that bound configuration.
 
 The environment may carry only values that point at things the operator
-already controls: the bind address, the domain, the cloud project, the
+already controls (the bind address, the domain, the cloud project, the
 storage bucket, the registry store's address, the log filter, and the
-brand strings. A wrong value can
-cause an outage but cannot weaken a control.
+brand strings) and values bounded in code, which it can only tighten. A
+wrong value can cause an outage but cannot weaken a control.
 
 Secrets reach the VM only by release to the attested workload, through the
 same attested path that releases data keys. A secret store that the VM's
