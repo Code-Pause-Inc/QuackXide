@@ -18,13 +18,18 @@ trusted inside the VM.
 
 The operator controls the host, the network, DNS, the object store, the
 cloud project's IAM, and every value passed to the VM: environment
-variables, `.env`, instance metadata and startup scripts. An attestation
-report proves which image runs, not which settings it was given.
+variables, `.env`, instance metadata and startup scripts. On a GCP
+Confidential VM the SEV-SNP measurement covers only Google's firmware, so
+the report alone does not prove which image runs; that depends on the
+workload-identity mechanism decided in ADR 0004. Even with it, the evidence
+does not show which settings the image was given.
 
 ## Decision
 
 **One process.** `platform-api`, with the query engine in-process, runs
-inside an AMD SEV-SNP Confidential VM. The attested boundary is the VM.
+inside an AMD SEV-SNP Confidential VM. The attested boundary is the VM;
+which binary runs in it is proven only as far as ADR 0004's workload
+identity reaches.
 
 **A planned edge/worker split, not built in v1.** A split into an HTTP edge
 and a query worker isolates anything only if the worker itself verifies the
@@ -47,15 +52,22 @@ any, passes TCP through and holds no certificate. No proxy runs in the
 image.
 
 **Same origin.** The frontend bundle is served by `platform-api` from
-inside the measured image, on the API's origin. The API has no CORS
-allowlist.
+inside the image, on the API's origin. The API has no CORS allowlist.
 
 **`connector-worker` follows the scope decision on connector ingestion.**
 If live ingestion is deferred from v1, `connector-worker` is not deployed
 and is not part of this topology. If it is kept, it runs in its own
 Confidential VM under the same attestation policy and passes the
-attestation gate before it seals anything. This record keeps only the
-chosen branch when it is accepted.
+attestation gate before it seals anything. It holds no tenant private key
+and never reads object contents: its service account may only list,
+create and delete objects under `tenants/{t}/connectors/`, which is what
+ADR 0003's snapshots, manifests and pruning need. It seals to tenant
+public keys from a source the operator cannot substitute (the bound
+deployment configuration, or an enrollment record authenticated as ADR
+0004 decides), never from the environment, because a substituted key
+would let the operator open the data. Source credentials are secrets and
+reach it only by attested release, like every other secret. This record
+keeps only the chosen branch when it is accepted.
 
 **The operator's settings are untrusted.** Everything the operator can set
 is untrusted input. Configuration may tighten a security control, never
@@ -75,7 +87,8 @@ that bound configuration.
 
 The environment may carry only values that point at things the operator
 already controls: the bind address, the domain, the cloud project, the
-storage bucket, the log filter, and the brand strings. A wrong value can
+storage bucket, the registry store's address, the log filter, and the
+brand strings. A wrong value can
 cause an outage but cannot weaken a control.
 
 Secrets reach the VM only by release to the attested workload, through the
@@ -95,9 +108,25 @@ and `.env` is never loaded in production.
 * `platform-api` owns ACME issuance and renewal and a TLS accept loop in
   place of `axum::serve`. A renewed key changes the attested TLS key hash.
 * The operator controls DNS and can obtain another publicly trusted
-  certificate for the domain. The controls are Certificate Transparency
-  monitoring and the browser's check of the attested TLS key, and
-  `docs/THREAT_MODEL.md` records the residual when the TLS edge is built.
+  certificate for the domain, then terminate TLS outside the VM. Checking
+  the attested application keys and checking the TLS connection are
+  separate:
+  * The browser verifies the attestation evidence, seals each query to the
+    application keys it binds, and accepts results only under them (P85).
+    These checks run in JavaScript the server delivers, and browser
+    JavaScript cannot inspect its own TLS connection. They do not show
+    that the browser reached the attested VM, and an operator who
+    intercepts TLS can serve JavaScript that skips them.
+  * A client that sees the TLS handshake checks the endpoint's key against
+    the attested TLS key hash: P85's independent command-line checker,
+    which also checks the digest of the served frontend bundle.
+    Certificate Transparency monitoring detects the second certificate.
+
+  Against that operator, bearer tokens, SQL text, results and the frontend
+  bundle depend on TLS reaching the VM, and the served JavaScript remains
+  trusted. The checker and Certificate Transparency monitoring detect the
+  interception; nothing here prevents it. `docs/THREAT_MODEL.md` records
+  this residual when the TLS edge is built.
 * The image carries the frontend bundle and no TLS proxy.
 * The production-mode mechanism must make development mode unreachable in
   a release build, for example by compiling the development paths out. A
