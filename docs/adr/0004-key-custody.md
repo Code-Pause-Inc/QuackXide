@@ -81,13 +81,17 @@ Who can decrypt when something fails, in both:
 
 * Release service down (KMS or Google's attestation service for A, the
   broker for C): research queries fail closed; stewards still open their
-  own data in the browser.
+  own uploads in the browser.
 * Steward's device lost: queries keep working; the steward loses direct
-  access until a recovery path exists.
+  access to their uploads.
 * Key policy changed by whoever administers it: that party can authorize
   another image, which then decrypts. Under C this is whoever runs the
   broker, which is the operator.
 * Image not on the allowed list, or a debug image: nothing decrypts.
+
+Option C does not meet the requirement above: the operator runs the
+broker and can authorize another image. Choosing C means
+`docs/THREAT_MODEL.md` A2 states that the operator can decrypt.
 
 A third combination, Confidential Space on plain AMD SEV, is rejected:
 SEV lacks SNP's memory-integrity protection. Google's attestation token
@@ -97,44 +101,58 @@ found no documented way to gate KMS on attestation while staying on SNP.
 ## Decision
 
 Option A is recommended. Moving from SEV-SNP to TDX is the maintainer's
-decision (open question 1); if SNP stays, option C applies and the
-sections below keep their shape with the broker in place of KMS.
+decision (open question 1). If SNP stays, option C applies, A2 records
+that the operator can decrypt, and the sections below keep their shape
+with the broker in place of KMS.
 
-**Each dataset has its own data key, wrapped twice.** The dataset is
-encrypted under a random data key. The data key is stored beside the
-ciphertext, wrapped to the steward's enrolled browser key (so the steward
-keeps direct access) and to a Cloud KMS key-encapsulation key of type
-X-Wing, the hybrid suite of ADR 0001
+**Each dataset has its own data key.** A dataset is one steward upload
+or one connector snapshot, with its objects and its manifest (ADR 0003).
+It is encrypted under a random data key, stored beside it wrapped to a
+Cloud KMS key-encapsulation key of type X-Wing, the hybrid suite of
+ADR 0001
 ([KMS key encapsulation](https://docs.cloud.google.com/kms/docs/key-encapsulation-mechanisms)).
-Whoever seals the dataset encapsulates to the KMS key's public half:
-the steward's browser for uploads (P38), `connector-worker` for connector
-data if P19 keeps it. Encapsulating needs only the public key, never
-attestation. The enclave never holds the steward's private key.
+The enclave never holds the steward's private key.
+
+* Steward uploads (P38) are also wrapped to the steward's own browser key,
+  by that browser, so the steward keeps direct access.
+* Connector data is wrapped to KMS only. A steward copy would need the
+  steward's public key from the enrollment record, which the operator
+  controls, so the copy would be a way to leak the data. Stewards reach
+  their connector data through the enclave.
+
+**Sealers take the KMS public key only from the attested workload.** A
+substituted key would let the operator open every new dataset without
+attestation. The browser takes it from the enclave, and it is part of the
+digest bound into the token the browser verifies (below).
+`connector-worker` takes it from the attested deployment configuration
+(ADR 0005). Encapsulating needs no attestation; trusting the key does.
 
 **Only an attested workload can decapsulate.** KMS decapsulation is
 granted only to a workload identity federation principal whose attestation
-token has `swname == CONFIDENTIAL_SPACE`, the `STABLE` support attribute,
-the TDX hardware model and an image digest on the allowed list
+token has `swname == CONFIDENTIAL_SPACE`, `dbgstat ==
+disabled-since-boot`, `hwmodel == GCP_INTEL_TDX`, the `STABLE` support
+attribute and an image digest on the allowed list
 ([granting access](https://docs.cloud.google.com/confidential-computing/confidential-space/docs/create-grant-access-confidential-resources)).
 The KMS key, the identity pool and that policy live in a key project that
 only the maintainer administers, separate from the deployment project;
 no deployment identity has IAM on it. This keeps deployers and the
 workload's own service account out of the release decision. It does not
-keep the maintainer out: `docs/THREAT_MODEL.md` A2 records that the key
-project's administrator can authorize another image.
+keep the maintainer out: on acceptance, `docs/THREAT_MODEL.md` A2 records
+that the key project's administrator can authorize another image.
 
 **Release is per query, with nothing cached.** The enclave decapsulates
 the data keys a query needs, opens the dataset in memory and drops the
 keys when the query ends. Revoking a grant or removing an image digest
-takes effect on the next query. The cost is one KMS call per query.
+takes effect on the next query. The cost is one KMS call for each dataset
+a query reads, usually one.
 
 **Freshness and binding.** Key release relies on the freshness of
 Google's short-lived token; the project issues no nonce for it. For the
 browser (P85), the browser supplies a nonce, and the workload requests a
 custom token with its own audience and two nonces: the browser's, and the
 SHA-256 digest of the request-decryption public key, the result-signing
-public key, the TLS public key hash (P67) and the deployment configuration
-digest (ADR 0005). That digest is the binding P14 calls the REPORT_DATA
+public key, the KMS public key, the TLS public key hash (P67) and the
+deployment configuration digest (ADR 0005). That digest is the binding P14 calls the REPORT_DATA
 layout; under option C the same 32 bytes go into REPORT_DATA. The
 browser verifies Google's signature, issuer, audience, nonce and claims
 before it sends a query. P47's raw-report verifier is not on the release
@@ -151,18 +169,19 @@ the only source.
 Manager access is granted only to the attested principal, never to the
 VM's service account (ADR 0005).
 
-**`connector-worker`**, if kept, holds only the KMS public key. It can
-seal data and cannot open any.
+**`connector-worker`**, if kept, takes the KMS public key from the attested
+deployment configuration and holds no private key. It can seal data and
+cannot open any.
 
 **Settled briefly.**
 
 | Topic | Decision |
 | --- | --- |
 | Enrollment (P33) | One key per tenant, created once; replacing it is an explicit, audited rotation. |
-| Steward loses their device | Queries keep working through the KMS copy; the steward loses direct access. Recovery is out of v1 and documented as a limit; re-wrapping data keys to a new enrolled key inside the enclave is the later path. |
+| Steward loses their device | Queries keep working through the KMS copy; the steward loses direct access to their uploads. Recovery is out of v1 and documented as a limit. Re-wrapping data keys to a newly enrolled key needs enrollment the operator cannot forge (P33), so no such path is proposed. |
 | Revoked grant, changed image | Effective on the next query; no released key outlives a query. |
 | Rotation (P77) | New KMS key versions for new datasets; existing data keys re-wrapped inside the enclave. |
-| Backup (P76) | Ciphertext and wrapped data keys are backed up from the bucket. The KMS private key cannot be exported; KMS's scheduled-destruction delay and the steward's copy are the fallbacks. |
+| Backup (P76) | Ciphertext and wrapped data keys are backed up from the bucket. The KMS private key cannot be exported; KMS's scheduled-destruction delay is the fallback, plus stewards' copies of their uploads. Connector data has no other copy. |
 | Forged grants, budgets or identities | The registries are operator-controlled: A2 residual for v1; signed grants proposed outside v1. |
 | Forged or rolled-back snapshots (ADR 0003) | Optional, not scheduled: a KMS signing key behind the same gate lets attested workloads sign manifests, which closes that residual. |
 | Served JavaScript | Remains the residual ADR 0005 records; the bundle is inside the image, so the image digest covers it. |
@@ -172,19 +191,26 @@ seal data and cannot open any.
 * Google is trusted for hardware verification, workload identity and key
   custody, and the platform is tied to GCP. A2 names this.
 * The maintainer, as key-project administrator, can authorize any image.
-  A2 records it; break-glass and policy changes are audited (P77).
+  A2 will record it; break-glass and policy changes are audited (P77).
 * P12 picks a TDX machine type; P47 and P48 become verification of
   Google's token; P49 publishes the image digest the policy allows; P50
   wires KMS and workload identity federation; P85 verifies Google's token
   in the browser. P5 records the re-plan.
 * Every query makes KMS calls: latency, quota and cost scale with queries.
-* Destroying the KMS key leaves only the stewards' copies.
-* The storage format changes: each dataset object carries its wrapped
-  data keys, under a new frame version beside `HPK1`. Nothing is deployed,
-  so no migration is provided.
+* Destroying the KMS key leaves only the stewards' copies of their
+  uploads; connector data is lost.
+* The storage format changes: each dataset carries its wrapped data
+  keys, and ADR 0003's snapshot manifests move from the tenant key to
+  their snapshot's data key, under a new frame version beside `HPK1`.
+  Nothing is deployed, so no migration is provided.
 * On acceptance, `docs/THREAT_MODEL.md` (Assets, A2), `docs/ARCHITECTURE.md`
   (key-release trust boundary, research flow) and `docs/PROJECT_SCOPE.md`
-  change to "the data key is released", not "the steward's key".
+  change to "the data key is released", not "the steward's key". Under
+  option A they also stop naming SEV-SNP as the platform:
+  `docs/PROJECT_SCOPE.md` (the Attestation row, the stack line and the
+  definition-of-done item that names genuine SEV-SNP hardware),
+  `docs/ARCHITECTURE.md` (the connector flow), `docs/THREAT_MODEL.md`
+  (A2 and "Out of scope"), `README.md` and P12 in `docs/V1_PLAN.md`.
 
 ## Open questions
 
