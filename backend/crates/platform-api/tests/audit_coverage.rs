@@ -19,7 +19,7 @@ use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
-use platform_enclave::DevAttestation;
+use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
@@ -70,6 +70,22 @@ fn json_header() -> (&'static str, String) {
 /// Full app: vault + jwt + provisioning + a query service with sealed
 /// QuickBooks fixture data for `tenant`.
 async fn full_app(tenant: TenantId, zk: ZkMode) -> Router {
+    full_app_with_attestation(
+        tenant,
+        zk,
+        Arc::new(DevAttestation::allow_insecure_dev()),
+        false,
+    )
+    .await
+}
+
+/// As [`full_app`], with the query gate's attestation.
+async fn full_app_with_attestation(
+    tenant: TenantId,
+    zk: ZkMode,
+    attestation: Arc<dyn AttestationProvider>,
+    require_attestation: bool,
+) -> Router {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
 
@@ -90,12 +106,12 @@ async fn full_app(tenant: TenantId, zk: ZkMode) -> Router {
     let query = ConnectorQueryService::new(
         vault.clone(),
         Arc::new(DevKeyProvider::new(tenant, keypair)),
-        Arc::new(DevAttestation::allow_insecure_dev()),
+        attestation,
         EngineSettings {
             zk,
             max_concurrent_queries: 4,
         },
-        false,
+        require_attestation,
     );
     let provisioning = ProvisioningService::new(
         Arc::new(InMemoryTenantRegistry::new(default_connector_slugs())),
@@ -282,6 +298,38 @@ async fn query_path_audits_attestation_and_execution_including_failure() {
         "{:?}",
         capture.events()
     );
+}
+
+#[tokio::test]
+async fn attestation_refusal_is_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let app = full_app_with_attestation(
+        tenant,
+        ZkMode::Disabled,
+        Arc::new(DevAttestation::strict()),
+        true,
+    )
+    .await;
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let events = capture.events();
+    assert!(
+        events.iter().any(|e| e.audit_kind == "tee.attestation"
+            && e.outcome == "denied"
+            && e.tenant_id == tenant.to_string()),
+        "{events:?}"
+    );
+    assert_eq!(capture.count("engine.query"), 0, "{events:?}");
 }
 
 #[tokio::test]

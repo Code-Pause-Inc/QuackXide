@@ -21,7 +21,7 @@ use platform_config::PlatformConfig;
 use platform_connectors::snapshot::SnapshotWriter;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
-use platform_enclave::DevAttestation;
+use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::{InMemoryBudgetLedger, InMemoryCatalogRegistry, InMemoryGrantRegistry};
 use quackxide_engine::EngineSettings;
@@ -56,6 +56,22 @@ fn cohorts_parquet() -> Vec<u8> {
 /// Build an app where `steward` has a sealed `health` connector dataset,
 /// queryable in research mode (cohort threshold k=5).
 async fn research_app(steward: TenantId, steward_keypair: TenantKeypair) -> Router {
+    research_app_with_attestation(
+        steward,
+        steward_keypair,
+        Arc::new(DevAttestation::allow_insecure_dev()),
+        false,
+    )
+    .await
+}
+
+/// As [`research_app`], with the query gate's attestation.
+async fn research_app_with_attestation(
+    steward: TenantId,
+    steward_keypair: TenantKeypair,
+    attestation: Arc<dyn AttestationProvider>,
+    require_attestation: bool,
+) -> Router {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let connector = ConnectorSlug::new("health").expect("slug");
     // Commit the cohort dataset as a snapshot sealed to the steward's key
@@ -80,12 +96,12 @@ async fn research_app(steward: TenantId, steward_keypair: TenantKeypair) -> Rout
     let service = ConnectorQueryService::new(
         vault.clone(),
         Arc::new(keys),
-        Arc::new(DevAttestation::allow_insecure_dev()),
+        attestation,
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
             max_concurrent_queries: 4,
         },
-        false,
+        require_attestation,
     )
     .with_research(stores, 5, 100);
 
@@ -220,6 +236,55 @@ async fn budget_exhausts_and_steward_top_up_restores_access() {
     let (status, body) = post(&app, "/api/v1/research/query", &rtoken, &research_body).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["budget_remaining"], 2);
+}
+
+#[tokio::test]
+async fn refused_attestation_charges_no_budget() {
+    // No evidence at all, then development evidence where SEV-SNP is required.
+    let providers: [Arc<dyn AttestationProvider>; 2] = [
+        Arc::new(DevAttestation::strict()),
+        Arc::new(DevAttestation::allow_insecure_dev()),
+    ];
+    for provider in providers {
+        let steward = TenantId::generate();
+        let researcher = TenantId::generate();
+        let app =
+            research_app_with_attestation(steward, TenantKeypair::generate(), provider, true).await;
+
+        // The grant check runs before the gate, so the refusal needs a grant.
+        let (status, grant) = post(
+            &app,
+            "/api/v1/grants",
+            &token_for(steward),
+            &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "grant: {grant}");
+        let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+
+        let research_body =
+            format!(r#"{{"steward_tenant":"{steward}","connector":"health","sql":"{AGG_SQL}"}}"#);
+        let (status, body) = post(
+            &app,
+            "/api/v1/research/query",
+            &token_for(researcher),
+            &research_body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+        assert_eq!(body["error"], "enclave attestation unavailable");
+
+        let (status, budget) = call(
+            &app,
+            "GET",
+            &format!("/api/v1/grants/{grant_id}/budget"),
+            &token_for(researcher),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(budget["spent"], 0, "budget: {budget}");
+    }
 }
 
 #[tokio::test]
