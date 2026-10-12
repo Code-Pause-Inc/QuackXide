@@ -29,6 +29,13 @@ uses [Semantic Versioning](https://semver.org/).
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
 
+### Added
+
+* `platform-api` exports Prometheus metrics (request counts and latency,
+  error responses by kind, plaintext-slot wait) on a separate
+  loopback-only listener, `METRICS_BIND_ADDR` (default `127.0.0.1:9464`).
+  Startup refuses a non-loopback address.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

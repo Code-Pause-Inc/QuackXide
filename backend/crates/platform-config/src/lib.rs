@@ -88,6 +88,9 @@ pub struct BrandConfig {
 pub struct ServerConfig {
     /// `BIND_ADDR`, e.g. `127.0.0.1:8080`.
     pub bind_addr: SocketAddr,
+    /// `METRICS_BIND_ADDR`, default `127.0.0.1:9464`. Loopback only: the
+    /// metrics listener is for a scraper on the same host, never public.
+    pub metrics_bind_addr: SocketAddr,
 }
 
 /// GCS vault settings. Optional so the API boots in storage-less local dev;
@@ -165,6 +168,19 @@ impl PlatformConfig {
                 reason: format!("{e}"),
             })?;
 
+        let metrics_bind_addr: SocketAddr = get_or(&get, "METRICS_BIND_ADDR", "127.0.0.1:9464")
+            .parse()
+            .map_err(|e| ConfigError::Invalid {
+                key: "METRICS_BIND_ADDR",
+                reason: format!("{e}"),
+            })?;
+        if !metrics_bind_addr.ip().is_loopback() {
+            return Err(ConfigError::Invalid {
+                key: "METRICS_BIND_ADDR",
+                reason: "must be a loopback address; metrics are never public".into(),
+            });
+        }
+
         let storage = StorageConfig {
             gcp_project_id: get_nonempty(&get, "GCP_PROJECT_ID"),
             bucket: get_nonempty(&get, "STORAGE_BUCKET"),
@@ -210,7 +226,10 @@ impl PlatformConfig {
 
         Ok(Self {
             brand,
-            server: ServerConfig { bind_addr },
+            server: ServerConfig {
+                bind_addr,
+                metrics_bind_addr,
+            },
             storage,
             auth,
             connectors,
@@ -375,5 +394,26 @@ mod tests {
         let err = PlatformConfig::from_source(source(&[("BIND_ADDR", "not-an-addr")]))
             .expect_err("must fail");
         assert!(err.to_string().contains("BIND_ADDR"));
+    }
+
+    #[test]
+    fn metrics_listen_on_loopback_by_default() {
+        let cfg = PlatformConfig::from_source(source(&[])).expect("loads");
+        assert_eq!(cfg.server.metrics_bind_addr.to_string(), "127.0.0.1:9464");
+        let cfg = PlatformConfig::from_source(source(&[("METRICS_BIND_ADDR", "[::1]:9000")]))
+            .expect("IPv6 loopback loads");
+        assert!(cfg.server.metrics_bind_addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn non_loopback_metrics_address_is_refused() {
+        for addr in ["0.0.0.0:9464", "[::]:9464", "10.0.0.5:9464", "not-an-addr"] {
+            let err = PlatformConfig::from_source(source(&[("METRICS_BIND_ADDR", addr)]))
+                .expect_err(addr);
+            assert!(
+                err.to_string().contains("METRICS_BIND_ADDR"),
+                "{addr}: {err}"
+            );
+        }
     }
 }
