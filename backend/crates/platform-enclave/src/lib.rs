@@ -7,6 +7,7 @@
 //! fails closed unless insecurity is requested explicitly.
 
 use async_trait::async_trait;
+use rand::Rng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeePlatform {
@@ -121,6 +122,11 @@ impl AttestationProvider for SnpAttestation {
     }
 }
 
+/// A fresh 32-byte attestation nonce from the operating system's RNG.
+pub fn fresh_nonce() -> [u8; 32] {
+    rand::rngs::OsRng.r#gen()
+}
+
 /// Execution gate for confidential workloads; `Ok` means execution may
 /// proceed on the returned platform.
 ///
@@ -156,6 +162,11 @@ pub fn provider_for(attestation_required: bool) -> std::sync::Arc<dyn Attestatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_nonces_differ() {
+        assert_ne!(fresh_nonce(), fresh_nonce());
+    }
 
     #[tokio::test]
     async fn strict_dev_attestation_fails_closed() {

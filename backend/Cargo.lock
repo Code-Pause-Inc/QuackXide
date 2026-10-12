@@ -2873,7 +2873,6 @@ dependencies = [
  "platform-telemetry",
  "platform-tenancy",
  "quackxide-engine",
- "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
@@ -2939,7 +2938,6 @@ dependencies = [
  "platform-storage",
  "platform-telemetry",
  "proptest",
- "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
@@ -2978,6 +2976,7 @@ name = "platform-enclave"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rand 0.8.7",
  "thiserror",
  "tokio",
  "tracing",
