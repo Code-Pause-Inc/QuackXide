@@ -29,6 +29,13 @@ uses [Semantic Versioning](https://semver.org/).
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
 
+### Added
+
+* `GET /readyz` reports whether `platform-api` can serve: storage
+  reachable, attestation passing, query service and token verifier
+  configured. It answers only `ready` or `not_ready`, and caches the result
+  for 5 seconds because it is public.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

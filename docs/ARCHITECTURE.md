@@ -330,6 +330,11 @@ Rules, enforced by the capture tests:
    enrollment (ok + denied), query attestation + execution (ok + failed),
    and provisioning.
 
+Readiness probes (`GET /readyz`) emit no events. They run every few
+seconds, touch no tenant data, and only list an empty control prefix and
+run the attestation check. The response is only `ready` or `not_ready`;
+which check failed goes to the operational log.
+
 ## Structural enforcement
 
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public

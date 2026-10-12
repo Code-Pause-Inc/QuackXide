@@ -233,6 +233,17 @@ impl ConnectorQueryService {
         }
     }
 
+    /// Whether the attestation gate would let a query through now. Unlike
+    /// `gate`, it emits no audit event, since readiness probes run every few
+    /// seconds.
+    pub async fn attestation_ready(&self) -> bool {
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        gate_execution(self.attestation.as_ref(), self.require_attestation, &nonce)
+            .await
+            .is_ok()
+    }
+
     /// Wait for a plaintext slot. Hold the permit until the decrypted blobs
     /// are dropped. A limit of zero refuses rather than waiting forever.
     async fn plaintext_slot(&self) -> Result<SemaphorePermit<'_>, ApiError> {
