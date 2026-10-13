@@ -1,5 +1,6 @@
 [package]
 name = "platform-api"
+default-run = "platform-api"
 description = "Axum HTTP edge: encrypted drive vault routes with JWT tenant isolation."
 version.workspace = true
 edition.workspace = true
