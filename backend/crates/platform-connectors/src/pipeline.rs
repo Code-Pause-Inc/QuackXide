@@ -10,17 +10,14 @@ use std::sync::Arc;
 
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 use platform_crypto::TenantPublicKey;
-use platform_enclave::{AttestationProvider, TeePlatform};
+use platform_enclave::{AttestationProvider, TeePlatform, fresh_nonce};
 use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
-use rand::RngCore;
 
 use crate::ConnectorError;
 use crate::parquet_out::dataset_to_parquet;
 use crate::snapshot::SnapshotWriter;
 use crate::source::{ConnectorSource, SyncContext};
-
-const ATTESTATION_NONCE_BYTES: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -85,8 +82,7 @@ impl EnclavePipeline {
     }
 
     async fn attestation_gate(&self, tenant: TenantId) -> Result<(), PipelineError> {
-        let mut nonce = [0u8; ATTESTATION_NONCE_BYTES];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce = fresh_nonce();
 
         match self.attestation.produce_evidence(&nonce).await {
             Ok(evidence) if evidence.platform == TeePlatform::SevSnp => {

@@ -11,6 +11,10 @@ uses [Semantic Versioning](https://semver.org/).
 * `docs/TESTING.md`: where each test layer lives, the naming and placement
   convention for negative tests and audit assertions, and the substitutes
   for what CI cannot exercise.
+* `GET /readyz` reports whether `platform-api` can serve: storage
+  reachable, attestation passing, query service and token verifier
+  configured. It answers only `ready` or `not_ready`, and caches the result
+  for 5 seconds because it is public.
 
 ### Security
 
