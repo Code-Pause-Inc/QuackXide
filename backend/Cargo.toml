@@ -44,6 +44,7 @@ quackxide-engine = { path = "crates/quackxide-engine" }
 # ── async runtime + HTTP edge ────────────────────────────────────────────────
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs"] }
 axum = "0.8"
+prometheus-client = "0.25"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 

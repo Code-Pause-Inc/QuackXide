@@ -20,14 +20,14 @@ use platform_connectors::pipeline::envelope_info;
 use platform_connectors::snapshot::{SnapshotManifest, manifest_info};
 use platform_core::{ConnectorSlug, TenantId};
 use platform_crypto::{SecretBytes, TenantKeypair};
-use platform_enclave::{AttestationProvider, gate_execution};
+use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{BudgetError, BudgetLedger, BudgetState, CatalogRegistry, GrantRegistry};
+use prometheus_client::metrics::histogram::Histogram;
 use quackxide_engine::{
     DisclosurePolicy, EngineSettings, MinCountThreshold, QueryError, QueryScope,
 };
-use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -135,6 +135,8 @@ pub struct ConnectorQueryService {
     /// Bounds how many queries hold decrypted plaintext at once
     /// (`EngineSettings::max_concurrent_queries`).
     plaintext_slots: Semaphore,
+    /// Time spent waiting for a plaintext slot, exported as a metric.
+    plaintext_wait: Histogram,
 }
 
 /// Budget units one research query consumes.
@@ -157,6 +159,7 @@ impl ConnectorQueryService {
             Semaphore::new(settings.max_concurrent_queries.min(Semaphore::MAX_PERMITS));
         Self {
             plaintext_slots,
+            plaintext_wait: crate::metrics::latency_histogram(),
             vault,
             keys,
             attestation,
@@ -199,8 +202,7 @@ impl ConnectorQueryService {
 
     /// Attestation gate + audit, shared by own-data and research queries.
     async fn gate(&self, tenant: TenantId, label: &str) -> Result<(), ApiError> {
-        let mut nonce = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce = fresh_nonce();
         match gate_execution(self.attestation.as_ref(), self.require_attestation, &nonce).await {
             Ok(platform_enclave::TeePlatform::SevSnp) => {
                 security_audit_event(
@@ -233,16 +235,36 @@ impl ConnectorQueryService {
         }
     }
 
+    /// Whether the attestation gate would let a query through now. Unlike
+    /// `gate`, it emits no audit event, since readiness probes run every few
+    /// seconds.
+    pub async fn attestation_ready(&self) -> bool {
+        gate_execution(
+            self.attestation.as_ref(),
+            self.require_attestation,
+            &fresh_nonce(),
+        )
+        .await
+        .is_ok()
+    }
+
     /// Wait for a plaintext slot. Hold the permit until the decrypted blobs
     /// are dropped. A limit of zero refuses rather than waiting forever.
     async fn plaintext_slot(&self) -> Result<SemaphorePermit<'_>, ApiError> {
         if self.settings.max_concurrent_queries == 0 {
             return Err(ApiError::QueryUnavailable);
         }
+        // Records the wait however it ends, including a cancelled query.
+        let _wait = crate::metrics::Timer::start(self.plaintext_wait.clone());
         self.plaintext_slots
             .acquire()
             .await
             .map_err(|_| ApiError::QueryUnavailable)
+    }
+
+    /// The plaintext-slot wait histogram, for registering with the metrics.
+    pub(crate) fn plaintext_wait_metric(&self) -> Histogram {
+        self.plaintext_wait.clone()
     }
 
     /// Decrypt `owner`'s current connector snapshot to plaintext Parquet:

@@ -6,6 +6,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+* `docs/TESTING.md`: where each test layer lives, the naming and placement
+  convention for negative tests and audit assertions, and the substitutes
+  for what CI cannot exercise.
+* `GET /readyz` reports whether `platform-api` can serve: storage
+  reachable, attestation passing, query service and token verifier
+  configured. It answers only `ready` or `not_ready`, and caches the result
+  for 5 seconds because it is public.
+* `platform-api` exports Prometheus metrics (request counts and latency,
+  error responses by kind, plaintext-slot wait) on a separate
+  loopback-only listener, `METRICS_BIND_ADDR` (default `127.0.0.1:9464`).
+  Startup refuses a non-loopback address.
+
 ### Security
 
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A
@@ -28,6 +42,11 @@ uses [Semantic Versioning](https://semver.org/).
 * `EngineSettings` and `ZkMode` have no default. Both defaulted to ZK mode
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
+
+### Changed
+
+* `platform-api` shuts down gracefully on SIGTERM as well as Ctrl-C, so
+  stopping its VM or container lets in-flight requests finish.
 
 ## [0.1.0] - 2026-09-30
 
