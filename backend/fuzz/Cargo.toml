@@ -14,6 +14,7 @@ platform-auth = { path = "../crates/platform-auth" }
 platform-billing = { path = "../crates/platform-billing" }
 platform-connectors = { path = "../crates/platform-connectors" }
 platform-crypto = { path = "../crates/platform-crypto" }
+platform-enclave = { path = "../crates/platform-enclave" }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -45,6 +46,13 @@ bench = false
 [[bin]]
 name = "jwt_verify"
 path = "fuzz_targets/jwt_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snp_report"
+path = "fuzz_targets/snp_report.rs"
 test = false
 doc = false
 bench = false

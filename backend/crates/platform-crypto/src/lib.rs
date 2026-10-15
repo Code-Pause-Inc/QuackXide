@@ -220,6 +220,25 @@ impl TenantKeypair {
         TenantPublicKey(self.public_key.clone())
     }
 
+    /// Export the raw 32-byte X25519 private scalar into a zeroize-on-drop
+    /// container (used by the key-release service to HPKE-wrap a released key
+    /// to an attested enclave's ephemeral public key).
+    pub fn to_private_key_bytes(&self) -> SecretBytes {
+        SecretBytes::new(self.private_key.to_bytes().to_vec())
+    }
+
+    /// Reconstruct a keypair inside enclave RAM from unwrapped private-key
+    /// bytes.
+    pub fn from_private_key_bytes(raw: &[u8]) -> Result<Self, CryptoError> {
+        let private_key =
+            KemPrivateKey::from_bytes(raw).map_err(|_| CryptoError::InvalidKeyLength)?;
+        let public_key = TenantKem::sk_to_pk(&private_key);
+        Ok(Self {
+            private_key,
+            public_key,
+        })
+    }
+
     /// Open a framed envelope. Fails on tamper, wrong recipient, or a
     /// mismatched `info` binding.
     pub fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, CryptoError> {
@@ -236,6 +255,14 @@ impl TenantKeypair {
         )
         .map(SecretBytes::new)
         .map_err(|_| CryptoError::OpenFailed)
+    }
+}
+
+impl Drop for TenantKeypair {
+    fn drop(&mut self) {
+        if let Ok(zero_sk) = KemPrivateKey::from_bytes(&[0u8; X25519_PUBLIC_KEY_BYTES]) {
+            self.private_key = zero_sk;
+        }
     }
 }
 

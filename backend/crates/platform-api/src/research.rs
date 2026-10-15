@@ -26,6 +26,16 @@ pub struct ResearchStores {
     pub catalog: Arc<dyn CatalogRegistry>,
 }
 
+impl ResearchStores {
+    pub fn in_memory() -> Self {
+        Self {
+            grants: Arc::new(platform_tenancy::InMemoryGrantRegistry::default()),
+            budgets: Arc::new(platform_tenancy::InMemoryBudgetLedger::default()),
+            catalog: Arc::new(platform_tenancy::InMemoryCatalogRegistry::default()),
+        }
+    }
+}
+
 /// Bounds on user-authored free text; oversize input is refused, not
 /// truncated.
 pub const MAX_TITLE_CHARS: usize = 120;

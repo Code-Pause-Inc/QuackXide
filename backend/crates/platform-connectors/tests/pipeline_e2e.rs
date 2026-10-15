@@ -195,6 +195,58 @@ async fn dev_evidence_cannot_satisfy_required_attestation() {
 }
 
 #[tokio::test]
+async fn simulated_snp_sync_verifies_in_dev_and_refuses_bad_policy_or_required_hardware() {
+    use platform_enclave::{GuestPolicy, SimulatedSnp, SimulatedSnpConfig};
+
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let keypair = TenantKeypair::generate();
+    let job = SyncJob {
+        tenant: TenantId::generate(),
+        tenant_public_key: keypair.public_key(),
+        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
+    };
+
+    // 1. Valid SimulatedSnp in dev mode (require_attestation = false) verifies and syncs.
+    let valid_pipeline = EnclavePipeline::new(Arc::new(SimulatedSnp::new()), vault.clone(), false);
+    valid_pipeline
+        .run_sync(&job)
+        .await
+        .expect("simulated SNP sync succeeds in dev mode");
+
+    // 2. SimulatedSnp with wrong measurement fails verification on the sync path.
+    let wrong_meas = SimulatedSnp::with_config(SimulatedSnpConfig {
+        measurement: [0xEE; 48],
+        ..SimulatedSnpConfig::default()
+    });
+    let bad_meas_pipeline = EnclavePipeline::new(Arc::new(wrong_meas), vault.clone(), false);
+    let err = bad_meas_pipeline
+        .run_sync(&job)
+        .await
+        .expect_err("wrong measurement must refuse sync");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+
+    // 3. SimulatedSnp with debug policy fails verification on the sync path.
+    let debug_sim = SimulatedSnp::with_config(SimulatedSnpConfig {
+        policy: GuestPolicy::production_default().with_debug(true),
+        ..SimulatedSnpConfig::default()
+    });
+    let debug_pipeline = EnclavePipeline::new(Arc::new(debug_sim), vault.clone(), false);
+    let err = debug_pipeline
+        .run_sync(&job)
+        .await
+        .expect_err("debug policy must refuse sync");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+
+    // 4. Valid SimulatedSnp is refused when hardware attestation is required (production).
+    let prod_pipeline = EnclavePipeline::new(Arc::new(SimulatedSnp::new()), vault, true);
+    let err = prod_pipeline
+        .run_sync(&job)
+        .await
+        .expect_err("simulated SNP cannot satisfy required hardware attestation");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+}
+
+#[tokio::test]
 async fn envelopes_are_bound_to_their_object() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();

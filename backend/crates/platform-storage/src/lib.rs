@@ -211,10 +211,32 @@ impl ObjectStoreVault {
     }
 
     /// Google Cloud Storage backend. Credentials resolve from the environment
-    /// or the GCE metadata server.
+    /// or the GCE metadata server unless `STORAGE_EMULATOR_HOST` points at a
+    /// local GCS emulator (`fsouza/fake-gcs-server`).
     pub fn new_gcs(bucket: &str) -> Result<Self, StorageError> {
-        let store = GoogleCloudStorageBuilder::from_env()
-            .with_bucket_name(bucket)
+        let emulator = std::env::var("STORAGE_EMULATOR_HOST").ok();
+        Self::new_gcs_with_emulator(bucket, emulator.as_deref())
+    }
+
+    /// Construct a GCS-backed vault with an optional local emulator host override.
+    pub fn new_gcs_with_emulator(
+        bucket: &str,
+        emulator_host: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        if let Some(raw_host) = emulator_host {
+            let trimmed = raw_host.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                let base_url = if trimmed.starts_with("http://") || trimmed.starts_with("https://")
+                {
+                    trimmed.to_owned()
+                } else {
+                    format!("http://{trimmed}")
+                };
+                builder = builder.with_base_url(&base_url).with_skip_signature(true);
+            }
+        }
+        let store = builder
             .build()
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         Ok(Self {
@@ -474,5 +496,17 @@ mod tests {
             .expect("list b");
         assert_eq!(b_list.len(), 1);
         assert_eq!(b_list[0], b_path);
+    }
+
+    #[test]
+    fn gcs_vault_accepts_storage_emulator_host_override() {
+        for host in [
+            "http://fake-gcs:4443",
+            "fake-gcs:4443",
+            "http://127.0.0.1:4443/",
+        ] {
+            ObjectStoreVault::new_gcs_with_emulator("quackxide-vault", Some(host))
+                .expect("emulator-backed GCS client builds without GCP credentials");
+        }
     }
 }

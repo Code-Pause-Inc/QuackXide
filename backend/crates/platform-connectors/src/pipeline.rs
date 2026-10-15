@@ -86,11 +86,49 @@ impl EnclavePipeline {
 
         match self.attestation.produce_evidence(&nonce).await {
             Ok(evidence) if evidence.platform == TeePlatform::SevSnp => {
+                if let Err(err) = self.attestation.verify_evidence(&evidence, &nonce) {
+                    security_audit_event(
+                        AuditKind::TeeAttestation,
+                        Some(tenant),
+                        "denied",
+                        "SEV-SNP evidence failed verification",
+                    );
+                    return Err(PipelineError::AttestationRefused(err.to_string()));
+                }
                 security_audit_event(
                     AuditKind::TeeAttestation,
                     Some(tenant),
                     "ok",
                     "SEV-SNP evidence produced for sync",
+                );
+                Ok(())
+            }
+            Ok(evidence) if evidence.platform == TeePlatform::Simulated => {
+                if self.require_attestation {
+                    security_audit_event(
+                        AuditKind::TeeAttestation,
+                        Some(tenant),
+                        "denied",
+                        "simulated SEV-SNP evidence cannot satisfy required hardware attestation",
+                    );
+                    return Err(PipelineError::AttestationRefused(
+                        "evidence platform is simulated, not hardware SEV-SNP".into(),
+                    ));
+                }
+                if let Err(err) = self.attestation.verify_evidence(&evidence, &nonce) {
+                    security_audit_event(
+                        AuditKind::TeeAttestation,
+                        Some(tenant),
+                        "denied",
+                        "simulated SEV-SNP evidence failed verification",
+                    );
+                    return Err(PipelineError::AttestationRefused(err.to_string()));
+                }
+                security_audit_event(
+                    AuditKind::TeeAttestation,
+                    Some(tenant),
+                    "simulated",
+                    "simulated SEV-SNP evidence verified for sync (dev only)",
                 );
                 Ok(())
             }
