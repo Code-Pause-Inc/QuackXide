@@ -15,6 +15,10 @@ uses [Semantic Versioning](https://semver.org/).
   reachable, attestation passing, query service and token verifier
   configured. It answers only `ready` or `not_ready`, and caches the result
   for 5 seconds because it is public.
+* `platform-api` exports Prometheus metrics (request counts and latency,
+  error responses by kind, plaintext-slot wait) on a separate
+  loopback-only listener, `METRICS_BIND_ADDR` (default `127.0.0.1:9464`).
+  Startup refuses a non-loopback address.
 
 ### Security
 

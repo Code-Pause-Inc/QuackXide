@@ -26,6 +26,7 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 
 pub mod admin;
+mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
@@ -119,8 +120,30 @@ impl From<StorageError> for ApiError {
     }
 }
 
+impl ApiError {
+    /// Stable metrics label for this kind of refusal; never the message.
+    fn kind(&self) -> &'static str {
+        match self {
+            ApiError::Unauthorized => "unauthorized",
+            ApiError::Forbidden => "forbidden",
+            ApiError::AuthNotConfigured => "auth_not_configured",
+            ApiError::NotFound => "not_found",
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::Backend => "backend",
+            ApiError::QueryUnavailable => "query_unavailable",
+            ApiError::ResearchUnavailable => "research_unavailable",
+            ApiError::ProvisioningUnavailable => "provisioning_unavailable",
+            ApiError::WebhookNotConfigured => "webhook_not_configured",
+            ApiError::AttestationUnavailable => "attestation_unavailable",
+            ApiError::QueryRejected(_) => "query_rejected",
+            ApiError::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let kind = self.kind();
         let (status, message) = match self {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
@@ -158,6 +181,7 @@ impl IntoResponse for ApiError {
             ),
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
+        response.extensions_mut().insert(metrics::Refusal(kind));
         if matches!(status, StatusCode::UNAUTHORIZED) {
             response
                 .headers_mut()
@@ -247,6 +271,29 @@ async fn require_admin(State(state): State<AppState>, mut req: Request, next: Ne
 // ── Router ───────────────────────────────────────────────────────────────────
 
 pub fn build_app(state: AppState) -> Router {
+    build_apps(state).0
+}
+
+/// The API router and the metrics router. Serve the metrics router only on
+/// the loopback `METRICS_BIND_ADDR` listener, never on the API's.
+pub fn build_apps(state: AppState) -> (Router, Router) {
+    let metrics = Arc::new(metrics::Metrics::new(
+        state
+            .query
+            .as_ref()
+            .map(|query| query.plaintext_wait_metric()),
+    ));
+    let api = routes(state).layer(middleware::from_fn_with_state(
+        metrics.clone(),
+        metrics::track,
+    ));
+    let metrics_app = Router::new()
+        .route("/metrics", get(metrics::render))
+        .with_state(metrics);
+    (api, metrics_app)
+}
+
+fn routes(state: AppState) -> Router {
     let tenant_auth = || middleware::from_fn_with_state(state.clone(), require_tenant);
 
     let drive = Router::new()

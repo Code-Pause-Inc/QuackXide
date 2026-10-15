@@ -347,6 +347,13 @@ seconds, touch no tenant data, and only list an empty control prefix and
 run the attestation check. The response is only `ready` or `not_ready`;
 which check failed goes to the operational log.
 
+Operational metrics are separate from this stream: request counts and
+latency, error responses by kind, and the wait for a plaintext slot, in
+OpenMetrics text format (which Prometheus scrapes) on a loopback-only
+listener (`METRICS_BIND_ADDR`, default `127.0.0.1:9464`), never on the
+API's port. Labels are route patterns, methods, status codes and error
+kinds only: no tenant ids, paths, messages, SQL text or engine name.
+
 ## Structural enforcement
 
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public

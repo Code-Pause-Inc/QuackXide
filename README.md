@@ -113,7 +113,7 @@ Backend (Rust, pinned in `rust-toolchain.toml`), from `backend/`:
 
 ```sh
 cp .env.example .env
-cargo run -p platform-api        # /healthz, /readyz, /api/v1/meta
+cargo run -p platform-api        # /healthz, /readyz, /api/v1/meta; metrics on 127.0.0.1:9464/metrics
 ```
 
 Frontend (Node, pinned in `.nvmrc`), from `frontend/`:

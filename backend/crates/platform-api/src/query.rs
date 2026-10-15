@@ -24,6 +24,7 @@ use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{BudgetError, BudgetLedger, BudgetState, CatalogRegistry, GrantRegistry};
+use prometheus_client::metrics::histogram::Histogram;
 use quackxide_engine::{
     DisclosurePolicy, EngineSettings, MinCountThreshold, QueryError, QueryScope,
 };
@@ -134,6 +135,8 @@ pub struct ConnectorQueryService {
     /// Bounds how many queries hold decrypted plaintext at once
     /// (`EngineSettings::max_concurrent_queries`).
     plaintext_slots: Semaphore,
+    /// Time spent waiting for a plaintext slot, exported as a metric.
+    plaintext_wait: Histogram,
 }
 
 /// Budget units one research query consumes.
@@ -156,6 +159,7 @@ impl ConnectorQueryService {
             Semaphore::new(settings.max_concurrent_queries.min(Semaphore::MAX_PERMITS));
         Self {
             plaintext_slots,
+            plaintext_wait: crate::metrics::latency_histogram(),
             vault,
             keys,
             attestation,
@@ -250,10 +254,17 @@ impl ConnectorQueryService {
         if self.settings.max_concurrent_queries == 0 {
             return Err(ApiError::QueryUnavailable);
         }
+        // Records the wait however it ends, including a cancelled query.
+        let _wait = crate::metrics::Timer::start(self.plaintext_wait.clone());
         self.plaintext_slots
             .acquire()
             .await
             .map_err(|_| ApiError::QueryUnavailable)
+    }
+
+    /// The plaintext-slot wait histogram, for registering with the metrics.
+    pub(crate) fn plaintext_wait_metric(&self) -> Histogram {
+        self.plaintext_wait.clone()
     }
 
     /// Decrypt `owner`'s current connector snapshot to plaintext Parquet:

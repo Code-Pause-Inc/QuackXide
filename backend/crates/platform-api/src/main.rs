@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use platform_api::{AppState, build_app};
+use platform_api::{AppState, build_apps};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
 use platform_storage::{ObjectStoreVault, VaultStore};
@@ -63,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
     security_audit_event(AuditKind::ServiceStart, None, "ok", "platform-api booting");
 
     let bind_addr = config.server.bind_addr;
-    let app = build_app(AppState {
+    let metrics_addr = config.server.metrics_bind_addr;
+    let (app, metrics_app) = build_apps(AppState {
         config: Arc::new(config),
         vault,
         jwt,
@@ -72,6 +73,16 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let shutdown = shutdown_signal()?;
+
+    // Loopback only (enforced by platform-config), for a scraper on this host.
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    tracing::info!(%metrics_addr, "metrics listening");
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(metrics_listener, metrics_app).await {
+            tracing::error!(error = %err, "metrics listener stopped");
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "platform-api listening");
     axum::serve(listener, app)
