@@ -19,6 +19,11 @@ uses [Semantic Versioning](https://semver.org/).
   error responses by kind, plaintext-slot wait) on a separate
   loopback-only listener, `METRICS_BIND_ADDR` (default `127.0.0.1:9464`).
   Startup refuses a non-loopback address.
+* `synth-data`, a dev-only crate that writes seeded synthetic Parquet for
+  tests, benchmarks and demos: a health-style `cohort` table with groups
+  on both sides of the cohort threshold k and one group dominated by a
+  single person, and a `wide` table for throughput benchmarks. From
+  `backend/`, `cargo run -p synth-data -- --help` lists the options.
 
 ### Security
 
