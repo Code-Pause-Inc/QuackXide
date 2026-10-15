@@ -123,10 +123,11 @@ cp .env.example .env
 npm install && npm run dev       # http://localhost:5173
 ```
 
-End-to-end locally, from `backend/`:
+End-to-end locally, from `backend/`. The secret goes in `backend/.env`
+(gitignored) so both terminals read the same value:
 
 ```sh
-export JWT_HS256_SECRET=$(openssl rand -hex 32)
+sed -i.bak "s/^JWT_HS256_SECRET=.*/JWT_HS256_SECRET=\"$(openssl rand -hex 32)\"/" .env && rm .env.bak
 cargo run -p platform-api                    # terminal 1
 cargo run -p platform-api --bin devtoken     # terminal 2: prints a token
 # frontend/.env: VITE_VAULT_MODE="http", VITE_DEV_JWT="<token>"
