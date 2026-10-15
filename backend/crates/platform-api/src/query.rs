@@ -33,9 +33,31 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::ApiError;
+use crate::key_release::{AttestationBundle, EnclaveIdentity};
+
+/// Per-query handle holding a tenant's released key in enclave RAM for the
+/// duration of a single query.
+#[async_trait]
+pub trait QueryKeySession: Send + Sync {
+    async fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, ApiError>;
+}
+
+struct DelegatingKeySession<'a, P: EnclaveKeyProvider + ?Sized> {
+    provider: &'a P,
+    tenant: TenantId,
+}
+
+#[async_trait]
+impl<P: EnclaveKeyProvider + ?Sized> QueryKeySession for DelegatingKeySession<'_, P> {
+    async fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, ApiError> {
+        self.provider
+            .open_envelope(self.tenant, info, envelope)
+            .await
+    }
+}
 
 /// Opens a tenant's sealed envelopes inside the enclave. In production this is
-/// an attestation-gated key-release channel.
+/// an attestation-gated key-release channel ([`crate::key_release::AttestedKeyProvider`]).
 #[async_trait]
 pub trait EnclaveKeyProvider: Send + Sync {
     async fn open_envelope(
@@ -44,6 +66,19 @@ pub trait EnclaveKeyProvider: Send + Sync {
         info: &[u8],
         envelope: &[u8],
     ) -> Result<SecretBytes, ApiError>;
+
+    /// Acquire a per-query key session for `tenant`. [`crate::key_release::AttestedKeyProvider`]
+    /// overrides this so key release happens once per query rather than once
+    /// per envelope.
+    async fn begin_query_session<'a>(
+        &'a self,
+        tenant: TenantId,
+    ) -> Result<Box<dyn QueryKeySession + 'a>, ApiError> {
+        Ok(Box::new(DelegatingKeySession {
+            provider: self,
+            tenant,
+        }))
+    }
 }
 
 /// DEV ONLY: holds one tenant keypair in process memory, which defeats the
@@ -118,6 +153,7 @@ pub struct ConnectorQueryService {
     vault: Arc<dyn VaultStore>,
     keys: Arc<dyn EnclaveKeyProvider>,
     attestation: Arc<dyn AttestationProvider>,
+    identity: Arc<EnclaveIdentity>,
     settings: EngineSettings,
     require_attestation: bool,
     /// None ⇒ research access not configured ⇒ research/grant routes 503.
@@ -163,6 +199,7 @@ impl ConnectorQueryService {
             vault,
             keys,
             attestation,
+            identity: Arc::new(EnclaveIdentity::generate()),
             settings,
             require_attestation,
             grants: None,
@@ -171,6 +208,53 @@ impl ConnectorQueryService {
             min_cohort: platform_config::DEFAULT_MIN_COHORT_SIZE,
             default_budget: DEFAULT_QUERY_BUDGET,
         }
+    }
+
+    /// Attach a shared [`EnclaveIdentity`] (used when pairing with
+    /// [`crate::key_release::AttestedKeyProvider`] so `GET /api/v1/attestation`
+    /// and key release report the identical ephemeral public keys).
+    pub fn with_enclave_identity(mut self, identity: Arc<EnclaveIdentity>) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// Produce an [`AttestationBundle`] binding `nonce` and this enclave's
+    /// ephemeral public keys (`GET /api/v1/attestation`).
+    pub async fn attestation_bundle(&self, nonce: [u8; 32]) -> Result<AttestationBundle, ApiError> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        let binding = self.identity.binding_for_nonce(nonce);
+        let report_data = binding.to_report_data();
+        let evidence = self
+            .attestation
+            .produce_evidence(&report_data)
+            .await
+            .map_err(|_| ApiError::AttestationUnavailable)?;
+
+        if self.require_attestation && evidence.platform != platform_enclave::TeePlatform::SevSnp {
+            return Err(ApiError::AttestationUnavailable);
+        }
+        self.attestation
+            .verify_evidence(&evidence, &report_data)
+            .map_err(|_| ApiError::AttestationUnavailable)?;
+
+        let platform = match evidence.platform {
+            platform_enclave::TeePlatform::SevSnp => "amd-sev-snp",
+            platform_enclave::TeePlatform::Simulated => "simulated",
+            platform_enclave::TeePlatform::Development => "development",
+        };
+
+        Ok(AttestationBundle {
+            platform: platform.to_owned(),
+            nonce_b64: B64.encode(nonce),
+            report_b64: B64.encode(&evidence.report),
+            cert_chain_b64: B64.encode(&evidence.cert_chain),
+            enclave_hpke_public_key_b64: B64.encode(self.identity.enclave_hpke_public_key()),
+            result_signing_public_key_b64: B64.encode(self.identity.result_signing_public_key()),
+            tls_cert_sha256_b64: B64.encode(self.identity.tls_cert_sha256()),
+            config_digest_b64: B64.encode(self.identity.config_digest()),
+        })
     }
 
     /// Enable the research-access layer: catalog, access requests, grants,
@@ -210,6 +294,15 @@ impl ConnectorQueryService {
                     Some(tenant),
                     "ok",
                     &format!("SEV-SNP evidence produced for {label}"),
+                );
+                Ok(())
+            }
+            Ok(platform_enclave::TeePlatform::Simulated) => {
+                security_audit_event(
+                    AuditKind::TeeAttestation,
+                    Some(tenant),
+                    "simulated",
+                    &format!("simulated SEV-SNP evidence verified for {label} (dev only)"),
                 );
                 Ok(())
             }
@@ -291,9 +384,10 @@ impl ConnectorQueryService {
             return Ok(Vec::new());
         };
 
+        let key_session = self.keys.begin_query_session(owner).await?;
         let envelope = self.vault.get(path).await?;
         let info = manifest_info(&owner, connector, &version);
-        let plaintext = self.keys.open_envelope(owner, &info, &envelope).await?;
+        let plaintext = key_session.open_envelope(&info, &envelope).await?;
         let manifest = serde_json::from_slice::<SnapshotManifest>(plaintext.expose())
             .ok()
             .filter(|m| m.version == version)
@@ -313,7 +407,7 @@ impl ConnectorQueryService {
             let path = TenantPaths::connector_snapshot_object(owner, connector, &version, *object);
             let envelope = self.vault.get(&path).await?;
             let info = envelope_info(&owner, connector, object);
-            let plaintext = self.keys.open_envelope(owner, &info, &envelope).await?;
+            let plaintext = key_session.open_envelope(&info, &envelope).await?;
             blobs.push(plaintext);
         }
         Ok(blobs)
