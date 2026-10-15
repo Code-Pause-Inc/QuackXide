@@ -122,6 +122,12 @@ impl TenantPaths {
         VaultPath(format!("control/tenants/{tenant}.json"))
     }
 
+    /// Prefix that holds nothing. Readiness lists it to check the store is
+    /// reachable without listing anything real.
+    pub fn readiness_probe() -> VaultPath {
+        VaultPath("control/readiness".to_owned())
+    }
+
     /// A tenant's enrolled HPKE public key, read by enclave pipelines to seal
     /// connector data to the tenant.
     pub fn tenant_enrollment(tenant: TenantId) -> VaultPath {

@@ -20,7 +20,7 @@ use platform_connectors::pipeline::envelope_info;
 use platform_connectors::snapshot::{SnapshotManifest, manifest_info};
 use platform_core::{ConnectorSlug, TenantId};
 use platform_crypto::{SecretBytes, TenantKeypair};
-use platform_enclave::{AttestationProvider, gate_execution};
+use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{BudgetError, BudgetLedger, BudgetState, CatalogRegistry, GrantRegistry};
@@ -28,7 +28,6 @@ use prometheus_client::metrics::histogram::Histogram;
 use quackxide_engine::{
     DisclosurePolicy, EngineSettings, MinCountThreshold, QueryError, QueryScope,
 };
-use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -203,8 +202,7 @@ impl ConnectorQueryService {
 
     /// Attestation gate + audit, shared by own-data and research queries.
     async fn gate(&self, tenant: TenantId, label: &str) -> Result<(), ApiError> {
-        let mut nonce = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce = fresh_nonce();
         match gate_execution(self.attestation.as_ref(), self.require_attestation, &nonce).await {
             Ok(platform_enclave::TeePlatform::SevSnp) => {
                 security_audit_event(
@@ -235,6 +233,19 @@ impl ConnectorQueryService {
                 Err(ApiError::AttestationUnavailable)
             }
         }
+    }
+
+    /// Whether the attestation gate would let a query through now. Unlike
+    /// `gate`, it emits no audit event, since readiness probes run every few
+    /// seconds.
+    pub async fn attestation_ready(&self) -> bool {
+        gate_execution(
+            self.attestation.as_ref(),
+            self.require_attestation,
+            &fresh_nonce(),
+        )
+        .await
+        .is_ok()
     }
 
     /// Wait for a plaintext slot. Hold the permit until the decrypted blobs

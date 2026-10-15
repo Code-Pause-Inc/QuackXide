@@ -28,6 +28,7 @@ use tower_http::trace::TraceLayer;
 pub mod admin;
 mod metrics;
 pub mod query;
+mod readiness;
 pub mod research;
 use admin::ProvisioningService;
 use query::{
@@ -358,6 +359,10 @@ fn routes(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/readyz",
+            get(readiness::readyz).layer(Extension(Arc::new(readiness::Readiness::default()))),
+        )
         .route("/api/v1/meta", get(meta))
         .nest("/api/v1/drive", drive)
         .nest("/api/v1/query", query)

@@ -7,6 +7,7 @@
 //! fails closed unless insecurity is requested explicitly.
 
 use async_trait::async_trait;
+use rand::Rng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeePlatform {
@@ -121,6 +122,11 @@ impl AttestationProvider for SnpAttestation {
     }
 }
 
+/// A fresh 32-byte attestation nonce from the operating system's RNG.
+pub fn fresh_nonce() -> [u8; 32] {
+    rand::rngs::OsRng.r#gen()
+}
+
 /// Execution gate for confidential workloads; `Ok` means execution may
 /// proceed on the returned platform.
 ///
@@ -157,6 +163,11 @@ pub fn provider_for(attestation_required: bool) -> std::sync::Arc<dyn Attestatio
 mod tests {
     use super::*;
 
+    #[test]
+    fn fresh_nonces_differ() {
+        assert_ne!(fresh_nonce(), fresh_nonce());
+    }
+
     #[tokio::test]
     async fn strict_dev_attestation_fails_closed() {
         let provider = DevAttestation::strict();
@@ -178,5 +189,66 @@ mod tests {
     async fn snp_provider_fails_closed_off_confidential_hardware() {
         let provider = SnpAttestation::new();
         assert!(provider.produce_evidence(b"nonce").await.is_err());
+    }
+
+    /// Claims SEV-SNP evidence. The gate trusts the platform tag until P47
+    /// verifies reports, so this stands in for real hardware.
+    struct SevSnpEvidence;
+
+    #[async_trait]
+    impl AttestationProvider for SevSnpEvidence {
+        async fn produce_evidence(
+            &self,
+            nonce: &[u8],
+        ) -> Result<AttestationEvidence, EnclaveError> {
+            Ok(AttestationEvidence {
+                platform: TeePlatform::SevSnp,
+                nonce: nonce.to_vec(),
+                report: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_proceeds_on_sev_snp_evidence() {
+        for required in [true, false] {
+            let platform = gate_execution(&SevSnpEvidence, required, b"nonce")
+                .await
+                .expect("SEV-SNP evidence proceeds");
+            assert_eq!(platform, TeePlatform::SevSnp);
+        }
+    }
+
+    #[tokio::test]
+    async fn required_gate_rejects_development_evidence() {
+        let provider = DevAttestation::allow_insecure_dev();
+        let result = gate_execution(&provider, true, b"nonce").await;
+        assert!(
+            matches!(result, Err(EnclaveError::Rejected(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_gate_refuses_when_the_provider_fails() {
+        let provider = DevAttestation::strict();
+        let result = gate_execution(&provider, true, b"nonce").await;
+        assert!(
+            matches!(result, Err(EnclaveError::Unavailable(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrequired_gate_proceeds_unattested() {
+        for provider in [
+            DevAttestation::allow_insecure_dev(),
+            DevAttestation::strict(),
+        ] {
+            let platform = gate_execution(&provider, false, b"nonce")
+                .await
+                .expect("development proceeds");
+            assert_eq!(platform, TeePlatform::Development);
+        }
     }
 }
