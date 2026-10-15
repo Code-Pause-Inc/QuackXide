@@ -36,3 +36,4 @@ What becomes easier or harder, and what must now be true.
 * [0003. Connector data as versioned snapshots](0003-connector-data-as-versioned-snapshots.md)
 * [0004. Key custody and attested key release](0004-key-custody.md)
 * [0005. Query and deployment topology](0005-query-topology.md)
+* [0008. Upgrade DataFusion, Arrow, Parquet, and `object_store`](0008-datafusion-55-upgrade.md)

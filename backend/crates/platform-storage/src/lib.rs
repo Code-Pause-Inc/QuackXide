@@ -24,7 +24,7 @@ use futures::TryStreamExt;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 
 /// A storage path that can only be constructed through [`TenantPaths`] (or
