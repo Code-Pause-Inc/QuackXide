@@ -7,6 +7,7 @@ use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
@@ -82,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
 /// Completes on Ctrl-C or SIGTERM, which is how a VM or container runtime
 /// stops the service. The SIGTERM handler is installed before serving, so a
 /// stop request that arrives during startup is not lost.
+#[cfg(unix)]
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     let mut terminate = signal(SignalKind::terminate())?;
     Ok(async move {
@@ -92,7 +94,15 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     })
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl-C received, shutting down");
+    })
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::Duration;
 
