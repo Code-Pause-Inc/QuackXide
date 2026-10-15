@@ -201,14 +201,16 @@ fn shell_quote(text: &str) -> String {
 }
 
 /// Writes this run's own temporary file beside `out`, then renames it to
-/// `out`. A failed or interrupted run never leaves a truncated file under the
-/// real name, and concurrent runs never share a temporary file.
+/// `out`. The plan is built before creating any directory or temporary file,
+/// a failed or interrupted run never leaves a truncated file under the real
+/// name, and concurrent runs never share a temporary file.
 fn write_atomically(spec: &Spec, out: &Path) -> Result<(), String> {
+    let batches = synth_data::batches(spec).map_err(|e| e.to_string())?;
     if let Some(dir) = out.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     let (tmp, file) = create_temp_beside(out)?;
-    let written = write_then_rename(spec, file, &tmp, out);
+    let written = write_then_rename(batches, file, &tmp, out);
     if written.is_err() {
         // Only this run's file: another run's temporary file is never touched.
         let _ = fs::remove_file(tmp);
@@ -241,9 +243,16 @@ fn create_temp_beside(out: &Path) -> Result<(PathBuf, File), String> {
     Err(format!("no free temporary name beside {}", out.display()))
 }
 
-fn write_then_rename(spec: &Spec, file: File, tmp: &Path, out: &Path) -> Result<(), String> {
+fn write_then_rename(
+    batches: synth_data::Batches,
+    file: File,
+    tmp: &Path,
+    out: &Path,
+) -> Result<(), String> {
     let mut writer = BufWriter::new(file);
-    synth_data::write_parquet(spec, &mut writer).map_err(|e| e.to_string())?;
+    batches
+        .write_parquet(&mut writer)
+        .map_err(|e| e.to_string())?;
     // Flushes, then drops the file, so it is closed before the rename.
     writer
         .into_inner()
@@ -351,6 +360,8 @@ mod tests {
             "--schema cohort --seed 7 --rows 99",
             "--schema cohort --seed 7 --rows 200 --k 1",
             "--schema wide --seed 7 --rows 0",
+            "--schema cohort --seed 7 --rows 18446744073709551615",
+            "--schema wide --seed 7 --rows 18446744073709551615",
         ] {
             assert!(parse(line).is_err(), "accepted {line:?}");
         }
@@ -370,6 +381,14 @@ mod tests {
         assert!(out.is_file());
         assert!(partial_files(&dir).is_empty());
         fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn invalid_spec_creates_no_directory_or_partial() {
+        let dir = scratch_dir("invalid-spec");
+        let out = dir.join("cohort.parquet");
+        assert!(write_atomically(&Spec::new(SchemaName::Cohort, 1, usize::MAX), &out).is_err());
+        assert!(!dir.exists());
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub const MIN_K: usize = 2;
 /// `i64`.
 pub const MAX_K: usize = 1_000_000;
 
+/// Largest `rows` either schema accepts, so a huge count is refused by
+/// [`Spec::validate`] instead of panicking when allocating the cohort plan.
+pub const MAX_ROWS: usize = 100_000_000;
+
 /// Rows per record batch. The generated values do not depend on it.
 pub const BATCH_ROWS: usize = 8192;
 
@@ -130,8 +134,9 @@ impl Spec {
         Self { k, ..self }
     }
 
-    /// Refuses a cohort `k` outside [`MIN_K`]..=[`MAX_K`], and too few rows:
-    /// the cohort needs [`cohort::min_rows`], `wide` at least one.
+    /// Refuses a cohort `k` outside [`MIN_K`]..=[`MAX_K`], and a row count
+    /// outside `min..=`[`MAX_ROWS`] (the cohort needs [`cohort::min_rows`],
+    /// `wide` at least one).
     pub fn validate(&self) -> Result<(), Error> {
         let min = match self.schema {
             SchemaName::Cohort => {
@@ -148,6 +153,9 @@ impl Spec {
                 rows: self.rows,
                 min,
             });
+        }
+        if self.rows > MAX_ROWS {
+            return Err(Error::TooManyRows { rows: self.rows });
         }
         Ok(())
     }
@@ -172,13 +180,7 @@ pub fn batches(spec: &Spec) -> Result<Batches, Error> {
 /// Writes `spec` to `out` as one Parquet file, a batch at a time, with
 /// parquet-rs's default writer settings.
 pub fn write_parquet<W: Write + Send>(spec: &Spec, out: W) -> Result<(), Error> {
-    let source = batches(spec)?;
-    let mut writer = ArrowWriter::try_new(out, source.schema(), None)?;
-    for batch in source {
-        writer.write(&batch?)?;
-    }
-    writer.close()?;
-    Ok(())
+    batches(spec)?.write_parquet(out)
 }
 
 /// `spec` as in-memory Parquet, for example for
@@ -208,6 +210,17 @@ impl Batches {
     /// The Arrow schema of every batch.
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Writes these batches to `out` as one Parquet file with parquet-rs's
+    /// default writer settings.
+    pub fn write_parquet<W: Write + Send>(self, out: W) -> Result<(), Error> {
+        let mut writer = ArrowWriter::try_new(out, self.schema(), None)?;
+        for batch in self {
+            writer.write(&batch?)?;
+        }
+        writer.close()?;
+        Ok(())
     }
 }
 
@@ -242,6 +255,8 @@ pub enum Error {
         rows: usize,
         min: usize,
     },
+    /// More than [`MAX_ROWS`] rows.
+    TooManyRows { rows: usize },
     /// Building a record batch failed.
     Arrow(ArrowError),
     /// Writing Parquet failed, including I/O errors from the output.
@@ -264,6 +279,9 @@ impl fmt::Display for Error {
                     f,
                     "the {schema} schema needs at least {min} rows, got {rows}"
                 )
+            }
+            Error::TooManyRows { rows } => {
+                write!(f, "rows must be at most {MAX_ROWS}, got {rows}")
             }
             Error::Arrow(e) => write!(f, "building a record batch failed: {e}"),
             Error::Parquet(e) => write!(f, "writing Parquet failed: {e}"),

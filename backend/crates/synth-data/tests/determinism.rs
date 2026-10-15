@@ -14,8 +14,8 @@ use arrow::datatypes::{Float64Type, Int64Type};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use synth_data::{
-    BATCH_ROWS, DEFAULT_K, Error, MAX_K, MIN_K, SchemaName, Spec, batches, cohort, parquet_bytes,
-    wide, write_parquet,
+    BATCH_ROWS, DEFAULT_K, Error, MAX_K, MAX_ROWS, MIN_K, SchemaName, Spec, batches, cohort,
+    parquet_bytes, wide, write_parquet,
 };
 
 // ── determinism ──────────────────────────────────────────────────────────────
@@ -32,6 +32,41 @@ fn same_seed_gives_identical_decoded_batches() {
         assert!(!first.is_empty());
         assert!(first == second, "same seed, different rows: {spec:?}");
     }
+}
+
+#[test]
+fn fixed_seed_matches_pinned_values() {
+    let cohort_batch = one_batch(&Spec::new(SchemaName::Cohort, 7, 100));
+    assert_eq!(
+        &strings(&cohort_batch, "condition")[..5],
+        [
+            "transplant",
+            "asthma",
+            "transplant",
+            "hypertension",
+            "diabetes",
+        ]
+    );
+    assert_eq!(&ints(&cohort_batch, "age")[..5], [54, 75, 63, 54, 38]);
+    assert_eq!(
+        &ints(&cohort_batch, "cost_cents")[..5],
+        [79_800_000, 199_386, 154_854, 156_568, 198_385]
+    );
+
+    let wide_batch = one_batch(&Spec::new(SchemaName::Wide, 7, 5));
+    assert_eq!(
+        strings(&wide_batch, "region"),
+        ["west", "east", "north", "east", "south"]
+    );
+    assert_eq!(ints(&wide_batch, "bucket"), [87, 97, 11, 44, 62]);
+    assert_eq!(
+        ints(&wide_batch, "i00"),
+        [373_256, 746_162, 206_834, 345_124, 901_309]
+    );
+    assert_eq!(
+        floats(&wide_batch, "f00"),
+        [67_247.85, 95_224.99, 23_677.35, 54_248.09, 71_703.33]
+    );
 }
 
 #[test]
@@ -261,6 +296,21 @@ fn zero_wide_rows_are_refused() {
         other => panic!("expected TooFewRows, got {other:?}"),
     }
     assert!(Spec::new(SchemaName::Wide, 1, 1).validate().is_ok());
+}
+
+#[test]
+fn too_many_rows_are_refused() {
+    for schema in SchemaName::ALL {
+        for rows in [MAX_ROWS + 1, usize::MAX] {
+            let error = refusal(Spec::new(schema, 1, rows));
+            assert!(error.to_string().contains(&format!("got {rows}")), "{error}");
+            match error {
+                Error::TooManyRows { rows: got } => assert_eq!(got, rows),
+                other => panic!("{schema}, {rows}: expected TooManyRows, got {other:?}"),
+            }
+        }
+        assert!(Spec::new(schema, 1, MAX_ROWS).validate().is_ok());
+    }
 }
 
 #[test]

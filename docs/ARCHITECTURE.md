@@ -24,6 +24,18 @@ encrypted Parquet, using blind indexes so equality search never reveals
 values. Compromise of the object store, of the API host's disk, or of an
 operator credential yields ciphertext only.
 
+## Deployment topology (target)
+
+ADR 0005 fixes the boundary. `platform-api`, with the query engine
+in-process, runs inside an attested SEV-SNP Confidential VM; "the enclave"
+in this document means that process inside that VM. TLS terminates in
+`platform-api`, and the frontend is served from the same origin. Every
+setting the operator can pass to the VM is untrusted: security-relevant
+settings are constants, bounded in code, or part of a deployment
+configuration bound into the attestation evidence, and secrets arrive only
+by release to the attested workload. Today `platform-api` serves plain HTTP
+and reads all configuration from the environment.
+
 ## Dataflows
 
 ### 1. Drive (zero-knowledge storage)
@@ -330,6 +342,18 @@ Rules, enforced by the capture tests:
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
    and provisioning.
+
+Readiness probes (`GET /readyz`) emit no events. They run every few
+seconds, touch no tenant data, and only list an empty control prefix and
+run the attestation check. The response is only `ready` or `not_ready`;
+which check failed goes to the operational log.
+
+Operational metrics are separate from this stream: request counts and
+latency, error responses by kind, and the wait for a plaintext slot, in
+OpenMetrics text format (which Prometheus scrapes) on a loopback-only
+listener (`METRICS_BIND_ADDR`, default `127.0.0.1:9464`), never on the
+API's port. Labels are route patterns, methods, status codes and error
+kinds only: no tenant ids, paths, messages, SQL text or engine name.
 
 ## Structural enforcement
 
