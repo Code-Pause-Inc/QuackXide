@@ -22,7 +22,7 @@ use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_i
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::{SecretBytes, TenantKeypair, hpke_seal_to_tenant};
-use platform_enclave::DevAttestation;
+use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use quackxide_engine::EngineSettings;
 use tower::ServiceExt;
@@ -38,6 +38,22 @@ fn token_for(tenant: TenantId) -> String {
 /// Build an app whose vault already holds a QuickBooks sync sealed to
 /// `tenant`, queryable via a dev key provider holding the matching keypair.
 async fn app_with_sealed_quickbooks(tenant: TenantId, zk: ZkMode) -> Router {
+    app_with_attestation(
+        tenant,
+        zk,
+        Arc::new(DevAttestation::allow_insecure_dev()),
+        false,
+    )
+    .await
+}
+
+/// As [`app_with_sealed_quickbooks`], with the query gate's attestation.
+async fn app_with_attestation(
+    tenant: TenantId,
+    zk: ZkMode,
+    attestation: Arc<dyn AttestationProvider>,
+    require_attestation: bool,
+) -> Router {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
 
@@ -57,12 +73,12 @@ async fn app_with_sealed_quickbooks(tenant: TenantId, zk: ZkMode) -> Router {
     let service = ConnectorQueryService::new(
         vault.clone(),
         Arc::new(DevKeyProvider::new(tenant, keypair)),
-        Arc::new(DevAttestation::allow_insecure_dev()),
+        attestation,
         EngineSettings {
             zk,
             max_concurrent_queries: 4,
         },
-        false,
+        require_attestation,
     )
     .with_min_cohort(2);
 
@@ -127,6 +143,27 @@ async fn confidential_query_returns_aggregate_over_sealed_connector_data() {
     assert_eq!(rows[0]["revenue"], 99.99);
     assert_eq!(rows[1]["currency"], "USD");
     assert_eq!(rows[1]["revenue"], 1730.25);
+}
+
+#[tokio::test]
+async fn query_is_refused_when_attestation_is_required_and_fails() {
+    // No evidence at all, then development evidence where SEV-SNP is required.
+    let providers: [Arc<dyn AttestationProvider>; 2] = [
+        Arc::new(DevAttestation::strict()),
+        Arc::new(DevAttestation::allow_insecure_dev()),
+    ];
+    for provider in providers {
+        let tenant = TenantId::generate();
+        let app = app_with_attestation(tenant, ZkMode::Disabled, provider, true).await;
+        let (status, body) = post_query(
+            &app,
+            Some(&token_for(tenant)),
+            r#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+        assert_eq!(body["error"], "enclave attestation unavailable");
+    }
 }
 
 #[tokio::test]
@@ -320,6 +357,26 @@ async fn observed_service(
     max_concurrent_queries: usize,
     fail_on_call: Option<usize>,
 ) -> (ConnectorQueryService, Arc<ObservedKeys>) {
+    observed_service_with_attestation(
+        tenant,
+        syncs,
+        max_concurrent_queries,
+        fail_on_call,
+        Arc::new(DevAttestation::allow_insecure_dev()),
+        false,
+    )
+    .await
+}
+
+/// As [`observed_service`], with the query gate's attestation.
+async fn observed_service_with_attestation(
+    tenant: TenantId,
+    syncs: usize,
+    max_concurrent_queries: usize,
+    fail_on_call: Option<usize>,
+    attestation: Arc<dyn AttestationProvider>,
+    require_attestation: bool,
+) -> (ConnectorQueryService, Arc<ObservedKeys>) {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
     let pipeline = EnclavePipeline::new(
@@ -345,12 +402,12 @@ async fn observed_service(
     let service = ConnectorQueryService::new(
         vault,
         keys.clone(),
-        Arc::new(DevAttestation::allow_insecure_dev()),
+        attestation,
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries,
         },
-        false,
+        require_attestation,
     );
     (service, keys)
 }
@@ -400,6 +457,24 @@ async fn zero_query_limit_refuses_instead_of_hanging() {
     )
     .await
     .expect("must not wait forever");
+    assert_eq!(error_status(result), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(keys.calls.load(Ordering::SeqCst), 0, "nothing decrypted");
+}
+
+#[tokio::test]
+async fn refused_attestation_opens_no_key() {
+    let tenant = TenantId::generate();
+    let (service, keys) = observed_service_with_attestation(
+        tenant,
+        1,
+        4,
+        None,
+        Arc::new(DevAttestation::strict()),
+        true,
+    )
+    .await;
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let result = service.query(tenant, &connector, COUNT_SQL).await;
     assert_eq!(error_status(result), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(keys.calls.load(Ordering::SeqCst), 0, "nothing decrypted");
 }

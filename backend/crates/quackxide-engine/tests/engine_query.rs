@@ -155,7 +155,7 @@ async fn disabled_zk_mode_allows_row_level_queries() {
 
 #[tokio::test]
 async fn querying_unregistered_table_errors() {
-    let scope = QueryScope::new(EngineSettings::default());
+    let scope = scope(ZkMode::Disabled);
     assert!(scope.sql("SELECT * FROM missing").await.is_err());
 }
 

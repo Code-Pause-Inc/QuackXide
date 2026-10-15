@@ -54,21 +54,13 @@ pub enum QueryError {
     StatementNotAllowed,
 }
 
+/// No `Default`: every caller chooses the ZK mode explicitly.
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
     /// Platform default comes from `FEATURE_ZK_ENABLED`; callers may override
     /// it per scope.
     pub zk: ZkMode,
     pub max_concurrent_queries: usize,
-}
-
-impl Default for EngineSettings {
-    fn default() -> Self {
-        Self {
-            zk: ZkMode::Disabled,
-            max_concurrent_queries: 4,
-        }
-    }
 }
 
 /// RAII scope for one query session.
@@ -294,16 +286,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_are_conservative() {
-        let scope = QueryScope::new(EngineSettings::default());
-        assert!(!scope.settings().zk.is_enabled());
-        assert!(scope.settings().max_concurrent_queries >= 1);
-    }
-
-    #[test]
     fn scope_cannot_reach_the_local_filesystem() {
         use datafusion::execution::object_store::ObjectStoreUrl;
-        let scope = QueryScope::new(EngineSettings::default());
+        let scope = QueryScope::new(EngineSettings {
+            zk: ZkMode::Enabled,
+            max_concurrent_queries: 1,
+        });
         let local = ObjectStoreUrl::local_filesystem();
         assert!(scope.ctx.runtime_env().object_store(&local).is_err());
     }
