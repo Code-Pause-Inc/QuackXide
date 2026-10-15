@@ -13,15 +13,11 @@ ignore = [
     # service performs RSA private-key operations. RS256 is retired by
     # ADR 0001.
     { id = "RUSTSEC-2023-0071", reason = "no network-facing RSA private-key operations; RS256 retired by ADR 0001" },
-    # quick-xml DoS: parsed only from the operator's object-store responses
-    # (via object_store 0.12, pinned by DataFusion 49). Fixed by the DataFusion
-    # upgrade tracked in docs/PROJECT_SCOPE.md.
-    { id = "RUSTSEC-2026-0194", reason = "object-store XML only; fixed by the DataFusion upgrade" },
-    { id = "RUSTSEC-2026-0195", reason = "object-store XML only; fixed by the DataFusion upgrade" },
-    # Unmaintained, no advisory against the code itself; transitive via
-    # DataFusion and object_store. Revisit on each DataFusion upgrade.
-    { id = "RUSTSEC-2024-0436", reason = "paste: compile-time proc-macro via DataFusion; unmaintained only" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile via object_store; unmaintained only" },
+    # quick-xml DoS (fixed in >= 0.41.0): parsed only from the operator's
+    # object-store XML responses (via object_store 0.13, pinned by DataFusion
+    # 55 to quick-xml 0.39). Revisit when object_store moves to quick-xml 0.41+.
+    { id = "RUSTSEC-2026-0194", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
+    { id = "RUSTSEC-2026-0195", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
 ]
 
 [licenses]

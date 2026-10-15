@@ -191,10 +191,10 @@ mod tests {
                     if line == "\r\n" || line.is_empty() {
                         break;
                     }
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.eq_ignore_ascii_case("content-length") {
-                            content_length = value.trim().parse().expect("length");
-                        }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().expect("length");
                     }
                 }
                 let mut body = vec![0u8; content_length];

@@ -119,12 +119,12 @@ const CASES: &[(&str, &str, Expect)] = &[
     // COUNT variants as n.
     ("count_case", "SELECT dept, COUNT(CASE WHEN dept <> 'ceo' THEN 1 END) AS n FROM people GROUP BY dept", Rejected),
     ("count_distinct", "SELECT dept, COUNT(DISTINCT id) AS n FROM people GROUP BY dept", Rejected),
-    ("count_filter", "SELECT dept, COUNT(*) FILTER (WHERE salary > 0) AS n FROM people GROUP BY dept", Unplannable),
+    ("count_filter", "SELECT dept, COUNT(*) FILTER (WHERE salary > 0) AS n FROM people GROUP BY dept", Rejected),
     ("count_column", "SELECT dept, COUNT(salary) AS n FROM people GROUP BY dept", Rejected),
     // Sub-cohort isolation inside a large group.
     ("case_in_sum", "SELECT COUNT(*) AS n, SUM(CASE WHEN id = 'p15' THEN salary ELSE 0 END) AS s FROM people", Rejected),
     ("case_in_max", "SELECT COUNT(*) AS n, MAX(CASE WHEN dept = 'legal' THEN salary END) AS s FROM people", Rejected),
-    ("filter_on_value", "SELECT COUNT(*) AS n, MAX(salary) FILTER (WHERE dept = 'ceo') AS s FROM people", Unplannable),
+    ("filter_on_value", "SELECT COUNT(*) AS n, MAX(salary) FILTER (WHERE dept = 'ceo') AS s FROM people", Rejected),
     ("arith_isolation", "SELECT COUNT(*) AS n, SUM(salary * CAST(id = 'p15' AS BIGINT)) AS s FROM people", Rejected),
     ("computed_below", "SELECT COUNT(*) AS n, MAX(s) AS s FROM (SELECT CASE WHEN id = 'p15' THEN salary END AS s FROM people) t", Rejected),
     ("computed_label_below", "SELECT COUNT(*) AS n, MAX(d) AS d FROM (SELECT CASE WHEN dept = 'ceo' THEN dept END AS d FROM people) t", Rejected),

@@ -33,10 +33,10 @@ impl Readiness {
     async fn is_ready(&self, state: &AppState) -> bool {
         // Held across the run, so concurrent probes wait for one result.
         let mut last = self.last.lock().await;
-        if let Some((at, failed)) = last.as_ref() {
-            if at.elapsed() < CACHE_FOR {
-                return failed.is_empty();
-            }
+        if let Some((at, failed)) = last.as_ref()
+            && at.elapsed() < CACHE_FOR
+        {
+            return failed.is_empty();
         }
         let failed = failed_checks(state).await;
         if last.as_ref().map(|(_, previous)| previous) != Some(&failed) {
