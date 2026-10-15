@@ -6,6 +6,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+* `docs/TESTING.md`: where each test layer lives, the naming and placement
+  convention for negative tests and audit assertions, and the substitutes
+  for what CI cannot exercise.
+
 ### Security
 
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A

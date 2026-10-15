@@ -48,7 +48,8 @@ the repository's supply-chain posture. Tagged releases are built from
 * **No `unsafe`.** The workspace denies it.
 * **A test for every failure path.** Every new refusal gets a negative
   test, and every new security decision emits a `SECURITY_AUDIT_EVENT`
-  covered by `platform-api/tests/audit_coverage.rs`.
+  covered by `platform-api/tests/audit_coverage.rs`. `docs/TESTING.md`
+  says where each test goes and how to name it.
 * **Audit events carry identifiers and outcomes only** — never key
   material, plaintext, filenames, or SQL text.
 * **Synthetic or public data only.** See `docs/DATA_POLICY.md`.
