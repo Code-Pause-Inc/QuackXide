@@ -35,6 +35,11 @@ uses [Semantic Versioning](https://semver.org/).
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
 
+### Changed
+
+* `platform-api` shuts down gracefully on SIGTERM as well as Ctrl-C, so
+  stopping its VM or container lets in-flight requests finish.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added
