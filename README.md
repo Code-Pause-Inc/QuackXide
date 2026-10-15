@@ -81,6 +81,7 @@ Every security decision, including denials, is written to a
 | `docs/PROJECT_SCOPE.md` | Release scope and definition of done |
 | `docs/V1_PLAN.md` | v1.0 plan: work items, order, and the issues they map to |
 | `docs/DATA_POLICY.md` | Synthetic and public data only |
+| `docs/SIMULATED_TEE_GCP_GUIDE.md` | Simulated SEV-SNP TEE to Google Cloud Confidential VM implementation guide |
 | `docs/adr/` | Architecture decision records |
 
 ## Layout
@@ -92,18 +93,21 @@ backend/crates/
   platform-telemetry/     JSON tracing + SECURITY_AUDIT_EVENT stream
   platform-crypto/        AEAD, HPKE envelopes, blind indexes, TOTP
   platform-auth/          JWT verification (dev HS256, RS256/JWKS) + keygen
-  platform-storage/       Tenant-isolated ciphertext vault (GCS / in-memory)
-  platform-enclave/       SEV-SNP attestation (fail-closed)
+  platform-storage/       Tenant-isolated ciphertext vault (GCS / emulator / in-memory)
+  platform-enclave/       1184B SEV-SNP report parser, P-384 chain verifier, SimulatedSnp
   platform-connectors/    Connector catalog, OAuth2, NDJSON, Parquet-out
   platform-tenancy/       Tenants, grants, budgets, dataset catalog
   platform-billing/       Merchant-of-Record webhook verification
   quackxide-engine/       QueryScope, plan gate, disclosure policies
-  platform-api/           HTTP edge (binary) + integration tests
+  platform-api/           HTTP edge, key-release relying party (bin/key-release), tests
   synth-data/             Seeded synthetic test and benchmark data (dev-only)
 frontend/src/
   lib/crypto/             Web Crypto worker (keys never touch the UI thread)
   lib/vault/              Ciphertext-only vault clients (local / http)
   components/             Drive, researcher portal, steward console, admin
+Dockerfile                Multi-stage enclave-api and key-release targets (Confidential Space labels)
+docker-compose.simulated-tee.yml  3-plane local Simulated SEV-SNP TEE stack
+scripts/test-simulated-tee.sh     End-to-end Docker smoke + tamper-refusal verification
 scripts/check.sh          Validation gate — run before every push
 scripts/hooks/            Git hooks
 ```
@@ -132,8 +136,39 @@ sed -i.bak "s/^JWT_HS256_SECRET=.*/JWT_HS256_SECRET=\"$(openssl rand -hex 32)\"/
 cargo run -p platform-api                    # terminal 1
 cargo run -p platform-api --bin devtoken     # terminal 2: prints a token
 # frontend/.env: VITE_VAULT_MODE="http", VITE_DEV_JWT="<token>"
-cargo run -p platform-api --bin query-demo   # sealed-query round trip
+cargo run -p platform-api --bin query-demo   # sealed-query round trip over SimulatedSnp + KeyReleaseRelyingParty
 ```
+
+### Simulated AMD SEV-SNP TEE (Local Docker)
+
+`docker-compose.simulated-tee.yml` runs the 3-plane Confidential Computing
+topology locally across isolated networks (`public_net` and `internal: true`
+`enclave_internal_net`) with `read_only: true`, `cap_drop: ["ALL"]`, and
+Google Cloud Confidential Space `tee.launch_policy.*` image labels:
+
+* **`enclave-api`** — Confidential workload container (`platform-api`) using
+  `SimulatedSnp` to sign 1184-byte binary SEV-SNP reports binding its
+  ephemeral X25519 HPKE key and P-384 result-signing key into `REPORT_DATA`.
+* **`key-release-service`** — Standalone relying party (`bin/key-release`)
+  that verifies the `ARK -> ASK -> VCEK` P-384 chain, `MEASUREMENT`,
+  `GuestPolicy` (`DEBUG=0`, `MIGRATE_MA=0`), `TcbVersion`, and single-use
+  challenge nonce before wrapping a tenant's private key via HPKE
+  (`key-release-v1`) for a single query.
+* **`fake-gcs`** — Local Cloud Storage vault (`fsouza/fake-gcs-server` via
+  `STORAGE_EMULATOR_HOST`) holding only HPKE-sealed manifests and Parquet
+  snapshots.
+
+Run the full Docker stack or execute the automated happy-path and
+tamper-refusal (`MEASUREMENT` mismatch + `GuestPolicy::DEBUG=1`) suite:
+
+```sh
+docker compose -f docker-compose.simulated-tee.yml up --build
+./scripts/test-simulated-tee.sh
+```
+
+See `docs/SIMULATED_TEE_GCP_GUIDE.md` for how each simulated component maps to
+Google Cloud Confidential Space, Confidential VMs (AMD SEV-SNP), Cloud KMS,
+and VPC Service Controls.
 
 Synthetic data (dev-only), from `backend/`:
 
@@ -163,12 +198,18 @@ production release (details in `docs/PROJECT_SCOPE.md`):
 
 * **Sign-in** — RS256/JWKS verification and TOTP exist; the managed
   sign-in service does not. Development uses HS256 tokens.
-* **Attestation** — SEV-SNP report verification is not implemented; with
-  `TEE_ATTESTATION_REQUIRED=true` every sync is refused.
-* **Key release** — the enclave key-release path is not wired; query
-  endpoints return 503 in production builds.
+* **Attestation** — 1184-byte binary SEV-SNP report parsing, `ARK -> ASK -> VCEK`
+  P-384 certificate chain verification (`AttestationVerifier`), and
+  protocol-faithful `SimulatedSnp` are implemented. Hardware `/dev/sev-guest`
+  report acquisition (`SnpAttestation` when `TEE_ATTESTATION_REQUIRED=true`)
+  and browser-side quote verification remain before production cutover.
+* **Key release** — attestation-gated HPKE key release
+  (`KeyReleaseRelyingParty`, `AttestedKeyProvider`, `bin/key-release`) with
+  once-per-query key sessions and zeroize-on-drop is implemented; Cloud KMS /
+  HSM backing for the relying party remains.
 * **Durability** — registries are in-memory behind traits.
-* **Encrypted results** — results currently leave as JSON over TLS.
+* **Encrypted results** — query responses carry an attested P-384
+  `enclave_signature` over JSON/TLS; client-key HPKE result encryption remains.
 * **Post-quantum cryptography** — target is X25519 + ML-KEM-768 and
   Ed25519 + ML-DSA-65; current suites are X25519 and RS256.
 

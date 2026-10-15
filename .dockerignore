@@ -1,0 +1,9 @@
+.git
+.github
+backend/target
+frontend
+node_modules
+docs
+*.md
+.env
+backend/.env

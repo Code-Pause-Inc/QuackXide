@@ -16,6 +16,8 @@ const DEFAULT_SYNC_INTERVAL_SECS: u64 = 900;
 pub const DEFAULT_MIN_COHORT_SIZE: u64 = 11;
 const DEFAULT_QUERY_BUDGET: u64 = 100;
 const DEFAULT_SIGNATURE_TOLERANCE_SECS: u64 = 300;
+pub const DEFAULT_QUERY_MAX_CONCURRENT: usize = 4;
+pub const MAX_QUERY_MAX_CONCURRENT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct PlatformConfig {
@@ -26,7 +28,19 @@ pub struct PlatformConfig {
     pub connectors: ConnectorConfig,
     pub research: ResearchConfig,
     pub billing: BillingConfig,
+    pub enclave: EnclaveConfig,
     pub features: FeatureFlags,
+}
+
+/// Enclave key-release and concurrency settings.
+#[derive(Debug, Clone)]
+pub struct EnclaveConfig {
+    /// `KEY_RELEASE_URL` — endpoint of the relying-party key-release service.
+    /// When unset, confidential query and research endpoints fail closed (503).
+    pub key_release_url: Option<String>,
+    /// `QUERY_MAX_CONCURRENT` — maximum concurrent queries holding decrypted
+    /// plaintext in enclave RAM (`1..=64`, default `4`).
+    pub query_max_concurrent: usize,
 }
 
 /// Merchant-of-Record (Paddle) webhook settings. Secret redacted in Debug.
@@ -219,6 +233,24 @@ impl PlatformConfig {
             )?,
         };
 
+        let raw_max_concurrent = parse_u64(
+            &get,
+            "QUERY_MAX_CONCURRENT",
+            DEFAULT_QUERY_MAX_CONCURRENT as u64,
+        )?;
+        if raw_max_concurrent == 0 || raw_max_concurrent > MAX_QUERY_MAX_CONCURRENT as u64 {
+            return Err(ConfigError::Invalid {
+                key: "QUERY_MAX_CONCURRENT",
+                reason: format!(
+                    "must be in 1..={MAX_QUERY_MAX_CONCURRENT}, got {raw_max_concurrent}"
+                ),
+            });
+        }
+        let enclave = EnclaveConfig {
+            key_release_url: get_nonempty(&get, "KEY_RELEASE_URL"),
+            query_max_concurrent: raw_max_concurrent as usize,
+        };
+
         let features = FeatureFlags {
             zk: ZkMode::from_flag(parse_bool(&get, "FEATURE_ZK_ENABLED", true)?),
             tee_attestation_required: parse_bool(&get, "TEE_ATTESTATION_REQUIRED", true)?,
@@ -235,6 +267,7 @@ impl PlatformConfig {
             connectors,
             research,
             billing,
+            enclave,
             features,
         })
     }
@@ -414,6 +447,33 @@ mod tests {
                 err.to_string().contains("METRICS_BIND_ADDR"),
                 "{addr}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn query_max_concurrent_is_bounded_and_fails_closed() {
+        let cfg = PlatformConfig::from_source(source(&[])).expect("defaults");
+        assert_eq!(
+            cfg.enclave.query_max_concurrent,
+            DEFAULT_QUERY_MAX_CONCURRENT
+        );
+        assert!(cfg.enclave.key_release_url.is_none());
+
+        let cfg = PlatformConfig::from_source(source(&[
+            ("QUERY_MAX_CONCURRENT", "16"),
+            ("KEY_RELEASE_URL", "http://127.0.0.1:8090"),
+        ]))
+        .expect("valid enclave config");
+        assert_eq!(cfg.enclave.query_max_concurrent, 16);
+        assert_eq!(
+            cfg.enclave.key_release_url.as_deref(),
+            Some("http://127.0.0.1:8090")
+        );
+
+        for invalid in ["0", "65", "not-a-number"] {
+            let err = PlatformConfig::from_source(source(&[("QUERY_MAX_CONCURRENT", invalid)]))
+                .expect_err(invalid);
+            assert!(err.to_string().contains("QUERY_MAX_CONCURRENT"), "{err}");
         }
     }
 }

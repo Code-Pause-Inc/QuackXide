@@ -32,6 +32,7 @@ pub fn init_from_env() {
 pub enum AuditKind {
     ServiceStart,
     KeyEnrollment,
+    KeyRelease,
     TeeAttestation,
     TenantProvisioned,
     DataAccess,
@@ -50,6 +51,7 @@ impl AuditKind {
         match self {
             AuditKind::ServiceStart => "service.start",
             AuditKind::KeyEnrollment => "crypto.key_enrollment",
+            AuditKind::KeyRelease => "crypto.key_release",
             AuditKind::TeeAttestation => "tee.attestation",
             AuditKind::TenantProvisioned => "tenant.provisioned",
             AuditKind::DataAccess => "data.access",

@@ -169,12 +169,15 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   `suppressed_rows`. A ZK scope without a threshold, or with `k = 0`,
   refuses every query.
 * **Key-release trust boundary.** The server cannot decrypt tenant data on
-  its own (envelopes are sealed to a private key it does not hold). The
-  query endpoint models the confidential-computing pattern: the key is
-  released only into an attested enclave (`EnclaveKeyProvider`), gated by
-  the same attestation seam as the pipeline. That release path is not wired
-  in this build → the endpoint fails closed with 503; the full path is
-  proven by the `DevKeyProvider` in tests and the `query-demo` binary.
+  its own (envelopes are sealed to a private key it does not hold at rest).
+  When `KEY_RELEASE_URL` is configured, `AttestedKeyProvider` acquires a
+  per-query `ReleasedKeySession` from `KeyReleaseRelyingParty`: it fetches a
+  single-use challenge nonce, binds the nonce and its in-RAM `EnclaveIdentity`
+  HPKE public key into a 64-byte `ReportDataBinding`, presents the signed
+  1184-byte `SnpReport` and `SnpCertChain` to the relying party, and unwraps
+  the HPKE-sealed tenant key into a zeroize-on-drop `TenantKeypair` for the
+  duration of that query. When `KEY_RELEASE_URL` is unset, the query endpoint
+  fails closed with 503.
 
 `FEATURE_ZK_ENABLED` sets the platform default and is `true` when unset.
 Disabling it permits row-level queries and removes the no-naked-data
@@ -268,9 +271,9 @@ traits; durable backends replace them without touching call sites.
 
 ## Cryptography posture
 
-* All primitives come from RustCrypto (`aes-gcm`, `hmac`, `sha2`, `rsa`)
-  and the `hpke` crate; TOTP is RFC 6238 over the existing HMAC stack and
-  is tested against the RFC's own vectors.
+* All primitives come from RustCrypto (`aes-gcm`, `hmac`, `p384`, `sha2`,
+  `rsa`) and the `hpke` crate; TOTP is RFC 6238 over the existing HMAC stack
+  and is tested against the RFC's own vectors.
 * Suites are pinned at single seams (one `TenantKem` type alias, one
   `JwtVerifier` construction site) and encrypted framing is versioned, so
   algorithm migration is a code change plus a version bump — not a storage
@@ -320,6 +323,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | --- | --- |
 | `service.start` | API or connector-worker boot |
 | `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
+| `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles, grants |
 | `data.access` | Every vault read, write, delete, and list — including misses |

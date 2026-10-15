@@ -333,6 +333,74 @@ async fn attestation_refusal_is_audited() {
 }
 
 #[tokio::test]
+async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_hardware() {
+    use platform_enclave::{GuestPolicy, SimulatedSnp, SimulatedSnpConfig};
+
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+
+    // 1. Valid SimulatedSnp on query path (require_attestation = false) verifies the binary report
+    // and emits outcome = "simulated".
+    let app = full_app_with_attestation(
+        tenant,
+        ZkMode::Disabled,
+        Arc::new(SimulatedSnp::new()),
+        false,
+    )
+    .await;
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        capture.contains("tee.attestation", "simulated"),
+        "{:?}",
+        capture.events()
+    );
+
+    // 2. SimulatedSnp with DEBUG policy enabled is rejected by the verifier even in dev mode.
+    let debug_sim = SimulatedSnp::with_config(SimulatedSnpConfig {
+        policy: GuestPolicy::production_default().with_debug(true),
+        ..SimulatedSnpConfig::default()
+    });
+    let bad_app =
+        full_app_with_attestation(tenant, ZkMode::Disabled, Arc::new(debug_sim), false).await;
+    let (status, _) = send(
+        &bad_app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // 3. Valid SimulatedSnp is rejected when hardware attestation is required (production mode).
+    let prod_app = full_app_with_attestation(
+        tenant,
+        ZkMode::Disabled,
+        Arc::new(SimulatedSnp::new()),
+        true,
+    )
+    .await;
+    let (status, _) = send(
+        &prod_app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn provisioning_webhook_is_audited() {
     let capture = AuditCapture::install();
     let app = full_app(TenantId::generate(), ZkMode::Disabled).await;
@@ -385,6 +453,116 @@ async fn provisioning_webhook_is_audited() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(
         capture.contains("auth.decision", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn key_release_handshake_audits_ok_and_denied_outcomes() {
+    use platform_api::key_release::{
+        AttestedKeyProvider, EnclaveIdentity, InProcessKeyReleaseClient, KeyReleaseRelyingParty,
+    };
+    use platform_enclave::{SimulatedSnp, SimulatedSnpConfig};
+
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let keypair = TenantKeypair::generate();
+    let snp = Arc::new(SimulatedSnp::new());
+
+    let pipeline = EnclavePipeline::new(snp.clone(), vault.clone(), false);
+    pipeline
+        .run_sync(&SyncJob {
+            tenant,
+            tenant_public_key: keypair.public_key(),
+            source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
+        })
+        .await
+        .expect("seal");
+
+    let rp = Arc::new(KeyReleaseRelyingParty::new(
+        snp.verifier(1_700_000_000),
+        false,
+    ));
+    rp.insert_tenant_key(tenant, &keypair);
+    let ok_provider = Arc::new(AttestedKeyProvider::new(
+        Arc::new(EnclaveIdentity::generate()),
+        snp.clone(),
+        Arc::new(InProcessKeyReleaseClient(rp.clone())),
+    ));
+    let ok_query = ConnectorQueryService::new(
+        vault.clone(),
+        ok_provider,
+        snp.clone(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+        },
+        false,
+    );
+    let ok_app = build_app(AppState {
+        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
+        vault: vault.clone(),
+        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        query: Some(Arc::new(ok_query)),
+        provisioning: None,
+    });
+
+    let (status, _) = send(
+        &ok_app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        capture.contains("crypto.key_release", "ok"),
+        "{:?}",
+        capture.events()
+    );
+
+    // Unapproved measurement triggers a key-release denial that is audited on both RP and enclave sides.
+    let bad_snp = Arc::new(SimulatedSnp::with_config(SimulatedSnpConfig {
+        measurement: [0xFF; 48],
+        ..SimulatedSnpConfig::default()
+    }));
+    let denied_provider = Arc::new(AttestedKeyProvider::new(
+        Arc::new(EnclaveIdentity::generate()),
+        bad_snp,
+        Arc::new(InProcessKeyReleaseClient(rp)),
+    ));
+    let denied_query = ConnectorQueryService::new(
+        vault.clone(),
+        denied_provider,
+        snp,
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+        },
+        false,
+    );
+    let denied_app = build_app(AppState {
+        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
+        vault,
+        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        query: Some(Arc::new(denied_query)),
+        provisioning: None,
+    });
+
+    let (status, _) = send(
+        &denied_app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        capture.contains("crypto.key_release", "denied"),
         "{:?}",
         capture.events()
     );

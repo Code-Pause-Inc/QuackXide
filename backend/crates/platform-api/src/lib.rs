@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -26,6 +26,7 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 
 pub mod admin;
+pub mod key_release;
 mod metrics;
 pub mod query;
 mod readiness;
@@ -364,6 +365,7 @@ fn routes(state: AppState) -> Router {
             get(readiness::readyz).layer(Extension(Arc::new(readiness::Readiness::default()))),
         )
         .route("/api/v1/meta", get(meta))
+        .route("/api/v1/attestation", get(get_attestation))
         .nest("/api/v1/drive", drive)
         .nest("/api/v1/query", query)
         .nest("/api/v1/grants", grants)
@@ -391,6 +393,34 @@ async fn meta(State(state): State<AppState>) -> Json<serde_json::Value> {
         "support_email": cfg.brand.support_email,
         "features": { "zk_enabled": cfg.features.zk.is_enabled() },
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestationQuery {
+    nonce_b64: Option<String>,
+}
+
+/// `GET /api/v1/attestation` — public enclave attestation evidence bundle
+/// binding a caller-supplied 32-byte challenge nonce (`?nonce_b64=...`) and
+/// the enclave's ephemeral HPKE and result-signing public keys.
+async fn get_attestation(
+    State(state): State<AppState>,
+    Query(query): Query<AttestationQuery>,
+) -> Result<Json<key_release::AttestationBundle>, ApiError> {
+    let nonce: [u8; 32] = match query.nonce_b64.as_deref() {
+        Some(raw_b64) => {
+            let decoded = B64
+                .decode(raw_b64.trim())
+                .map_err(|_| ApiError::BadRequest("invalid base64 attestation nonce"))?;
+            decoded
+                .try_into()
+                .map_err(|_| ApiError::BadRequest("attestation nonce must be 32 bytes"))?
+        }
+        None => platform_enclave::fresh_nonce(),
+    };
+    let service = query_service(&state)?;
+    let bundle = service.attestation_bundle(nonce).await?;
+    Ok(Json(bundle))
 }
 
 // ── Admin console + MoR webhook handlers ─────────────────────────────────────
