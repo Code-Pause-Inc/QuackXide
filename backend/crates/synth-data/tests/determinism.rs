@@ -303,7 +303,10 @@ fn too_many_rows_are_refused() {
     for schema in SchemaName::ALL {
         for rows in [MAX_ROWS + 1, usize::MAX] {
             let error = refusal(Spec::new(schema, 1, rows));
-            assert!(error.to_string().contains(&format!("got {rows}")), "{error}");
+            assert!(
+                error.to_string().contains(&format!("got {rows}")),
+                "{error}"
+            );
             match error {
                 Error::TooManyRows { rows: got } => assert_eq!(got, rows),
                 other => panic!("{schema}, {rows}: expected TooManyRows, got {other:?}"),
