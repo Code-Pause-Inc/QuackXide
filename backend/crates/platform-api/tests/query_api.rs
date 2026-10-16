@@ -146,6 +146,29 @@ async fn confidential_query_returns_aggregate_over_sealed_connector_data() {
 }
 
 #[tokio::test]
+async fn query_response_names_the_tee_platform() {
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    let sql = r#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#;
+
+    let simulated = app_with_attestation(
+        tenant,
+        ZkMode::Disabled,
+        Arc::new(platform_enclave::SimulatedSnp::new()),
+        false,
+    )
+    .await;
+    let (status, body) = post_query(&simulated, Some(&token), sql).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["tee_platform"], "simulated");
+
+    let dev = app_with_sealed_quickbooks(tenant, ZkMode::Disabled).await;
+    let (status, body) = post_query(&dev, Some(&token), sql).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["tee_platform"], "development");
+}
+
+#[tokio::test]
 async fn query_is_refused_when_attestation_is_required_and_fails() {
     // No evidence at all, then development evidence where SEV-SNP is required.
     let providers: [Arc<dyn AttestationProvider>; 2] = [

@@ -239,14 +239,8 @@ impl ConnectorQueryService {
             .verify_evidence(&evidence, &report_data)
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
-        let platform = match evidence.platform {
-            platform_enclave::TeePlatform::SevSnp => "amd-sev-snp",
-            platform_enclave::TeePlatform::Simulated => "simulated",
-            platform_enclave::TeePlatform::Development => "development",
-        };
-
         Ok(AttestationBundle {
-            platform: platform.to_owned(),
+            platform: platform_label(evidence.platform).to_owned(),
             nonce_b64: B64.encode(nonce),
             report_b64: B64.encode(&evidence.report),
             cert_chain_b64: B64.encode(&evidence.cert_chain),
@@ -285,7 +279,12 @@ impl ConnectorQueryService {
     }
 
     /// Attestation gate + audit, shared by own-data and research queries.
-    async fn gate(&self, tenant: TenantId, label: &str) -> Result<(), ApiError> {
+    /// Returns the platform that passed, for the response's `tee_platform`.
+    async fn gate(
+        &self,
+        tenant: TenantId,
+        label: &str,
+    ) -> Result<platform_enclave::TeePlatform, ApiError> {
         let nonce = fresh_nonce();
         match gate_execution(self.attestation.as_ref(), self.require_attestation, &nonce).await {
             Ok(platform_enclave::TeePlatform::SevSnp) => {
@@ -295,7 +294,7 @@ impl ConnectorQueryService {
                     "ok",
                     &format!("SEV-SNP evidence produced for {label}"),
                 );
-                Ok(())
+                Ok(platform_enclave::TeePlatform::SevSnp)
             }
             Ok(platform_enclave::TeePlatform::Simulated) => {
                 security_audit_event(
@@ -304,16 +303,16 @@ impl ConnectorQueryService {
                     "simulated",
                     &format!("simulated SEV-SNP evidence verified for {label} (dev only)"),
                 );
-                Ok(())
+                Ok(platform_enclave::TeePlatform::Simulated)
             }
-            Ok(_) => {
+            Ok(platform) => {
                 security_audit_event(
                     AuditKind::TeeAttestation,
                     Some(tenant),
                     "dev_insecure",
                     &format!("{label} proceeding unattested (attestation not required; dev only)"),
                 );
-                Ok(())
+                Ok(platform)
             }
             Err(err) => {
                 security_audit_event(
@@ -419,7 +418,7 @@ impl ConnectorQueryService {
         connector: &ConnectorSlug,
         sql: &str,
     ) -> Result<Value, ApiError> {
-        self.gate(tenant, "query").await?;
+        let tee_platform = platform_label(self.gate(tenant, "query").await?);
         let _slot = self.plaintext_slot().await?;
         let blobs = self.decrypt_connector(tenant, connector).await?;
         let object_count = blobs.len();
@@ -434,7 +433,7 @@ impl ConnectorQueryService {
             );
             return Ok(json!({
                 "rows": [], "row_count": 0, "suppressed_rows": 0, "object_count": 0,
-                "zk_mode": zk_mode,
+                "zk_mode": zk_mode, "tee_platform": tee_platform,
             }));
         }
 
@@ -464,7 +463,7 @@ impl ConnectorQueryService {
         );
         Ok(json!({
             "rows": rows, "row_count": row_count, "suppressed_rows": suppressed,
-            "object_count": object_count, "zk_mode": zk_mode,
+            "object_count": object_count, "zk_mode": zk_mode, "tee_platform": tee_platform,
         }))
     }
 
@@ -628,7 +627,7 @@ impl ConnectorQueryService {
             return Err(ApiError::Forbidden);
         };
 
-        self.gate(researcher, "research query").await?;
+        let tee_platform = platform_label(self.gate(researcher, "research query").await?);
 
         // Budget charge — after the attestation gate so operator
         // infrastructure failures never burn researcher budget, but before
@@ -680,7 +679,7 @@ impl ConnectorQueryService {
             return Ok(json!({
                 "rows": [], "row_count": 0, "suppressed_rows": 0,
                 "object_count": 0, "min_cohort": self.min_cohort, "mode": "research",
-                "budget_remaining": budget.remaining(),
+                "budget_remaining": budget.remaining(), "tee_platform": tee_platform,
             }));
         }
 
@@ -738,7 +737,18 @@ impl ConnectorQueryService {
             "min_cohort": self.min_cohort,
             "mode": "research",
             "budget_remaining": budget.remaining(),
+            "tee_platform": tee_platform,
         }))
+    }
+}
+
+/// The platform name in attestation bundles and query responses; the portal
+/// shows a simulated-TEE notice on "simulated".
+fn platform_label(platform: platform_enclave::TeePlatform) -> &'static str {
+    match platform {
+        platform_enclave::TeePlatform::SevSnp => "amd-sev-snp",
+        platform_enclave::TeePlatform::Simulated => "simulated",
+        platform_enclave::TeePlatform::Development => "development",
     }
 }
 

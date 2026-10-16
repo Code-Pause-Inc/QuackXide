@@ -178,6 +178,7 @@ async fn granted_researcher_gets_disclosure_controlled_aggregates() {
     .await;
     assert_eq!(status, StatusCode::OK, "query: {body}");
     assert_eq!(body["mode"], "research");
+    assert_eq!(body["tee_platform"], "development");
     assert_eq!(body["suppressed_rows"], 1);
     let rows = body["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 1);
