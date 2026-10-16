@@ -158,6 +158,13 @@ Google Cloud Confidential Space `tee.launch_policy.*` image labels:
   `STORAGE_EMULATOR_HOST`) holding only HPKE-sealed manifests and Parquet
   snapshots.
 
+The simulation runs the real protocol (report format, verifier, attested key
+release, sealed queries) on any machine. It does not protect anything: the
+host can read the simulated enclave's memory, so it is for development and CI
+only. `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence, the
+production trust root rejects simulated chains, and query and research
+responses report `"tee_platform": "simulated"`.
+
 Run the full Docker stack or execute the automated happy-path and
 tamper-refusal (`MEASUREMENT` mismatch + `GuestPolicy::DEBUG=1`) suite:
 

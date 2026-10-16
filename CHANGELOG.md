@@ -24,6 +24,8 @@ uses [Semantic Versioning](https://semver.org/).
   on both sides of the cohort threshold k and one group dominated by a
   single person, and a `wide` table for throughput benchmarks. From
   `backend/`, `cargo run -p synth-data -- --help` lists the options.
+* Query and research responses include `tee_platform`, the platform that
+  passed the attestation gate: `amd-sev-snp`, `simulated` or `development`.
 
 ### Security
 
