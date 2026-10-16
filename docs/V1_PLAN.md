@@ -63,6 +63,9 @@ The work that takes QuackXide from v0.1.0 to its first production release (`docs
 | P26 | #46 | Zeroize platform credentials held in configuration |
 | P27 | #47 | Access-request approval converges after a partial failure, and never fails open |
 | P84 | #49 | Simulated SEV-SNP mode for development and CI |
+| P46 | #98 | Test the attestation-refusal path on query and research routes |
+| P69 | #99 | DataFusion, Arrow, Parquet and `object_store` upgrade |
+| P75 | #100 | Readiness, operational metrics and graceful shutdown |
 
 Items not listed are not posted yet.
 
