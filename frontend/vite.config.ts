@@ -4,8 +4,10 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 // Branding and endpoints come from VITE_* env vars (see .env.example).
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss()],
+  // Tests ignore .env files so local tokens and branding cannot change results.
+  envDir: mode === "test" ? false : undefined,
   server: {
     port: 5173,
   },
@@ -26,4 +28,4 @@ export default defineConfig({
       },
     ],
   },
-});
+}));
