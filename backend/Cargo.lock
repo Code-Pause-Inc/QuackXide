@@ -3120,6 +3120,7 @@ name = "platform-telemetry"
 version = "0.1.0"
 dependencies = [
  "platform-core",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

@@ -54,6 +54,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 * `platform-api` shuts down gracefully on SIGTERM as well as Ctrl-C, so
   stopping its VM or container lets in-flight requests finish.
+* `connector-worker` stops on SIGTERM or Ctrl-C. A sync already running
+  finishes and commits its snapshot; jobs not yet started wait for the
+  next run.
 
 ## [0.1.0] - 2026-09-30
 
