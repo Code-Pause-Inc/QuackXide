@@ -29,6 +29,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `GET /api/v1/drive/objects` skips a manifest deleted between listing
+  and reading it, instead of failing the whole listing with 404.
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A
   subtotal row beside its group rows let one query recover a suppressed
   cohort's count and values. Sorts and limits below the aggregate are
