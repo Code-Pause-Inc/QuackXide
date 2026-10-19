@@ -3,66 +3,28 @@
 //! disclosure-controlled queries (small cohorts suppressed); ungranted and
 //! revoked access is refused; and row-level egress is blocked.
 
+mod common;
+
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
-use parquet::arrow::ArrowWriter;
-use platform_api::query::{ConnectorQueryService, MultiTenantDevKeyProvider};
-use platform_api::research::ResearchStores;
-use platform_api::{AppState, build_app};
-use platform_auth::JwtVerifier;
-use platform_config::PlatformConfig;
-use platform_connectors::snapshot::SnapshotWriter;
-use platform_core::{ConnectorSlug, TenantId, ZkMode};
+use axum::http::StatusCode;
+use platform_core::TenantId;
 use platform_crypto::TenantKeypair;
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, VaultStore};
-use platform_tenancy::{InMemoryBudgetLedger, InMemoryCatalogRegistry, InMemoryGrantRegistry};
-use quackxide_engine::EngineSettings;
-use tower::ServiceExt;
+
+use common::{call, dev_attestation, post};
 
 const SECRET: &str = "research-itest-secret";
-const ISS: &str = "urn:platform:auth";
-const AUD: &str = "urn:platform:drive";
 
 fn token_for(tenant: TenantId) -> String {
-    platform_auth::mint_token(SECRET, ISS, AUD, tenant, "itest", 3600).expect("mint")
-}
-
-/// A cohort dataset: 6 "flu" rows, 1 "rare_disease" row.
-fn cohorts_parquet() -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("condition", DataType::Utf8, false),
-        Field::new("age", DataType::Int64, false),
-    ]));
-    let condition =
-        StringArray::from_iter_values(["flu", "flu", "flu", "flu", "flu", "flu", "rare_disease"]);
-    let age = Int64Array::from(vec![30, 40, 50, 33, 44, 55, 61]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(condition), Arc::new(age)])
-        .expect("batch");
-    let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
-    writer.write(&batch).expect("write");
-    writer.close().expect("close");
-    buf
+    common::token_for(SECRET, tenant)
 }
 
 /// Build an app where `steward` has a sealed `health` connector dataset,
 /// queryable in research mode (cohort threshold k=5).
 async fn research_app(steward: TenantId, steward_keypair: TenantKeypair) -> Router {
-    research_app_with_attestation(
-        steward,
-        steward_keypair,
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        false,
-    )
-    .await
+    research_app_with_attestation(steward, steward_keypair, dev_attestation(), false).await
 }
 
 /// As [`research_app`], with the query gate's attestation.
@@ -72,80 +34,14 @@ async fn research_app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let connector = ConnectorSlug::new("health").expect("slug");
-    // Commit the cohort dataset as a snapshot sealed to the steward's key
-    // (as the pipeline would).
-    let steward_public_key = steward_keypair.public_key();
-    let mut snapshot =
-        SnapshotWriter::begin(&*vault, steward, &steward_public_key, connector.clone());
-    snapshot
-        .put("cohorts", &cohorts_parquet())
-        .await
-        .expect("put");
-    snapshot.commit().await.expect("commit");
-
-    let mut keys = MultiTenantDevKeyProvider::new();
-    keys.insert(steward, steward_keypair);
-
-    let stores = ResearchStores {
-        grants: Arc::new(InMemoryGrantRegistry::default()),
-        budgets: Arc::new(InMemoryBudgetLedger::default()),
-        catalog: Arc::new(InMemoryCatalogRegistry::default()),
-    };
-    let service = ConnectorQueryService::new(
-        vault.clone(),
-        Arc::new(keys),
+    common::research_app(
+        SECRET,
+        steward,
+        steward_keypair,
         attestation,
-        EngineSettings {
-            zk: ZkMode::Disabled, // research mode forces ZK on regardless
-            max_concurrent_queries: 4,
-        },
         require_attestation,
     )
-    .with_research(stores, 5, 100);
-
-    let config = PlatformConfig::from_source(|_| None).expect("config");
-    build_app(AppState {
-        config: Arc::new(config),
-        vault,
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: Some(Arc::new(service)),
-        provisioning: None,
-    })
-}
-
-async fn post(app: &Router, uri: &str, token: &str, body: &str) -> (StatusCode, serde_json::Value) {
-    call(app, "POST", uri, token, Some(body)).await
-}
-
-async fn call(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    token: &str,
-    body: Option<&str>,
-) -> (StatusCode, serde_json::Value) {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .body(
-            body.map(|b| Body::from(b.to_owned()))
-                .unwrap_or(Body::empty()),
-        )
-        .expect("request");
-    let response = app.clone().oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, json)
+    .await
 }
 
 const AGG_SQL: &str =

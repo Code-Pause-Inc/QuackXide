@@ -3,21 +3,18 @@
 //! the second factor cannot be skipped and a refresh token cannot be used
 //! as an access token.
 
-use std::sync::{Arc, OnceLock};
+mod common;
+
+use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::StatusCode;
 use platform_api::{AppState, build_app};
-use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
-use platform_config::PlatformConfig;
-use platform_core::TenantId;
+use platform_auth::TokenType;
 use platform_storage::ObjectStoreVault;
 use platform_telemetry::capture::AuditCapture;
-use tower::ServiceExt;
 
-const ISS: &str = "urn:platform:issuer";
-const AUD: &str = "urn:platform:drive";
+use common::{bearer, default_config, json_header, rs256_token, rs256_verifier};
 
 /// One route behind `require_tenant` in each area, and the admin route.
 const ROUTES: &[(&str, &str)] = &[
@@ -29,43 +26,26 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/tenants"),
 ];
 
-fn keypair() -> &'static GeneratedKeypair {
-    static KEYPAIR: OnceLock<GeneratedKeypair> = OnceLock::new();
-    KEYPAIR.get_or_init(|| platform_auth::generate_rs256_keypair(2048).expect("keypair"))
-}
-
-fn token(token_type: TokenType, admin: bool) -> String {
-    let keys = keypair();
-    TokenSigner::rs256_from_pem(&keys.private_pem, &keys.kid, ISS, AUD)
-        .expect("signer")
-        .mint(TenantId::generate(), "user-1", token_type, 900, admin)
-        .expect("mint")
-}
-
 fn app() -> Router {
-    let verifier = JwtVerifier::rs256_from_jwks(&keypair().jwks_json, ISS, AUD).expect("verifier");
     build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
+        config: Arc::new(default_config()),
         vault: Arc::new(ObjectStoreVault::new_in_memory()),
-        jwt: Some(Arc::new(verifier)),
+        jwt: Some(Arc::new(rs256_verifier())),
         query: None,
         provisioning: None,
     })
 }
 
 async fn status(app: &Router, method: &str, uri: &str, token: &str) -> StatusCode {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from("{}"))
-        .expect("request");
-    app.clone()
-        .oneshot(request)
-        .await
-        .expect("response")
-        .status()
+    common::send(
+        app,
+        method,
+        uri,
+        &[bearer(token), json_header()],
+        b"{}".to_vec(),
+    )
+    .await
+    .0
 }
 
 #[tokio::test]
@@ -79,7 +59,7 @@ async fn preauth_and_refresh_tokens_are_refused_on_every_route() {
         (TokenType::Refresh, false),
         (TokenType::Refresh, true),
     ] {
-        let bearer = token(token_type, admin);
+        let bearer = rs256_token(token_type, admin);
         for &(method, uri) in ROUTES {
             let got = status(&app, method, uri, &bearer).await;
             if got != StatusCode::UNAUTHORIZED {
@@ -103,8 +83,8 @@ async fn preauth_and_refresh_tokens_are_refused_on_every_route() {
 #[tokio::test]
 async fn access_tokens_still_pass_authentication() {
     let app = app();
-    let user = token(TokenType::Access, false);
-    let admin = token(TokenType::Access, true);
+    let user = rs256_token(TokenType::Access, false);
+    let admin = rs256_token(TokenType::Access, true);
     for &(method, uri) in ROUTES {
         let bearer = if uri.starts_with("/admin") {
             &admin

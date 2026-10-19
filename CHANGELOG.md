@@ -8,6 +8,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
+  cached RS256 keypair), request helpers, and app builders for the API
+  integration tests.
 * `docs/TESTING.md`: where each test layer lives, the naming and placement
   convention for negative tests and audit assertions, and the substitutes
   for what CI cannot exercise.
