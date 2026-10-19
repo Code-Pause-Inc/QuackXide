@@ -69,7 +69,8 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 Rust, Apache DataFusion, Arrow, Parquet, Axum; AMD SEV-SNP; AES-256-GCM and
 HPKE, with hybrid X25519 + ML-KEM-768 and Ed25519 + ML-DSA-65 as the target
 suites; React 19, TypeScript, Web Crypto, Vite, Tailwind. Established
-libraries only, and no silent downgrade to classical-only cryptography.
+libraries only (as ADR 0007 defines them), and no silent downgrade to
+classical-only cryptography.
 
 ## Constraints
 

@@ -8,6 +8,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
+  frame `HPK2`), the libraries and what "established" means, browser
+  storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
+  migration mode in v1.
 * `docs/TESTING.md`: where each test layer lives, the naming and placement
   convention for negative tests and audit assertions, and the substitutes
   for what CI cannot exercise.
