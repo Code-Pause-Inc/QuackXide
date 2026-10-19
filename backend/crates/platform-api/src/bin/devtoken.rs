@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         platform_auth::mint_token
     };
     let token = mint(
-        &secret,
+        secret.expose(),
         &config.auth.issuer,
         &config.auth.audience,
         tenant,

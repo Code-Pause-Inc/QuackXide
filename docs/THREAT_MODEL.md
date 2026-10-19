@@ -26,7 +26,7 @@ production requirements, including its failure paths.
 | Research grants and budgets | `platform-tenancy` registries | Steward-scoped; no existence oracle |
 | Aggregate results | Researcher portal | Plan gate, genuine-count check, cohort suppression, budget |
 | Audit stream | `SECURITY_AUDIT_EVENT` log target | Identifiers and outcomes only; no content |
-| Platform credentials | Environment (`JWT_*`, webhook secrets) | Never committed; zeroize-on-drop; redacted `Debug` |
+| Platform credentials | Environment (`JWT_*`, webhook secrets) | Never committed; the configuration copy is a `SecretString`, zeroized on drop and redacted in `Debug`; the environment copy remains (see residual risks) |
 
 ## Principals
 
@@ -137,6 +137,11 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   (clearing them would require `unsafe`). Plaintext is confined to enclave
   memory, so this matters only against an attacker who can read that
   memory.
+* **Credentials in the process environment.** Configuration reads
+  `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` into zeroizing
+  `SecretString`s, but the original values stay in the process
+  environment for the life of the process, readable by anything that can
+  read that process's memory or `/proc/<pid>/environ`.
 * **Extreme values.** `MIN` and `MAX` over a cohort of at least *k* still
   return one individual's actual value. This is standard for aggregate
   release; removing them from the allowlist, or applying a dominance rule,

@@ -27,9 +27,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let jwt = config.auth.hs256_secret.as_deref().map(|secret| {
+    let jwt = config.auth.hs256_secret.as_ref().map(|secret| {
         Arc::new(JwtVerifier::hs256(
-            secret,
+            secret.expose(),
             &config.auth.issuer,
             &config.auth.audience,
         ))

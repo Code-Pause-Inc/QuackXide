@@ -29,6 +29,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` are held as `SecretString`
+  (moved to `platform-core`), zeroized on drop and redacted in `Debug`.
+  Their environment copies remain; `docs/THREAT_MODEL.md` lists this as a
+  residual risk.
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A
   subtotal row beside its group rows let one query recover a suppressed
   cohort's count and values. Sorts and limits below the aggregate are

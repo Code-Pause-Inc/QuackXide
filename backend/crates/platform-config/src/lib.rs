@@ -6,7 +6,8 @@
 
 use std::net::SocketAddr;
 
-use platform_core::ZkMode;
+use platform_core::{SecretString, ZkMode};
+use zeroize::Zeroizing;
 
 /// Neutral fallback used until an operator sets `APP_PUBLIC_NAME`.
 pub const DEFAULT_PUBLIC_NAME: &str = "Confidential Drive";
@@ -43,26 +44,15 @@ pub struct EnclaveConfig {
     pub query_max_concurrent: usize,
 }
 
-/// Merchant-of-Record (Paddle) webhook settings. Secret redacted in Debug.
-#[derive(Clone)]
+/// Merchant-of-Record (Paddle) webhook settings. The secret is zeroized on
+/// drop and redacted in Debug.
+#[derive(Debug, Clone)]
 pub struct BillingConfig {
     /// `MOR_WEBHOOK_SECRET` — Paddle notification-destination secret. When
     /// unset, the webhook endpoint refuses.
-    pub paddle_webhook_secret: Option<String>,
+    pub paddle_webhook_secret: Option<SecretString>,
     /// `MOR_SIGNATURE_TOLERANCE_SECS` — replay-guard freshness window.
     pub signature_tolerance_secs: u64,
-}
-
-impl std::fmt::Debug for BillingConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BillingConfig")
-            .field(
-                "paddle_webhook_secret",
-                &self.paddle_webhook_secret.as_ref().map(|_| "<redacted>"),
-            )
-            .field("signature_tolerance_secs", &self.signature_tolerance_secs)
-            .finish()
-    }
 }
 
 /// Background connector sync settings.
@@ -117,29 +107,17 @@ pub struct StorageConfig {
     pub bucket: Option<String>,
 }
 
-/// JWT verification settings. Secrets never appear in Debug output.
-#[derive(Clone)]
+/// JWT verification settings. Secrets are zeroized on drop and never
+/// appear in Debug output.
+#[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// `JWT_HS256_SECRET` — shared secret for dev/self-hosted deployments.
     /// When unset, every authenticated route refuses with 503.
-    pub hs256_secret: Option<String>,
+    pub hs256_secret: Option<SecretString>,
     /// `JWT_ISSUER` — internal identifier expected in the `iss` claim.
     pub issuer: String,
     /// `JWT_AUDIENCE` — expected `aud` claim.
     pub audience: String,
-}
-
-impl std::fmt::Debug for AuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthConfig")
-            .field(
-                "hs256_secret",
-                &self.hs256_secret.as_ref().map(|_| "<redacted>"),
-            )
-            .field("issuer", &self.issuer)
-            .field("audience", &self.audience)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +179,7 @@ impl PlatformConfig {
         };
 
         let auth = AuthConfig {
-            hs256_secret: get_nonempty(&get, "JWT_HS256_SECRET"),
+            hs256_secret: get_secret(&get, "JWT_HS256_SECRET"),
             issuer: get_or(&get, "JWT_ISSUER", "urn:platform:auth"),
             audience: get_or(&get, "JWT_AUDIENCE", "urn:platform:drive"),
         };
@@ -225,7 +203,7 @@ impl PlatformConfig {
         };
 
         let billing = BillingConfig {
-            paddle_webhook_secret: get_nonempty(&get, "MOR_WEBHOOK_SECRET"),
+            paddle_webhook_secret: get_secret(&get, "MOR_WEBHOOK_SECRET"),
             signature_tolerance_secs: parse_u64(
                 &get,
                 "MOR_SIGNATURE_TOLERANCE_SECS",
@@ -284,6 +262,14 @@ fn get_nonempty(get: &impl Fn(&str) -> Option<String>, key: &str) -> Option<Stri
     get(key)
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+/// As [`get_nonempty`], for secrets: the raw value is zeroized too, so the
+/// only remaining copy is the returned [`SecretString`].
+fn get_secret(get: &impl Fn(&str) -> Option<String>, key: &str) -> Option<SecretString> {
+    let raw = Zeroizing::new(get(key)?);
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| SecretString::new(trimmed.to_owned()))
 }
 
 fn parse_u64(
@@ -391,6 +377,24 @@ mod tests {
         let debugged = format!("{:?}", cfg.auth);
         assert!(!debugged.contains("super-secret-value"));
         assert!(debugged.contains("<redacted>"));
+        assert_eq!(
+            cfg.auth.hs256_secret.as_ref().map(SecretString::expose),
+            Some("super-secret-value")
+        );
+    }
+
+    #[test]
+    fn secrets_are_trimmed_and_blank_means_unset() {
+        let cfg = PlatformConfig::from_source(source(&[
+            ("JWT_HS256_SECRET", "  padded  "),
+            ("MOR_WEBHOOK_SECRET", "   "),
+        ]))
+        .expect("loads");
+        assert_eq!(
+            cfg.auth.hs256_secret.as_ref().map(SecretString::expose),
+            Some("padded")
+        );
+        assert!(cfg.billing.paddle_webhook_secret.is_none());
     }
 
     #[test]
