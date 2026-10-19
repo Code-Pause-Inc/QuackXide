@@ -74,7 +74,16 @@ async fn main() -> anyhow::Result<()> {
         interval_secs = config.connectors.sync_interval_secs,
         "scheduler starting"
     );
-    SyncScheduler::new(pipeline, jobs).run(interval).await;
+    let shutdown = platform_telemetry::shutdown_signal()?;
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::join!(
+        SyncScheduler::new(pipeline, jobs).run(interval, stop_rx),
+        async {
+            shutdown.await;
+            // Lets the sync in flight commit before the scheduler returns.
+            let _ = stop.send(true);
+        },
+    );
     Ok(())
 }
 

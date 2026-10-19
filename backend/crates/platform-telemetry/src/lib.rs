@@ -7,6 +7,9 @@
 use platform_core::TenantId;
 
 pub mod capture;
+mod shutdown;
+
+pub use shutdown::shutdown_signal;
 
 /// `tracing` target for audit records, so log routing can split them from
 /// operational logs.
