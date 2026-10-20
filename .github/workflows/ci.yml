@@ -99,3 +99,48 @@ jobs:
           npm ci --no-audit --no-fund
           npx vitest run --coverage --coverage.reporter=text-summary | tee coverage.txt
           { echo '## Frontend coverage'; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  release-binaries:
+    name: release build has no dev binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: backend
+      # The release.yml build: default features, release profile, locked.
+      - name: Release build of platform-api
+        run: |
+          cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api \
+            --message-format=json-render-diagnostics > release-artifacts.json
+      # Cargo's own report of what this build produced. target/ is not
+      # evidence: the cache can restore binaries from other builds.
+      - name: The release build contains no dev-only binary
+        run: |
+          built=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .target.name' release-artifacts.json | sort -u)
+          echo "Binaries in the release build:"
+          echo "$built"
+          if ! grep -qx platform-api <<<"$built"; then
+            echo "::error::platform-api is missing from the build report; the check cannot run"
+            exit 1
+          fi
+          for bin in devstack; do
+            if grep -qx "$bin" <<<"$built"; then
+              echo "::error::the default-feature release build produced the dev-only binary $bin"
+              exit 1
+            fi
+          done
+      - name: devstack cannot be built without the dev feature
+        run: |
+          if cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api --bin devstack 2> devstack.err; then
+            echo "::error::devstack built without --features dev"
+            exit 1
+          fi
+          if ! grep -qE 'requires the features.*dev' devstack.err; then
+            cat devstack.err
+            echo "::error::building devstack failed, but not because the dev feature is off"
+            exit 1
+          fi
+

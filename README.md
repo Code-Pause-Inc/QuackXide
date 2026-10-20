@@ -100,6 +100,7 @@ backend/crates/
   platform-billing/       Merchant-of-Record webhook verification
   quackxide-engine/       QueryScope, plan gate, disclosure policies
   platform-api/           HTTP edge, key-release relying party (bin/key-release), tests
+                          dev-only research stack, feature "dev" (bin/devstack, src/dev.rs)
   synth-data/             Seeded synthetic test and benchmark data (dev-only)
 frontend/src/
   lib/crypto/             Web Crypto worker (keys never touch the UI thread)
@@ -138,6 +139,49 @@ cargo run -p platform-api --bin devtoken     # terminal 2: prints a token
 # frontend/.env: VITE_VAULT_MODE="http", VITE_DEV_JWT="<token>"
 cargo run -p platform-api --bin query-demo   # sealed-query round trip over SimulatedSnp + KeyReleaseRelyingParty
 ```
+
+### Local research stack (dev only)
+
+`devstack` runs the API with the research routes wired and seeded, so the
+steward and researcher lifecycle runs on one machine without SEV-SNP
+hardware. It is insecure by design: tenant keys live in process memory, TEE
+evidence is fabricated, and all state is in memory and lost when it stops.
+It is built only with the `dev` feature, listens only on a loopback
+`BIND_ADDR`, and refuses to start unless the command sets
+`DEVSTACK_ALLOW_INSECURE=1` (a value in `.env` does not count) and
+`JWT_HS256_SECRET` is set in `backend/.env`, as above.
+
+Terminal 1, from `backend/`. Leave it running:
+
+```sh
+DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstack
+```
+
+At startup it seals a synthetic cohort (`synth-data`, with groups on both
+sides of `RESEARCH_MIN_COHORT_SIZE`) as a steward's `health` dataset,
+publishes its catalog listing, and prints a token for the steward and one
+for a researcher.
+
+Terminal 2: put the two tokens in variables, then run the researcher's
+access request, the steward's approval and the researcher's query:
+
+```sh
+S_TOKEN='<steward token>'
+R_TOKEN='<researcher token>'
+API=http://127.0.0.1:8080
+CATALOG=$(curl -s "$API/api/v1/catalog" -H "Authorization: Bearer $R_TOKEN")
+LISTING=$(echo "$CATALOG" | sed -E 's/.*"listing_id":"([^"]+)".*/\1/')
+STEWARD=$(echo "$CATALOG" | sed -E 's/.*"steward_tenant":"([^"]+)".*/\1/')
+REQ=$(curl -s -X POST "$API/api/v1/catalog/$LISTING/request" -H "Authorization: Bearer $R_TOKEN" -H 'Content-Type: application/json' -d '{"note":"local test"}' | sed -E 's/.*"request_id":"([^"]+)".*/\1/')
+curl -s -X POST "$API/api/v1/research/requests/$REQ/approve" -H "Authorization: Bearer $S_TOKEN" -H 'Content-Type: application/json' -d '{}'
+curl -s "$API/api/v1/research/query" -H "Authorization: Bearer $R_TOKEN" -H 'Content-Type: application/json' -d "{\"steward_tenant\":\"$STEWARD\",\"connector\":\"health\",\"sql\":\"SELECT condition, COUNT(*) AS n FROM health GROUP BY condition ORDER BY condition\"}"
+```
+
+The query releases only conditions with at least `RESEARCH_MIN_COHORT_SIZE`
+rows and counts the rest in `suppressed_rows`: with the default of 11, seven
+are released and two suppressed. The frontend cannot reach the API from the
+Vite dev server (there is no same-origin proxy) and has no research-query
+form, so these steps use `curl`.
 
 ### Simulated AMD SEV-SNP TEE (Local Docker)
 
