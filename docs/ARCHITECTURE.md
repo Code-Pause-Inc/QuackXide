@@ -129,7 +129,8 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   snapshots are deleted after the commit. The manifest's HPKE `info` is
   `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`.
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
-  aborts siblings. The `connector-worker` binary runs fixture jobs
+  aborts siblings. On SIGTERM or Ctrl-C it lets the sync in flight commit
+  and starts no more. The `connector-worker` binary runs fixture jobs
   end-to-end without live credentials; `HttpJsonSource` (OAuth refresh →
   GET → mapper) is the production fetch path.
 

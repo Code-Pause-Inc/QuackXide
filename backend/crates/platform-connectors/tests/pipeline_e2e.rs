@@ -3,17 +3,22 @@
 //! contract.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Float64Array, StringArray};
+use async_trait::async_trait;
+use platform_connectors::dataset::Dataset;
 use platform_connectors::parquet_out::read_parquet_batches;
 use platform_connectors::pipeline::{EnclavePipeline, PipelineError, SyncJob, envelope_info};
 use platform_connectors::snapshot::{SnapshotManifest, manifest_info};
-use platform_connectors::source::FixtureSource;
+use platform_connectors::source::{ConnectorSource, FixtureSource, SyncContext};
 use platform_connectors::worker::SyncScheduler;
-use platform_core::TenantId;
+use platform_connectors::{ConnectorDescriptor, ConnectorError};
+use platform_core::{ConnectorSlug, TenantId};
 use platform_crypto::TenantKeypair;
 use platform_enclave::{DevAttestation, SnpAttestation};
 use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
+use tokio::sync::{Notify, watch};
 
 fn dev_pipeline(vault: Arc<dyn VaultStore>) -> EnclavePipeline {
     EnclavePipeline::new(Arc::new(DevAttestation::allow_insecure_dev()), vault, false)
@@ -48,7 +53,7 @@ async fn full_confidential_sync_round_trip() {
     );
     assert!(written.path.ends_with(".parquet"));
 
-    let slug = platform_core::ConnectorSlug::new("quickbooks").expect("slug");
+    let slug = ConnectorSlug::new("quickbooks").expect("slug");
     let paths = vault
         .list(&TenantPaths::tenant_root(tenant))
         .await
@@ -153,6 +158,84 @@ async fn scheduler_tick_runs_all_jobs_and_isolates_results() {
             "one sealed object and one manifest per connector"
         );
     }
+}
+
+/// A source whose fetch waits for the test, to hold a sync in flight.
+struct GatedSource {
+    inner: FixtureSource,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl ConnectorSource for GatedSource {
+    fn descriptor(&self) -> &ConnectorDescriptor {
+        self.inner.descriptor()
+    }
+
+    async fn fetch(&self, ctx: &SyncContext) -> Result<Vec<Dataset>, ConnectorError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.inner.fetch(ctx).await
+    }
+}
+
+#[tokio::test]
+async fn stopping_the_scheduler_finishes_the_sync_in_flight_and_starts_no_more() {
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let keypair = TenantKeypair::generate();
+    let tenant = TenantId::generate();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let jobs = vec![
+        SyncJob {
+            tenant,
+            tenant_public_key: keypair.public_key(),
+            source: Arc::new(GatedSource {
+                inner: FixtureSource::quickbooks_demo().expect("fixture"),
+                started: started.clone(),
+                release: release.clone(),
+            }),
+        },
+        SyncJob {
+            tenant,
+            tenant_public_key: keypair.public_key(),
+            source: Arc::new(FixtureSource::odoo_demo().expect("fixture")),
+        },
+    ];
+
+    let (stop, stop_rx) = watch::channel(false);
+    let scheduler = SyncScheduler::new(Arc::new(dev_pipeline(vault.clone())), jobs);
+    let running = tokio::spawn(scheduler.run(Duration::from_secs(3600), stop_rx));
+
+    // Stop while the first sync is fetching, then let it continue.
+    started.notified().await;
+    stop.send(true).expect("scheduler is running");
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("scheduler stops")
+        .expect("scheduler task");
+
+    let quickbooks = ConnectorSlug::new("quickbooks").expect("slug");
+    let manifests = vault
+        .list(&TenantPaths::connector_manifests_prefix(
+            tenant,
+            &quickbooks,
+        ))
+        .await
+        .expect("list");
+    assert_eq!(manifests.len(), 1, "the sync in flight committed");
+    let stored = vault
+        .list(&TenantPaths::tenant_root(tenant))
+        .await
+        .expect("list");
+    assert_eq!(
+        stored.len(),
+        2,
+        "only that sync's object and manifest; the next job never started"
+    );
 }
 
 #[tokio::test]
