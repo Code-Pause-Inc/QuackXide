@@ -2988,7 +2988,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "subtle",
  "tokio",
  "tower",
@@ -3021,7 +3021,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror",
 ]
 
@@ -3080,7 +3080,7 @@ dependencies = [
  "proptest",
  "rand 0.8.7",
  "sha1",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror",
  "zeroize",
 ]
@@ -3094,7 +3094,7 @@ dependencies = [
  "rand 0.8.7",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "subtle",
  "thiserror",
  "tokio",

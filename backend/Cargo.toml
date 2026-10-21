@@ -86,7 +86,7 @@ hmac = "0.12"
 # targets `digest` 0.11.x and does not implement the traits `hmac 0.12`
 # expects.
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 p384 = "0.13"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
