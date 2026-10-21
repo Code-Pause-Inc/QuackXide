@@ -29,6 +29,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* The Drive client checks the vault's plaintext copies of a manifest's
+  tenant, chunk count and timestamp against the authenticated manifest,
+  shows only authenticated values, and on download refuses a record for
+  another object or chunks whose total length differs from the
+  authenticated file size.
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A
   subtotal row beside its group rows let one query recover a suppressed
   cohort's count and values. Sorts and limits below the aggregate are
