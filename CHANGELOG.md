@@ -33,6 +33,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `GET /api/v1/drive/objects` skips a manifest deleted between listing
+  and reading it, instead of failing the whole listing with 404.
 * `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` are held as `SecretString`
   (moved to `platform-core`), zeroized on drop and redacted in `Debug`.
   Their environment copies remain; `docs/THREAT_MODEL.md` lists this as a

@@ -703,7 +703,13 @@ async fn list_objects(
         else {
             continue;
         };
-        let stored = state.vault.get(&path).await?;
+        // A manifest deleted between `list` and `get` (a concurrent
+        // `delete_object`) is simply no longer listed, not a 404.
+        let stored = match state.vault.get(&path).await {
+            Ok(stored) => stored,
+            Err(StorageError::NotFound) => continue,
+            Err(other) => return Err(other.into()),
+        };
         match serde_json::from_slice::<ManifestBody>(&stored) {
             Ok(body) => entries.push(ListEntry { object_id, body }),
             Err(_) => {
@@ -785,6 +791,8 @@ async fn delete_object(
     audited_get(&state, tenant, &manifest_path, &detail).await?;
     state.vault.delete(&manifest_path).await?;
 
+    // Every stored chunk, not `0..chunk_count`: a manifest overwritten with
+    // a smaller count must not strand the trailing chunks.
     let chunks = state
         .vault
         .list(&TenantPaths::drive_object_prefix(tenant, object_id))
