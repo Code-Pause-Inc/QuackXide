@@ -6,7 +6,7 @@ describe("resolveBrand", () => {
     const brand = resolveBrand({});
     expect(brand.publicName).toBe("Confidential Drive");
     expect(brand.domainName).toBe("localhost");
-    expect(brand.apiBaseUrl).toBe("http://127.0.0.1:8080");
+    expect(brand.apiBaseUrl).toBe("");
     expect(brand.features.zkEnabled).toBe(false);
   });
 
@@ -24,8 +24,9 @@ describe("resolveBrand", () => {
   });
 
   it("treats whitespace-only overrides as unset", () => {
-    const brand = resolveBrand({ VITE_APP_PUBLIC_NAME: "   " });
+    const brand = resolveBrand({ VITE_APP_PUBLIC_NAME: "   ", VITE_API_BASE_URL: "  " });
     expect(brand.publicName).toBe("Confidential Drive");
+    expect(brand.apiBaseUrl).toBe("");
   });
 
   it("parses the ZK user toggle in common spellings", () => {

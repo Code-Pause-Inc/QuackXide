@@ -128,6 +128,10 @@ cp .env.example .env
 npm install && npm run dev       # http://localhost:5173
 ```
 
+The dev server proxies `/api`, `/admin` and `/healthz` to the backend
+(`API_PROXY_TARGET`, default `http://127.0.0.1:8080`), so the browser calls
+its own origin and needs no CORS. Leave `VITE_API_BASE_URL` empty.
+
 End-to-end locally, from `backend/`. The secret goes in `backend/.env`
 (gitignored) so both terminals read the same value:
 
