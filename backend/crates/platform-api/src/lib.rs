@@ -18,7 +18,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
-use platform_core::{ConnectorSlug, ObjectId, TenantId};
+use platform_core::{ConnectorSlug, ObjectId, SecretString, TenantId};
 use platform_storage::{StorageError, TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
@@ -445,7 +445,12 @@ async fn mor_webhook(State(state): State<AppState>, req: Request) -> Response {
 
     let result = admin::handle_mor_webhook(
         provisioning,
-        state.config.billing.paddle_webhook_secret.as_deref(),
+        state
+            .config
+            .billing
+            .paddle_webhook_secret
+            .as_ref()
+            .map(SecretString::expose),
         state.config.billing.signature_tolerance_secs,
         signature.as_deref(),
         &raw_body,
@@ -698,7 +703,13 @@ async fn list_objects(
         else {
             continue;
         };
-        let stored = state.vault.get(&path).await?;
+        // A manifest deleted between `list` and `get` (a concurrent
+        // `delete_object`) is simply no longer listed, not a 404.
+        let stored = match state.vault.get(&path).await {
+            Ok(stored) => stored,
+            Err(StorageError::NotFound) => continue,
+            Err(other) => return Err(other.into()),
+        };
         match serde_json::from_slice::<ManifestBody>(&stored) {
             Ok(body) => entries.push(ListEntry { object_id, body }),
             Err(_) => {
@@ -780,6 +791,8 @@ async fn delete_object(
     audited_get(&state, tenant, &manifest_path, &detail).await?;
     state.vault.delete(&manifest_path).await?;
 
+    // Every stored chunk, not `0..chunk_count`: a manifest overwritten with
+    // a smaller count must not strand the trailing chunks.
     let chunks = state
         .vault
         .list(&TenantPaths::drive_object_prefix(tenant, object_id))

@@ -6,11 +6,13 @@ mod common;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
+use bytes::Bytes;
 use platform_api::{AppState, ManifestBody, build_app};
 use platform_core::TenantId;
-use platform_storage::ObjectStoreVault;
+use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
 
 use common::{AUD, ISS, bearer, content_type, send};
 
@@ -28,10 +30,14 @@ fn token_for(tenant: TenantId) -> String {
 }
 
 fn manifest_json() -> String {
+    manifest_json_with_chunks(1)
+}
+
+fn manifest_json_with_chunks(chunk_count: u32) -> String {
     serde_json::json!({
         "wrapped_key": { "iv_b64": base64_iv(), "data_b64": "d3JhcHBlZC1rZXk=" },
         "manifest":    { "iv_b64": base64_iv(), "data_b64": "bWFuaWZlc3QtY3Q=" },
-        "chunk_count": 1,
+        "chunk_count": chunk_count,
         "encrypted_size_bytes": 44,
         "created_at_iso": "2026-07-30T12:00:00.000Z"
     })
@@ -359,4 +365,119 @@ async fn auth_not_configured_fails_closed_with_503() {
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = build_app(common::app_state(SECRET, vault.clone()));
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+
+    send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json_with_chunks(3).into_bytes(),
+    )
+    .await;
+    for index in 0..3 {
+        send(
+            &app,
+            "PUT",
+            &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
+            &[bearer(&token), content_type("application/octet-stream")],
+            sealed_chunk_body(),
+        )
+        .await;
+    }
+    // Overwrite with a smaller count: chunks 1 and 2 are now past its end.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json_with_chunks(1).into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/api/v1/drive/objects/{OBJ}"),
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let object = OBJ.parse().expect("object id");
+    let left = vault
+        .list(&platform_storage::TenantPaths::drive_object_prefix(
+            tenant, object,
+        ))
+        .await
+        .expect("list");
+    assert!(left.is_empty(), "stranded chunks: {left:?}");
+}
+
+/// Deletes every manifest right after listing it, as a `delete_object`
+/// racing between `list_objects`'s `list` and `get` would.
+struct RacingDeleteVault(ObjectStoreVault);
+
+#[async_trait]
+impl VaultStore for RacingDeleteVault {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.0.put(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        self.0.get(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        self.0.delete(path).await
+    }
+    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        let paths = self.0.list(prefix).await?;
+        if prefix.as_str().ends_with("/drive/manifests") {
+            for path in &paths {
+                self.0.delete(path).await?;
+            }
+        }
+        Ok(paths)
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.0.usage(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn listing_skips_manifests_deleted_concurrently() {
+    let app = build_app(common::app_state(
+        SECRET,
+        Arc::new(RacingDeleteVault(ObjectStoreVault::new_in_memory())),
+    ));
+    let token = token_for(TenantId::generate());
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("list json");
+    assert!(listed.is_empty(), "deleted manifest must not be listed");
 }
