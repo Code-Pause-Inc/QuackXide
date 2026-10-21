@@ -18,7 +18,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
-use platform_core::{ConnectorSlug, ObjectId, TenantId};
+use platform_core::{ConnectorSlug, ObjectId, SecretString, TenantId};
 use platform_storage::{StorageError, TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
@@ -445,7 +445,12 @@ async fn mor_webhook(State(state): State<AppState>, req: Request) -> Response {
 
     let result = admin::handle_mor_webhook(
         provisioning,
-        state.config.billing.paddle_webhook_secret.as_deref(),
+        state
+            .config
+            .billing
+            .paddle_webhook_secret
+            .as_ref()
+            .map(SecretString::expose),
         state.config.billing.signature_tolerance_secs,
         signature.as_deref(),
         &raw_body,

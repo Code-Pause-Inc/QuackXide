@@ -5,6 +5,7 @@ export interface BrandConfig {
   publicName: string;
   domainName: string;
   supportEmail: string;
+  /** API origin; "" means the page's own origin. */
   apiBaseUrl: string;
   features: {
     /** Default visibility of zero-knowledge features in the UI. */
@@ -36,7 +37,9 @@ export function resolveBrand(env: BrandEnv): BrandConfig {
     publicName: nonEmpty(env.VITE_APP_PUBLIC_NAME, "Confidential Drive"),
     domainName: nonEmpty(env.VITE_APP_DOMAIN_NAME, "localhost"),
     supportEmail: nonEmpty(env.VITE_APP_SUPPORT_EMAIL, "support@localhost"),
-    apiBaseUrl: nonEmpty(env.VITE_API_BASE_URL, "http://127.0.0.1:8080"),
+    // Empty means same origin: requests go to "/api/...", which the Vite dev
+    // proxy forwards in development and the serving origin answers in production.
+    apiBaseUrl: nonEmpty(env.VITE_API_BASE_URL, ""),
     features: {
       zkEnabled: parseBool(env.VITE_FEATURE_ZK_ENABLED, false),
     },
