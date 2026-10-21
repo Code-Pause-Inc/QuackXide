@@ -95,7 +95,7 @@ rand = "0.8"
 
 # ── auth + storage backends ─────────────────────────────────────────────────
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
-object_store = { version = "0.13", features = ["gcp"] }
+object_store = { version = "0.14", features = ["gcp"] }
 url = "2"
 # RSA key generation for the `keygen` binary; jsonwebtoken's RustCrypto
 # backend uses the same crate for RS256.
@@ -104,8 +104,8 @@ http-body-util = "0.1"                                            # API integrat
 
 # ── connector pipelines ─────────────────────────────────────────────────────
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-arrow = "59"
-parquet = { version = "59", features = ["arrow"] }
+arrow = "60"
+parquet = { version = "60", features = ["arrow"] }
 
 # ── query engine ─────────────────────────────────────────────────────────────
 datafusion = "55"                                                 # arrow/parquet 59 chosen to match
