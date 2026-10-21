@@ -129,6 +129,10 @@ cp .env.example .env
 npm install && npm run dev       # http://localhost:5173
 ```
 
+The dev server proxies `/api`, `/admin` and `/healthz` to the backend
+(`API_PROXY_TARGET`, default `http://127.0.0.1:8080`), so the browser calls
+its own origin and needs no CORS. Leave `VITE_API_BASE_URL` empty.
+
 End-to-end locally, from `backend/`. The secret goes in `backend/.env`
 (gitignored) so both terminals read the same value:
 
@@ -179,9 +183,8 @@ curl -s "$API/api/v1/research/query" -H "Authorization: Bearer $R_TOKEN" -H 'Con
 
 The query releases only conditions with at least `RESEARCH_MIN_COHORT_SIZE`
 rows and counts the rest in `suppressed_rows`: with the default of 11, seven
-are released and two suppressed. The frontend cannot reach the API from the
-Vite dev server (there is no same-origin proxy) and has no research-query
-form, so these steps use `curl`.
+are released and two suppressed. The frontend has no research-query form yet,
+so these steps use `curl`.
 
 ### Simulated AMD SEV-SNP TEE (Local Docker)
 

@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { VaultClient } from "../vault/types";
-import { CHUNK_SIZE_BYTES, generateMasterKey } from "./core";
+import {
+  CHUNK_SIZE_BYTES,
+  decryptManifest,
+  dekAad,
+  encryptManifest,
+  generateMasterKey,
+  manifestAad,
+  unwrapFileKey,
+} from "./core";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
 import type { DeviceKeys } from "./keystore";
 import type { ChunkRecord, ManifestRecord } from "./types";
@@ -202,5 +210,63 @@ describe("drive integrity", () => {
 
   it("rejects objects sealed under another device's master key", async () => {
     await expect(downloadFile({ ...ctx, keys: await deviceKeys() }, objectId)).rejects.toThrow();
+  });
+
+  it("rejects a vault timestamp that differs from the authenticated manifest", async () => {
+    vault.patchManifest(objectId, { createdAtIso: "2000-01-01T00:00:00.000Z" });
+
+    await expect(downloadFile(ctx, objectId)).rejects.toThrow("timestamp does not match");
+    const listed = await listFiles(ctx);
+    expect(listed.find((f) => f.objectId === objectId)?.name).toMatch(/failed integrity check/);
+  });
+
+  it("marks a tampered vault chunk count as unreadable in the listing", async () => {
+    vault.patchManifest(objectId, { chunkCount: 9 });
+
+    const listed = await listFiles(ctx);
+    expect(listed.find((f) => f.objectId === objectId)?.name).toMatch(/failed integrity check/);
+  });
+
+  it("reports chunk count and timestamp from the authenticated manifest", async () => {
+    const [listed] = await listFiles(ctx);
+    const record = vault.manifests.get(objectId)!;
+    expect(listed).toMatchObject({ chunkCount: 2, createdAtIso: record.createdAtIso });
+  });
+
+  it("rejects another object's record served for this object id", async () => {
+    // An empty file has no chunks, so its record alone would decrypt cleanly.
+    const empty = await uploadFile(ctx, new File([], "empty.txt"));
+    vault.manifests.set(objectId, vault.manifests.get(empty.objectId)!);
+
+    await expect(downloadFile(ctx, objectId)).rejects.toThrow("manifest is for another object");
+  });
+
+  it("rejects a record sealed for another tenant under the same key", async () => {
+    const other = await uploadFile(
+      { ...ctx, keys: { ...ctx.keys, tenantId: crypto.randomUUID() } },
+      new File(["other"], "other.txt"),
+    );
+
+    await expect(downloadFile(ctx, other.objectId)).rejects.toThrow("belongs to another tenant");
+    const listed = await listFiles(ctx);
+    expect(listed.find((f) => f.objectId === other.objectId)?.name).toMatch(
+      /failed integrity check/,
+    );
+  });
+
+  it("rejects chunks whose total length differs from the authenticated size", async () => {
+    // Re-seal a manifest that claims one byte more than the chunks hold.
+    const record = vault.manifests.get(objectId)!;
+    const { tenantId } = record;
+    const dek = await unwrapFileKey(ctx.keys.kek, record.wrappedKey, dekAad(tenantId, objectId));
+    const aad = manifestAad(tenantId, objectId);
+    const manifest = await decryptManifest(dek, aad, record.manifest);
+    const resealed = await encryptManifest(dek, aad, {
+      ...manifest,
+      sizeBytes: manifest.sizeBytes + 1,
+    });
+    vault.patchManifest(objectId, { manifest: resealed });
+
+    await expect(downloadFile(ctx, objectId)).rejects.toThrow("file size does not match");
   });
 });

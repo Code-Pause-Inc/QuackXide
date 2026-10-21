@@ -6,6 +6,10 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod secret;
+
+pub use secret::SecretString;
+
 /// Errors for core identifier parsing/validation.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CoreError {

@@ -2,19 +2,15 @@
 //! TEE attestation, provisioning, data access including misses and denials)
 //! emits its SECURITY_AUDIT_EVENT record.
 
+mod common;
+
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use hmac::{Hmac, Mac};
-use http_body_util::BodyExt;
+use axum::http::StatusCode;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::query::{ConnectorQueryService, DevKeyProvider};
 use platform_api::{AppState, build_app};
-use platform_auth::JwtVerifier;
-use platform_config::PlatformConfig;
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{TenantId, ZkMode};
@@ -24,59 +20,20 @@ use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
-use sha2::Sha256;
-use tower::ServiceExt;
+
+use common::{app_state, bearer, dev_attestation, json_header, send, synced_vault};
 
 const SECRET: &str = "audit-itest-secret";
-const ISS: &str = "urn:platform:auth";
-const AUD: &str = "urn:platform:drive";
 const PADDLE_SECRET: &str = "pdl_ntfset_audit_secret";
 
 fn token_for(tenant: TenantId) -> String {
-    platform_auth::mint_token(SECRET, ISS, AUD, tenant, "itest", 3600).expect("mint")
-}
-
-async fn send(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    headers: &[(&str, String)],
-    body: Vec<u8>,
-) -> (StatusCode, Vec<u8>) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    for (name, value) in headers {
-        builder = builder.header(*name, value);
-    }
-    let request = builder.body(Body::from(body)).expect("request");
-    let response = app.clone().oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    (status, bytes.to_vec())
-}
-
-fn auth(token: &str) -> (&'static str, String) {
-    ("Authorization", format!("Bearer {token}"))
-}
-
-fn json_header() -> (&'static str, String) {
-    ("Content-Type", "application/json".to_owned())
+    common::token_for(SECRET, tenant)
 }
 
 /// Full app: vault + jwt + provisioning + a query service with sealed
 /// QuickBooks fixture data for `tenant`.
 async fn full_app(tenant: TenantId, zk: ZkMode) -> Router {
-    full_app_with_attestation(
-        tenant,
-        zk,
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        false,
-    )
-    .await
+    full_app_with_attestation(tenant, zk, dev_attestation(), false).await
 }
 
 /// As [`full_app`], with the query gate's attestation.
@@ -86,22 +43,8 @@ async fn full_app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
-
-    let pipeline = EnclavePipeline::new(
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        vault.clone(),
-        false,
-    );
-    pipeline
-        .run_sync(&SyncJob {
-            tenant,
-            tenant_public_key: keypair.public_key(),
-            source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
-        })
-        .await
-        .expect("seal");
+    let vault = synced_vault(tenant, &keypair, 1).await;
 
     let query = ConnectorQueryService::new(
         vault.clone(),
@@ -118,18 +61,11 @@ async fn full_app_with_attestation(
         vault.clone(),
     );
 
-    let config = PlatformConfig::from_source(|k| match k {
-        "MOR_WEBHOOK_SECRET" => Some(PADDLE_SECRET.to_owned()),
-        _ => None,
-    })
-    .expect("config");
-
     build_app(AppState {
-        config: Arc::new(config),
-        vault,
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        config: Arc::new(common::config_with_mor_secret(PADDLE_SECRET)),
         query: Some(Arc::new(query)),
         provisioning: Some(Arc::new(provisioning)),
+        ..app_state(SECRET, vault)
     })
 }
 
@@ -149,7 +85,7 @@ async fn data_access_hits_misses_and_auth_denials_are_audited() {
         &app,
         "GET",
         "/api/v1/drive/objects/00000000-aaaa-4bbb-8ccc-000000000001/manifest",
-        &[auth(&token)],
+        &[bearer(&token)],
         Vec::new(),
     )
     .await;
@@ -160,7 +96,7 @@ async fn data_access_hits_misses_and_auth_denials_are_audited() {
         &app,
         "GET",
         "/api/v1/drive/objects",
-        &[auth(&token)],
+        &[bearer(&token)],
         Vec::new(),
     )
     .await;
@@ -201,7 +137,7 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
         &app,
         "PUT",
         "/api/v1/drive/enrollment",
-        &[auth(&token), json_header()],
+        &[bearer(&token), json_header()],
         body.into_bytes(),
     )
     .await;
@@ -211,7 +147,7 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
         &app,
         "GET",
         "/api/v1/drive/enrollment",
-        &[auth(&token)],
+        &[bearer(&token)],
         Vec::new(),
     )
     .await;
@@ -224,7 +160,7 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
         &app,
         "PUT",
         "/api/v1/drive/enrollment",
-        &[auth(&token), json_header()],
+        &[bearer(&token), json_header()],
         br#"{"hpke_public_key_b64":"AAAA"}"#.to_vec(),
     )
     .await;
@@ -247,7 +183,7 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
         &app,
         "GET",
         "/api/v1/drive/enrollment",
-        &[auth(&other)],
+        &[bearer(&other)],
         Vec::new(),
     )
     .await;
@@ -266,7 +202,7 @@ async fn query_path_audits_attestation_and_execution_including_failure() {
         &app,
         "POST",
         "/api/v1/query",
-        &[auth(&token), json_header()],
+        &[bearer(&token), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;
@@ -277,7 +213,7 @@ async fn query_path_audits_attestation_and_execution_including_failure() {
         &app,
         "POST",
         "/api/v1/query",
-        &[auth(&token), json_header()],
+        &[bearer(&token), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT nope FROM nothing"}"#.to_vec(),
     )
     .await;
@@ -316,7 +252,7 @@ async fn attestation_refusal_is_audited() {
         &app,
         "POST",
         "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
+        &[bearer(&token_for(tenant)), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;
@@ -353,7 +289,7 @@ async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_
         &app,
         "POST",
         "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
+        &[bearer(&token_for(tenant)), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;
@@ -375,7 +311,7 @@ async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_
         &bad_app,
         "POST",
         "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
+        &[bearer(&token_for(tenant)), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;
@@ -393,7 +329,7 @@ async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_
         &prod_app,
         "POST",
         "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
+        &[bearer(&token_for(tenant)), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;
@@ -408,27 +344,15 @@ async fn provisioning_webhook_is_audited() {
     let body =
         br#"{"event_type":"subscription.created","data":{"id":"sub_a","customer_id":"cus_a","items":[{"price":{"id":"pri_x"}}]}}"#
             .to_vec();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut mac = Hmac::<Sha256>::new_from_slice(PADDLE_SECRET.as_bytes()).unwrap();
-    mac.update(ts.to_string().as_bytes());
-    mac.update(b":");
-    mac.update(&body);
-    let hex: String = mac
-        .finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-
     let (status, _) = send(
         &app,
         "POST",
         "/admin/webhooks/mor",
         &[
-            ("Paddle-Signature", format!("ts={ts};h1={hex}")),
+            (
+                "Paddle-Signature",
+                common::paddle_signature(PADDLE_SECRET, &body),
+            ),
             json_header(),
         ],
         body,
@@ -502,18 +426,15 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         false,
     );
     let ok_app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault: vault.clone(),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
         query: Some(Arc::new(ok_query)),
-        provisioning: None,
+        ..app_state(SECRET, vault.clone())
     });
 
     let (status, _) = send(
         &ok_app,
         "POST",
         "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
+        &[bearer(&token_for(tenant)), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;
@@ -545,18 +466,15 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         false,
     );
     let denied_app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault,
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
         query: Some(Arc::new(denied_query)),
-        provisioning: None,
+        ..app_state(SECRET, vault)
     });
 
     let (status, _) = send(
         &denied_app,
         "POST",
         "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
+        &[bearer(&token_for(tenant)), json_header()],
         br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
     )
     .await;

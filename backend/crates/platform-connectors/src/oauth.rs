@@ -4,35 +4,10 @@
 //! stored refresh token for short-lived access tokens. Client secrets and
 //! refresh tokens are held in zeroizing, redacted containers.
 
+pub use platform_core::SecretString;
 use serde::Deserialize;
-use zeroize::Zeroizing;
 
 use crate::ConnectorError;
-
-/// A secret string: zeroized on drop, redacted in Debug.
-pub struct SecretString(Zeroizing<String>);
-
-impl SecretString {
-    pub fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecretString(<redacted>)")
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretString {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer).map(Self::new)
-    }
-}
 
 #[derive(Debug)]
 pub struct OAuth2Config {

@@ -31,8 +31,8 @@ function summarize(record: ManifestRecord, manifest: FileManifest): DriveFileSum
     name: manifest.name,
     mimeType: manifest.mimeType,
     sizeBytes: manifest.sizeBytes,
-    chunkCount: record.chunkCount,
-    createdAtIso: record.createdAtIso,
+    chunkCount: manifest.chunkCount,
+    createdAtIso: manifest.createdAtIso,
   };
 }
 
@@ -86,10 +86,16 @@ export async function uploadFile(
   return summarize(record, manifest);
 }
 
+/**
+ * Decrypts a record's manifest and checks the vault's plaintext copies of
+ * its fields against it. Everything outside the sealed manifest is
+ * untrusted; a mismatch means the record was tampered with or substituted.
+ */
 async function openManifest(
   keys: DeviceKeys,
   record: ManifestRecord,
 ): Promise<{ dek: CryptoKey; manifest: FileManifest }> {
+  if (record.tenantId !== keys.tenantId) throw new Error("manifest belongs to another tenant");
   const dek = await unwrapFileKey(
     keys.kek,
     record.wrappedKey,
@@ -100,6 +106,13 @@ async function openManifest(
     manifestAad(record.tenantId, record.objectId),
     record.manifest,
   );
+  const { chunkCount } = manifest;
+  if (!Number.isSafeInteger(chunkCount) || chunkCount < 0 || chunkCount !== record.chunkCount) {
+    throw new Error("chunk count does not match the authenticated manifest");
+  }
+  if (manifest.createdAtIso !== record.createdAtIso) {
+    throw new Error("timestamp does not match the authenticated manifest");
+  }
   return { dek, manifest };
 }
 
@@ -131,15 +144,13 @@ export async function downloadFile(
 ): Promise<DownloadResult> {
   const record = await vault.getManifest(objectId);
   if (!record) throw new Error("object not found");
+  // Another object's record would authenticate under its own id.
+  if (record.objectId !== objectId) throw new Error("manifest is for another object");
 
   const { dek, manifest } = await openManifest(keys, record);
-  // The chunk count comes from the authenticated manifest; the vault's copy
-  // is untrusted, and a mismatch means the record was tampered with.
   const { chunkCount } = manifest;
-  if (!Number.isSafeInteger(chunkCount) || chunkCount < 0 || chunkCount !== record.chunkCount) {
-    throw new Error("chunk count does not match the authenticated manifest");
-  }
   const parts: ArrayBuffer[] = [];
+  let totalBytes = 0;
   for (let index = 0; index < chunkCount; index += 1) {
     const chunk = await vault.getChunk(objectId, index);
     if (!chunk) throw new Error(`missing chunk ${index}`);
@@ -148,7 +159,12 @@ export async function downloadFile(
       data: chunk.data,
     });
     parts.push(plain);
+    totalBytes += plain.byteLength;
     onProgress?.(index + 1, chunkCount);
+  }
+
+  if (totalBytes !== manifest.sizeBytes) {
+    throw new Error("file size does not match the authenticated manifest");
   }
 
   return {

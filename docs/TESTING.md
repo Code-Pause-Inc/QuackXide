@@ -45,7 +45,13 @@ template:
 lists itself as a dev-dependency with that feature on, so test builds
 enable it and `cargo test` needs no flag.
 
-Tests that need RS256 tokens follow `token_types.rs` (see [Managed sign-in](#managed-sign-in)).
+`tests/common/mod.rs` holds the shared helpers; a test file uses them with
+`mod common;`. It has the HS256 token minters (`token_for`, `admin_token`,
+taking the file's secret), the request helpers (`send`, `send_json`, `call`,
+`post`, `post_query`), and the app builders (`app_state`, `synced_vault`,
+`research_app`). Use them rather than writing new ones, and add a helper
+there when a second file needs it. Tests that need RS256 tokens use its
+`rs256_token` and `rs256_verifier` (see [Managed sign-in](#managed-sign-in)).
 
 ### Audit assertions
 
@@ -158,8 +164,9 @@ test. The issues named below build them; this guide only records the choice.
 Generate an RS256 key in the test with the public
 `platform_auth::generate_rs256_keypair`, sign tokens with
 `TokenSigner::rs256_from_pem`, and verify with
-`JwtVerifier::rs256_from_jwks`. `token_types.rs` shows the pattern, with the
-keypair generated once in a `OnceLock`. Do not use `keygen::fixtures`: it is
+`JwtVerifier::rs256_from_jwks`. `rs256_token` and `rs256_verifier` in
+`platform-api/tests/common/mod.rs` do this, with the keypair generated once
+per test binary in a `OnceLock`. Do not use `keygen::fixtures`: it is
 `#[cfg(test)]` and private to `platform-auth`.
 
 ### GCS

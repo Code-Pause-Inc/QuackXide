@@ -177,7 +177,12 @@ pub fn require_opt_in(process_env: impl Fn(&str) -> Option<String>) -> Result<()
 /// Refuses unless `config` has a JWT secret to sign and verify dev tokens
 /// with, and a loopback `BIND_ADDR`. Returns the secret.
 pub fn require_dev_config(config: &PlatformConfig) -> Result<&str, DevRefusal> {
-    let Some(secret) = config.auth.hs256_secret.as_deref() else {
+    let Some(secret) = config
+        .auth
+        .hs256_secret
+        .as_ref()
+        .map(platform_core::SecretString::expose)
+    else {
         return Err(DevRefusal::NoJwtSecret);
     };
     let bind_addr = config.server.bind_addr;
