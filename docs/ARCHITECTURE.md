@@ -295,21 +295,26 @@ now, decrypt later"). The current suites are classical.
 
 | Use | Current | Target |
 | --- | --- | --- |
-| Key encapsulation (envelopes, enrollment) | X25519 (DHKEM, HKDF-SHA256) | Hybrid X25519 + ML-KEM-768 |
+| Key encapsulation (envelopes, enrollment) | X25519 (DHKEM, HKDF-SHA256), frame `HPK1` | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2` |
 | Bulk encryption | AES-256-GCM | AES-256-GCM |
-| Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 |
+| Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 for keys only an attested workload holds; tokens per ADR 0006 |
+
+ADR 0007 records the construction, the libraries (`hpke` 0.14 on the
+backend and, built for wasm32, in the browser), how the browser stores an
+X-Wing seed, and the cross-implementation vectors that prove the two
+sides agree.
 
 Migration rules:
 
-* Established implementations only (RustCrypto, `hpke`, and vetted
-  ML-KEM / ML-DSA crates; Web Crypto where the browser supports the
+* Established implementations only, as ADR 0007 defines the term
+  (RustCrypto, `hpke`, and Web Crypto where the browser supports the
   algorithm). No invented primitives.
 * The suite changes at the existing seams — `TenantKem`, the `JwtVerifier`
   construction site, the browser crypto core — with a new frame version
   alongside `HPK1`.
 * No silent downgrade: a reader configured for the hybrid suite refuses
-  classical-only envelopes and signatures unless an explicit, logged
-  migration mode is enabled.
+  classical-only envelopes and signatures. v1 has no migration mode
+  (ADR 0007): nothing has been sealed under `HPK1` outside development.
 
 The work is tracked in `docs/PROJECT_SCOPE.md`; the threat it closes is A4
 in `docs/THREAT_MODEL.md`.

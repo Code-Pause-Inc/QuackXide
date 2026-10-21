@@ -8,6 +8,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
+  frame `HPK2`), the libraries and what "established" means, browser
+  storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
+  migration mode in v1.
 * `docs/TESTING.md`: where each test layer lives, the naming and placement
   convention for negative tests and audit assertions, and the substitutes
   for what CI cannot exercise.
@@ -33,6 +37,11 @@ uses [Semantic Versioning](https://semver.org/).
   (moved to `platform-core`), zeroized on drop and redacted in `Debug`.
   Their environment copies remain; `docs/THREAT_MODEL.md` lists this as a
   residual risk.
+* The Drive client checks the vault's plaintext copies of a manifest's
+  tenant, chunk count and timestamp against the authenticated manifest,
+  shows only authenticated values, and on download refuses a record for
+  another object or chunks whose total length differs from the
+  authenticated file size.
 * The disclosure gate refuses `ROLLUP`, `CUBE` and `GROUPING SETS`. A
   subtotal row beside its group rows let one query recover a suppressed
   cohort's count and values. Sorts and limits below the aggregate are

@@ -100,9 +100,9 @@ exist.
 
 | Attack | Control | Status |
 | --- | --- | --- |
-| Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 | **To build** — current suite is X25519 only |
+| Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, ADR 0007) | **To build** — current suite is X25519 only |
 | Forge signatures | Hybrid Ed25519 + ML-DSA-65 | **To build** — current tokens use RS256 |
-| Silent downgrade to classical-only | Versioned framing; hybrid suites must refuse classical-only input | **To build** |
+| Silent downgrade to classical-only | Versioned framing (`HPK2`); hybrid readers refuse `HPK1` and X25519-only keys, with no migration mode (ADR 0007) | **To build** |
 
 The suite seams (`TenantKem`, the `JwtVerifier` construction site, the
 `HPK1` frame version) exist so this migration is a code change plus a
@@ -119,7 +119,10 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   release.
 * **Correctness of the underlying libraries.** RustCrypto, `hpke`,
   DataFusion, and Web Crypto are trusted. QuackXide implements no
-  cryptographic primitives.
+  cryptographic primitives. The post-quantum crates (`x-wing`, `ml-kem`,
+  `ml-dsa`) and `hpke` have no independent audit; ADR 0007 records this
+  as an accepted risk and the cross-implementation vectors that check
+  them.
 * **Collusion between a steward and a researcher.** A steward can share
   their own data by other means.
 
