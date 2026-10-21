@@ -27,7 +27,8 @@ async fn research_app(steward: TenantId, steward_keypair: TenantKeypair) -> Rout
     research_app_with_attestation(steward, steward_keypair, dev_attestation(), false).await
 }
 
-/// As [`research_app`], with the query gate's attestation.
+/// As [`research_app`], with the query gate's attestation. The wiring is
+/// `platform_api::dev`, the same as the `devstack` server's.
 async fn research_app_with_attestation(
     steward: TenantId,
     steward_keypair: TenantKeypair,

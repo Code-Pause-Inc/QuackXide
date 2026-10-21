@@ -33,6 +33,17 @@ uses [Semantic Versioning](https://semver.org/).
   `backend/`, `cargo run -p synth-data -- --help` lists the options.
 * Query and research responses include `tee_platform`, the platform that
   passed the attestation gate: `amd-sev-snp`, `simulated` or `development`.
+* `devstack`, a dev-only server that runs the research lifecycle on one
+  machine: the API with the research routes on in-process dev keys and
+  fabricated attestation, seeded with a synthetic cohort, its catalog
+  listing, and a token each for a steward and a researcher. It is built
+  only with `platform-api`'s `dev` feature, refuses to start without
+  `DEVSTACK_ALLOW_INSECURE=1` and `JWT_HS256_SECRET`, and listens only on
+  loopback. The API integration tests share its wiring (`platform_api::dev`),
+  and CI checks that a default-feature release build contains no `devstack`
+  binary. From `backend/`,
+  `DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstack`
+  starts it.
 
 ### Security
 

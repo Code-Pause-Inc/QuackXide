@@ -1,3 +1,19 @@
+[features]
+default = []
+# DEV ONLY. Builds the `devstack` local research server and the research
+# wiring it shares with the integration tests: tenant keys held in process
+# memory and fabricated, unattested TEE evidence. Never a default feature;
+# release builds (`.github/workflows/release.yml`, `Dockerfile`) do not
+# enable it.
+dev = ["dep:synth-data"]
+
+# Built only when `dev` is on (`--features dev`, or any build that includes
+# tests, through the dev-dependency below). A plain
+# `cargo build --release -p platform-api` never produces it.
+[[bin]]
+name = "devstack"
+required-features = ["dev"]
+
 [package]
 name = "platform-api"
 default-run = "platform-api"
@@ -38,12 +54,20 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
+# Dev-only, enabled by the `dev` feature: the seeded synthetic cohort that
+# `devstack` seals to its steward tenant at startup.
+synth-data = { workspace = true, optional = true }
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["json"] }
 hmac.workspace = true
 http-body-util.workspace = true
 parquet.workspace = true
+# This crate with `dev` on, for tests only. Resolver 2 applies
+# dev-dependency features only when tests, benches or examples are built,
+# so plain and release builds stay without `dev`, while `cargo test` and
+# `cargo clippy --all-targets` build and lint the dev wiring and `devstack`.
+platform-api = { path = ".", features = ["dev"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true

@@ -15,19 +15,16 @@ use axum::http::{Request, StatusCode};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
-use platform_api::query::{ConnectorQueryService, MultiTenantDevKeyProvider};
-use platform_api::research::ResearchStores;
+use platform_api::dev::DevResearchStack;
 use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
-use platform_connectors::snapshot::SnapshotWriter;
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, VaultStore};
-use platform_tenancy::{InMemoryBudgetLedger, InMemoryCatalogRegistry, InMemoryGrantRegistry};
 use quackxide_engine::EngineSettings;
 use sha2::Sha256;
 use tower::ServiceExt;
@@ -252,7 +249,8 @@ pub fn cohorts_parquet() -> Vec<u8> {
 
 /// An app where `steward` has a sealed `health` dataset ([`cohorts_parquet`])
 /// and the research layer (catalog, grants, budgets; k=5, default budget
-/// 100) is enabled, with the query gate's attestation.
+/// 100) is enabled, with the query gate's attestation. The wiring is
+/// [`platform_api::dev::DevResearchStack`], the same as the `devstack` server's.
 pub async fn research_app(
     secret: &str,
     steward: TenantId,
@@ -260,38 +258,24 @@ pub async fn research_app(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let connector = ConnectorSlug::new("health").expect("slug");
-    // Commit the cohort dataset as a snapshot sealed to the steward's key
-    // (as the pipeline would).
-    let steward_public_key = steward_keypair.public_key();
-    let mut snapshot =
-        SnapshotWriter::begin(&*vault, steward, &steward_public_key, connector.clone());
-    snapshot
-        .put("cohorts", &cohorts_parquet())
+    let cohorts = cohorts_parquet();
+    let mut stack = DevResearchStack::new();
+    stack
+        .commit_snapshot(steward, steward_keypair, &connector, "cohorts", &cohorts)
         .await
-        .expect("put");
-    snapshot.commit().await.expect("commit");
-
-    let mut keys = MultiTenantDevKeyProvider::new();
-    keys.insert(steward, steward_keypair);
-
-    let stores = ResearchStores {
-        grants: Arc::new(InMemoryGrantRegistry::default()),
-        budgets: Arc::new(InMemoryBudgetLedger::default()),
-        catalog: Arc::new(InMemoryCatalogRegistry::default()),
-    };
-    let service = ConnectorQueryService::new(
-        vault.clone(),
-        Arc::new(keys),
-        attestation,
+        .expect("commit");
+    let vault = stack.vault();
+    let service = stack.query_service_with_attestation(
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
             max_concurrent_queries: 4,
         },
+        5,
+        100,
+        attestation,
         require_attestation,
-    )
-    .with_research(stores, 5, 100);
+    );
 
     build_app(AppState {
         query: Some(Arc::new(service)),

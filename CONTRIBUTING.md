@@ -32,6 +32,8 @@ Every pull request runs:
 * dependency review, `cargo-deny` (advisories, licenses, sources), and
   `npm audit`;
 * the attribution guard over files and commit messages;
+* a default-feature release build of `platform-api`, which fails if it
+  contains the dev-only `devstack` binary;
 * a coverage report in the job summary.
 
 Fuzz targets (`backend/fuzz/`) run weekly, and the OpenSSF Scorecard tracks

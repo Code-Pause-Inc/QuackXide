@@ -27,13 +27,23 @@ Test one crate's logic without the HTTP layer. Run them with
 ### API integration tests
 
 Each file builds the full router with `platform_api::build_app` and sends
-requests through `tower::ServiceExt::oneshot`, so no port is bound. The
-setup in `research_api.rs` is the template:
+requests through `tower::ServiceExt::oneshot`, so no port is bound. Tests
+that need research access build it with `platform_api::dev::DevResearchStack`,
+the same wiring the `devstack` server runs; `research_api.rs` is the
+template:
 
-* an in-memory vault, `ObjectStoreVault::new_in_memory()`;
-* keys from `MultiTenantDevKeyProvider`, with one keypair inserted per tenant;
-* attestation from `DevAttestation::allow_insecure_dev()`;
-* in-memory registries from `platform_tenancy`.
+* `DevResearchStack::new()` is an in-memory vault with no tenant keys;
+* `commit_snapshot` seals a dataset to a tenant's keypair, commits it as
+  that tenant's connector snapshot, and keeps the keypair in a
+  `MultiTenantDevKeyProvider` so queries can open it;
+* `query_service` adds in-memory grant, budget and catalog registries and
+  attestation from `DevAttestation::allow_insecure_dev()`;
+  `query_service_with_attestation` takes the attestation provider and
+  whether attestation is required, for attestation-refusal tests.
+
+`platform_api::dev` exists only with the `dev` feature. `platform-api`
+lists itself as a dev-dependency with that feature on, so test builds
+enable it and `cargo test` needs no flag.
 
 `tests/common/mod.rs` holds the shared helpers; a test file uses them with
 `mod common;`. It has the HS256 token minters (`token_for`, `admin_token`,
