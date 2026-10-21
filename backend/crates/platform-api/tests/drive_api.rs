@@ -2,38 +2,31 @@
 //! only from the token, so a valid tenant-B token must never observe tenant
 //! A's objects.
 
+mod common;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::StatusCode;
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use platform_api::{AppState, ManifestBody, build_app};
-use platform_auth::JwtVerifier;
-use platform_config::PlatformConfig;
 use platform_core::TenantId;
 use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
-use tower::ServiceExt;
+
+use common::{AUD, ISS, bearer, content_type, send};
 
 const SECRET: &str = "integration-test-secret";
-const ISS: &str = "urn:platform:auth";
-const AUD: &str = "urn:platform:drive";
 
 fn test_app() -> Router {
-    let config = PlatformConfig::from_source(|_| None).expect("default config");
-    build_app(AppState {
-        config: Arc::new(config),
-        vault: Arc::new(ObjectStoreVault::new_in_memory()),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: None,
-        provisioning: None,
-    })
+    build_app(common::app_state(
+        SECRET,
+        Arc::new(ObjectStoreVault::new_in_memory()),
+    ))
 }
 
 fn token_for(tenant: TenantId) -> String {
-    platform_auth::mint_token(SECRET, ISS, AUD, tenant, "itest", 3600).expect("mint")
+    common::token_for(SECRET, tenant)
 }
 
 fn manifest_json() -> String {
@@ -61,41 +54,12 @@ fn sealed_chunk_body() -> Vec<u8> {
     vec![0u8; 28]
 }
 
-async fn send(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    token: Option<&str>,
-    body: Option<(&str, Vec<u8>)>,
-) -> (StatusCode, Vec<u8>) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(token) = token {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-    let request = match body {
-        Some((content_type, bytes)) => builder
-            .header(header::CONTENT_TYPE, content_type)
-            .body(Body::from(bytes))
-            .expect("request"),
-        None => builder.body(Body::empty()).expect("request"),
-    };
-    let response = app.clone().oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    (status, bytes.to_vec())
-}
-
 const OBJ: &str = "00000000-aaaa-4bbb-8ccc-000000000001";
 
 #[tokio::test]
 async fn requests_without_a_token_are_401() {
     let app = test_app();
-    let (status, _) = send(&app, "GET", "/api/v1/drive/objects", None, None).await;
+    let (status, _) = send(&app, "GET", "/api/v1/drive/objects", &[], Vec::new()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -110,7 +74,14 @@ async fn garbage_and_expired_and_wrong_audience_tokens_are_401() {
         platform_auth::mint_token(SECRET, ISS, "urn:other", tenant, "u", 3600).expect("mint"),
         platform_auth::mint_token("wrong-secret", ISS, AUD, tenant, "u", 3600).expect("mint"),
     ] {
-        let (status, _) = send(&app, "GET", "/api/v1/drive/objects", Some(&bad), None).await;
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/api/v1/drive/objects",
+            &[bearer(&bad)],
+            Vec::new(),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
@@ -122,7 +93,7 @@ async fn garbage_and_expired_and_wrong_audience_tokens_are_401() {
 #[tokio::test]
 async fn unauthenticated_public_routes_still_work() {
     let app = test_app();
-    let (status, body) = send(&app, "GET", "/healthz", None, None).await;
+    let (status, body) = send(&app, "GET", "/healthz", &[], Vec::new()).await;
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("ok"));
 }
@@ -136,8 +107,8 @@ async fn manifest_and_chunk_round_trip() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        Some(("application/json", manifest_json().into_bytes())),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -146,8 +117,8 @@ async fn manifest_and_chunk_round_trip() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        Some(&token),
-        Some(("application/octet-stream", sealed_chunk_body())),
+        &[bearer(&token), content_type("application/octet-stream")],
+        sealed_chunk_body(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -156,8 +127,8 @@ async fn manifest_and_chunk_round_trip() {
         &app,
         "GET",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        None,
+        &[bearer(&token)],
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -168,14 +139,21 @@ async fn manifest_and_chunk_round_trip() {
         &app,
         "GET",
         &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        Some(&token),
-        None,
+        &[bearer(&token)],
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, sealed_chunk_body());
 
-    let (status, body) = send(&app, "GET", "/api/v1/drive/objects", Some(&token), None).await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("list json");
     assert_eq!(listed.len(), 1);
@@ -193,16 +171,16 @@ async fn tenant_isolation_is_absolute() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token_a),
-        Some(("application/json", manifest_json().into_bytes())),
+        &[bearer(&token_a), content_type("application/json")],
+        manifest_json().into_bytes(),
     )
     .await;
     send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        Some(&token_a),
-        Some(("application/octet-stream", sealed_chunk_body())),
+        &[bearer(&token_a), content_type("application/octet-stream")],
+        sealed_chunk_body(),
     )
     .await;
 
@@ -211,8 +189,8 @@ async fn tenant_isolation_is_absolute() {
         &app,
         "GET",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token_b),
-        None,
+        &[bearer(&token_b)],
+        Vec::new(),
     )
     .await;
     assert_eq!(
@@ -225,8 +203,8 @@ async fn tenant_isolation_is_absolute() {
         &app,
         "GET",
         &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        Some(&token_b),
-        None,
+        &[bearer(&token_b)],
+        Vec::new(),
     )
     .await;
     assert_eq!(
@@ -235,7 +213,14 @@ async fn tenant_isolation_is_absolute() {
         "cross-tenant chunk read must 404"
     );
 
-    let (status, body) = send(&app, "GET", "/api/v1/drive/objects", Some(&token_b), None).await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token_b)],
+        Vec::new(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("list json");
     assert!(listed.is_empty(), "cross-tenant list must be empty");
@@ -245,8 +230,8 @@ async fn tenant_isolation_is_absolute() {
         &app,
         "DELETE",
         &format!("/api/v1/drive/objects/{OBJ}"),
-        Some(&token_b),
-        None,
+        &[bearer(&token_b)],
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -255,8 +240,8 @@ async fn tenant_isolation_is_absolute() {
         &app,
         "GET",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token_a),
-        None,
+        &[bearer(&token_a)],
+        Vec::new(),
     )
     .await;
     assert_eq!(
@@ -275,8 +260,8 @@ async fn delete_removes_manifest_and_chunks() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        Some(("application/json", manifest_json().into_bytes())),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
     )
     .await;
     for index in 0..3 {
@@ -284,8 +269,8 @@ async fn delete_removes_manifest_and_chunks() {
             &app,
             "PUT",
             &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
-            Some(&token),
-            Some(("application/octet-stream", sealed_chunk_body())),
+            &[bearer(&token), content_type("application/octet-stream")],
+            sealed_chunk_body(),
         )
         .await;
     }
@@ -294,8 +279,8 @@ async fn delete_removes_manifest_and_chunks() {
         &app,
         "DELETE",
         &format!("/api/v1/drive/objects/{OBJ}"),
-        Some(&token),
-        None,
+        &[bearer(&token)],
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -305,8 +290,8 @@ async fn delete_removes_manifest_and_chunks() {
             &app,
             "GET",
             &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
-            Some(&token),
-            None,
+            &[bearer(&token)],
+            Vec::new(),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -323,8 +308,8 @@ async fn malformed_inputs_are_rejected() {
         &app,
         "GET",
         "/api/v1/drive/objects/not-a-uuid/manifest",
-        Some(&token),
-        None,
+        &[bearer(&token)],
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -334,8 +319,8 @@ async fn malformed_inputs_are_rejected() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        Some(&token),
-        Some(("application/octet-stream", vec![0u8; 10])),
+        &[bearer(&token), content_type("application/octet-stream")],
+        vec![0u8; 10],
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -345,8 +330,8 @@ async fn malformed_inputs_are_rejected() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        Some(&token),
-        Some(("application/octet-stream", vec![0u8; 6 * 1024 * 1024])),
+        &[bearer(&token), content_type("application/octet-stream")],
+        vec![0u8; 6 * 1024 * 1024],
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -357,8 +342,8 @@ async fn malformed_inputs_are_rejected() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        Some(("application/json", bad_manifest.into_bytes())),
+        &[bearer(&token), content_type("application/json")],
+        bad_manifest.into_bytes(),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -366,29 +351,26 @@ async fn malformed_inputs_are_rejected() {
 
 #[tokio::test]
 async fn auth_not_configured_fails_closed_with_503() {
-    let config = PlatformConfig::from_source(|_| None).expect("default config");
     let app = build_app(AppState {
-        config: Arc::new(config),
-        vault: Arc::new(ObjectStoreVault::new_in_memory()),
         jwt: None,
-        query: None,
-        provisioning: None,
+        ..common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()))
     });
     let token = token_for(TenantId::generate());
-    let (status, _) = send(&app, "GET", "/api/v1/drive/objects", Some(&token), None).await;
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
 async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
     let vault = Arc::new(ObjectStoreVault::new_in_memory());
-    let app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("default config")),
-        vault: vault.clone(),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: None,
-        provisioning: None,
-    });
+    let app = build_app(common::app_state(SECRET, vault.clone()));
     let tenant = TenantId::generate();
     let token = token_for(tenant);
 
@@ -396,11 +378,8 @@ async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        Some((
-            "application/json",
-            manifest_json_with_chunks(3).into_bytes(),
-        )),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json_with_chunks(3).into_bytes(),
     )
     .await;
     for index in 0..3 {
@@ -408,8 +387,8 @@ async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
             &app,
             "PUT",
             &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
-            Some(&token),
-            Some(("application/octet-stream", sealed_chunk_body())),
+            &[bearer(&token), content_type("application/octet-stream")],
+            sealed_chunk_body(),
         )
         .await;
     }
@@ -418,11 +397,8 @@ async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        Some((
-            "application/json",
-            manifest_json_with_chunks(1).into_bytes(),
-        )),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json_with_chunks(1).into_bytes(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -431,8 +407,8 @@ async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
         &app,
         "DELETE",
         &format!("/api/v1/drive/objects/{OBJ}"),
-        Some(&token),
-        None,
+        &[bearer(&token)],
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -478,25 +454,29 @@ impl VaultStore for RacingDeleteVault {
 
 #[tokio::test]
 async fn listing_skips_manifests_deleted_concurrently() {
-    let app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("default config")),
-        vault: Arc::new(RacingDeleteVault(ObjectStoreVault::new_in_memory())),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: None,
-        provisioning: None,
-    });
+    let app = build_app(common::app_state(
+        SECRET,
+        Arc::new(RacingDeleteVault(ObjectStoreVault::new_in_memory())),
+    ));
     let token = token_for(TenantId::generate());
     let (status, _) = send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        Some(&token),
-        Some(("application/json", manifest_json().into_bytes())),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(&app, "GET", "/api/v1/drive/objects", Some(&token), None).await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("list json");
     assert!(listed.is_empty(), "deleted manifest must not be listed");

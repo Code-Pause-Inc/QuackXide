@@ -8,6 +8,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
+  cached RS256 keypair), request helpers, and app builders for the API
+  integration tests.
 * ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`

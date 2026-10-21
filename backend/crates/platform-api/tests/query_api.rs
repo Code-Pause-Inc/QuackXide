@@ -3,48 +3,37 @@
 //! queries it. Covers tenant isolation, the 503 fail-closed path, and the
 //! ZK-mode policy gate.
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use http_body_util::BodyExt;
 use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
 use platform_api::{ApiError, AppState, build_app};
-use platform_auth::JwtVerifier;
-use platform_config::PlatformConfig;
-use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_info};
-use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::{SecretBytes, TenantKeypair, hpke_seal_to_tenant};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use quackxide_engine::EngineSettings;
-use tower::ServiceExt;
+
+use common::{app_state, bearer, dev_attestation, post_query, send, synced_vault};
 
 const SECRET: &str = "query-itest-secret";
-const ISS: &str = "urn:platform:auth";
-const AUD: &str = "urn:platform:drive";
 
 fn token_for(tenant: TenantId) -> String {
-    platform_auth::mint_token(SECRET, ISS, AUD, tenant, "itest", 3600).expect("mint")
+    common::token_for(SECRET, tenant)
 }
 
 /// Build an app whose vault already holds a QuickBooks sync sealed to
 /// `tenant`, queryable via a dev key provider holding the matching keypair.
 async fn app_with_sealed_quickbooks(tenant: TenantId, zk: ZkMode) -> Router {
-    app_with_attestation(
-        tenant,
-        zk,
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        false,
-    )
-    .await
+    app_with_attestation(tenant, zk, dev_attestation(), false).await
 }
 
 /// As [`app_with_sealed_quickbooks`], with the query gate's attestation.
@@ -54,22 +43,8 @@ async fn app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
-
-    // The connector pipeline seals the fixture into the vault.
-    let pipeline = EnclavePipeline::new(
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        vault.clone(),
-        false,
-    );
-    let job = SyncJob {
-        tenant,
-        tenant_public_key: keypair.public_key(),
-        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
-    };
-    pipeline.run_sync(&job).await.expect("seal sync");
-
+    let vault = synced_vault(tenant, &keypair, 1).await;
     let service = ConnectorQueryService::new(
         vault.clone(),
         Arc::new(DevKeyProvider::new(tenant, keypair)),
@@ -82,43 +57,10 @@ async fn app_with_attestation(
     )
     .with_min_cohort(2);
 
-    let config = PlatformConfig::from_source(|_| None).expect("config");
     build_app(AppState {
-        config: Arc::new(config),
-        vault,
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
         query: Some(Arc::new(service)),
-        provisioning: None,
+        ..app_state(SECRET, vault)
     })
-}
-
-async fn post_query(
-    app: &Router,
-    token: Option<&str>,
-    body: &str,
-) -> (StatusCode, serde_json::Value) {
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/api/v1/query")
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(token) = token {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-    let request = builder.body(Body::from(body.to_owned())).expect("request");
-    let response = app.clone().oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    let json = if bytes.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-    };
-    (status, json)
 }
 
 #[tokio::test]
@@ -310,14 +252,10 @@ async fn copy_to_disk_is_refused_without_the_zk_gate() {
 
 #[tokio::test]
 async fn query_unavailable_when_not_configured_returns_503() {
-    let config = PlatformConfig::from_source(|_| None).expect("config");
-    let app = build_app(AppState {
-        config: Arc::new(config),
-        vault: Arc::new(ObjectStoreVault::new_in_memory()),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: None,
-        provisioning: None,
-    });
+    let app = build_app(app_state(
+        SECRET,
+        Arc::new(ObjectStoreVault::new_in_memory()),
+    ));
     let token = token_for(TenantId::generate());
     let (status, _) = post_query(
         &app,
@@ -385,7 +323,7 @@ async fn observed_service(
         syncs,
         max_concurrent_queries,
         fail_on_call,
-        Arc::new(DevAttestation::allow_insecure_dev()),
+        dev_attestation(),
         false,
     )
     .await
@@ -400,21 +338,8 @@ async fn observed_service_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> (ConnectorQueryService, Arc<ObservedKeys>) {
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
-    let pipeline = EnclavePipeline::new(
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        vault.clone(),
-        false,
-    );
-    let job = SyncJob {
-        tenant,
-        tenant_public_key: keypair.public_key(),
-        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
-    };
-    for _ in 0..syncs {
-        pipeline.run_sync(&job).await.expect("seal sync");
-    }
+    let vault = synced_vault(tenant, &keypair, syncs).await;
     let keys = Arc::new(ObservedKeys {
         inner: DevKeyProvider::new(tenant, keypair),
         calls: AtomicUsize::new(0),
@@ -528,29 +453,6 @@ async fn decryption_failure_midway_fails_closed_and_releases_the_slot() {
 }
 
 // ── Snapshots: repeated or interrupted syncs never change what a query reads ──
-
-/// `syncs` full QuickBooks syncs into a fresh vault, sealed to `keypair`.
-async fn synced_vault(
-    tenant: TenantId,
-    keypair: &TenantKeypair,
-    syncs: usize,
-) -> Arc<dyn VaultStore> {
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let pipeline = EnclavePipeline::new(
-        Arc::new(DevAttestation::allow_insecure_dev()),
-        vault.clone(),
-        false,
-    );
-    let job = SyncJob {
-        tenant,
-        tenant_public_key: keypair.public_key(),
-        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
-    };
-    for _ in 0..syncs {
-        pipeline.run_sync(&job).await.expect("seal sync");
-    }
-    vault
-}
 
 fn service_over(
     tenant: TenantId,
@@ -701,23 +603,15 @@ async fn a_manifest_listing_an_object_twice_fails_closed() {
 async fn grant_routes_without_research_config_report_research_unavailable() {
     let tenant = TenantId::generate();
     let app = app_with_sealed_quickbooks(tenant, ZkMode::Disabled).await;
-    let request = Request::builder()
-        .method("GET")
-        .uri("/api/v1/grants")
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", token_for(tenant)),
-        )
-        .body(Body::empty())
-        .expect("request");
-    let response = app.oneshot(request).await.expect("response");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
+    let (status, bytes) = send(
+        &app,
+        "GET",
+        "/api/v1/grants",
+        &[bearer(&token_for(tenant))],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body["error"], "research access not configured");
 }
