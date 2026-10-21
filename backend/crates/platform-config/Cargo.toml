@@ -15,3 +15,4 @@ workspace = true
 platform-core.workspace = true
 dotenvy.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true

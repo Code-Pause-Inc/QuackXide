@@ -33,6 +33,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` are held as `SecretString`
+  (moved to `platform-core`), zeroized on drop and redacted in `Debug`.
+  Their environment copies remain; `docs/THREAT_MODEL.md` lists this as a
+  residual risk.
 * The Drive client checks the vault's plaintext copies of a manifest's
   tenant, chunk count and timestamp against the authenticated manifest,
   shows only authenticated values, and on download refuses a record for
