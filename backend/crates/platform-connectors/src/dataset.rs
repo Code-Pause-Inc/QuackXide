@@ -3,6 +3,7 @@
 
 use crate::ConnectorError;
 use serde::Serialize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,8 +24,8 @@ pub fn col(name: &'static str, ty: ColumnType) -> ColumnSpec {
     ColumnSpec { name, ty }
 }
 
-/// A single typed cell. `Null` is valid in any column.
-#[derive(Debug, Clone, PartialEq)]
+/// A single typed cell, wiped on drop. `Null` is valid in any column.
+#[derive(Debug, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub enum FieldValue {
     Str(String),
     I64(i64),
@@ -107,5 +108,12 @@ mod tests {
             ds.push_row(vec![FieldValue::F64(1.0), FieldValue::F64(2.0)])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cells_zeroize_on_drop() {
+        // Cells hold connector plaintext; dropping a dataset must wipe them.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<FieldValue>();
     }
 }

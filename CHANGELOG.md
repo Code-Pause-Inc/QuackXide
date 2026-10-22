@@ -47,6 +47,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `HttpJsonSource` refuses a connector endpoint that is not `https`
+  (plain `http` only on loopback), as token endpoints already did, so a
+  bearer token is never sent in cleartext. Connector HTTP requests refuse
+  redirects, time out, and cap response bodies at 64 KiB for token
+  responses and 64 MiB for payloads. Response bodies, `Dataset` cells and
+  the query-result JSON buffer are zeroized on drop.
 * `GET /api/v1/drive/objects` skips a manifest deleted between listing
   and reading it, instead of failing the whole listing with 404.
 * `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` are held as `SecretString`

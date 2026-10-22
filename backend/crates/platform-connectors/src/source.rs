@@ -1,5 +1,7 @@
 //! Connector sources: where raw data enters the enclave.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use platform_core::TenantId;
@@ -7,7 +9,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
-use crate::oauth::{OAuth2Config, SecretString, TokenResponse, refresh_access_token};
+use crate::oauth::{
+    OAuth2Config, SecretString, TokenResponse, read_capped, refresh_access_token, tls_url,
+};
 use crate::{ConnectorDescriptor, ConnectorError, mappers};
 
 #[derive(Debug, Clone)]
@@ -74,10 +78,24 @@ impl ConnectorSource for FixtureSource {
     }
 }
 
+/// Largest connector payload read into enclave RAM.
+pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Redirects are refused, not followed: a hop could downgrade to cleartext
+/// or carry the request to a host the endpoint check never saw.
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+}
+
 /// Production HTTP source: OAuth2 refresh → authenticated GET → mapper.
 pub struct HttpJsonSource {
     descriptor: ConnectorDescriptor,
-    endpoint: String,
+    endpoint: reqwest::Url,
     oauth: OAuth2Config,
     /// Held across the exchange so concurrent syncs never replay a token the
     /// provider has already rotated. In memory only; not persisted.
@@ -96,11 +114,14 @@ impl HttpJsonSource {
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
             descriptor: descriptor_for(slug)?,
-            endpoint,
+            endpoint: tls_url(&endpoint)
+                .map_err(|reason| ConnectorError::Http(format!("connector endpoint {reason}")))?,
             oauth,
             refresh_token: Mutex::new(refresh_token),
             mapper,
-            client: reqwest::Client::new(),
+            client: client_builder()
+                .build()
+                .map_err(|e| ConnectorError::Http(e.to_string()))?,
         })
     }
 
@@ -123,18 +144,22 @@ impl ConnectorSource for HttpJsonSource {
 
     async fn fetch(&self, _ctx: &SyncContext) -> Result<Vec<Dataset>, ConnectorError> {
         let tokens = self.refresh().await?;
-        let payload: Value = self
+        let response = self
             .client
-            .get(&self.endpoint)
+            .get(self.endpoint.clone())
             .bearer_auth(tokens.access_token.expose())
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| ConnectorError::Http(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ConnectorError::Http(e.to_string()))?
-            .json()
-            .await
+            .map_err(|e| ConnectorError::Http(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ConnectorError::Http(format!(
+                "connector endpoint returned {status}"
+            )));
+        }
+        let body = read_capped(response, MAX_PAYLOAD_BYTES).await?;
+        let payload: Value = serde_json::from_slice(body.expose())
             .map_err(|e| ConnectorError::Http(e.to_string()))?;
         Ok(vec![(self.mapper)(&payload)?])
     }
@@ -171,9 +196,11 @@ mod tests {
         ));
     }
 
-    /// Minimal HTTP/1.1 stub: `/token` records each form body and rotates
-    /// `rt-0` to `rt-1` once; any other path serves the CRM fixture.
-    fn spawn_stub() -> (String, Arc<StdMutex<Vec<String>>>) {
+    type Seen = Arc<StdMutex<Vec<(String, String)>>>;
+
+    /// Minimal HTTP/1.1 stub: records each request line and body, and writes
+    /// back whatever `respond` returns for them.
+    fn spawn_server(respond: fn(&str, &str) -> String) -> (String, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -201,31 +228,35 @@ mod tests {
                 reader.read_exact(&mut body).expect("body");
                 let body = String::from_utf8(body).expect("utf8");
 
-                let response = if request_line.contains("/token") {
-                    let rotate = body.contains("refresh_token=rt-0");
-                    recorded.lock().expect("lock").push(body);
-                    if rotate {
-                        r#"{"access_token":"at","refresh_token":"rt-1"}"#.to_owned()
-                    } else {
-                        r#"{"access_token":"at"}"#.to_owned()
-                    }
-                } else {
-                    mappers::fixtures::crm().to_string()
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.len(),
-                    response
-                );
+                let response = respond(&request_line, &body);
+                recorded.lock().expect("lock").push((request_line, body));
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         (base, seen)
     }
 
-    #[tokio::test]
-    async fn rotated_refresh_token_is_used_for_later_syncs() {
-        let (base, seen) = spawn_stub();
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// `/token` rotates `rt-0` to `rt-1` once; `/data` serves the CRM fixture.
+    fn crm_provider(request_line: &str, body: &str) -> String {
+        if request_line.contains("/token") {
+            if body.contains("refresh_token=rt-0") {
+                ok(r#"{"access_token":"at","refresh_token":"rt-1"}"#)
+            } else {
+                ok(r#"{"access_token":"at"}"#)
+            }
+        } else {
+            ok(&mappers::fixtures::crm().to_string())
+        }
+    }
+
+    fn source_for(base: &str) -> HttpJsonSource {
         let mut source = HttpJsonSource::new(
             "generic_crm",
             format!("{base}/data"),
@@ -234,17 +265,32 @@ mod tests {
             mappers::crm_contacts,
         )
         .expect("known slug");
-        source.client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
-        let ctx = SyncContext {
+        // The production client, minus any proxy in the test environment.
+        source.client = client_builder().no_proxy().build().expect("client");
+        source
+    }
+
+    fn ctx() -> SyncContext {
+        SyncContext {
             tenant: TenantId::generate(),
             since: None,
-        };
+        }
+    }
+
+    fn requested(seen: &Seen, path: &str) -> bool {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .any(|(line, _)| line.contains(path))
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_token_is_used_for_later_syncs() {
+        let (base, seen) = spawn_server(crm_provider);
+        let source = source_for(&base);
 
         for _ in 0..3 {
-            let datasets = source.fetch(&ctx).await.expect("sync");
+            let datasets = source.fetch(&ctx()).await.expect("sync");
             assert_eq!(datasets.len(), 1);
         }
 
@@ -252,7 +298,8 @@ mod tests {
             .lock()
             .expect("lock")
             .iter()
-            .map(|body| {
+            .filter(|(line, _)| line.contains("/token"))
+            .map(|(_, body)| {
                 body.split('&')
                     .find_map(|kv| kv.strip_prefix("refresh_token="))
                     .expect("refresh_token field")
@@ -261,5 +308,123 @@ mod tests {
             .collect();
         // Rotated once, then the rotated token is kept when none is reissued.
         assert_eq!(sent, ["rt-0", "rt-1", "rt-1"]);
+    }
+
+    #[test]
+    fn cleartext_endpoints_are_refused() {
+        let build = |endpoint: &str| {
+            HttpJsonSource::new(
+                "generic_crm",
+                endpoint.into(),
+                oauth("https://idp.example/token".into()),
+                SecretString::new("rt-0".into()),
+                mappers::crm_contacts,
+            )
+        };
+        assert!(build("https://api.example/data").is_ok());
+        assert!(build("http://127.0.0.1:8080/data").is_ok());
+        for bad in [
+            "http://api.example/data",
+            "http://10.0.0.5/data",
+            "ftp://api.example/data",
+            "not a url",
+            "",
+        ] {
+            assert!(matches!(build(bad), Err(ConnectorError::Http(_))), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_refused_without_being_followed() {
+        fn redirecting(request_line: &str, body: &str) -> String {
+            if request_line.contains("/data") {
+                "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            } else {
+                crm_provider(request_line, body)
+            }
+        }
+        let (base, seen) = spawn_server(redirecting);
+
+        let result = source_for(&base).fetch(&ctx()).await;
+
+        assert!(matches!(result, Err(ConnectorError::Http(_))), "{result:?}");
+        assert!(!requested(&seen, "/elsewhere"), "redirect was followed");
+    }
+
+    #[tokio::test]
+    async fn oversized_payloads_are_refused() {
+        fn oversized(request_line: &str, body: &str) -> String {
+            if request_line.contains("/data") {
+                // Declared length alone must refuse it; no body is sent.
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    MAX_PAYLOAD_BYTES + 1
+                )
+            } else {
+                crm_provider(request_line, body)
+            }
+        }
+        let (base, _) = spawn_server(oversized);
+
+        let result = source_for(&base).fetch(&ctx()).await;
+
+        assert!(
+            matches!(&result, Err(ConnectorError::Http(msg)) if msg.contains("exceeds")),
+            "{result:?}"
+        );
+    }
+
+    fn padded_token() -> String {
+        let pad = "x".repeat(crate::oauth::MAX_TOKEN_RESPONSE_BYTES);
+        format!(r#"{{"access_token":"at","pad":"{pad}"}}"#)
+    }
+
+    #[tokio::test]
+    async fn oversized_token_responses_are_refused() {
+        fn oversized(request_line: &str, body: &str) -> String {
+            if request_line.contains("/token") {
+                ok(&padded_token())
+            } else {
+                crm_provider(request_line, body)
+            }
+        }
+        let (base, seen) = spawn_server(oversized);
+
+        let result = source_for(&base).fetch(&ctx()).await;
+
+        assert!(
+            matches!(&result, Err(ConnectorError::Http(msg)) if msg.contains("exceeds")),
+            "{result:?}"
+        );
+        assert!(!requested(&seen, "/data"));
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_token_responses_are_refused() {
+        fn chunked(request_line: &str, body: &str) -> String {
+            if request_line.contains("/token") {
+                // No Content-Length: the cap must hold while streaming.
+                let token = padded_token();
+                let half = token.len() / 2;
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    half,
+                    &token[..half],
+                    token.len() - half,
+                    &token[half..]
+                )
+            } else {
+                crm_provider(request_line, body)
+            }
+        }
+        let (base, seen) = spawn_server(chunked);
+
+        let result = source_for(&base).fetch(&ctx()).await;
+
+        assert!(
+            matches!(&result, Err(ConnectorError::Http(msg)) if msg.contains("exceeds")),
+            "{result:?}"
+        );
+        assert!(!requested(&seen, "/data"));
     }
 }
