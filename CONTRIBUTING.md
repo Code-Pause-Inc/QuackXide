@@ -34,9 +34,16 @@ Every pull request runs:
 * the attribution guard over files and commit messages;
 * a default-feature release build of `platform-api`, which fails if it
   contains the dev-only `devstack` binary;
+* a build of every fuzz target (`backend/fuzz/`), which also fails if
+  `backend/fuzz/Cargo.lock` is stale;
+* a gitleaks secret scan of the full history;
 * a coverage report in the job summary.
 
-Fuzz targets (`backend/fuzz/`) run weekly, and the OpenSSF Scorecard tracks
+Every cargo build, check, clippy and test command runs with `--locked`, so
+commit `Cargo.lock` (and `backend/fuzz/Cargo.lock`, which a workspace
+dependency change can also move) with any `Cargo.toml` change.
+
+Fuzz targets compile on every pull request and run weekly, and the OpenSSF Scorecard tracks
 the repository's supply-chain posture. Tagged releases are built from
 `check.sh`-verified sources with signed build provenance.
 

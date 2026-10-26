@@ -108,7 +108,9 @@ cd backend/fuzz
 cargo +nightly fuzz run <target>
 ```
 
-The targets run weekly in CI. P70 adds a build check on every pull request.
+Every pull request checks that each target compiles (`cargo check
+--manifest-path backend/fuzz/Cargo.toml --locked --bins`, on stable), and
+the targets run weekly in CI.
 A new parser of untrusted input gets a target.
 
 ## Negative tests and audit assertions
