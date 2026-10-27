@@ -19,18 +19,19 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
     { id = "RUSTSEC-2026-0195", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
     # crypto-bigint timing (fixed in >= 0.7.6): 0.5 comes in through
-    # elliptic-curve 0.13 (p256, p384, via hpke 0.12 and jsonwebtoken 11).
-    # The HPKE suite is X25519; production P-384 use is ECDSA verification of
-    # public AMD certificates and reports. P-384 signing happens only in the
-    # simulated TEE, with keys derived from public seeds. Revisit when the
-    # hpke upgrade (P35) and p384 0.14 land.
+    # elliptic-curve 0.13 (p256 via jsonwebtoken 11, p384 via
+    # platform-enclave). The HPKE suite is X25519, no ES256/ES384 token is
+    # signed, and production P-384 use is ECDSA verification of public AMD
+    # certificates and reports. P-384 signing happens only in the simulated
+    # TEE, with throwaway random or seeded keys that production attestation
+    # refuses. Revisit when the hpke upgrade (P35) and p384 0.14 land.
     { id = "RUSTSEC-2026-0387", reason = "no secret P-256/P-384 arithmetic outside the simulated TEE; elliptic-curve 0.13 pins crypto-bigint 0.5" },
     # zstd and zstd-safe (fixed in zstd >= 0.14.3, zstd-safe >= 8.2.0):
-    # arrow, parquet and DataFusion 55 pin zstd 0.13. They use the bulk API
-    # and the raw stream decoder, never the `with_context` stream
-    # constructors (0391), and build zstd without the `seekable` (0398) or
-    # `legacy` (0403) features. Revisit when arrow and parquet move to
-    # zstd 0.14.
+    # arrow, parquet and DataFusion 55 pin zstd 0.13. arrow-ipc and parquet
+    # use the bulk API and async-compression drives zstd-safe directly, never
+    # the `with_context` stream constructors (0391); zstd and zstd-safe build
+    # with only `std`, without `seekable` (0398) or `legacy` (0403). Revisit
+    # when arrow and parquet move to zstd 0.14.
     { id = "RUSTSEC-2026-0391", reason = "no zstd with_context streams; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature not enabled; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0403", reason = "zstd legacy feature not enabled; DataFusion 55 pins zstd 0.13" },
