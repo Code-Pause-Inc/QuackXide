@@ -9,6 +9,6 @@
 /frontend/src/lib/crypto/                      @AxolDad
 /scripts/                                      @AxolDad
 /.github/                                      @AxolDad
-/deny.toml                                     @AxolDad
+/backend/deny.toml                             @AxolDad
 /LICENSE-*                                     @AxolDad
 /NOTICE                                        @AxolDad
