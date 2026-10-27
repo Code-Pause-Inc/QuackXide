@@ -11,6 +11,9 @@ uses [Semantic Versioning](https://semver.org/).
 * Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
+* CI compiles every fuzz target on each pull request, and runs a gitleaks
+  secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
+  runs the same scan when gitleaks is installed.
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.
@@ -100,6 +103,9 @@ uses [Semantic Versioning](https://semver.org/).
 * `connector-worker` stops on SIGTERM or Ctrl-C. A sync already running
   finishes and commits its snapshot; jobs not yet started wait for the
   next run.
+* Every cargo build, check, clippy, test and coverage command in
+  `scripts/check.sh` and CI runs with `--locked`, and the weekly fuzz run
+  refuses a stale `backend/fuzz/Cargo.lock`, which is brought up to date.
 
 ## [0.1.0] - 2026-09-30
 

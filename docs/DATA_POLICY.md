@@ -29,6 +29,11 @@ test environment use **synthetic or public data only**.
 
 * `scripts/check.sh` fails if a data file is tracked outside a `fixtures/`
   directory.
+* gitleaks scans the full history for credentials on every pull request
+  (`.gitleaks.toml`), and `scripts/check.sh` runs the same scan when
+  gitleaks is installed. A synthetic test literal that trips a rule is
+  allowed in `.gitleaks.toml` by exact value or path, never by disabling
+  a rule.
 * Pull requests are reviewed for data content.
 * If real or sensitive data is committed by mistake, do not try to fix it
   with a follow-up commit alone: report it immediately as described in

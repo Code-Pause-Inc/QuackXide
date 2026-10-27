@@ -1848,6 +1848,7 @@ dependencies = [
  "dotenvy",
  "platform-core",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -1883,6 +1884,7 @@ dependencies = [
  "serde",
  "thiserror",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

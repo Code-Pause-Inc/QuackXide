@@ -21,6 +21,11 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz
+      # cargo-fuzz has no --locked flag; a locked fetch first fails if
+      # Cargo.lock is stale, so the run below never rewrites it.
+      - name: Dependencies match Cargo.lock
+        working-directory: backend/fuzz
+        run: cargo +nightly fetch --locked
       - name: Fuzz ${{ matrix.target }} for 5 minutes
         working-directory: backend/fuzz
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300

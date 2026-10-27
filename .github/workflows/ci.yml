@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: backend
-      - run: cargo test --manifest-path backend/Cargo.toml --workspace
+      - run: cargo test --manifest-path backend/Cargo.toml --workspace --locked
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
@@ -85,7 +85,7 @@ jobs:
           tool: cargo-llvm-cov
       - name: Backend coverage
         run: |
-          cargo llvm-cov --manifest-path backend/Cargo.toml --workspace --summary-only \
+          cargo llvm-cov --manifest-path backend/Cargo.toml --workspace --locked --summary-only \
             | tee coverage.txt
           { echo '## Backend coverage'; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -144,3 +144,41 @@ jobs:
             exit 1
           fi
 
+
+  fuzz-build:
+    name: fuzz targets compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: backend/fuzz
+      # Build only, on stable: fuzz.yml runs the targets weekly on nightly.
+      # The fuzz crate is outside the workspace, so this also catches a
+      # backend/fuzz/Cargo.lock that a workspace change left stale.
+      - name: Check every fuzz target
+        run: cargo check --manifest-path backend/fuzz/Cargo.toml --locked --bins
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # The gitleaks CLI, pinned by version and checksum. The gitleaks-action
+      # wrapper needs a licence key on organization repositories.
+      - name: Install gitleaks
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          rm gitleaks.tar.gz
+      - name: Scan the full history
+        run: ./gitleaks git --no-banner --redact --config .gitleaks.toml .

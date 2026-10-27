@@ -1,0 +1,12 @@
+# gitleaks configuration for scripts/check.sh and the ci.yml secret-scan job.
+# docs/DATA_POLICY.md rule 3: no credentials in the repository.
+#
+# The default rules apply. A test-only literal that trips a rule (a
+# synthetic key or token that is not, and never was, a real credential)
+# is allowed here by exact value or by path, with a comment saying which
+# test uses it. Never allow a whole rule or directory to silence a finding.
+
+title = "QuackXide"
+
+[extend]
+useDefault = true
