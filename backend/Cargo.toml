@@ -14,6 +14,7 @@ members = [
     "crates/quackxide-engine",
     "crates/platform-api",
     "crates/synth-data",
+    "crates/envelope-wasm",
 ]
 exclude = ["fuzz"]
 
@@ -92,6 +93,12 @@ subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 rand = "0.8"
+# The browser build of the envelope code (`envelope-wasm`). `scripts/build-wasm.sh`
+# refuses a `wasm-bindgen` CLI whose version differs from this one.
+wasm-bindgen = "=0.2.126"
+# `rand` 0.8's `OsRng` uses getrandom 0.2; on wasm32 it needs the JavaScript
+# backend (`crypto.getRandomValues`).
+getrandom = { version = "0.2", features = ["js"] }
 
 # ── auth + storage backends ─────────────────────────────────────────────────
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
@@ -119,3 +126,13 @@ rand_chacha = "0.9"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The browser build of `envelope-wasm` (`scripts/build-wasm.sh`): small, no
+# debug info, no symbol names.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+debug = false
+strip = true
+panic = "abort"

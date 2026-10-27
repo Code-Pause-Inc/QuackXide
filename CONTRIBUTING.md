@@ -8,7 +8,9 @@ in `docs/PROJECT_SCOPE.md`.
 
 * Backend: Rust, pinned in `rust-toolchain.toml` (rustup installs it on
   first use), from `backend/`.
-* Frontend: Node, pinned in `.nvmrc`, from `frontend/`.
+* Frontend: Node, pinned in `.nvmrc`, from `frontend/`. It needs the
+  browser envelope module, built by `scripts/build-wasm.sh` (see
+  "Development" in `README.md` for the `wasm-bindgen` CLI it needs).
 * Enable the repository's git hooks once per clone:
 
   ```bash

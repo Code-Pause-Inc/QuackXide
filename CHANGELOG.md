@@ -8,6 +8,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Browser envelope sealing: `envelope-wasm` builds `platform-crypto`'s HPKE
+  envelope seal for wasm32, and the crypto worker loads it through
+  `frontend/src/lib/crypto/envelope.ts` to seal to a tenant's raw public
+  key. `scripts/build-wasm.sh` builds it (no debug info, local paths
+  remapped) for `check.sh` and the CI jobs that run frontend tests.
+  Envelope readers choose the suite from the frame magic, `info` strings
+  are defined once in `platform_crypto::info` (with new kinds for steward
+  uploads and research results), and `fixtures/envelope/` holds vectors
+  that the Rust and vitest tests both check. `platform-crypto`'s AEAD
+  helpers, blind indexes and TOTP move behind its default `server`
+  feature.
 * Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
