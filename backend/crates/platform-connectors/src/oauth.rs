@@ -4,10 +4,16 @@
 //! stored refresh token for short-lived access tokens. Client secrets and
 //! refresh tokens are held in zeroizing, redacted containers.
 
+use std::io::Write;
+
 pub use platform_core::SecretString;
+use platform_crypto::{SecretBytes, ZeroizingWriter};
 use serde::Deserialize;
 
 use crate::ConnectorError;
+
+/// Largest token-endpoint response read into enclave RAM.
+pub const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct OAuth2Config {
@@ -115,18 +121,48 @@ async fn post_token_form(
     }
 
     parse_token_response(
-        &response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Http(e.to_string()))?,
+        read_capped(response, MAX_TOKEN_RESPONSE_BYTES)
+            .await?
+            .expose(),
     )
+}
+
+/// Read a response body into a zeroizing buffer, refusing it once it exceeds
+/// `limit` bytes, whether the length is declared up front or streamed.
+pub(crate) async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<SecretBytes, ConnectorError> {
+    let too_large = || ConnectorError::Http(format!("response body exceeds {limit} bytes"));
+    let declared = response
+        .content_length()
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    if declared > limit {
+        return Err(too_large());
+    }
+    let mut body = ZeroizingWriter::with_capacity(declared);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ConnectorError::Http(e.to_string()))?
+    {
+        if chunk.len() > limit - body.len() {
+            return Err(too_large());
+        }
+        body.write_all(&chunk)
+            .map_err(|e| ConnectorError::Http(e.to_string()))?;
+    }
+    Ok(body.into_secret())
+}
+
+fn token_endpoint(raw: &str) -> Result<reqwest::Url, ConnectorError> {
+    tls_url(raw).map_err(|reason| ConnectorError::OAuth(format!("token endpoint {reason}")))
 }
 
 /// Credentials are only ever sent over TLS; plain HTTP is accepted for
 /// loopback endpoints (local test servers) and nothing else.
-fn token_endpoint(raw: &str) -> Result<reqwest::Url, ConnectorError> {
-    let url = reqwest::Url::parse(raw)
-        .map_err(|_| ConnectorError::OAuth("invalid token endpoint URL".into()))?;
+pub(crate) fn tls_url(raw: &str) -> Result<reqwest::Url, &'static str> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "is not a valid URL")?;
     let loopback = url.host_str().is_some_and(|host| {
         host == "localhost"
             || host
@@ -138,9 +174,7 @@ fn token_endpoint(raw: &str) -> Result<reqwest::Url, ConnectorError> {
     match url.scheme() {
         "https" => Ok(url),
         "http" if loopback => Ok(url),
-        _ => Err(ConnectorError::OAuth(
-            "token endpoint must use https".into(),
-        )),
+        _ => Err("must use https"),
     }
 }
 
