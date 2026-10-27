@@ -47,6 +47,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `tokio` 1.54.1 (RUSTSEC-2026-0384; 1.54.0 is yanked) and `zstd-sys`
+  2.1.2 (RUSTSEC-2026-0410). `backend/deny.toml` records why
+  RUSTSEC-2026-0387 (`crypto-bigint` 0.5) and RUSTSEC-2026-0391, -0398 and
+  -0403 (`zstd` 0.13) do not apply until upstream crates move to fixed
+  versions.
 * `GET /api/v1/drive/objects` skips a manifest deleted between listing
   and reading it, instead of failing the whole listing with 404.
 * `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` are held as `SecretString`
