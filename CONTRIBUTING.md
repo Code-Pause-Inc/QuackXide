@@ -19,9 +19,18 @@ See "Development" in `README.md` for running the API and frontend locally.
 
 ## Before every push
 
-Run `scripts/check.sh`. It builds, lints (clippy with warnings as errors),
-and tests the backend and frontend, and runs the white-label, config, data,
-and attribution guards.
+Run `scripts/check.sh`. It builds and tests the backend and frontend, lints
+both with warnings as errors (clippy for the backend, ESLint via `npm run lint`
+for the frontend), and runs the white-label, config, data, and attribution
+guards.
+
+`typescript-eslint` does not support TypeScript 7 yet, so in `frontend/` the
+`typescript` package is an alias for `@typescript/typescript6` (the TS 6 API
+it loads) and TS 7 is installed as `typescript7`. `npm run typecheck` and
+`npm run build` call TS 7 explicitly, because both packages provide a `tsc`
+command. An editor that uses the workspace TypeScript version gets TS 6, so
+it can differ slightly from `npm run typecheck`; use the editor's bundled
+TypeScript, or trust `npm run typecheck`.
 
 ## Continuous integration
 
