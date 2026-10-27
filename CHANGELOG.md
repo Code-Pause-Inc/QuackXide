@@ -8,6 +8,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
+  as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
+  `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.
