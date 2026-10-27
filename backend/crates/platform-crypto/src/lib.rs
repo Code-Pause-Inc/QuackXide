@@ -13,6 +13,7 @@ use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
 use sha2::Sha256;
+use std::io::{self, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod totp;
@@ -72,6 +73,61 @@ impl SecretBytes {
 impl std::fmt::Debug for SecretBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SecretBytes(<{} bytes redacted>)", self.0.len())
+    }
+}
+
+/// In-memory sink that never leaves plaintext in freed memory: growth moves
+/// into a fresh allocation and zeroizes the old one, and drop zeroizes.
+pub struct ZeroizingWriter {
+    buf: Vec<u8>,
+}
+
+impl ZeroizingWriter {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    pub fn into_secret(mut self) -> SecretBytes {
+        SecretBytes::new(std::mem::take(&mut self.buf))
+    }
+}
+
+impl Write for ZeroizingWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let needed = self
+            .buf
+            .len()
+            .checked_add(data.len())
+            .ok_or_else(|| io::Error::other("zeroizing buffer overflow"))?;
+        if needed > self.buf.capacity() {
+            let mut next = Vec::with_capacity(needed.max(self.buf.capacity().saturating_mul(2)));
+            next.extend_from_slice(&self.buf);
+            // Zeroizes the full capacity of the old allocation before it is freed.
+            self.buf.zeroize();
+            self.buf = next;
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ZeroizingWriter {
+    fn drop(&mut self) {
+        self.buf.zeroize();
     }
 }
 
@@ -317,6 +373,24 @@ mod tests {
         let debugged = format!("{secret:?}");
         assert!(!debugged.contains("super secret"));
         assert!(debugged.contains("redacted"));
+    }
+
+    #[test]
+    fn zeroizing_writer_grows_without_losing_bytes() {
+        let mut writer = ZeroizingWriter::with_capacity(4);
+        let mut expected = Vec::new();
+        for chunk in [
+            &b"ab"[..],
+            b"cdefg",
+            b"",
+            b"hijklmnopqrstuvwxyz",
+            b"0123456789",
+        ] {
+            writer.write_all(chunk).expect("write");
+            expected.extend_from_slice(chunk);
+        }
+        assert!(writer.buf.capacity() > 4, "growth must have occurred");
+        assert_eq!(writer.into_secret().expose(), expected.as_slice());
     }
 
     #[test]

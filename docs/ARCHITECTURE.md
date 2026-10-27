@@ -105,8 +105,13 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   client-credentials for machine-to-machine sources. Secrets live in
   zeroizing, Debug-redacted containers, and token-endpoint error bodies are
   never echoed (error pages can contain credentials).
+* **Credentials only over TLS**: token and connector endpoints must be
+  `https` (plain `http` only on loopback, for local test servers).
+  Redirects are refused rather than followed, requests time out, and
+  response bodies stream into zeroizing buffers under a cap (64 KiB for
+  token responses, 64 MiB for connector payloads).
 * **RAM-only plaintext**: payload → typed `Dataset` (validated at the row
-  boundary — arity and column types) → Parquet in a zeroize-on-drop buffer →
+  boundary — arity and column types; cells zeroized on drop) → Parquet in a zeroize-on-drop buffer →
   HPKE envelope → vault. The plaintext buffer is zeroized the instant its
   ciphertext exists.
 * **Bounded untrusted input**: NDJSON payloads parse under explicit limits
