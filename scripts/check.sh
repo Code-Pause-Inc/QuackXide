@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # check.sh — full validation: backend fmt/check/clippy/test, frontend
-# typecheck/test/build, the white-label guards, and the attribution guard.
+# typecheck/lint/test/build, the white-label guards, and the attribution guard.
 # Must pass before every push.
 # =============================================================================
 set -euo pipefail
@@ -24,6 +24,9 @@ echo "== frontend: clean install =="
 
 echo "== frontend: typecheck =="
 (cd "$ROOT/frontend" && npm run typecheck)
+
+echo "== frontend: lint (warnings are errors) =="
+(cd "$ROOT/frontend" && npm run lint)
 
 echo "== frontend: unit tests =="
 (cd "$ROOT/frontend" && npm test)
