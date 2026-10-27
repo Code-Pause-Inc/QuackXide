@@ -14,6 +14,11 @@ uses [Semantic Versioning](https://semver.org/).
 * CI compiles every fuzz target on each pull request, and runs a gitleaks
   secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
   runs the same scan when gitleaks is installed.
+* `VaultStore::put_if_absent`, a create-only write (`PutMode::Create`;
+  `x-goog-if-generation-match: 0` on GCS). `StorageError` gains
+  `AlreadyExists` and `PreconditionFailed`, which the API returns as 409
+  instead of 502. `ObjectStoreVault::new` takes any
+  `Arc<dyn ObjectStore>`.
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.

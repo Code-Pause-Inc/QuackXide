@@ -432,6 +432,9 @@ impl VaultStore for RacingDeleteVault {
     async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
         self.0.put(path, ciphertext).await
     }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.0.put_if_absent(path, ciphertext).await
+    }
     async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
         self.0.get(path).await
     }

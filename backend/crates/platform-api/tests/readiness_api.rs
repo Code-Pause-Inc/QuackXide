@@ -43,6 +43,9 @@ impl VaultStore for TestVault {
     async fn put(&self, _: &VaultPath, _: Bytes) -> Result<(), StorageError> {
         unreachable!("readiness never writes")
     }
+    async fn put_if_absent(&self, _: &VaultPath, _: Bytes) -> Result<(), StorageError> {
+        unreachable!("readiness never writes")
+    }
     async fn get(&self, _: &VaultPath) -> Result<Bytes, StorageError> {
         unreachable!("readiness never reads")
     }

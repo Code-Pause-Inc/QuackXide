@@ -175,7 +175,17 @@ per test binary in a `OnceLock`. Do not use `keygen::fixtures`: it is
 
 Use the in-memory `ObjectStoreVault::new_in_memory()`. Failure paths
 (conditional-write conflicts, transient errors) use the fault-injecting test
-double from P41.
+double from P41. To inject a backend error, wrap a store and pass it to
+`ObjectStoreVault::new`, as `RefusingStore` in
+`platform-storage/src/lib.rs` does.
+
+`InMemory` enforces `VaultStore::put_if_absent` natively, but the GCS
+emulator does not: fake-gcs-server ignores `ifGenerationMatch`. So check
+create-only writes against a real bucket by hand (the P12 development
+bucket) whenever the create-only path or the `object_store` version
+changes. Write an object with `put_if_absent` and then write it again: the
+second write must fail with `StorageError::AlreadyExists` and leave the
+first object unchanged.
 
 ## Acceptance tests for definition-of-done items 1-3
 

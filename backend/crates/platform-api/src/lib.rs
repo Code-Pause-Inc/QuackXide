@@ -95,6 +95,8 @@ pub enum ApiError {
     Forbidden,
     AuthNotConfigured,
     NotFound,
+    /// A create-only or conditional write lost to an existing object (409).
+    Conflict,
     BadRequest(&'static str),
     Backend,
     /// The confidential query service is not configured (503).
@@ -118,6 +120,7 @@ impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         match err {
             StorageError::NotFound => ApiError::NotFound,
+            StorageError::AlreadyExists | StorageError::PreconditionFailed => ApiError::Conflict,
             StorageError::Backend(_) => ApiError::Backend,
         }
     }
@@ -131,6 +134,7 @@ impl ApiError {
             ApiError::Forbidden => "forbidden",
             ApiError::AuthNotConfigured => "auth_not_configured",
             ApiError::NotFound => "not_found",
+            ApiError::Conflict => "conflict",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Backend => "backend",
             ApiError::QueryUnavailable => "query_unavailable",
@@ -155,6 +159,7 @@ impl IntoResponse for ApiError {
                 "authentication not configured",
             ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
+            ApiError::Conflict => (StatusCode::CONFLICT, "conflict"),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Backend => (StatusCode::BAD_GATEWAY, "storage backend error"),
             ApiError::QueryUnavailable => (
@@ -871,4 +876,24 @@ async fn get_enrollment(
     .await?;
     security_audit_event(AuditKind::DataAccess, Some(tenant), "ok", "get_enrollment");
     Ok(([(header::CONTENT_TYPE, "application/json")], stored).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_errors_map_to_documented_statuses() {
+        for (err, status) in [
+            (StorageError::NotFound, StatusCode::NOT_FOUND),
+            (StorageError::AlreadyExists, StatusCode::CONFLICT),
+            (StorageError::PreconditionFailed, StatusCode::CONFLICT),
+            (
+                StorageError::Backend("down".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            assert_eq!(ApiError::from(err).into_response().status(), status);
+        }
+    }
 }
