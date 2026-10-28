@@ -187,8 +187,7 @@ pub async fn list_tenants(provisioning: &ProvisioningService) -> Result<Value, A
         let usage = provisioning
             .vault
             .usage(&TenantPaths::tenant_root(record.tenant_id))
-            .await
-            .map_err(|_| ApiError::Backend)?;
+            .await?;
         views.push(TenantView {
             record,
             storage_object_count: usage.object_count,

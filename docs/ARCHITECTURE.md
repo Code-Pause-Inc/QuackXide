@@ -72,6 +72,10 @@ Client key architecture:
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
   `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  Storage errors are classified: missing objects are 404, lost
+  create-only writes 409, transient failures (after the storage client's
+  own retries) 503 with `Retry-After`, and permanent ones (credentials,
+  permissions, configuration) 502.
 * **JWT tenant boundary** — tenant identity enters the API only as the
   verified `tid` claim; handlers never read a tenant from paths or bodies.
   No secret configured ⇒ authenticated routes refuse with 503 (fail closed).
