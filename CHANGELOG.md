@@ -8,6 +8,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
+  as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
+  `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
+* CI compiles every fuzz target on each pull request, and runs a gitleaks
+  secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
+  runs the same scan when gitleaks is installed.
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.
@@ -47,6 +53,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `tokio` 1.54.1 (RUSTSEC-2026-0384; 1.54.0 is yanked) and `zstd-sys`
+  2.1.2 (RUSTSEC-2026-0410). `backend/deny.toml` records why
+  RUSTSEC-2026-0387 (`crypto-bigint` 0.5) and RUSTSEC-2026-0391, -0398 and
+  -0403 (`zstd` 0.13) do not apply until upstream crates move to fixed
+  versions.
+* `HttpJsonSource` refuses a connector endpoint that is not `https`
+  (plain `http` only on loopback), as token endpoints already did, so a
+  bearer token is never sent in cleartext. Connector HTTP requests refuse
+  redirects, time out, and cap response bodies at 64 KiB for token
+  responses and 64 MiB for payloads. Response bodies, `Dataset` cells and
+  the query-result JSON buffer are zeroized on drop.
 * `GET /api/v1/drive/objects` skips a manifest deleted between listing
   and reading it, instead of failing the whole listing with 404.
 * `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` are held as `SecretString`
@@ -93,6 +110,9 @@ uses [Semantic Versioning](https://semver.org/).
 * `connector-worker` stops on SIGTERM or Ctrl-C. A sync already running
   finishes and commits its snapshot; jobs not yet started wait for the
   next run.
+* Every cargo build, check, clippy, test and coverage command in
+  `scripts/check.sh` and CI runs with `--locked`, and the weekly fuzz run
+  refuses a stale `backend/fuzz/Cargo.lock`, which is brought up to date.
 
 ## [0.1.0] - 2026-09-30
 

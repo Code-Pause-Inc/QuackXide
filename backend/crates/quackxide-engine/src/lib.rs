@@ -29,7 +29,7 @@ use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use platform_core::ZkMode;
-use platform_crypto::SecretBytes;
+use platform_crypto::{SecretBytes, ZeroizingWriter};
 use url::Url;
 
 pub mod blind;
@@ -279,7 +279,8 @@ fn wiped_copy(blob: &[u8]) -> Bytes {
 /// Serialize record batches to a JSON array of row objects.
 pub fn batches_to_json(batches: &[RecordBatch]) -> Result<serde_json::Value, QueryError> {
     let refs: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
-    let mut buf = Vec::new();
+    // Rows serialize to plaintext JSON; growth and drop wipe each copy.
+    let mut buf = ZeroizingWriter::with_capacity(0);
     {
         let mut writer = arrow::json::ArrayWriter::new(&mut buf);
         writer
@@ -292,7 +293,8 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Result<serde_json::Value, Que
     if buf.is_empty() {
         return Ok(serde_json::Value::Array(Vec::new()));
     }
-    serde_json::from_slice(&buf).map_err(|e| QueryError::Serialize(e.to_string()))
+    serde_json::from_slice(buf.into_secret().expose())
+        .map_err(|e| QueryError::Serialize(e.to_string()))
 }
 
 /// Queries only: no DDL, DML, `COPY` or session statements.

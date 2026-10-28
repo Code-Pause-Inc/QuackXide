@@ -89,7 +89,8 @@ Goal: gain access through the API.
 | Skipping the second factor, or using a refresh token as an access token | Only `typ = access` tokens pass the API's authentication; `preauth` and `refresh` tokens and tokens with no `typ` get 401 on every data and admin route | Built, tested (`tests/token_types.rs`) |
 | Cross-tenant reads, lists, deletes | Tenant only from the verified `tid` claim; `VaultPath` constructible only from typed ids | Built, tested |
 | Missing configuration used as a bypass | Unset auth secret → 503; unwired key release → 503; ZK gate and attestation requirement default to on | Built, tested |
-| Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch | Built, tested |
+| Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
+| Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
 | Forged billing webhooks | Signature verification with replay tolerance | Built, tested |
 | Account takeover of a steward or researcher | Managed sign-in with MFA (TOTP module exists) | **To build** |
 
@@ -135,9 +136,11 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   followed by a formal privacy-loss accountant in place of the constant
   per-query cost.
 * **Unzeroized working memory.** Decrypted Parquet bytes, OAuth secrets,
-  and the Parquet output buffer are zeroized, but decoded Arrow arrays and
-  the Parquet encoder's internal buffers are freed without zeroization
-  (clearing them would require `unsafe`). Plaintext is confined to enclave
+  connector response bodies, `Dataset` cells, the Parquet output buffer
+  and the query-result JSON buffer are zeroized. Decoded Arrow arrays, the
+  Parquet encoder's and HTTP client's internal buffers, and parsed
+  `serde_json` values are freed without zeroization (clearing them would
+  require `unsafe` or changes to those libraries). Plaintext is confined to enclave
   memory, so this matters only against an attacker who can read that
   memory.
 * **Credentials in the process environment.** Configuration reads
