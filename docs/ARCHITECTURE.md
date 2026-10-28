@@ -86,6 +86,11 @@ Client key architecture:
   Integration tests verify that cross-tenant reads, lists, and deletes are
   refused.
 
+Deleting an object removes its chunks first and its manifest last, so a
+delete that fails partway leaves the object listed and a retry finishes it.
+Until then the object's download fails, since some chunks are gone. An
+object whose manifest is gone is a 404.
+
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
 

@@ -72,6 +72,14 @@ uses [Semantic Versioning](https://semver.org/).
   `DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstack`
   starts it.
 
+### Fixed
+
+* A drive delete that fails partway can be retried: `DELETE
+  /api/v1/drive/objects/{id}` now deletes the chunks before the manifest,
+  so after a failure the object is still found and the retry removes the
+  rest. Before, the manifest went first, the retry got 404 and the chunks
+  were stranded.
+
 ### Security
 
 * `tokio` 1.54.1 (RUSTSEC-2026-0384; 1.54.0 is yanked) and `zstd-sys`

@@ -819,10 +819,12 @@ async fn delete_object(
     // Existence check first: not every backend errors when deleting a
     // missing key, and an absent object must be an honest 404 everywhere.
     audited_get(&state, tenant, &manifest_path, &detail).await?;
-    state.vault.delete(&manifest_path).await?;
 
-    // Every stored chunk, not `0..chunk_count`: a manifest overwritten with
-    // a smaller count must not strand the trailing chunks.
+    // Chunks first, manifest last: if any delete fails, the manifest is
+    // still there, so the client's retry finds the object and finishes the
+    // job instead of getting a 404 with chunks stranded. Every stored chunk,
+    // not `0..chunk_count`: a manifest overwritten with a smaller count must
+    // not strand the trailing chunks.
     let chunks = state
         .vault
         .list(&TenantPaths::drive_object_prefix(tenant, object_id))
@@ -832,6 +834,11 @@ async fn delete_object(
             Ok(()) | Err(StorageError::NotFound) => {}
             Err(err) => return Err(err.into()),
         }
+    }
+    match state.vault.delete(&manifest_path).await {
+        // A concurrent delete got there first; the object is gone either way.
+        Ok(()) | Err(StorageError::NotFound) => {}
+        Err(err) => return Err(err.into()),
     }
     security_audit_event(AuditKind::DataAccess, Some(tenant), "ok", &detail);
     Ok(StatusCode::NO_CONTENT)
