@@ -100,6 +100,13 @@ uses [Semantic Versioning](https://semver.org/).
 * `EngineSettings` and `ZkMode` have no default. Both defaulted to ZK mode
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
+* Audit records are written whatever `RUST_LOG` says. They shared the
+  operational log filter, so `RUST_LOG=warn` silently dropped every
+  `SECURITY_AUDIT_EVENT` record. The `log` bridge is no longer compiled
+  in: at `debug`, DataFusion and sqlparser wrote SQL text and plan
+  literals, including a researcher's `WHERE` values, to the host's logs.
+  Query engine errors keep a fixed category instead of library error
+  text, which could quote cell values.
 
 ### Changed
 
