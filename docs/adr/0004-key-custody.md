@@ -158,11 +158,11 @@ P14 calls the REPORT_DATA layout. The browser verifies Google's
 signature, issuer, audience, nonce and claims before it sends a query.
 
 **The SEV-SNP code is for simulation only.** The SEV-SNP report parser
-and verifier in `platform-enclave` stay for the simulated TEE (P84) and
-are not on the release path. The `key-release` relying party in
-`platform-api` is a development and simulation stand-in for KMS: it is
-built only with the `dev` feature, like `devstack`, so it cannot be
-deployed. The off-the-shelf requirement above stands.
+and verifier in `platform-enclave` are not on the release path; they
+serve only the simulated TEE (P84) until it changes. The `key-release`
+relying party in `platform-api` is a development and simulation stand-in
+for KMS: it is built only with the `dev` feature, like `devstack`, so it
+cannot be deployed. The off-the-shelf requirement above stands.
 
 **The researcher's result key** is generated non-extractable in the
 researcher's browser and enrolled (P33). The enclave takes the recipient
