@@ -48,6 +48,14 @@ uses [Semantic Versioning](https://semver.org/).
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.
+* ADR 0006 (Accepted): sign-in through Auth0 with a platform token
+  exchange in a separate identity service, running in its own attested
+  Confidential VM with its signing key released by Cloud KMS, hybrid Ed25519 + ML-DSA-65 platform tokens, one identity per
+  tenant, an `adm` allowlist, the platform's TOTP for every role with
+  audited administrator reset for recovery, session lifetimes with the refresh
+  token in an `HttpOnly` cookie, and the authorization-code + PKCE browser flow.
+  `docs/ARCHITECTURE.md` gains the target authorization model and
+  `docs/THREAT_MODEL.md` A3 and A4 list the new controls.
 * ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`

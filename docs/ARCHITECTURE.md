@@ -271,6 +271,52 @@ grant. `research.catalog` events carry identifiers only.
 **Residual risk:** overlapping-query differencing. See
 `docs/THREAT_MODEL.md`.
 
+## Authorization model (target)
+
+ADR 0006 decides how a person signs in and what the API
+trusts. None of this is built yet; today the API accepts any validly
+signed token whose `typ` is `access`.
+
+```
+browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
+   │                        │ code
+   │                        ▼
+   │                identity service ── exchanges code, verifies Auth0 ID token (JWKS)
+   │                        │            looks up (iss, sub) → tid, adm
+   │◀── preauth ────────────┤            refuses unknown or Suspended tenants
+   │── TOTP code ──────────▶│
+   │◀── access + refresh ───┘
+   │
+   └── Authorization: Bearer <access> ──▶ platform-api (verifies platform tokens only)
+```
+
+* **One verifier, one format.** The API verifies only platform tokens
+  minted by the identity service, a separate binary in its own attested
+  Confidential VM (`sub`, `tid`, `iss`, `aud`, `exp`,
+  `adm`, `typ`). Auth0 tokens never reach the browser or the API. Only the
+  identity service fetches Auth0's keys, and only it holds the platform
+  signing key, released by Cloud KMS only to the attested identity-service
+  workload (ADR 0004 option A); API replicas hold public material only.
+* **Token types.** `preauth` is issued after Auth0 sign-in and is good
+  only for the second-factor step. `access` is issued only after the
+  second factor and is the only type `authenticate` accepts. `refresh`
+  rotates on every use, and reuse of a rotated token revokes its family.
+* **Tenant identity.** Each signed-in person maps to exactly one tenant
+  through the identity registry, keyed by the provider's `(iss, sub)`,
+  never by email. `tid` remains the only source of tenant identity in the
+  API, and an unknown or Suspended tenant is refused.
+* **Roles.** Steward and researcher stay grant relationships between
+  tenants (see "Research access"); tokens carry no role claims. `adm`
+  grants cross-tenant administrative powers and comes only from a
+  server-side allowlist, never from a provider attribute.
+* **Second factor.** The platform's TOTP, required for stewards,
+  researchers and administrators before any `access` token is issued.
+* **Browser session.** The access token is held in memory and passed to
+  the crypto worker; never `localStorage`, `sessionStorage` or IndexedDB.
+  No token is ever placed in a URL.
+* **Signatures.** Platform tokens use hybrid Ed25519 + ML-DSA-65
+  (ADR 0006, built in P37); see "Cryptography posture".
+
 ## Crate boundaries (backend/crates/)
 
 | Crate | Owns | Never contains |
