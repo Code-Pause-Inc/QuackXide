@@ -24,7 +24,11 @@ use futures::TryStreamExt;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{
+    BackoffConfig, ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    RetryConfig,
+};
+use platform_config::StorageClientConfig;
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 
 /// A storage path that can only be constructed through [`TenantPaths`] (or
@@ -240,18 +244,34 @@ impl ObjectStoreVault {
 
     /// Google Cloud Storage backend. Credentials resolve from the environment
     /// or the GCE metadata server unless `STORAGE_EMULATOR_HOST` points at a
-    /// local GCS emulator (`fsouza/fake-gcs-server`).
-    pub fn new_gcs(bucket: &str) -> Result<Self, StorageError> {
+    /// local GCS emulator (`fsouza/fake-gcs-server`). Timeouts and retries
+    /// come from `client`, never from `object_store`'s defaults.
+    pub fn new_gcs(bucket: &str, client: &StorageClientConfig) -> Result<Self, StorageError> {
         let emulator = std::env::var("STORAGE_EMULATOR_HOST").ok();
-        Self::new_gcs_with_emulator(bucket, emulator.as_deref())
+        Self::new_gcs_with_emulator(bucket, emulator.as_deref(), client)
     }
 
-    /// Construct a GCS-backed vault with an optional local emulator host override.
+    /// Construct a GCS-backed vault with an optional local emulator host
+    /// override. Plain HTTP is allowed only to an emulator.
     pub fn new_gcs_with_emulator(
         bucket: &str,
         emulator_host: Option<&str>,
+        client: &StorageClientConfig,
     ) -> Result<Self, StorageError> {
-        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        let mut options = ClientOptions::new()
+            .with_timeout(client.request_timeout)
+            .with_connect_timeout(client.connect_timeout)
+            .with_allow_http(false);
+        let mut builder = GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(bucket)
+            .with_retry(RetryConfig {
+                backoff: BackoffConfig {
+                    max_backoff: client.max_backoff(),
+                    ..BackoffConfig::default()
+                },
+                max_retries: client.max_retries as usize,
+                retry_timeout: client.retry_timeout,
+            });
         if let Some(raw_host) = emulator_host {
             let trimmed = raw_host.trim().trim_end_matches('/');
             if !trimmed.is_empty() {
@@ -261,9 +281,11 @@ impl ObjectStoreVault {
                 } else {
                     format!("http://{trimmed}")
                 };
+                options = options.with_allow_http(base_url.starts_with("http://"));
                 builder = builder.with_base_url(&base_url).with_skip_signature(true);
             }
         }
+        let builder = builder.with_client_options(options);
         let store = builder
             .build()
             .map_err(|e| StorageError::Fatal(e.to_string()))?;
@@ -817,6 +839,104 @@ mod tests {
         }
     }
 
+    /// A local "GCS" that holds every connection open and never answers, or
+    /// answers every request with 503. Returns its address and a count of
+    /// the requests it received.
+    async fn fake_gcs(answer_503: bool) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                if !answer_503 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    held.push(stream);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        if stream.readable().await.is_err() {
+                            return;
+                        }
+                        match stream.try_read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                            Err(_) => return,
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let reply = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = stream.writable().await;
+                    let _ = stream.try_write(reply);
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn client(request_secs: u64, max_retries: u32, retry_secs: u64) -> StorageClientConfig {
+        StorageClientConfig {
+            request_timeout: std::time::Duration::from_secs(request_secs),
+            connect_timeout: std::time::Duration::from_secs(1),
+            max_retries,
+            retry_timeout: std::time::Duration::from_secs(retry_secs),
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_backend_fails_within_the_configured_bound() {
+        let (url, _) = fake_gcs(false).await;
+        let settings = client(1, 1, 1);
+        let vault = ObjectStoreVault::new_gcs_with_emulator("bucket", Some(&url), &settings)
+            .expect("vault");
+        let started = std::time::Instant::now();
+        let err = vault
+            .get(&TenantPaths::drive_manifest(tenant_a(), object_1()))
+            .await
+            .expect_err("a stalled backend never answers");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+        assert!(elapsed >= settings.request_timeout, "{elapsed:?}");
+        // One second of slack for scheduling.
+        assert!(
+            elapsed <= settings.worst_case() + std::time::Duration::from_secs(1),
+            "{elapsed:?} exceeds {:?}",
+            settings.worst_case()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_retried_exactly_max_retries_times() {
+        use std::sync::atomic::Ordering;
+        for max_retries in [0, 2] {
+            let (url, requests) = fake_gcs(true).await;
+            let vault = ObjectStoreVault::new_gcs_with_emulator(
+                "bucket",
+                Some(&url),
+                &client(5, max_retries, 30),
+            )
+            .expect("vault");
+            let err = vault
+                .get(&TenantPaths::drive_manifest(tenant_a(), object_1()))
+                .await
+                .expect_err("every answer is a 503");
+            assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+            assert_eq!(requests.load(Ordering::SeqCst), max_retries as usize + 1);
+        }
+    }
+
     #[test]
     fn gcs_vault_accepts_storage_emulator_host_override() {
         for host in [
@@ -824,8 +944,12 @@ mod tests {
             "fake-gcs:4443",
             "http://127.0.0.1:4443/",
         ] {
-            ObjectStoreVault::new_gcs_with_emulator("quackxide-vault", Some(host))
-                .expect("emulator-backed GCS client builds without GCP credentials");
+            ObjectStoreVault::new_gcs_with_emulator(
+                "quackxide-vault",
+                Some(host),
+                &StorageClientConfig::default(),
+            )
+            .expect("emulator-backed GCS client builds without GCP credentials");
         }
     }
 }

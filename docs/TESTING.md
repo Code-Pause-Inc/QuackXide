@@ -180,7 +180,10 @@ failure seen by the API, use `FlakyVault` from `tests/common/mod.rs`; each
 drive operation has an outage test in `drive_api.rs`. To check how an
 `object_store` error is classified, wrap a store and pass it to
 `ObjectStoreVault::new`, as `FaultyStore` in `platform-storage/src/lib.rs`
-does.
+does. Timeouts and retries need the real HTTP client: point
+`ObjectStoreVault::new_gcs_with_emulator` at a local listener that stalls or
+answers 503, as `fake_gcs` in `platform-storage/src/lib.rs` and
+`stalled_storage_fails_within_the_documented_bound` in `drive_api.rs` do.
 
 `InMemory` enforces `VaultStore::put_if_absent` natively, but the GCS
 emulator does not: fake-gcs-server ignores `ifGenerationMatch`. So check

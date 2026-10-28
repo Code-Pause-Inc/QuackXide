@@ -604,3 +604,38 @@ async fn fatal_storage_failure_is_502_without_retry_after() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(headers.get(axum::http::header::RETRY_AFTER).is_none());
 }
+
+/// A drive call against a GCS that accepts connections and never answers
+/// fails as a retryable outage within the configured bound.
+#[tokio::test]
+async fn stalled_storage_fails_within_the_documented_bound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let settings = platform_config::StorageClientConfig {
+        request_timeout: std::time::Duration::from_secs(1),
+        connect_timeout: std::time::Duration::from_secs(1),
+        max_retries: 1,
+        retry_timeout: std::time::Duration::from_secs(1),
+    };
+    let vault =
+        ObjectStoreVault::new_gcs_with_emulator("bucket", Some(&url), &settings).expect("vault");
+    let app = build_app(common::app_state(SECRET, Arc::new(vault)));
+    let token = token_for(TenantId::generate());
+
+    let started = std::time::Instant::now();
+    assert_retryable_outage(&app, &token, "GET", "/api/v1/drive/objects").await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= settings.worst_case() + std::time::Duration::from_secs(1),
+        "{elapsed:?} exceeds {:?}",
+        settings.worst_case()
+    );
+}

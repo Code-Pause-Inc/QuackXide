@@ -5,6 +5,7 @@
 //! customer-facing output.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use platform_core::{SecretString, ZkMode};
 use zeroize::Zeroizing;
@@ -19,6 +20,15 @@ const DEFAULT_QUERY_BUDGET: u64 = 100;
 const DEFAULT_SIGNATURE_TOLERANCE_SECS: u64 = 300;
 pub const DEFAULT_QUERY_MAX_CONCURRENT: usize = 4;
 pub const MAX_QUERY_MAX_CONCURRENT: usize = 64;
+
+/// Storage client defaults: a request that stalls fails after at most
+/// [`StorageClientConfig::worst_case`] (55 s with these values).
+const DEFAULT_STORAGE_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_STORAGE_CONNECT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_STORAGE_MAX_RETRIES: u64 = 3;
+const DEFAULT_STORAGE_RETRY_TIMEOUT_SECS: u64 = 20;
+/// Longest wait between two retries; never longer than the retry window.
+pub const STORAGE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct PlatformConfig {
@@ -105,6 +115,53 @@ pub struct StorageConfig {
     pub gcp_project_id: Option<String>,
     /// `STORAGE_BUCKET` — bucket holding `tenants/{tenant_id}/…` paths.
     pub bucket: Option<String>,
+    /// Timeouts and retries of the GCS client.
+    pub client: StorageClientConfig,
+}
+
+/// How long the GCS client waits and how often it retries. Every value is
+/// bounded, so a stalled backend always fails within [`Self::worst_case`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageClientConfig {
+    /// `STORAGE_REQUEST_TIMEOUT_SECS` (1..=300, default 30): one HTTP
+    /// request, connection included.
+    pub request_timeout: Duration,
+    /// `STORAGE_CONNECT_TIMEOUT_SECS` (1..=60 and at most the request
+    /// timeout, default 5).
+    pub connect_timeout: Duration,
+    /// `STORAGE_MAX_RETRIES` (0..=10, default 3): retries of a request that
+    /// failed with a server error, 429, a timeout or a connection error.
+    pub max_retries: u32,
+    /// `STORAGE_RETRY_TIMEOUT_SECS` (0..=240, default 20): no retry starts
+    /// after this long from the first attempt. Kept under the five minutes
+    /// a request's credentials stay valid.
+    pub retry_timeout: Duration,
+}
+
+impl StorageClientConfig {
+    /// The wait between retries: at most [`STORAGE_MAX_BACKOFF`], and never
+    /// longer than the retry window.
+    pub fn max_backoff(&self) -> Duration {
+        STORAGE_MAX_BACKOFF.min(self.retry_timeout)
+    }
+
+    /// The longest a storage call can take before it fails: the last retry
+    /// may start just inside the retry window, after one backoff, and run
+    /// for a full request timeout.
+    pub fn worst_case(&self) -> Duration {
+        self.retry_timeout + self.max_backoff() + self.request_timeout
+    }
+}
+
+impl Default for StorageClientConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(DEFAULT_STORAGE_REQUEST_TIMEOUT_SECS),
+            connect_timeout: Duration::from_secs(DEFAULT_STORAGE_CONNECT_TIMEOUT_SECS),
+            max_retries: DEFAULT_STORAGE_MAX_RETRIES as u32,
+            retry_timeout: Duration::from_secs(DEFAULT_STORAGE_RETRY_TIMEOUT_SECS),
+        }
+    }
 }
 
 /// JWT verification settings. Secrets are zeroized on drop and never
@@ -173,9 +230,43 @@ impl PlatformConfig {
             });
         }
 
+        let request_timeout = parse_bounded(
+            &get,
+            "STORAGE_REQUEST_TIMEOUT_SECS",
+            DEFAULT_STORAGE_REQUEST_TIMEOUT_SECS,
+            1..=300,
+        )?;
+        let connect_timeout = parse_bounded(
+            &get,
+            "STORAGE_CONNECT_TIMEOUT_SECS",
+            DEFAULT_STORAGE_CONNECT_TIMEOUT_SECS,
+            1..=60,
+        )?;
+        if connect_timeout > request_timeout {
+            return Err(ConfigError::Invalid {
+                key: "STORAGE_CONNECT_TIMEOUT_SECS",
+                reason: "must not exceed STORAGE_REQUEST_TIMEOUT_SECS".into(),
+            });
+        }
         let storage = StorageConfig {
             gcp_project_id: get_nonempty(&get, "GCP_PROJECT_ID"),
             bucket: get_nonempty(&get, "STORAGE_BUCKET"),
+            client: StorageClientConfig {
+                request_timeout: Duration::from_secs(request_timeout),
+                connect_timeout: Duration::from_secs(connect_timeout),
+                max_retries: parse_bounded(
+                    &get,
+                    "STORAGE_MAX_RETRIES",
+                    DEFAULT_STORAGE_MAX_RETRIES,
+                    0..=10,
+                )? as u32,
+                retry_timeout: Duration::from_secs(parse_bounded(
+                    &get,
+                    "STORAGE_RETRY_TIMEOUT_SECS",
+                    DEFAULT_STORAGE_RETRY_TIMEOUT_SECS,
+                    0..=240,
+                )?),
+            },
         };
 
         let auth = AuthConfig {
@@ -286,6 +377,26 @@ fn parse_u64(
     }
 }
 
+fn parse_bounded(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<u64, ConfigError> {
+    let value = parse_u64(get, key, default)?;
+    if !range.contains(&value) {
+        return Err(ConfigError::Invalid {
+            key,
+            reason: format!(
+                "must be in {}..={}, got {value}",
+                range.start(),
+                range.end()
+            ),
+        });
+    }
+    Ok(value)
+}
+
 fn parse_bool(
     get: &impl Fn(&str) -> Option<String>,
     key: &'static str,
@@ -335,6 +446,60 @@ mod tests {
         assert_eq!(cfg.research.pricing_currency, "USD");
         assert!(cfg.billing.paddle_webhook_secret.is_none());
         assert_eq!(cfg.billing.signature_tolerance_secs, 300);
+        assert_eq!(cfg.storage.client, StorageClientConfig::default());
+        assert_eq!(cfg.storage.client.worst_case(), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn storage_client_settings_are_read_and_bounded() {
+        let cfg = PlatformConfig::from_source(source(&[
+            ("STORAGE_REQUEST_TIMEOUT_SECS", "10"),
+            ("STORAGE_CONNECT_TIMEOUT_SECS", "2"),
+            ("STORAGE_MAX_RETRIES", "0"),
+            ("STORAGE_RETRY_TIMEOUT_SECS", "3"),
+        ]))
+        .expect("valid storage settings");
+        assert_eq!(
+            cfg.storage.client,
+            StorageClientConfig {
+                request_timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(2),
+                max_retries: 0,
+                retry_timeout: Duration::from_secs(3),
+            }
+        );
+        // The backoff never outlasts a short retry window.
+        assert_eq!(cfg.storage.client.max_backoff(), Duration::from_secs(3));
+        assert_eq!(cfg.storage.client.worst_case(), Duration::from_secs(16));
+
+        for (key, value) in [
+            ("STORAGE_REQUEST_TIMEOUT_SECS", "0"),
+            ("STORAGE_REQUEST_TIMEOUT_SECS", "301"),
+            ("STORAGE_CONNECT_TIMEOUT_SECS", "0"),
+            ("STORAGE_CONNECT_TIMEOUT_SECS", "61"),
+            ("STORAGE_MAX_RETRIES", "11"),
+            ("STORAGE_MAX_RETRIES", "-1"),
+            ("STORAGE_RETRY_TIMEOUT_SECS", "241"),
+            ("STORAGE_RETRY_TIMEOUT_SECS", "soon"),
+        ] {
+            assert!(
+                matches!(
+                    PlatformConfig::from_source(source(&[(key, value)])),
+                    Err(ConfigError::Invalid { key: k, .. }) if k == key
+                ),
+                "{key}={value} must be refused"
+            );
+        }
+        assert!(matches!(
+            PlatformConfig::from_source(source(&[
+                ("STORAGE_REQUEST_TIMEOUT_SECS", "5"),
+                ("STORAGE_CONNECT_TIMEOUT_SECS", "6"),
+            ])),
+            Err(ConfigError::Invalid {
+                key: "STORAGE_CONNECT_TIMEOUT_SECS",
+                ..
+            })
+        ));
     }
 
     #[test]

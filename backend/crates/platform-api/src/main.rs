@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     let vault: Arc<dyn VaultStore> = match config.storage.bucket.as_deref() {
         Some(bucket) => {
             tracing::info!(vault = "gcs", "storage vault: Google Cloud Storage");
-            Arc::new(ObjectStoreVault::new_gcs(bucket)?)
+            Arc::new(ObjectStoreVault::new_gcs(bucket, &config.storage.client)?)
         }
         None => {
             tracing::warn!(

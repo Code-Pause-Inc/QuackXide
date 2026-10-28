@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+platform-config.workspace = true
 platform-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
