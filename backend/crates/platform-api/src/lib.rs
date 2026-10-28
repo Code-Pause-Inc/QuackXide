@@ -98,7 +98,11 @@ pub enum ApiError {
     /// A create-only or conditional write lost to an existing object (409).
     Conflict,
     BadRequest(&'static str),
+    /// A backend failed in a way retrying does not fix (502).
     Backend,
+    /// Storage failed transiently; the client may retry after
+    /// [`STORAGE_RETRY_AFTER_SECS`] (503 with `Retry-After`).
+    StorageUnavailable,
     /// The confidential query service is not configured (503).
     QueryUnavailable,
     /// Research access (grants, budgets, catalog) is not configured (503).
@@ -116,12 +120,17 @@ pub enum ApiError {
     BudgetExhausted,
 }
 
+/// `Retry-After` on a transient storage failure. The storage client has
+/// already retried before the error reached the API.
+pub const STORAGE_RETRY_AFTER_SECS: u32 = 5;
+
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         match err {
             StorageError::NotFound => ApiError::NotFound,
             StorageError::AlreadyExists | StorageError::PreconditionFailed => ApiError::Conflict,
-            StorageError::Backend(_) => ApiError::Backend,
+            StorageError::Unavailable(_) => ApiError::StorageUnavailable,
+            StorageError::Fatal(_) => ApiError::Backend,
         }
     }
 }
@@ -137,6 +146,7 @@ impl ApiError {
             ApiError::Conflict => "conflict",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Backend => "backend",
+            ApiError::StorageUnavailable => "storage_unavailable",
             ApiError::QueryUnavailable => "query_unavailable",
             ApiError::ResearchUnavailable => "research_unavailable",
             ApiError::ProvisioningUnavailable => "provisioning_unavailable",
@@ -162,6 +172,10 @@ impl IntoResponse for ApiError {
             ApiError::Conflict => (StatusCode::CONFLICT, "conflict"),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Backend => (StatusCode::BAD_GATEWAY, "storage backend error"),
+            ApiError::StorageUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage temporarily unavailable",
+            ),
             ApiError::QueryUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "confidential query not available",
@@ -190,6 +204,15 @@ impl IntoResponse for ApiError {
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
+        if matches!(kind, "storage_unavailable") {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                STORAGE_RETRY_AFTER_SECS
+                    .to_string()
+                    .parse()
+                    .expect("digits"),
+            );
+        }
         if matches!(status, StatusCode::UNAUTHORIZED) {
             response
                 .headers_mut()
@@ -889,11 +912,28 @@ mod tests {
             (StorageError::AlreadyExists, StatusCode::CONFLICT),
             (StorageError::PreconditionFailed, StatusCode::CONFLICT),
             (
-                StorageError::Backend("down".into()),
+                StorageError::Unavailable("down".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                StorageError::Fatal("forbidden".into()),
                 StatusCode::BAD_GATEWAY,
             ),
         ] {
-            assert_eq!(ApiError::from(err).into_response().status(), status);
+            let retryable = err.is_retryable();
+            let response = ApiError::from(err).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER).is_some(),
+                retryable,
+                "Retry-After only on a retryable failure"
+            );
         }
+        assert_eq!(
+            ApiError::from(StorageError::Unavailable("down".into()))
+                .into_response()
+                .headers()[header::RETRY_AFTER],
+            STORAGE_RETRY_AFTER_SECS.to_string()
+        );
     }
 }

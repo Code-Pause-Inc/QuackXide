@@ -47,9 +47,11 @@ enable it and `cargo test` needs no flag.
 
 `tests/common/mod.rs` holds the shared helpers; a test file uses them with
 `mod common;`. It has the HS256 token minters (`token_for`, `admin_token`,
-taking the file's secret), the request helpers (`send`, `send_json`, `call`,
-`post`, `post_query`), and the app builders (`app_state`, `synced_vault`,
-`research_app`). Use them rather than writing new ones, and add a helper
+taking the file's secret), the request helpers (`send`, `send_with_headers`,
+`send_json`, `call`, `post`, `post_query`), the app builders (`app_state`,
+`synced_vault`, `research_app`), and `FlakyVault`, an in-memory vault that
+fails the operations chosen in `Faults` with a transient (`outage`) or
+permanent (`misconfigured`) storage error. Use them rather than writing new ones, and add a helper
 there when a second file needs it. Tests that need RS256 tokens use its
 `rs256_token` and `rs256_verifier` (see [Managed sign-in](#managed-sign-in)).
 
@@ -173,11 +175,12 @@ per test binary in a `OnceLock`. Do not use `keygen::fixtures`: it is
 
 ### GCS
 
-Use the in-memory `ObjectStoreVault::new_in_memory()`. Failure paths
-(conditional-write conflicts, transient errors) use the fault-injecting test
-double from P41. To inject a backend error, wrap a store and pass it to
-`ObjectStoreVault::new`, as `RefusingStore` in
-`platform-storage/src/lib.rs` does.
+Use the in-memory `ObjectStoreVault::new_in_memory()`. For a storage
+failure seen by the API, use `FlakyVault` from `tests/common/mod.rs`; each
+drive operation has an outage test in `drive_api.rs`. To check how an
+`object_store` error is classified, wrap a store and pass it to
+`ObjectStoreVault::new`, as `FaultyStore` in `platform-storage/src/lib.rs`
+does.
 
 `InMemory` enforces `VaultStore::put_if_absent` natively, but the GCS
 emulator does not: fake-gcs-server ignores `ifGenerationMatch`. So check

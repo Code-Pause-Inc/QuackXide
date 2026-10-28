@@ -179,8 +179,22 @@ pub enum StorageError {
     /// A conditional write's precondition did not hold.
     #[error("storage precondition failed")]
     PreconditionFailed,
+    /// Transient: the backend failed or could not be reached after the
+    /// client's own retries. The same request may succeed later.
     #[error("storage backend unavailable: {0}")]
-    Backend(String),
+    Unavailable(String),
+    /// Permanent until an operator acts: credentials, permissions, an
+    /// invalid path, an unsupported operation or configuration. Retrying
+    /// the same request does not help.
+    #[error("storage backend failed: {0}")]
+    Fatal(String),
+}
+
+impl StorageError {
+    /// Whether the same request may succeed if retried later.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
 }
 
 /// Aggregate ciphertext footprint under a prefix (admin storage reporting).
@@ -252,7 +266,7 @@ impl ObjectStoreVault {
         }
         let store = builder
             .build()
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+            .map_err(|e| StorageError::Fatal(e.to_string()))?;
         Ok(Self::new(Arc::new(store)))
     }
 
@@ -272,12 +286,18 @@ fn store_path(path: &VaultPath) -> StorePath {
     StorePath::from(path.as_str())
 }
 
+/// Classify an `object_store` error. Its HTTP client has already retried
+/// 5xx, 429 and timeouts and turns 401, 403, 404, 409 and 412 into their own
+/// variants, so `Generic` is a failure that outlasted those retries.
+/// Anything not known to be transient is fatal.
 fn map_err(err: object_store::Error) -> StorageError {
+    use object_store::Error as E;
     match err {
-        object_store::Error::NotFound { .. } => StorageError::NotFound,
-        object_store::Error::AlreadyExists { .. } => StorageError::AlreadyExists,
-        object_store::Error::Precondition { .. } => StorageError::PreconditionFailed,
-        other => StorageError::Backend(other.to_string()),
+        E::NotFound { .. } => StorageError::NotFound,
+        E::AlreadyExists { .. } => StorageError::AlreadyExists,
+        E::Precondition { .. } => StorageError::PreconditionFailed,
+        E::Generic { .. } | E::JoinError { .. } => StorageError::Unavailable(err.to_string()),
+        other => StorageError::Fatal(other.to_string()),
     }
 }
 
@@ -340,6 +360,7 @@ impl VaultStore for ObjectStoreVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::str::FromStr;
 
     fn tenant_a() -> TenantId {
@@ -561,22 +582,21 @@ mod tests {
         );
     }
 
-    /// In-memory store whose writes fail with a chosen `object_store` error,
-    /// as GCS reports a failed generation match.
+    /// Store on which every operation fails with a chosen `object_store`
+    /// error, as GCS reports a failed generation match or an outage.
     #[derive(Debug)]
-    struct RefusingStore {
-        inner: InMemory,
+    struct FaultyStore {
         error: fn() -> object_store::Error,
     }
 
-    impl std::fmt::Display for RefusingStore {
+    impl std::fmt::Display for FaultyStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("RefusingStore")
+            f.write_str("FaultyStore")
         }
     }
 
     #[async_trait]
-    impl ObjectStore for RefusingStore {
+    impl ObjectStore for FaultyStore {
         async fn put_opts(
             &self,
             _: &StorePath,
@@ -587,90 +607,214 @@ mod tests {
         }
         async fn put_multipart_opts(
             &self,
-            location: &StorePath,
-            opts: object_store::PutMultipartOptions,
+            _: &StorePath,
+            _: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
+            Err((self.error)())
         }
         async fn get_opts(
             &self,
-            location: &StorePath,
-            options: object_store::GetOptions,
+            _: &StorePath,
+            _: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
+            Err((self.error)())
         }
         fn delete_stream(
             &self,
             locations: futures::stream::BoxStream<'static, object_store::Result<StorePath>>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<StorePath>> {
-            self.inner.delete_stream(locations)
+            let error = self.error;
+            Box::pin(locations.map(move |_| Err(error())))
         }
         fn list(
             &self,
-            prefix: Option<&StorePath>,
+            _: Option<&StorePath>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.inner.list(prefix)
+            Box::pin(futures::stream::once(std::future::ready(Err(
+                (self.error)(),
+            ))))
         }
         async fn list_with_delimiter(
             &self,
-            prefix: Option<&StorePath>,
+            _: Option<&StorePath>,
         ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
+            Err((self.error)())
         }
         async fn copy_opts(
             &self,
-            from: &StorePath,
-            to: &StorePath,
-            options: object_store::CopyOptions,
+            _: &StorePath,
+            _: &StorePath,
+            _: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
+            Err((self.error)())
         }
     }
 
-    fn refusing(error: fn() -> object_store::Error) -> ObjectStoreVault {
-        ObjectStoreVault::new(Arc::new(RefusingStore {
-            inner: InMemory::new(),
-            error,
-        }))
+    fn faulty(error: fn() -> object_store::Error) -> ObjectStoreVault {
+        ObjectStoreVault::new(Arc::new(FaultyStore { error }))
     }
 
-    async fn refused_write(error: fn() -> object_store::Error) -> StorageError {
-        refusing(error)
-            .put_if_absent(
-                &TenantPaths::tenant_enrollment(tenant_a()),
-                Bytes::from_static(b"key"),
-            )
-            .await
-            .expect_err("write refused")
+    /// Every vault operation's error, on a store that fails them all.
+    async fn every_operation_fails(error: fn() -> object_store::Error) -> Vec<StorageError> {
+        let vault = faulty(error);
+        let path = TenantPaths::drive_manifest(tenant_a(), object_1());
+        let prefix = TenantPaths::tenant_root(tenant_a());
+        let bytes = || Bytes::from_static(b"ciphertext");
+        vec![
+            vault.put(&path, bytes()).await.expect_err("put"),
+            vault
+                .put_if_absent(&path, bytes())
+                .await
+                .expect_err("put_if_absent"),
+            vault.get(&path).await.expect_err("get"),
+            vault.delete(&path).await.expect_err("delete"),
+            vault.list(&prefix).await.expect_err("list"),
+            vault.usage(&prefix).await.expect_err("usage"),
+        ]
+    }
+
+    fn generic() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "test",
+            source: "503 after retries".into(),
+        }
+    }
+
+    fn permission_denied() -> object_store::Error {
+        object_store::Error::PermissionDenied {
+            path: "p".into(),
+            source: "403".into(),
+        }
     }
 
     #[tokio::test]
-    async fn backend_conditional_write_errors_are_classified() {
+    async fn every_operation_classifies_backend_errors() {
+        for err in every_operation_fails(generic).await {
+            assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+            assert!(err.is_retryable());
+        }
+        for err in every_operation_fails(permission_denied).await {
+            assert!(matches!(err, StorageError::Fatal(_)), "{err:?}");
+            assert!(!err.is_retryable());
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_write_errors_are_classified() {
+        let vault = faulty(|| object_store::Error::AlreadyExists {
+            path: "p".into(),
+            source: "generation mismatch".into(),
+        });
+        let path = TenantPaths::tenant_enrollment(tenant_a());
         assert!(matches!(
-            refused_write(|| object_store::Error::AlreadyExists {
-                path: "p".into(),
-                source: "generation mismatch".into(),
-            })
-            .await,
-            StorageError::AlreadyExists
+            vault.put_if_absent(&path, Bytes::from_static(b"key")).await,
+            Err(StorageError::AlreadyExists)
         ));
+        let vault = faulty(|| object_store::Error::Precondition {
+            path: "p".into(),
+            source: "etag mismatch".into(),
+        });
         assert!(matches!(
-            refused_write(|| object_store::Error::Precondition {
-                path: "p".into(),
-                source: "etag mismatch".into(),
-            })
-            .await,
-            StorageError::PreconditionFailed
+            vault.put_if_absent(&path, Bytes::from_static(b"key")).await,
+            Err(StorageError::PreconditionFailed)
         ));
-        assert!(matches!(
-            refused_write(|| object_store::Error::Generic {
-                store: "test",
-                source: "unavailable".into(),
-            })
-            .await,
-            StorageError::Backend(_)
-        ));
+    }
+
+    #[tokio::test]
+    async fn map_err_classifies_every_object_store_error() {
+        use object_store::Error as E;
+        let source = || -> Box<dyn std::error::Error + Send + Sync> { "cause".into() };
+        let aborted = tokio::spawn(std::future::pending::<()>());
+        aborted.abort();
+        let join_error = aborted.await.expect_err("aborted task");
+
+        let cases: Vec<(E, &str)> = vec![
+            (
+                E::NotFound {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "not_found",
+            ),
+            (
+                E::AlreadyExists {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "already_exists",
+            ),
+            (
+                E::Precondition {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "precondition_failed",
+            ),
+            (
+                E::Generic {
+                    store: "s",
+                    source: source(),
+                },
+                "unavailable",
+            ),
+            (E::JoinError { source: join_error }, "unavailable"),
+            (
+                E::PermissionDenied {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "fatal",
+            ),
+            (
+                E::Unauthenticated {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "fatal",
+            ),
+            (E::NotSupported { source: source() }, "fatal"),
+            (
+                E::NotModified {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "fatal",
+            ),
+            (
+                E::NotImplemented {
+                    operation: "op".into(),
+                    implementer: "s".into(),
+                },
+                "fatal",
+            ),
+            (
+                E::UnknownConfigurationKey {
+                    store: "s",
+                    key: "k".into(),
+                },
+                "fatal",
+            ),
+            (
+                E::InvalidPath {
+                    source: object_store::path::Error::EmptySegment {
+                        path: "a//b".into(),
+                    },
+                },
+                "fatal",
+            ),
+        ];
+        for (err, expected) in cases {
+            let shown = format!("{err:?}");
+            let class = match map_err(err) {
+                StorageError::NotFound => "not_found",
+                StorageError::AlreadyExists => "already_exists",
+                StorageError::PreconditionFailed => "precondition_failed",
+                StorageError::Unavailable(_) => "unavailable",
+                StorageError::Fatal(_) => "fatal",
+            };
+            assert_eq!(class, expected, "{shown}");
+        }
     }
 
     #[test]

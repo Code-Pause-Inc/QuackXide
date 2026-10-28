@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Storage errors are retryable or fatal. `StorageError::Backend` is
+  replaced by `Unavailable` (an `object_store` failure that outlasted the
+  client's retries; the API returns 503 with `Retry-After: 5`) and `Fatal`
+  (credentials, permissions, invalid paths, unsupported operations and
+  configuration; 502). The admin tenant listing now reports a storage
+  outage as 503. `platform-api/tests/common/mod.rs` gains `FlakyVault`,
+  which can fail `put`, `get`, `delete`, `list` and `usage`, and each drive
+  operation has an outage test.
 * Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
