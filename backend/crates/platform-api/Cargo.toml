@@ -72,3 +72,4 @@ platform-api = { path = ".", features = ["dev"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
+tracing-subscriber.workspace = true
