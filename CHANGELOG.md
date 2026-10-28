@@ -8,6 +8,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* The drive listing (`GET /api/v1/drive/objects`) is bounded: it returns at
+  most 1000 objects (`MAX_LISTED_OBJECTS`) and reads their manifests 16 at a
+  time instead of one by one. A drive holding more is refused with 422 "too
+  many objects to list" and an audited `data.access` denial, never a
+  partial list.
 * The GCS vault's timeouts and retries are explicit settings instead of
   `object_store`'s defaults (10 retries within 3 minutes):
   `STORAGE_REQUEST_TIMEOUT_SECS` (30), `STORAGE_CONNECT_TIMEOUT_SECS` (5),
