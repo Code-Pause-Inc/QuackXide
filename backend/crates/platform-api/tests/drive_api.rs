@@ -12,6 +12,8 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::{AppState, ManifestBody, build_app};
 use platform_core::TenantId;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
 
 use common::{AUD, ISS, bearer, content_type, send};
@@ -638,4 +640,133 @@ async fn stalled_storage_fails_within_the_documented_bound() {
         "{elapsed:?} exceeds {:?}",
         settings.worst_case()
     );
+}
+
+// ── Retryable delete ──
+
+/// In-memory vault whose `fail_at`-th `delete` call (counting from 1) fails
+/// once with an outage; every other call succeeds.
+struct FailOnceDeleteVault {
+    inner: ObjectStoreVault,
+    deletes: AtomicUsize,
+    fail_at: usize,
+}
+
+#[async_trait]
+impl VaultStore for FailOnceDeleteVault {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.inner.put(path, ciphertext).await
+    }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.inner.put_if_absent(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        self.inner.get(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        if self.deletes.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+            return Err(common::outage());
+        }
+        self.inner.delete(path).await
+    }
+    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        self.inner.list(prefix).await
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.inner.usage(prefix).await
+    }
+}
+
+const CHUNKS: u32 = 3;
+
+/// Upload a manifest and [`CHUNKS`] chunks, then delete with the
+/// `fail_at`-th vault delete failing. Returns the app, token and vault.
+async fn delete_failing_at(fail_at: usize) -> (Router, String, Arc<FailOnceDeleteVault>, TenantId) {
+    let vault = Arc::new(FailOnceDeleteVault {
+        inner: ObjectStoreVault::new_in_memory(),
+        deletes: AtomicUsize::new(0),
+        fail_at,
+    });
+    let app = build_app(common::app_state(SECRET, vault.clone()));
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json_with_chunks(CHUNKS).into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for index in 0..CHUNKS {
+        let (status, _) = send(
+            &app,
+            "PUT",
+            &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
+            &[bearer(&token), content_type("application/octet-stream")],
+            sealed_chunk_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    (app, token, vault, tenant)
+}
+
+async fn delete_status(app: &Router, token: &str) -> StatusCode {
+    send(
+        app,
+        "DELETE",
+        &format!("/api/v1/drive/objects/{OBJ}"),
+        &[bearer(token)],
+        Vec::new(),
+    )
+    .await
+    .0
+}
+
+async fn manifest_status(app: &Router, token: &str) -> StatusCode {
+    send(
+        app,
+        "GET",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(token)],
+        Vec::new(),
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn delete_that_fails_partway_converges_on_retry() {
+    // Fail between chunk deletes (2nd), and on the last delete, which is the
+    // manifest (one per chunk, then the manifest).
+    for fail_at in [2, CHUNKS as usize + 1] {
+        let (app, token, vault, tenant) = delete_failing_at(fail_at).await;
+
+        assert_eq!(
+            delete_status(&app, &token).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fail_at={fail_at}"
+        );
+        // The object is still visible, so the retry can find it.
+        assert_eq!(manifest_status(&app, &token).await, StatusCode::OK);
+
+        assert_eq!(delete_status(&app, &token).await, StatusCode::NO_CONTENT);
+        assert_eq!(manifest_status(&app, &token).await, StatusCode::NOT_FOUND);
+        let object = OBJ.parse().expect("object id");
+        let left = vault
+            .list(&platform_storage::TenantPaths::drive_object_prefix(
+                tenant, object,
+            ))
+            .await
+            .expect("list");
+        assert!(
+            left.is_empty(),
+            "fail_at={fail_at}: stranded chunks {left:?}"
+        );
+
+        // Deleting again is an honest 404.
+        assert_eq!(delete_status(&app, &token).await, StatusCode::NOT_FOUND);
+    }
 }
