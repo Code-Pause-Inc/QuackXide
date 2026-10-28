@@ -16,6 +16,7 @@ use axum::{Extension, Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
 use platform_core::{ConnectorSlug, ObjectId, SecretString, TenantId};
@@ -81,6 +82,13 @@ pub struct ManifestBody {
     pub created_at_iso: String,
 }
 
+/// Most drive objects one listing returns. With more, the listing is
+/// refused rather than cut short: v1 has no pagination, and a partial list
+/// would look like missing files.
+pub const MAX_LISTED_OBJECTS: usize = 1000;
+/// Manifest reads one listing runs at a time.
+const LIST_READ_CONCURRENCY: usize = 16;
+
 #[derive(Debug, Serialize)]
 struct ListEntry {
     object_id: String,
@@ -118,6 +126,8 @@ pub enum ApiError {
     /// Research query refused: the grant's query budget is spent. The
     /// steward can restore access with a top-up.
     BudgetExhausted,
+    /// The drive holds more than [`MAX_LISTED_OBJECTS`] objects (422).
+    ListTooLarge,
 }
 
 /// `Retry-After` on a transient storage failure. The storage client has
@@ -154,6 +164,7 @@ impl ApiError {
             ApiError::AttestationUnavailable => "attestation_unavailable",
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
+            ApiError::ListTooLarge => "list_too_large",
         }
     }
 }
@@ -201,6 +212,9 @@ impl IntoResponse for ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "research query budget exhausted",
             ),
+            ApiError::ListTooLarge => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "too many objects to list")
+            }
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
@@ -721,9 +735,21 @@ async fn list_objects(
         .vault
         .list(&TenantPaths::drive_manifest_prefix(tenant))
         .await?;
+    if paths.len() > MAX_LISTED_OBJECTS {
+        security_audit_event(
+            AuditKind::DataAccess,
+            Some(tenant),
+            "denied",
+            &format!(
+                "list_objects count={} exceeds cap={MAX_LISTED_OBJECTS}",
+                paths.len()
+            ),
+        );
+        return Err(ApiError::ListTooLarge);
+    }
 
-    let mut entries = Vec::with_capacity(paths.len());
-    for path in paths {
+    let vault = &state.vault;
+    let read = |path: platform_storage::VaultPath| async move {
         let Some(object_id) = path
             .as_str()
             .rsplit('/')
@@ -731,23 +757,36 @@ async fn list_objects(
             .and_then(|name| name.strip_suffix(".json"))
             .map(str::to_owned)
         else {
-            continue;
+            return Ok(None);
         };
         // A manifest deleted between `list` and `get` (a concurrent
         // `delete_object`) is simply no longer listed, not a 404.
-        let stored = match state.vault.get(&path).await {
+        let stored = match vault.get(&path).await {
             Ok(stored) => stored,
-            Err(StorageError::NotFound) => continue,
-            Err(other) => return Err(other.into()),
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(other) => return Err(ApiError::from(other)),
         };
         match serde_json::from_slice::<ManifestBody>(&stored) {
-            Ok(body) => entries.push(ListEntry { object_id, body }),
+            Ok(body) => Ok(Some(ListEntry { object_id, body })),
             Err(_) => {
                 tracing::warn!(%path, "skipping unparsable manifest record");
+                Ok(None)
             }
         }
-    }
-    entries.sort_by(|a, b| b.body.created_at_iso.cmp(&a.body.created_at_iso));
+    };
+    let mut entries: Vec<ListEntry> = futures::stream::iter(paths)
+        .map(read)
+        .buffer_unordered(LIST_READ_CONCURRENCY)
+        .try_filter_map(|entry| async move { Ok(entry) })
+        .try_collect()
+        .await?;
+    // Newest first; reads finish in any order, so ties break on the id.
+    entries.sort_by(|a, b| {
+        b.body
+            .created_at_iso
+            .cmp(&a.body.created_at_iso)
+            .then_with(|| a.object_id.cmp(&b.object_id))
+    });
     security_audit_event(
         AuditKind::DataAccess,
         Some(tenant),

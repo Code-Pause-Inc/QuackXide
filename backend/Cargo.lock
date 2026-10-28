@@ -2995,6 +2995,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "futures",
  "hmac",
  "http-body-util",
  "parquet",

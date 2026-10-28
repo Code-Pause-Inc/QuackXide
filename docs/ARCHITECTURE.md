@@ -86,6 +86,10 @@ Client key architecture:
   Integration tests verify that cross-tenant reads, lists, and deletes are
   refused.
 
+A drive listing returns at most 1000 objects (`MAX_LISTED_OBJECTS`), newest
+first, reading their manifests 16 at a time. A drive holding more is refused
+with 422 rather than listed in part; v1 has no pagination.
+
 Deleting an object removes its chunks first and its manifest last, so a
 delete that fails partway leaves the object listed and a retry finishes it.
 Until then the object's download fails, since some chunks are gone. An
