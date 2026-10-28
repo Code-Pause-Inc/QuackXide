@@ -57,7 +57,8 @@ impl<P: EnclaveKeyProvider + ?Sized> QueryKeySession for DelegatingKeySession<'_
 }
 
 /// Opens a tenant's sealed envelopes inside the enclave. In production this is
-/// an attestation-gated key-release channel ([`crate::key_release::AttestedKeyProvider`]).
+/// Cloud KMS behind attestation (ADR 0004, P50); the simulated TEE uses the
+/// dev-only `key_release::AttestedKeyProvider`.
 #[async_trait]
 pub trait EnclaveKeyProvider: Send + Sync {
     async fn open_envelope(
@@ -67,7 +68,7 @@ pub trait EnclaveKeyProvider: Send + Sync {
         envelope: &[u8],
     ) -> Result<SecretBytes, ApiError>;
 
-    /// Acquire a per-query key session for `tenant`. [`crate::key_release::AttestedKeyProvider`]
+    /// Acquire a per-query key session for `tenant`. `key_release::AttestedKeyProvider`
     /// overrides this so key release happens once per query rather than once
     /// per envelope.
     async fn begin_query_session<'a>(
@@ -211,7 +212,7 @@ impl ConnectorQueryService {
     }
 
     /// Attach a shared [`EnclaveIdentity`] (used when pairing with
-    /// [`crate::key_release::AttestedKeyProvider`] so `GET /api/v1/attestation`
+    /// the dev-only `key_release::AttestedKeyProvider` so `GET /api/v1/attestation`
     /// and key release report the identical ephemeral public keys).
     pub fn with_enclave_identity(mut self, identity: Arc<EnclaveIdentity>) -> Self {
         self.identity = identity;

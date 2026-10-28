@@ -2,9 +2,10 @@
 default = []
 # DEV ONLY. Builds the `devstack` local research server and the research
 # wiring it shares with the integration tests: tenant keys held in process
-# memory and fabricated, unattested TEE evidence. Never a default feature;
-# release builds (`.github/workflows/release.yml`, `Dockerfile`) do not
-# enable it.
+# memory and fabricated, unattested TEE evidence. Also builds the simulated
+# TEE's key-release stand-in (`key_release::stand_in`). Never a default
+# feature; release builds (`.github/workflows/release.yml`) do not enable
+# it. The `Dockerfile` does: it builds the simulated TEE stack.
 dev = ["dep:synth-data"]
 
 # Built only when `dev` is on (`--features dev`, or any build that includes
@@ -12,6 +13,16 @@ dev = ["dep:synth-data"]
 # `cargo build --release -p platform-api` never produces it.
 [[bin]]
 name = "devstack"
+required-features = ["dev"]
+
+# Dev-only: the simulated TEE's key-release stand-in for Cloud KMS (ADR 0004)
+# and the demo that drives it.
+[[bin]]
+name = "key-release"
+required-features = ["dev"]
+
+[[bin]]
+name = "query-demo"
 required-features = ["dev"]
 
 [package]

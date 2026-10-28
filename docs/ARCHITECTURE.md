@@ -195,15 +195,18 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   refuses every query.
 * **Key-release trust boundary.** The server cannot decrypt tenant data on
   its own (envelopes are sealed to a private key it does not hold at rest).
-  When `KEY_RELEASE_URL` is configured, `AttestedKeyProvider` acquires a
-  per-query `ReleasedKeySession` from `KeyReleaseRelyingParty`: it fetches a
+  In a `dev` build, when `KEY_RELEASE_URL` is configured,
+  `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
+  `KeyReleaseRelyingParty`: it fetches a
   single-use challenge nonce, binds the nonce and its in-RAM `EnclaveIdentity`
   HPKE public key into a 64-byte `ReportDataBinding`, presents the signed
   1184-byte `SnpReport` and `SnpCertChain` to the relying party, and unwraps
   the HPKE-sealed tenant key into a zeroize-on-drop `TenantKeypair` for the
   duration of that query. When `KEY_RELEASE_URL` is unset, the query endpoint
   fails closed with 503. That relying party is the development and
-  simulation stand-in (ADR 0004). In production each dataset has its own
+  simulation stand-in (ADR 0004): it and its clients compile only with the
+  `dev` feature, and a build without it refuses to start when
+  `KEY_RELEASE_URL` is set. In production each dataset has its own
   data key, wrapped to a Cloud KMS key that decapsulates only for the
   attested Confidential Space workload, once per query; the steward's
   private key never leaves their browser. That path is to build (P50).
@@ -461,8 +464,9 @@ kinds only: no tenant ids, paths, messages, SQL text or engine name.
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public
   constructor; ids are UUID-validated at parse time.
 * Fail closed is the default everywhere: unset auth secret → 503; unwired
-  key release → 503; unverifiable attestation → refusal; fabricated dev
-  evidence requires an explicit, logged `allow_insecure_dev()`.
+  key release → 503; `KEY_RELEASE_URL` without the `dev` feature → refusal
+  to start; unverifiable attestation → refusal; fabricated dev evidence
+  requires an explicit, logged `allow_insecure_dev()`.
 * Workspace-wide `unsafe_code = "deny"`.
 * `scripts/check.sh` fails the build if the engine name appears in the
   shipped frontend bundle (white-label guard) or the deployment domain

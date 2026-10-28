@@ -160,6 +160,16 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The simulated TEE's key-release service is dev-only (ADR 0004): the
+  relying party, its clients and `AttestedKeyProvider`
+  (`key_release::stand_in`), and the `key-release` and `query-demo`
+  binaries, are built only with the `dev` feature. A `platform-api` built
+  without it refuses to start when `KEY_RELEASE_URL` is set, with an audited
+  `service.start` denial, and keeps no enclave HPKE private key. The
+  `Dockerfile` builds the simulated TEE images with `dev` and no longer
+  carries Confidential Space launch-policy labels. CI checks that release
+  builds contain neither binary and that the release `platform-api` refuses
+  `KEY_RELEASE_URL`.
 * `platform-api` shuts down gracefully on SIGTERM as well as Ctrl-C, so
   stopping its VM or container lets in-flight requests finish.
 * `connector-worker` stops on SIGTERM or Ctrl-C. A sync already running
