@@ -65,7 +65,7 @@ anyhow = "1"
 
 # ── telemetry ────────────────────────────────────────────────────────────────
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry", "std"] }
 
 # ── configuration ────────────────────────────────────────────────────────────
 dotenvy = "0.15"
@@ -114,7 +114,7 @@ datafusion = "55"                                                 # arrow/parque
 proptest = "1"
 # Seeded RNG for synth-data. synth-data uses rand_chacha's own rand_core
 # re-export, so this need not match `rand` above.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 
 [profile.release]
 lto = "thin"
