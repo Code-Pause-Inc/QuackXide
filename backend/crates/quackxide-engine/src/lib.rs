@@ -15,6 +15,7 @@
 //!   restricts results to aggregates, and [`disclosure`] requires a genuine
 //!   `COUNT(*) AS n` and suppresses cohorts below the minimum size.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -40,10 +41,10 @@ pub use disclosure::{DisclosurePolicy, MinCountThreshold};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
-    #[error("parquet decode failed: {0}")]
-    Parquet(String),
-    #[error("query planning/execution failed: {0}")]
-    Execution(String),
+    #[error("parquet decode failed while {0}")]
+    Parquet(ParquetStage),
+    #[error("query failed while {0}")]
+    Execution(ExecutionStage),
     #[error("result serialization failed: {0}")]
     Serialize(String),
     #[error("query rejected: row-level egress is not permitted in zero-knowledge mode")]
@@ -52,6 +53,47 @@ pub enum QueryError {
     Disclosure(String),
     #[error("query rejected: only read-only queries are permitted")]
     StatementNotAllowed,
+}
+
+/// Where decoding a Parquet blob failed. Holds no upstream message, which
+/// could quote the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParquetStage {
+    Metadata,
+    Reader,
+    Batch,
+}
+
+impl fmt::Display for ParquetStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ParquetStage::Metadata => "reading metadata",
+            ParquetStage::Reader => "building the reader",
+            ParquetStage::Batch => "decoding a batch",
+        })
+    }
+}
+
+/// Where loading, planning or running a query failed. Holds no upstream
+/// message: DataFusion errors can quote SQL literals, and Arrow cast errors
+/// quote cell values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionStage {
+    LoadTable,
+    Plan,
+    Prepare,
+    Execute,
+}
+
+impl fmt::Display for ExecutionStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ExecutionStage::LoadTable => "loading the table",
+            ExecutionStage::Plan => "planning",
+            ExecutionStage::Prepare => "preparing the plan",
+            ExecutionStage::Execute => "executing",
+        })
+    }
 }
 
 /// No `Default`: every caller chooses the ZK mode explicitly.
@@ -128,23 +170,23 @@ impl QueryScope {
         let mut rows = 0usize;
         for blob in blobs {
             let reader = ParquetRecordBatchReaderBuilder::try_new(wiped_copy(blob))
-                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                .map_err(|_| QueryError::Parquet(ParquetStage::Metadata))?;
             schema.get_or_insert_with(|| reader.schema().clone());
             let batches: Vec<RecordBatch> = reader
                 .build()
-                .map_err(|e| QueryError::Parquet(e.to_string()))?
+                .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?
                 .collect::<Result<_, _>>()
-                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                .map_err(|_| QueryError::Parquet(ParquetStage::Batch))?;
             rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
             partitions.push(batches);
         }
 
         let schema = schema.expect("non-empty blobs yield a schema");
         let mem = MemTable::try_new(schema, partitions)
-            .map_err(|e| QueryError::Execution(e.to_string()))?;
+            .map_err(|_| QueryError::Execution(ExecutionStage::LoadTable))?;
         self.ctx
             .register_table(table, Arc::new(mem))
-            .map_err(|e| QueryError::Execution(e.to_string()))?;
+            .map_err(|_| QueryError::Execution(ExecutionStage::LoadTable))?;
         self.tables.push(table.to_owned());
         Ok(rows)
     }
@@ -164,7 +206,7 @@ impl QueryScope {
             .state()
             .create_logical_plan(query)
             .await
-            .map_err(|e| QueryError::Execution(e.to_string()))?;
+            .map_err(|_| QueryError::Execution(ExecutionStage::Plan))?;
         read_only()
             .verify_plan(&plan)
             .map_err(|_| QueryError::StatementNotAllowed)?;
@@ -172,7 +214,7 @@ impl QueryScope {
             .ctx
             .execute_logical_plan(plan)
             .await
-            .map_err(|e| QueryError::Execution(e.to_string()))?;
+            .map_err(|_| QueryError::Execution(ExecutionStage::Prepare))?;
 
         let gated = self.settings.zk.is_enabled() || self.disclosure.is_some();
         if gated {
@@ -194,7 +236,7 @@ impl QueryScope {
         let batches = df
             .collect()
             .await
-            .map_err(|e| QueryError::Execution(e.to_string()))?;
+            .map_err(|_| QueryError::Execution(ExecutionStage::Execute))?;
 
         match disclosure {
             None => Ok(batches),

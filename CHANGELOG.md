@@ -16,6 +16,11 @@ uses [Semantic Versioning](https://semver.org/).
   outage as 503. `platform-api/tests/common/mod.rs` gains `FlakyVault`,
   which can fail `put`, `get`, `delete`, `list` and `usage`, and each drive
   operation has an outage test.
+* `docs/DEVELOPMENT.md`: prerequisites (WSL2 on Windows), the first build,
+  everyday test commands, running `cargo deny` and `npm audit` before a
+  push, what each `scripts/check.sh` step checks and how to fix it, where
+  to start reading the code, and a glossary. `CONTRIBUTING.md` "Setup"
+  links to it.
 * Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
@@ -108,6 +113,13 @@ uses [Semantic Versioning](https://semver.org/).
 * `EngineSettings` and `ZkMode` have no default. Both defaulted to ZK mode
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
+* Audit records are written whatever `RUST_LOG` says. They shared the
+  operational log filter, so `RUST_LOG=warn` silently dropped every
+  `SECURITY_AUDIT_EVENT` record. The `log` bridge is no longer compiled
+  in: at `debug`, DataFusion and sqlparser wrote SQL text and plan
+  literals, including a researcher's `WHERE` values, to the host's logs.
+  Query engine errors keep a fixed category instead of library error
+  text, which could quote cell values.
 
 ### Changed
 
