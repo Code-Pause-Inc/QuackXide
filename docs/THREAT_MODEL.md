@@ -92,7 +92,12 @@ Goal: gain access through the API.
 | Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
 | Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
 | Forged billing webhooks | Signature verification with replay tolerance | Built, tested |
-| Account takeover of a steward or researcher | Managed sign-in with MFA (TOTP module exists) | **To build** |
+| Account takeover of a steward, researcher or administrator | Sign-in through Auth0, then the platform's TOTP before any `access` token is issued, for every role including administrators (ADR 0006); TOTP replay and rate limits; recovery only by audited administrator reset | **To build** (P29, P30) — TOTP module exists |
+| Self-assigned administrator access | `adm` set only from a server-side allowlist keyed by the provider's `(iss, sub)`, never from a provider attribute (ADR 0006) | **To build** (P29) |
+| Access by a suspended or unknown tenant | The exchange and `require_tenant` / `require_admin` refuse unknown or Suspended tenants with 403 (ADR 0006) | **To build** (P29) — today any validly signed `tid` passes |
+| Login CSRF or a replayed sign-in response | Authorization code with PKCE (S256), single-use `state` and OIDC `nonce` checked by the identity service, exact-match redirect URIs; no token in a URL (ADR 0006) | **To build** (P13, P29, P32) |
+| Stolen or replayed refresh token | Rotation on every use; reuse revokes the token family; sign-out and administrator disable revoke immediately (ADR 0006) | **To build** (P30) |
+| Token theft from browser storage | Access token held in memory only, never `localStorage`, `sessionStorage` or IndexedDB; provider tokens never reach the browser (ADR 0006) | **To build** (P31, P32) |
 
 ### A4. Future cryptanalytic adversary ("harvest now, decrypt later")
 
@@ -102,7 +107,7 @@ exist.
 | Attack | Control | Status |
 | --- | --- | --- |
 | Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, ADR 0007) | **To build** — current suite is X25519 only |
-| Forge signatures | Hybrid Ed25519 + ML-DSA-65 | **To build** — current tokens use RS256 |
+| Forge signatures | Hybrid Ed25519 + ML-DSA-65, including platform tokens (ADR 0006, P37) | **To build** — current tokens use RS256 |
 | Silent downgrade to classical-only | Versioned framing (`HPK2`); hybrid readers refuse `HPK1` and X25519-only keys, with no migration mode (ADR 0007) | **To build** |
 
 The suite seams (`TenantKem`, the `JwtVerifier` construction site, the

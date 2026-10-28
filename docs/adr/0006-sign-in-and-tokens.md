@@ -3,10 +3,6 @@
 * Status: Proposed
 * Date: 2026-10-22
 
-> **Draft.** Items marked **[Maintainer decision]** are open and need
-> @AxolDad. The text around them gives the recommended answer so the
-> record can be accepted once they are filled in.
-
 ## Context
 
 * ADR 0001 moves signatures to Ed25519 + ML-DSA-65 and keeps the RS256
@@ -44,38 +40,28 @@
 
 ### 1. Provider and topology
 
-* **Provider: [Maintainer decision]** — the managed OIDC provider (P13
-  creates its tenants). Requirements for the choice: standards OIDC with
-  authorization code + PKCE, a published JWKS, exact-match redirect URIs,
-  white-label hosted pages and emails (P29), and synthetic test identities
-  on a non-production tenant. The two candidates are compared below.
+* **Provider: Auth0 (Okta).** P13 creates its tenants. The requirements
+  were standard OIDC with authorization code + PKCE, a published JWKS,
+  exact-match redirect URIs, white-label hosted pages and emails (P29), and
+  synthetic test identities on a non-production tenant. Auth0 meets them
+  with its documented flow, so the browser sign-in (section 6) uses the
+  standard confidential-client design with no provider-specific
+  workarounds.
+* **Sign-in holds no health data.** Auth0's HIPAA BAA is available only on
+  its Enterprise plan. The provider holds only steward, researcher and
+  administrator accounts; datasets never reach it. If the sponsor decides
+  that sign-in data needs a BAA, this record is revisited.
 
-#### Provider options
+**Why Auth0.** Keeping the standard sign-in flow outweighs staying in
+GCP. Google Cloud Identity Platform (GCIP), the alternative considered,
+would keep sign-in inside GCP, but its browser SDK hands the provider's ID
+token to the browser. It would need custom replacements for `state`,
+`nonce` and the confidential client (a sign-in transaction, `Origin`
+checks, an `auth_time` limit and a used-token store): more
+security-critical code to build, test and review. GCIP's main advantage,
+a BAA on any plan, matters only if health data reaches sign-in, which it
+does not.
 
-Prices and plan terms were checked on 2026-10-27 and may change.
-
-| | Google Cloud Identity Platform (GCIP) | Auth0 (Okta) |
-| --- | --- | --- |
-| Hosting | Google Cloud, same project and billing as the SEV-SNP environment (P12) | Separate vendor (Okta) outside GCP |
-| HIPAA BAA | Listed as a covered service under the Google Cloud BAA | Add-on to the Enterprise plan only |
-| Free allowance | First 50,000 monthly active users free for email, phone and social sign-in; OIDC/SAML federation free for the first 50 per project, then $0.015 each | Free plan up to 25,000 monthly active users, 1 tenant |
-| Paid plans | Pay per user above the free tier; SMS for MFA billed per message (US $0.01) | Essentials $35/month, Professional $240/month, Enterprise custom |
-| Test environments | A separate GCP project per environment | 1 tenant on Free, 3 on Essentials, separate dev and prod environments from Essentials |
-| Sign-in pages | Built with Google's Firebase/Identity Platform SDK and UI library rather than a provider-hosted login page | Provider-hosted Universal Login page, customizable, with a custom domain |
-| Fit with section 6 | Section 6b: the browser SDK signs in and posts the GCIP ID token once to the identity service, with a sign-in transaction, `Origin` checks and replay limits in place of `state` and `nonce`. P13 confirms whether a standard authorization-code endpoint exists (then 6a applies) | Section 6a: standard authorization code + PKCE, with the identity service as the confidential client |
-| Main trade-off | Stays in GCP with the BAA available at no plan upgrade, but may require changing the browser flow | Least setup and standard OIDC, but the BAA needs the Enterprise plan |
-
-Both issue classical JWTs with a published JWKS, so the exchange design
-and section 2 are unaffected by the choice. Either way, the platform's own
-TOTP (section 4) is the second factor, so provider MFA features are not
-required.
-
-Questions that decide between them:
-
-1. Will real protected health information ever reach sign-in, so a BAA is
-   required? If yes, GCIP, or Auth0 Enterprise.
-2. Must every service run inside GCP?
-3. What monthly budget is available for identity?
 * **Token exchange, not direct trust.** A platform identity service sits
   between the provider and the API:
   1. The identity service verifies the provider's ID token. Only it fetches
@@ -91,13 +77,16 @@ Questions that decide between them:
   verifier plus provider JWKS on every replica. The exchange keeps one
   token format at the API and keeps the token-signature choice (section 2)
   ours rather than the provider's.
-* Deployment of the identity service (separate binary or module in the
-  API process) follows ADR 0005. **[Maintainer decision]** if ADR 0005 does
-  not already settle it. Its signing key never resides on an API replica.
+* **The identity service is a separate binary**, not a module of
+  `platform-api`, so its signing key never resides in an API process or
+  replica. ADR 0005's one-process topology covers `platform-api` and the
+  query engine only. The API learns the identity service's issuer,
+  audience and verification key from the configuration bound into the
+  attestation evidence (ADR 0005).
 
 ### 2. Token signatures
 
-**Recommended: option (a).** The identity service mints platform tokens
+**Option (a).** The identity service mints platform tokens
 signed with hybrid Ed25519 + ML-DSA-65, as ADR 0001 requires.
 
 * The format is not a JWT, since no JOSE algorithm covers the hybrid. The
@@ -119,14 +108,12 @@ signed with hybrid Ed25519 + ML-DSA-65, as ADR 0001 requires.
   RUSTSEC-2023-0071 exception stands; the reason text changes only if the
   `rsa` crate stays for development key generation.
 
-**Alternative: option (b).** A superseding ADR limits hybrid signatures to
+**Option (b), not chosen.** A superseding ADR limits hybrid signatures to
 long-lived material (keys only an attested workload holds) and keeps
 short-lived tokens classical (Ed25519 or RS256). It is simpler and smaller,
 justified because a token expiring in minutes gains little from
 post-quantum protection. It conflicts with ADR 0001 as written and would
 mean A4's "Forge signatures" row is closed by argument rather than code.
-
-**[Maintainer decision]** — confirm (a), or choose (b).
 
 ### 3. Identity and tenancy
 
@@ -153,13 +140,12 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
 
 ### 4. Second factor
 
-* **Recommended: the platform's TOTP**, enforced by the identity service
+* **The platform's TOTP**, enforced by the identity service
   between `preauth` and `access`. It is provider-independent, the code
   exists, and it gives one place to audit the factor. Provider MFA would
   also need the identity service to require and check an MFA claim
-  (`amr`/`acr`), whose meaning varies by provider.
-  **[Maintainer decision]** — confirm, or choose provider MFA checked
-  through a required claim at the exchange.
+  (`amr`/`acr`), whose meaning varies by provider, so Auth0's MFA is not
+  used.
 * **Everyone needs it:** stewards, researchers and administrators. An
   `adm` access token is never issued without it. `THREAT_MODEL.md` A3 is
   updated to say so.
@@ -167,9 +153,8 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
   durable in P63): TOTP secrets, AEAD-encrypted at rest under a key from
   configuration; the last accepted step per user (replay protection);
   failed-attempt counters; refresh-token families.
-* Recovery: one-time recovery codes stored hashed, or an audited
-  administrator reset. **[Maintainer decision]**; recommended: audited
-  administrator reset only for v1, documented in the runbook.
+* **Recovery** is an audited administrator reset only in v1, documented
+  in the runbook. One-time recovery codes are not issued in v1.
 
 ### 5. Session
 
@@ -192,85 +177,38 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
   Because that endpoint is cookie-authenticated, it also checks `Origin`
   against an exact allowlist and requires a custom request header (CSRF
   defence). API calls themselves stay bearer-only, so they need no CSRF
-  defence. **[Maintainer decision]** if a reload should instead force a
-  fresh sign-in (refresh token in memory only).
+  defence.
 
 ### 6. Browser sign-in flow
 
-The flow depends on the provider chosen in section 1: 6a applies to Auth0
-and 6b to Google Cloud Identity Platform (GCIP). These rules hold for both:
-
-* No hand-written OAuth or OIDC code in the frontend or the identity
-  service; only the provider's maintained SDK or a maintained OIDC library.
-* The implicit and hybrid flows are not used.
-* Redirect URIs and authorized domains are exact-match, registered per
-  environment (P13).
-* No access, ID or refresh token is ever placed in a URL, fragment or
-  browser history.
-* The platform `preauth` token is returned in a response body, and the
-  refresh token is set as the cookie described in section 5.
-
-#### 6a. Auth0: the identity service is a confidential client
-
 * OAuth 2.0 / OIDC **authorization code with PKCE (S256)**, using Auth0's
-  hosted Universal Login page.
-* **The identity service runs the code exchange.** The browser only
-  follows redirects. No provider token ever reaches the browser.
+  hosted Universal Login page. The implicit and hybrid flows are not used.
+* **The identity service is a confidential client** and runs the code
+  exchange, with a maintained OIDC library or Auth0's server SDK. The
+  browser only follows redirects. No provider token ever reaches the
+  browser, and no hand-written OAuth runs in the frontend.
 * The identity service generates the single-use `state`, the OIDC `nonce`
   and the PKCE verifier. It keeps them server-side for the sign-in
   transaction (at most 10 minutes), keyed by a random transaction id in an
   `HttpOnly`, `Secure`, `SameSite=Lax` cookie bound to that one sign-in.
   On callback it checks `state` (the login-CSRF defence), consumes it, and
   checks `nonce` in the ID token. Replayed or unknown values are refused.
-* After the callback, the browser makes a `fetch` that returns the
-  `preauth` token in the response body.
-
-#### 6b. GCIP: the browser SDK signs in, the identity service exchanges
-
-GCIP sign-in runs through Google's Identity Platform (Firebase Auth) web
-SDK, which handles the provider redirect, `state` and PKCE itself and
-gives the browser a GCIP ID token. P13 confirms whether GCIP also offers a
-standard authorization-code endpoint the identity service could call as in
-6a; if so, 6a is used instead. Otherwise:
-
-* **SDK set-up.** The SDK uses in-memory persistence
-  (`inMemoryPersistence`), so the GCIP session is not written to
-  IndexedDB or `localStorage`. For redirect-based sign-in, the SDK's
-  `/__/auth/` handler is served from the app's own domain (a transparent
-  proxy to the project's auth domain, per Google's guidance for browsers
-  that block third-party storage), so it works without third-party
-  cookies and the redirect URI is on our domain.
-* **Start of sign-in.** Before calling the SDK, the page asks the identity
-  service for a single-use sign-in transaction. The service sets its id in
-  an `HttpOnly`, `Secure`, `SameSite=Strict` cookie, valid for at most 10
-  minutes.
-* **Exchange.** The page sends the GCIP ID token once, in a `POST` body,
-  to the identity service's exchange endpoint, then signs out of the SDK
-  and drops the token. The endpoint requires the transaction cookie, an
-  `Origin` exactly matching the app's origin, and a custom request header,
-  and it consumes the transaction. This stands in for `state` and `nonce`:
-  another site cannot make the victim's browser exchange the attacker's
-  token (login CSRF), and a token can be exchanged only inside a sign-in
-  the page itself started.
-* **Verification at the exchange** (P29), as Google documents for ID
-  tokens: `alg` is RS256 and `kid` matches one of Google's published
-  securetoken public keys (fetched and refreshed only here); `iss` is
-  exactly `https://securetoken.google.com/<project-id>`; `aud` is exactly
-  the project id; `exp` is in the future and `iat` in the past, with a
-  bounded clock skew; `sub` is non-empty and is the user id used as the
-  registry key. In addition, `auth_time` must be within the last 5
-  minutes, so an older GCIP token cannot start a platform session, and
-  each `(sub, iat)` pair is accepted once, so a replayed token is refused.
-* **What differs from 6a.** The GCIP ID token is briefly held by the
-  browser, in memory only. The controls above give the login-CSRF, replay
-  and audience binding that `state`, `nonce` and a confidential client
-  give in 6a. The ID token is never sent to `platform-api`.
-* GCIP's own MFA is not used; the platform's TOTP (section 4) still runs
-  after the exchange.
+* Redirect URIs are exact-match, registered per environment in Auth0
+  (P13).
+* No access, ID or refresh token is ever placed in a URL, fragment or
+  browser history. After the callback, the browser makes a `fetch` that
+  returns the `preauth` token in the response body, and the refresh token
+  is set as the cookie described in section 5.
+* If Auth0's server SDK hides `state`, `nonce` or PKCE, the PR adopting it
+  shows how it gives equivalent login-CSRF, replay and audience binding.
 
 ## Consequences
 
-* A new identity-service component exists (P29) and holds the only token
+* Auth0 is a second vendor outside GCP. Separate development, staging
+  and production tenants need at least the Essentials plan (the Free plan
+  has one tenant). Auth0's hosted pages and emails are configured with the
+  public brand (P29).
+* A new identity-service binary exists (P29) and holds the only token
   signing key. Its key custody is documented for deployment (P68, P77).
 * The API keeps one verifier and one token format. Provider changes stay
   inside the identity service.
