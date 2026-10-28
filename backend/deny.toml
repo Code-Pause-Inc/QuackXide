@@ -11,8 +11,9 @@ ignore = [
     # rsa (Marvin timing attack on private-key operations): used for offline
     # key generation and public-key RS256 verification; no network-facing
     # service performs RSA private-key operations. RS256 is retired by
-    # ADR 0001.
-    { id = "RUSTSEC-2023-0071", reason = "no network-facing RSA private-key operations; RS256 retired by ADR 0001" },
+    # ADR 0001; its removal from production tokens is decided in ADR 0006
+    # and built in P37.
+    { id = "RUSTSEC-2023-0071", reason = "no network-facing RSA private-key operations; RS256 retired by ADR 0001, removal per ADR 0006" },
     # quick-xml DoS (fixed in >= 0.41.0): parsed only from the operator's
     # object-store XML responses (via object_store 0.13, pinned by DataFusion
     # 55 to quick-xml 0.39). Revisit when object_store moves to quick-xml 0.41+.

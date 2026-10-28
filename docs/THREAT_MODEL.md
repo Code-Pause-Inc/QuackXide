@@ -70,7 +70,7 @@ Goal: read dataset content from infrastructure the operator controls.
 | Attack | Control | Status |
 | --- | --- | --- |
 | Read the object store | Ciphertext only; envelopes sealed to a key the operator does not hold | Built |
-| Read API host disk or logs | Plaintext never persisted; audit events carry no content, SQL, or filenames | Built, tested |
+| Read API host disk or logs | Plaintext never persisted; audit events carry no content, SQL, or filenames, and are written whatever `RUST_LOG` says; DataFusion and sqlparser output, which can quote SQL, never reaches the logs; engine errors keep no upstream text | Built, tested (`tests/log_leak.rs`, `audit_records_ignore_the_operational_filter`) |
 | Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
 | Run a query outside a genuine enclave | Attestation gate with `TEE_ATTESTATION_REQUIRED=true` | Seam built; **SEV-SNP report verification to build** — fails closed until then |
@@ -92,7 +92,13 @@ Goal: gain access through the API.
 | Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
 | Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
 | Forged billing webhooks | Signature verification with replay tolerance | Built, tested |
-| Account takeover of a steward or researcher | Managed sign-in with MFA (TOTP module exists) | **To build** |
+| Account takeover of a steward, researcher or administrator | Sign-in through Auth0, then the platform's TOTP before any `access` token is issued, for every role including administrators (ADR 0006); TOTP replay and rate limits; recovery only by audited administrator reset, with an out-of-band identity check, no self-reset and at least two administrators | **To build** (P29, P30) — TOTP module exists |
+| Theft of the token signing key, which can mint any `tid` and `adm` token | Key held in Cloud KMS and released only to the attested identity-service Confidential VM (ADR 0006, ADR 0004 option A); never on an API replica | **To build** (P29) |
+| Self-assigned administrator access | `adm` set only from a server-side allowlist keyed by the provider's `(iss, sub)`, never from a provider attribute (ADR 0006) | **To build** (P29) |
+| Access by a suspended or unknown tenant | The exchange and `require_tenant` / `require_admin` refuse unknown or Suspended tenants with 403 (ADR 0006) | **To build** (P29) — today any validly signed `tid` passes |
+| Login CSRF or a replayed sign-in response | Authorization code with PKCE (S256), single-use `state` and OIDC `nonce` checked by the identity service, exact-match redirect URIs; no token in a URL (ADR 0006) | **To build** (P13, P29, P32) |
+| Stolen or replayed refresh token | Rotation on every use; reuse revokes the token family; sign-out and administrator disable revoke immediately (ADR 0006) | **To build** (P30) |
+| Token theft from browser storage | Access token held in memory only, never `localStorage`, `sessionStorage` or IndexedDB; provider tokens never reach the browser (ADR 0006) | **To build** (P31, P32) |
 
 ### A4. Future cryptanalytic adversary ("harvest now, decrypt later")
 
@@ -102,7 +108,7 @@ exist.
 | Attack | Control | Status |
 | --- | --- | --- |
 | Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, ADR 0007) | **To build** — current suite is X25519 only |
-| Forge signatures | Hybrid Ed25519 + ML-DSA-65 | **To build** — current tokens use RS256 |
+| Forge signatures | Hybrid Ed25519 + ML-DSA-65, including platform tokens (ADR 0006, P37) | **To build** — current tokens use RS256 |
 | Silent downgrade to classical-only | Versioned framing (`HPK2`); hybrid readers refuse `HPK1` and X25519-only keys, with no migration mode (ADR 0007) | **To build** |
 
 The suite seams (`TenantKem`, the `JwtVerifier` construction site, the

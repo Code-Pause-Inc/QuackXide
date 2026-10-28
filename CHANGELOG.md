@@ -19,15 +19,54 @@ uses [Semantic Versioning](https://semver.org/).
   that the Rust and vitest tests both check. `platform-crypto`'s AEAD
   helpers, blind indexes and TOTP move behind its default `server`
   feature.
+* The drive listing (`GET /api/v1/drive/objects`) is bounded: it returns at
+  most 1000 objects (`MAX_LISTED_OBJECTS`) and reads their manifests 16 at a
+  time instead of one by one. A drive holding more is refused with 422 "too
+  many objects to list" and an audited `data.access` denial, never a
+  partial list.
+* The GCS vault's timeouts and retries are explicit settings instead of
+  `object_store`'s defaults (10 retries within 3 minutes):
+  `STORAGE_REQUEST_TIMEOUT_SECS` (30), `STORAGE_CONNECT_TIMEOUT_SECS` (5),
+  `STORAGE_MAX_RETRIES` (3) and `STORAGE_RETRY_TIMEOUT_SECS` (20), each
+  bounded and refused at startup when out of range. A stalled backend fails
+  within retry timeout + backoff + request timeout (55 s by default). The
+  client refuses plain HTTP except to a `STORAGE_EMULATOR_HOST`.
+  `ObjectStoreVault::new_gcs` takes the settings.
+* Storage errors are retryable or fatal. `StorageError::Backend` is
+  replaced by `Unavailable` (an `object_store` failure that outlasted the
+  client's retries; the API returns 503 with `Retry-After: 5`) and `Fatal`
+  (credentials, permissions, invalid paths, unsupported operations and
+  configuration; 502). The admin tenant listing now reports a storage
+  outage as 503. `platform-api/tests/common/mod.rs` gains `FlakyVault`,
+  which can fail `put`, `get`, `delete`, `list` and `usage`, and each drive
+  operation has an outage test.
+* `docs/DEVELOPMENT.md`: prerequisites (WSL2 on Windows), the first build,
+  everyday test commands, running `cargo deny` and `npm audit` before a
+  push, what each `scripts/check.sh` step checks and how to fix it, where
+  to start reading the code, and a glossary. `CONTRIBUTING.md` "Setup"
+  links to it.
 * Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
 * CI compiles every fuzz target on each pull request, and runs a gitleaks
   secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
   runs the same scan when gitleaks is installed.
+* `VaultStore::put_if_absent`, a create-only write (`PutMode::Create`;
+  `x-goog-if-generation-match: 0` on GCS). `StorageError` gains
+  `AlreadyExists` and `PreconditionFailed`, which the API returns as 409
+  instead of 502. `ObjectStoreVault::new` takes any
+  `Arc<dyn ObjectStore>`.
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.
+* ADR 0006 (Accepted): sign-in through Auth0 with a platform token
+  exchange in a separate identity service, running in its own attested
+  Confidential VM with its signing key released by Cloud KMS, hybrid Ed25519 + ML-DSA-65 platform tokens, one identity per
+  tenant, an `adm` allowlist, the platform's TOTP for every role with
+  audited administrator reset for recovery, session lifetimes with the refresh
+  token in an `HttpOnly` cookie, and the authorization-code + PKCE browser flow.
+  `docs/ARCHITECTURE.md` gains the target authorization model and
+  `docs/THREAT_MODEL.md` A3 and A4 list the new controls.
 * ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
@@ -61,6 +100,14 @@ uses [Semantic Versioning](https://semver.org/).
   binary. From `backend/`,
   `DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstack`
   starts it.
+
+### Fixed
+
+* A drive delete that fails partway can be retried: `DELETE
+  /api/v1/drive/objects/{id}` now deletes the chunks before the manifest,
+  so after a failure the object is still found and the retry removes the
+  rest. Before, the manifest went first, the retry got 404 and the chunks
+  were stranded.
 
 ### Security
 
@@ -106,6 +153,13 @@ uses [Semantic Versioning](https://semver.org/).
 * `EngineSettings` and `ZkMode` have no default. Both defaulted to ZK mode
   off, so a query service built from `Default` would have returned rows
   unfiltered. Every caller now chooses the mode explicitly.
+* Audit records are written whatever `RUST_LOG` says. They shared the
+  operational log filter, so `RUST_LOG=warn` silently dropped every
+  `SECURITY_AUDIT_EVENT` record. The `log` bridge is no longer compiled
+  in: at `debug`, DataFusion and sqlparser wrote SQL text and plan
+  literals, including a researcher's `WHERE` values, to the host's logs.
+  Query engine errors keep a fixed category instead of library error
+  text, which could quote cell values.
 
 ### Changed
 

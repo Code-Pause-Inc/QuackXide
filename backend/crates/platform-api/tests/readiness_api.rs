@@ -43,6 +43,9 @@ impl VaultStore for TestVault {
     async fn put(&self, _: &VaultPath, _: Bytes) -> Result<(), StorageError> {
         unreachable!("readiness never writes")
     }
+    async fn put_if_absent(&self, _: &VaultPath, _: Bytes) -> Result<(), StorageError> {
+        unreachable!("readiness never writes")
+    }
     async fn get(&self, _: &VaultPath) -> Result<Bytes, StorageError> {
         unreachable!("readiness never reads")
     }
@@ -53,7 +56,7 @@ impl VaultStore for TestVault {
         self.lists.fetch_add(1, Ordering::SeqCst);
         match self.listing {
             Listing::Works => Ok(Vec::new()),
-            Listing::Fails => Err(StorageError::Backend("down".into())),
+            Listing::Fails => Err(StorageError::Unavailable("down".into())),
             Listing::Hangs => std::future::pending().await,
         }
     }

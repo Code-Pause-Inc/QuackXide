@@ -79,11 +79,28 @@ Client key architecture:
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
   `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  Storage errors are classified: missing objects are 404, lost
+  create-only writes 409, transient failures (after the storage client's
+  own retries) 503 with `Retry-After`, and permanent ones (credentials,
+  permissions, configuration) 502. The GCS client's timeouts and retries
+  are set from `STORAGE_*` settings (`backend/.env.example`), each bounded,
+  so a stalled backend fails within retry timeout + backoff + request
+  timeout (55 s by default). It refuses plain HTTP except to a local
+  emulator.
 * **JWT tenant boundary** — tenant identity enters the API only as the
   verified `tid` claim; handlers never read a tenant from paths or bodies.
   No secret configured ⇒ authenticated routes refuse with 503 (fail closed).
   Integration tests verify that cross-tenant reads, lists, and deletes are
   refused.
+
+A drive listing returns at most 1000 objects (`MAX_LISTED_OBJECTS`), newest
+first, reading their manifests 16 at a time. A drive holding more is refused
+with 422 rather than listed in part; v1 has no pagination.
+
+Deleting an object removes its chunks first and its manifest last, so a
+delete that fails partway leaves the object listed and a retry finishes it.
+Until then the object's download fails, since some chunks are gone. An
+object whose manifest is gone is a 404.
 
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
@@ -261,6 +278,52 @@ grant. `research.catalog` events carry identifiers only.
 **Residual risk:** overlapping-query differencing. See
 `docs/THREAT_MODEL.md`.
 
+## Authorization model (target)
+
+ADR 0006 decides how a person signs in and what the API
+trusts. None of this is built yet; today the API accepts any validly
+signed token whose `typ` is `access`.
+
+```
+browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
+   │                        │ code
+   │                        ▼
+   │                identity service ── exchanges code, verifies Auth0 ID token (JWKS)
+   │                        │            looks up (iss, sub) → tid, adm
+   │◀── preauth ────────────┤            refuses unknown or Suspended tenants
+   │── TOTP code ──────────▶│
+   │◀── access + refresh ───┘
+   │
+   └── Authorization: Bearer <access> ──▶ platform-api (verifies platform tokens only)
+```
+
+* **One verifier, one format.** The API verifies only platform tokens
+  minted by the identity service, a separate binary in its own attested
+  Confidential VM (`sub`, `tid`, `iss`, `aud`, `exp`,
+  `adm`, `typ`). Auth0 tokens never reach the browser or the API. Only the
+  identity service fetches Auth0's keys, and only it holds the platform
+  signing key, released by Cloud KMS only to the attested identity-service
+  workload (ADR 0004 option A); API replicas hold public material only.
+* **Token types.** `preauth` is issued after Auth0 sign-in and is good
+  only for the second-factor step. `access` is issued only after the
+  second factor and is the only type `authenticate` accepts. `refresh`
+  rotates on every use, and reuse of a rotated token revokes its family.
+* **Tenant identity.** Each signed-in person maps to exactly one tenant
+  through the identity registry, keyed by the provider's `(iss, sub)`,
+  never by email. `tid` remains the only source of tenant identity in the
+  API, and an unknown or Suspended tenant is refused.
+* **Roles.** Steward and researcher stay grant relationships between
+  tenants (see "Research access"); tokens carry no role claims. `adm`
+  grants cross-tenant administrative powers and comes only from a
+  server-side allowlist, never from a provider attribute.
+* **Second factor.** The platform's TOTP, required for stewards,
+  researchers and administrators before any `access` token is issued.
+* **Browser session.** The access token is held in memory and passed to
+  the crypto worker; never `localStorage`, `sessionStorage` or IndexedDB.
+  No token is ever placed in a URL.
+* **Signatures.** Platform tokens use hybrid Ed25519 + ML-DSA-65
+  (ADR 0006, built in P37); see "Cryptography posture".
+
 ## Crate boundaries (backend/crates/)
 
 | Crate | Owns | Never contains |
@@ -365,6 +428,23 @@ Rules, enforced by the capture tests:
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
    and provisioning.
+
+Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
+installs the subscriber that `build_subscriber` returns: two JSON layers on
+stdout. `RUST_LOG` filters only the operational layer; the audit layer
+writes every `SECURITY_AUDIT_EVENT` record whatever it says, so no setting
+turns the stream off. `audit_records_ignore_the_operational_filter` in
+`platform-telemetry` checks this under `error`, `off`,
+`SECURITY_AUDIT_EVENT=off` and `trace`.
+
+Query content stays out of the operational log. `tracing-subscriber` is
+built without its `log` bridge (`backend/Cargo.toml`), so DataFusion and
+sqlparser output, which quotes SQL text and plan literals, is never logged
+by any binary. `QueryError::Parquet` and `QueryError::Execution` hold a
+fixed stage, never upstream error text, which can quote cell values.
+`platform-api/tests/log_leak.rs` runs a research query at `RUST_LOG=trace`
+whose SQL literal and failing cell value are unique, and checks that
+neither reaches a log line, an audit record or the HTTP response.
 
 Readiness probes (`GET /readyz`) emit no events. They run every few
 seconds, touch no tenant data, and only list an empty control prefix and

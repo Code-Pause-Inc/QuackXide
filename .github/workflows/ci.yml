@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
       - run: rustup target add wasm32-unknown-unknown
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
       - run: cargo test --manifest-path backend/Cargo.toml --workspace --locked
@@ -88,10 +88,10 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - run: rustup component add llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov
       - name: Backend coverage
@@ -124,7 +124,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
       # The release.yml build: default features, release profile, locked.
@@ -169,7 +169,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend/fuzz
       # Build only, on stable: fuzz.yml runs the targets weekly on nightly.
