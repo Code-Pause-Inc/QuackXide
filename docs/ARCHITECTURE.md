@@ -75,7 +75,11 @@ Client key architecture:
   Storage errors are classified: missing objects are 404, lost
   create-only writes 409, transient failures (after the storage client's
   own retries) 503 with `Retry-After`, and permanent ones (credentials,
-  permissions, configuration) 502.
+  permissions, configuration) 502. The GCS client's timeouts and retries
+  are set from `STORAGE_*` settings (`backend/.env.example`), each bounded,
+  so a stalled backend fails within retry timeout + backoff + request
+  timeout (55 s by default). It refuses plain HTTP except to a local
+  emulator.
 * **JWT tenant boundary** — tenant identity enters the API only as the
   verified `tid` claim; handlers never read a tenant from paths or bodies.
   No secret configured ⇒ authenticated routes refuse with 503 (fail closed).

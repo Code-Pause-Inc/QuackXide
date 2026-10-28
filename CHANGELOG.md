@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* The GCS vault's timeouts and retries are explicit settings instead of
+  `object_store`'s defaults (10 retries within 3 minutes):
+  `STORAGE_REQUEST_TIMEOUT_SECS` (30), `STORAGE_CONNECT_TIMEOUT_SECS` (5),
+  `STORAGE_MAX_RETRIES` (3) and `STORAGE_RETRY_TIMEOUT_SECS` (20), each
+  bounded and refused at startup when out of range. A stalled backend fails
+  within retry timeout + backoff + request timeout (55 s by default). The
+  client refuses plain HTTP except to a `STORAGE_EMULATOR_HOST`.
+  `ObjectStoreVault::new_gcs` takes the settings.
 * Storage errors are retryable or fatal. `StorageError::Backend` is
   replaced by `Unavailable` (an `object_store` failure that outlasted the
   client's retries; the API returns 503 with `Retry-After: 5`) and `Fatal`
