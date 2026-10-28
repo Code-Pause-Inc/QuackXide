@@ -8,6 +8,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `docs/DEVELOPMENT.md`: prerequisites (WSL2 on Windows), the first build,
+  everyday test commands, running `cargo deny` and `npm audit` before a
+  push, what each `scripts/check.sh` step checks and how to fix it, where
+  to start reading the code, and a glossary. `CONTRIBUTING.md` "Setup"
+  links to it.
 * Frontend lint: ESLint (typescript-eslint and the React hooks rules) runs
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
