@@ -1,7 +1,7 @@
 # 0004. Key custody and attested key release
 
-* Status: Proposed
-* Date: 2026-10-12
+* Status: Accepted
+* Date: 2026-10-28
 
 ## Context
 
@@ -100,10 +100,11 @@ found no documented way to gate KMS on attestation while staying on SNP.
 
 ## Decision
 
-Option A is recommended. Moving from SEV-SNP to TDX is the maintainer's
-decision (open question 1). If SNP stays, option C applies, A2 records
-that the operator can decrypt, and the sections below keep their shape
-with the broker in place of KMS.
+Option A: Confidential Space on Intel TDX, with Cloud KMS. The platform
+moves from SEV-SNP to TDX, subject to P12 phase A confirming a TDX machine
+type and region available to the project, and its cost. Option C would
+make A2 say the operator can decrypt, and A is the only documented way on
+GCP to prove which binary runs.
 
 **Each dataset has its own data key.** A dataset is one steward upload
 or one connector snapshot, with its objects and its manifest (ADR 0003).
@@ -137,8 +138,8 @@ The KMS key, the identity pool and that policy live in a key project that
 only the maintainer administers, separate from the deployment project;
 no deployment identity has IAM on it. This keeps deployers and the
 workload's own service account out of the release decision. It does not
-keep the maintainer out: on acceptance, `docs/THREAT_MODEL.md` A2 records
-that the key project's administrator can authorize another image.
+keep the maintainer out: `docs/THREAT_MODEL.md` A2 records that the key
+project's administrator can authorize another image.
 
 **Release is per query, with nothing cached.** The enclave decapsulates
 the data keys a query needs, opens the dataset in memory and drops the
@@ -152,11 +153,16 @@ browser (P85), the browser supplies a nonce, and the workload requests a
 custom token with its own audience and two nonces: the browser's, and the
 SHA-256 digest of the request-decryption public key, the result-signing
 public key, the KMS public key, the TLS public key hash (P67) and the
-deployment configuration digest (ADR 0005). That digest is the binding P14 calls the REPORT_DATA
-layout; under option C the same 32 bytes go into REPORT_DATA. The
-browser verifies Google's signature, issuer, audience, nonce and claims
-before it sends a query. P47's raw-report verifier is not on the release
-path under option A.
+deployment configuration digest (ADR 0005). That digest is the binding
+P14 calls the REPORT_DATA layout. The browser verifies Google's
+signature, issuer, audience, nonce and claims before it sends a query.
+
+**The SEV-SNP code is for simulation only.** The SEV-SNP report parser
+and verifier in `platform-enclave` stay for the simulated TEE (P84) and
+are not on the release path. The `key-release` relying party in
+`platform-api` is a development and simulation stand-in for KMS: it is
+built only with the `dev` feature, like `devstack`, so it cannot be
+deployed. The off-the-shelf requirement above stands.
 
 **The researcher's result key** is generated non-extractable in the
 researcher's browser and enrolled (P33). The enclave takes the recipient
@@ -188,6 +194,8 @@ cannot open any.
 
 ## Consequences
 
+* If P12 phase A finds no TDX machine type and region the project can
+  use at a workable cost, a new record supersedes this one.
 * Google is trusted for hardware verification, workload identity and key
   custody, and the platform is tied to GCP. A2 names this.
 * The maintainer, as key-project administrator, can authorize any image.
@@ -203,26 +211,22 @@ cannot open any.
   keys, and ADR 0003's snapshot manifests move from the tenant key to
   their snapshot's data key, under a new frame version beside `HPK1`.
   Nothing is deployed, so no migration is provided.
-* On acceptance, `docs/THREAT_MODEL.md` (Assets, A2), `docs/ARCHITECTURE.md`
-  (key-release trust boundary, research flow) and `docs/PROJECT_SCOPE.md`
-  change to "the data key is released", not "the steward's key". Under
-  option A they also stop naming SEV-SNP as the platform:
-  `docs/PROJECT_SCOPE.md` (the Attestation row, the stack line and the
-  definition-of-done item that names genuine SEV-SNP hardware),
-  `docs/ARCHITECTURE.md` (the connector flow), `docs/THREAT_MODEL.md`
-  (A2 and "Out of scope"), `README.md` and P12 in `docs/V1_PLAN.md`.
+* `docs/THREAT_MODEL.md` (Assets, A2, "Out of scope"),
+  `docs/ARCHITECTURE.md` (key-release trust boundary, connector and
+  research flows), `docs/PROJECT_SCOPE.md`, `README.md` and
+  `docs/V1_PLAN.md` describe production release as KMS unwrapping the
+  dataset's data key, not release of the steward's key, and name
+  Confidential Space on TDX as the platform.
 
 ## Open questions
 
-1. TDX (option A) or SEV-SNP (option C)? Needs P12 phase A: a TDX machine
-   type and region available to the project, and its cost.
-2. Is Cloud KMS X-Wing generally available? The release notes list X-Wing
+1. Is Cloud KMS X-Wing generally available? The release notes list X-Wing
    KEM keys and an HPKE option built on X-Wing without a launch stage.
-3. Whether KMS opens standard HPKE envelopes itself, or returns a shared
+2. Whether KMS opens standard HPKE envelopes itself, or returns a shared
    secret the enclave turns into a wrapping key. ADR 0007 (P17) decides
    the construction; this record only requires X-Wing.
-4. How the browser trusts Google's token-signing keys: a key set pinned in
+3. How the browser trusts Google's token-signing keys: a key set pinned in
    the release bundle (and refreshed with releases) or fetched from Google
    at run time.
-5. The documented nonce size limits disagree (8 to 88 or 10 to 74 bytes);
+4. The documented nonce size limits disagree (8 to 88 or 10 to 74 bytes);
    a 32-byte digest fits both.

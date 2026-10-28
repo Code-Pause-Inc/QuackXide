@@ -60,6 +60,14 @@ uses [Semantic Versioning](https://semver.org/).
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
   migration mode in v1.
+* ADR 0004 (Accepted): Confidential Space on Intel TDX with Cloud KMS, in
+  place of SEV-SNP, subject to P12 confirming a TDX machine type, region
+  and cost. Each dataset has its own data key, which KMS unwraps only for
+  the attested workload, per query. The SEV-SNP code and the `key-release`
+  relying party serve only the simulated TEE. `docs/THREAT_MODEL.md` A2
+  names Google and the key project's administrator as trusted, and the
+  architecture, scope, testing guide, README and v1.0 plan (P12, P47,
+  P48, P50) follow.
 * `docs/TESTING.md`: where each test layer lives, the naming and placement
   convention for negative tests and audit assertions, and the substitutes
   for what CI cannot exercise.

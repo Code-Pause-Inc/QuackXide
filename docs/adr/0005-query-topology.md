@@ -27,9 +27,9 @@ does not show which settings the image was given.
 ## Decision
 
 **One process.** `platform-api`, with the query engine in-process, runs
-inside an AMD SEV-SNP Confidential VM. The attested boundary is the VM;
-which binary runs in it is proven only as far as ADR 0004's workload
-identity reaches.
+as a Confidential Space workload on an Intel TDX Confidential VM
+(ADR 0004). The attested boundary is the VM; which binary runs in it is
+proven by the image digest in Google's attestation token.
 
 **A planned edge/worker split, not built in v1.** A split into an HTTP edge
 and a query worker isolates anything only if the worker itself verifies the

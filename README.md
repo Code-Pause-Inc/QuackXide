@@ -57,7 +57,7 @@ key that opens the data.
 
 1. **Ingress.** Drive files are encrypted in the browser (Web Crypto,
    non-extractable keys, AES-256-GCM). Connector pipelines sync external
-   sources into attested SEV-SNP memory, shape them into Parquet, and seal
+   sources into attested enclave memory, shape them into Parquet, and seal
    them to the tenant's HPKE key before anything persists.
 2. **Storage.** Ciphertext only, in HPKE envelopes with versioned framing
    and context binding. Storage paths are built only from typed tenant ids,
@@ -147,7 +147,7 @@ cargo run -p platform-api --bin query-demo   # sealed-query round trip over Simu
 ### Local research stack (dev only)
 
 `devstack` runs the API with the research routes wired and seeded, so the
-steward and researcher lifecycle runs on one machine without SEV-SNP
+steward and researcher lifecycle runs on one machine without TEE
 hardware. It is insecure by design: tenant keys live in process memory, TEE
 evidence is fabricated, and all state is in memory and lost when it stops.
 It is built only with the `dev` feature, listens only on a loopback
@@ -252,15 +252,16 @@ production release (details in `docs/PROJECT_SCOPE.md`):
 
 * **Sign-in** — RS256/JWKS verification and TOTP exist; the managed
   sign-in service does not. Development uses HS256 tokens.
-* **Attestation** — 1184-byte binary SEV-SNP report parsing, `ARK -> ASK -> VCEK`
-  P-384 certificate chain verification (`AttestationVerifier`), and
-  protocol-faithful `SimulatedSnp` are implemented. Hardware `/dev/sev-guest`
-  report acquisition (`SnpAttestation` when `TEE_ATTESTATION_REQUIRED=true`)
-  and browser-side quote verification remain before production cutover.
-* **Key release** — attestation-gated HPKE key release
-  (`KeyReleaseRelyingParty`, `AttestedKeyProvider`, `bin/key-release`) with
-  once-per-query key sessions and zeroize-on-drop is implemented; Cloud KMS /
-  HSM backing for the relying party remains.
+* **Attestation** — production runs as a Confidential Space workload on
+  Intel TDX (ADR 0004). Verifying Google's attestation token, in the
+  enclave and in the browser, remains. For the simulated TEE, 1184-byte
+  SEV-SNP report parsing, `ARK -> ASK -> VCEK` P-384 chain verification
+  (`AttestationVerifier`) and `SimulatedSnp` are implemented.
+* **Key release** — in production, Cloud KMS unwraps each dataset's data
+  key only for the attested workload (ADR 0004); this remains. The
+  simulated TEE's stand-in (`KeyReleaseRelyingParty`, `AttestedKeyProvider`,
+  `bin/key-release`), with once-per-query key sessions and zeroize-on-drop,
+  is implemented.
 * **Durability** — registries are in-memory behind traits.
 * **Encrypted results** — query responses carry an attested P-384
   `enclave_signature` over JSON/TLS; client-key HPKE result encryption remains.
