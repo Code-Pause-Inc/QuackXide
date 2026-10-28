@@ -56,7 +56,7 @@ impl VaultStore for TestVault {
         self.lists.fetch_add(1, Ordering::SeqCst);
         match self.listing {
             Listing::Works => Ok(Vec::new()),
-            Listing::Fails => Err(StorageError::Backend("down".into())),
+            Listing::Fails => Err(StorageError::Unavailable("down".into())),
             Listing::Hangs => std::future::pending().await,
         }
     }

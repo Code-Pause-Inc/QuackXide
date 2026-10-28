@@ -484,3 +484,123 @@ async fn listing_skips_manifests_deleted_concurrently() {
     let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("list json");
     assert!(listed.is_empty(), "deleted manifest must not be listed");
 }
+
+// ── Storage outages ──
+
+/// A drive app over a vault failing `faults` with `error`, and a token.
+fn faulty_drive(faults: common::Faults, error: fn() -> StorageError) -> (Router, String) {
+    let vault = Arc::new(common::FlakyVault::new(faults, error));
+    let app = build_app(common::app_state(SECRET, vault));
+    (app, token_for(TenantId::generate()))
+}
+
+async fn put_manifest(app: &Router, token: &str) -> StatusCode {
+    send(
+        app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(token), content_type("application/json")],
+        manifest_json().into_bytes(),
+    )
+    .await
+    .0
+}
+
+/// A transient outage is a 503 with `Retry-After`, never a 404 or an empty
+/// success.
+async fn assert_retryable_outage(app: &Router, token: &str, method: &str, uri: &str) {
+    let body = if method == "PUT" {
+        manifest_json().into_bytes()
+    } else {
+        Vec::new()
+    };
+    let (status, headers, body) = common::send_with_headers(
+        app,
+        method,
+        uri,
+        &[bearer(token), content_type("application/json")],
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+    assert_eq!(
+        headers[axum::http::header::RETRY_AFTER],
+        platform_api::STORAGE_RETRY_AFTER_SECS.to_string()
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+    assert_eq!(json["error"], "storage temporarily unavailable");
+}
+
+#[tokio::test]
+async fn put_outage_is_retryable() {
+    let (app, token) = faulty_drive(
+        common::Faults {
+            put: true,
+            ..Default::default()
+        },
+        common::outage,
+    );
+    let uri = format!("/api/v1/drive/objects/{OBJ}/manifest");
+    assert_retryable_outage(&app, &token, "PUT", &uri).await;
+}
+
+#[tokio::test]
+async fn get_outage_is_retryable_not_not_found() {
+    let (app, token) = faulty_drive(
+        common::Faults {
+            get: true,
+            ..Default::default()
+        },
+        common::outage,
+    );
+    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    let uri = format!("/api/v1/drive/objects/{OBJ}/manifest");
+    assert_retryable_outage(&app, &token, "GET", &uri).await;
+}
+
+#[tokio::test]
+async fn delete_outage_is_retryable() {
+    let (app, token) = faulty_drive(
+        common::Faults {
+            delete: true,
+            ..Default::default()
+        },
+        common::outage,
+    );
+    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    let uri = format!("/api/v1/drive/objects/{OBJ}");
+    assert_retryable_outage(&app, &token, "DELETE", &uri).await;
+}
+
+#[tokio::test]
+async fn list_outage_is_retryable_not_an_empty_list() {
+    let (app, token) = faulty_drive(
+        common::Faults {
+            list: true,
+            ..Default::default()
+        },
+        common::outage,
+    );
+    assert_retryable_outage(&app, &token, "GET", "/api/v1/drive/objects").await;
+}
+
+#[tokio::test]
+async fn fatal_storage_failure_is_502_without_retry_after() {
+    let (app, token) = faulty_drive(
+        common::Faults {
+            put: true,
+            ..Default::default()
+        },
+        common::misconfigured,
+    );
+    let (status, headers, _) = common::send_with_headers(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(headers.get(axum::http::header::RETRY_AFTER).is_none());
+}
