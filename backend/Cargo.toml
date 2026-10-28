@@ -114,7 +114,7 @@ datafusion = "55"                                                 # arrow/parque
 proptest = "1"
 # Seeded RNG for synth-data. synth-data uses rand_chacha's own rand_core
 # re-export, so this need not match `rand` above.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 
 [profile.release]
 lto = "thin"
