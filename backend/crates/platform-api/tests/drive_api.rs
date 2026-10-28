@@ -770,3 +770,131 @@ async fn delete_that_fails_partway_converges_on_retry() {
         assert_eq!(delete_status(&app, &token).await, StatusCode::NOT_FOUND);
     }
 }
+
+// ── Listing cap ──
+
+/// Store `count` manifests for `tenant` straight into `vault`, with
+/// distinct creation times.
+async fn store_manifests(vault: &dyn VaultStore, tenant: TenantId, count: usize) {
+    let mut body: serde_json::Value = serde_json::from_str(&manifest_json()).expect("json");
+    for i in 0..count {
+        body["created_at_iso"] = format!("2026-01-01T00:00:{:02}.{i:06}Z", i % 60).into();
+        vault
+            .put(
+                &platform_storage::TenantPaths::drive_manifest(
+                    tenant,
+                    platform_core::ObjectId::generate(),
+                ),
+                body.to_string().into(),
+            )
+            .await
+            .expect("put manifest");
+    }
+}
+
+async fn list(app: &Router, token: &str) -> (StatusCode, serde_json::Value) {
+    common::send_json(
+        app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(token)],
+        Vec::new(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn listing_at_the_cap_returns_every_object_newest_first() {
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let tenant = TenantId::generate();
+    store_manifests(vault.as_ref(), tenant, platform_api::MAX_LISTED_OBJECTS).await;
+    let app = build_app(common::app_state(SECRET, vault));
+
+    let (status, json) = list(&app, &token_for(tenant)).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = json.as_array().expect("array");
+    assert_eq!(entries.len(), platform_api::MAX_LISTED_OBJECTS);
+    let times: Vec<&str> = entries
+        .iter()
+        .map(|e| e["created_at_iso"].as_str().expect("time"))
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] >= w[1]), "newest first");
+}
+
+#[tokio::test]
+async fn listing_past_the_cap_is_refused_not_truncated() {
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let tenant = TenantId::generate();
+    store_manifests(vault.as_ref(), tenant, platform_api::MAX_LISTED_OBJECTS + 1).await;
+    let app = build_app(common::app_state(SECRET, vault));
+
+    let (status, json) = list(&app, &token_for(tenant)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json["error"], "too many objects to list");
+}
+
+/// Counts how many manifest reads are in flight at once.
+struct ConcurrencyVault {
+    inner: ObjectStoreVault,
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[async_trait]
+impl VaultStore for ConcurrencyVault {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.inner.put(path, ciphertext).await
+    }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.inner.put_if_absent(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let result = self.inner.get(path).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        self.inner.delete(path).await
+    }
+    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        self.inner.list(prefix).await
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.inner.usage(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn manifest_reads_run_concurrently_but_bounded() {
+    let vault = Arc::new(ConcurrencyVault {
+        inner: ObjectStoreVault::new_in_memory(),
+        in_flight: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+    let tenant = TenantId::generate();
+    store_manifests(vault.as_ref(), tenant, 64).await;
+    let app = build_app(common::app_state(SECRET, vault.clone()));
+
+    let (status, json) = list(&app, &token_for(tenant)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.as_array().expect("array").len(), 64);
+    let peak = vault.peak.load(Ordering::SeqCst);
+    assert!(peak > 1, "reads ran one at a time");
+    assert!(peak <= 16, "{peak} reads at once");
+}
+
+#[tokio::test]
+async fn a_failed_manifest_read_fails_the_whole_listing() {
+    let (app, token) = faulty_drive(
+        common::Faults {
+            get: true,
+            ..Default::default()
+        },
+        common::outage,
+    );
+    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    assert_retryable_outage(&app, &token, "GET", "/api/v1/drive/objects").await;
+}

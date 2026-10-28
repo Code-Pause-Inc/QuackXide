@@ -485,3 +485,45 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         capture.events()
     );
 }
+
+#[tokio::test]
+async fn drive_listing_past_the_cap_is_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let manifest = serde_json::json!({
+        "wrapped_key": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "d3JhcHBlZA==" },
+        "manifest": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "bWFuaWZlc3Q=" },
+        "chunk_count": 1,
+        "encrypted_size_bytes": 1,
+        "created_at_iso": "2026-01-01T00:00:00Z",
+    })
+    .to_string();
+    for _ in 0..=platform_api::MAX_LISTED_OBJECTS {
+        vault
+            .put(
+                &platform_storage::TenantPaths::drive_manifest(
+                    tenant,
+                    platform_core::ObjectId::generate(),
+                ),
+                manifest.clone().into(),
+            )
+            .await
+            .expect("put");
+    }
+    let app = build_app(app_state(SECRET, vault));
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token_for(tenant))],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        capture.contains("data.access", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
