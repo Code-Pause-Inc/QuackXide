@@ -1,6 +1,6 @@
 # 0006. Sign-in, identity and token signatures
 
-* Status: Proposed
+* Status: Accepted
 * Date: 2026-10-22
 
 ## Context
@@ -77,12 +77,19 @@ does not.
   verifier plus provider JWKS on every replica. The exchange keeps one
   token format at the API and keeps the token-signature choice (section 2)
   ours rather than the provider's.
-* **The identity service is a separate binary**, not a module of
-  `platform-api`, so its signing key never resides in an API process or
-  replica. ADR 0005's one-process topology covers `platform-api` and the
-  query engine only. The API learns the identity service's issuer,
-  audience and verification key from the configuration bound into the
-  attestation evidence (ADR 0005).
+* **The identity service is a separate binary in its own Confidential
+  VM**, under the same attestation policy as `platform-api`. ADR 0005's
+  one-process topology covers only `platform-api` and the query engine, so
+  this record places the identity service.
+* **Its signing key gets the same protection as data keys.** The key can
+  mint a token for any `tid`, with or without `adm`, so it is held in
+  Cloud KMS and released only to the attested identity-service workload,
+  following option A of ADR 0004 (key custody and attested key release).
+  It never resides in an API process or replica, and no operator path
+  exports it.
+* The API learns the identity service's issuer, audience and verification
+  key from the configuration bound into the attestation evidence
+  (ADR 0005).
 
 ### 2. Token signatures
 
@@ -148,13 +155,17 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
   used.
 * **Everyone needs it:** stewards, researchers and administrators. An
   `adm` access token is never issued without it. `THREAT_MODEL.md` A3 is
-  updated to say so.
+  updated to say so. Passkeys (WebAuthn) for administrators may follow in
+  v1.1.
 * **Storage** (the `IdentityRegistry` trait, in-memory in P29 and P30,
   durable in P63): TOTP secrets, AEAD-encrypted at rest under a key from
   configuration; the last accepted step per user (replay protection);
   failed-attempt counters; refresh-token families.
-* **Recovery** is an audited administrator reset only in v1, documented
-  in the runbook. One-time recovery codes are not issued in v1.
+* **Recovery** is an audited administrator reset only in v1; one-time
+  recovery codes are not issued. The reset requires an out-of-band check
+  of the person's identity, and no administrator can reset their own
+  account, so at least two administrators must exist at all times. The
+  procedure is documented in the runbook.
 
 ### 5. Session
 
@@ -178,6 +189,8 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
   against an exact allowlist and requires a custom request header (CSRF
   defence). API calls themselves stay bearer-only, so they need no CSRF
   defence.
+* The identity service and the app are served from the same site, so the
+  `SameSite=Strict` refresh cookie is sent on refresh requests.
 
 ### 6. Browser sign-in flow
 
@@ -208,11 +221,13 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
   and production tenants need at least the Essentials plan (the Free plan
   has one tenant). Auth0's hosted pages and emails are configured with the
   public brand (P29).
-* A new identity-service binary exists (P29) and holds the only token
-  signing key. Its key custody is documented for deployment (P68, P77).
+* A new identity-service binary exists (P29) in its own attested
+  Confidential VM, and holds the only token signing key, released by
+  Cloud KMS only to that workload. Its key custody is documented for
+  deployment (P68, P77).
 * The API keeps one verifier and one token format. Provider changes stay
   inside the identity service.
-* Tokens grow to about 4.5 KB under option (a). Headers, proxies and the
+* Tokens grow to about 4.5 KB. Headers, proxies and the
   router must accept them (tested in P37).
 * `JwtVerifier`/`RawClaims` cannot verify provider tokens unchanged; the
   exchange gets its own provider verifier (P29).

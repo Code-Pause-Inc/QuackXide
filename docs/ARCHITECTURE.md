@@ -256,7 +256,7 @@ grant. `research.catalog` events carry identifiers only.
 
 ## Authorization model (target)
 
-ADR 0006 (Proposed) decides how a person signs in and what the API
+ADR 0006 decides how a person signs in and what the API
 trusts. None of this is built yet; today the API accepts any validly
 signed token whose `typ` is `access`.
 
@@ -274,10 +274,12 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 ```
 
 * **One verifier, one format.** The API verifies only platform tokens
-  minted by the identity service, a separate binary (`sub`, `tid`, `iss`, `aud`, `exp`,
+  minted by the identity service, a separate binary in its own attested
+  Confidential VM (`sub`, `tid`, `iss`, `aud`, `exp`,
   `adm`, `typ`). Auth0 tokens never reach the browser or the API. Only the
   identity service fetches Auth0's keys, and only it holds the platform
-  signing key; API replicas hold public material only.
+  signing key, released by Cloud KMS only to the attested identity-service
+  workload (ADR 0004 option A); API replicas hold public material only.
 * **Token types.** `preauth` is issued after Auth0 sign-in and is good
   only for the second-factor step. `access` is issued only after the
   second factor and is the only type `authenticate` accepts. `refresh`
