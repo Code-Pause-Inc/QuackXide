@@ -371,6 +371,23 @@ Rules, enforced by the capture tests:
    enrollment (ok + denied), query attestation + execution (ok + failed),
    and provisioning.
 
+Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
+installs the subscriber that `build_subscriber` returns: two JSON layers on
+stdout. `RUST_LOG` filters only the operational layer; the audit layer
+writes every `SECURITY_AUDIT_EVENT` record whatever it says, so no setting
+turns the stream off. `audit_records_ignore_the_operational_filter` in
+`platform-telemetry` checks this under `error`, `off`,
+`SECURITY_AUDIT_EVENT=off` and `trace`.
+
+Query content stays out of the operational log. `tracing-subscriber` is
+built without its `log` bridge (`backend/Cargo.toml`), so DataFusion and
+sqlparser output, which quotes SQL text and plan literals, is never logged
+by any binary. `QueryError::Parquet` and `QueryError::Execution` hold a
+fixed stage, never upstream error text, which can quote cell values.
+`platform-api/tests/log_leak.rs` runs a research query at `RUST_LOG=trace`
+whose SQL literal and failing cell value are unique, and checks that
+neither reaches a log line, an audit record or the HTTP response.
+
 Readiness probes (`GET /readyz`) emit no events. They run every few
 seconds, touch no tenant data, and only list an empty control prefix and
 run the attestation check. The response is only `ready` or `not_ready`;

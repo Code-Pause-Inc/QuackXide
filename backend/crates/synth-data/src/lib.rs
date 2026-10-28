@@ -30,7 +30,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::errors::ParquetError;
 use rand_chacha::ChaCha8Rng;
-use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::rand_core::{Rng, SeedableRng};
 
 /// Default cohort threshold. Mirrors `DEFAULT_MIN_COHORT_SIZE` in
 /// `platform-config` and `RESEARCH_MIN_COHORT_SIZE` in `backend/.env.example`;
@@ -521,7 +521,7 @@ pub mod wide {
     use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use rand_chacha::ChaCha8Rng;
-    use rand_chacha::rand_core::RngCore;
+    use rand_chacha::rand_core::Rng;
 
     use super::below;
 
