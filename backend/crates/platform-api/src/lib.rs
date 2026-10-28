@@ -95,8 +95,14 @@ pub enum ApiError {
     Forbidden,
     AuthNotConfigured,
     NotFound,
+    /// A create-only or conditional write lost to an existing object (409).
+    Conflict,
     BadRequest(&'static str),
+    /// A backend failed in a way retrying does not fix (502).
     Backend,
+    /// Storage failed transiently; the client may retry after
+    /// [`STORAGE_RETRY_AFTER_SECS`] (503 with `Retry-After`).
+    StorageUnavailable,
     /// The confidential query service is not configured (503).
     QueryUnavailable,
     /// Research access (grants, budgets, catalog) is not configured (503).
@@ -114,11 +120,17 @@ pub enum ApiError {
     BudgetExhausted,
 }
 
+/// `Retry-After` on a transient storage failure. The storage client has
+/// already retried before the error reached the API.
+pub const STORAGE_RETRY_AFTER_SECS: u32 = 5;
+
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         match err {
             StorageError::NotFound => ApiError::NotFound,
-            StorageError::Backend(_) => ApiError::Backend,
+            StorageError::AlreadyExists | StorageError::PreconditionFailed => ApiError::Conflict,
+            StorageError::Unavailable(_) => ApiError::StorageUnavailable,
+            StorageError::Fatal(_) => ApiError::Backend,
         }
     }
 }
@@ -131,8 +143,10 @@ impl ApiError {
             ApiError::Forbidden => "forbidden",
             ApiError::AuthNotConfigured => "auth_not_configured",
             ApiError::NotFound => "not_found",
+            ApiError::Conflict => "conflict",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Backend => "backend",
+            ApiError::StorageUnavailable => "storage_unavailable",
             ApiError::QueryUnavailable => "query_unavailable",
             ApiError::ResearchUnavailable => "research_unavailable",
             ApiError::ProvisioningUnavailable => "provisioning_unavailable",
@@ -155,8 +169,13 @@ impl IntoResponse for ApiError {
                 "authentication not configured",
             ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
+            ApiError::Conflict => (StatusCode::CONFLICT, "conflict"),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Backend => (StatusCode::BAD_GATEWAY, "storage backend error"),
+            ApiError::StorageUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage temporarily unavailable",
+            ),
             ApiError::QueryUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "confidential query not available",
@@ -185,6 +204,15 @@ impl IntoResponse for ApiError {
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
+        if matches!(kind, "storage_unavailable") {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                STORAGE_RETRY_AFTER_SECS
+                    .to_string()
+                    .parse()
+                    .expect("digits"),
+            );
+        }
         if matches!(status, StatusCode::UNAUTHORIZED) {
             response
                 .headers_mut()
@@ -791,10 +819,12 @@ async fn delete_object(
     // Existence check first: not every backend errors when deleting a
     // missing key, and an absent object must be an honest 404 everywhere.
     audited_get(&state, tenant, &manifest_path, &detail).await?;
-    state.vault.delete(&manifest_path).await?;
 
-    // Every stored chunk, not `0..chunk_count`: a manifest overwritten with
-    // a smaller count must not strand the trailing chunks.
+    // Chunks first, manifest last: if any delete fails, the manifest is
+    // still there, so the client's retry finds the object and finishes the
+    // job instead of getting a 404 with chunks stranded. Every stored chunk,
+    // not `0..chunk_count`: a manifest overwritten with a smaller count must
+    // not strand the trailing chunks.
     let chunks = state
         .vault
         .list(&TenantPaths::drive_object_prefix(tenant, object_id))
@@ -804,6 +834,11 @@ async fn delete_object(
             Ok(()) | Err(StorageError::NotFound) => {}
             Err(err) => return Err(err.into()),
         }
+    }
+    match state.vault.delete(&manifest_path).await {
+        // A concurrent delete got there first; the object is gone either way.
+        Ok(()) | Err(StorageError::NotFound) => {}
+        Err(err) => return Err(err.into()),
     }
     security_audit_event(AuditKind::DataAccess, Some(tenant), "ok", &detail);
     Ok(StatusCode::NO_CONTENT)
@@ -871,4 +906,41 @@ async fn get_enrollment(
     .await?;
     security_audit_event(AuditKind::DataAccess, Some(tenant), "ok", "get_enrollment");
     Ok(([(header::CONTENT_TYPE, "application/json")], stored).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_errors_map_to_documented_statuses() {
+        for (err, status) in [
+            (StorageError::NotFound, StatusCode::NOT_FOUND),
+            (StorageError::AlreadyExists, StatusCode::CONFLICT),
+            (StorageError::PreconditionFailed, StatusCode::CONFLICT),
+            (
+                StorageError::Unavailable("down".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                StorageError::Fatal("forbidden".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let retryable = err.is_retryable();
+            let response = ApiError::from(err).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER).is_some(),
+                retryable,
+                "Retry-After only on a retryable failure"
+            );
+        }
+        assert_eq!(
+            ApiError::from(StorageError::Unavailable("down".into()))
+                .into_response()
+                .headers()[header::RETRY_AFTER],
+            STORAGE_RETRY_AFTER_SECS.to_string()
+        );
+    }
 }

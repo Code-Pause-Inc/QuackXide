@@ -8,6 +8,22 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* The GCS vault's timeouts and retries are explicit settings instead of
+  `object_store`'s defaults (10 retries within 3 minutes):
+  `STORAGE_REQUEST_TIMEOUT_SECS` (30), `STORAGE_CONNECT_TIMEOUT_SECS` (5),
+  `STORAGE_MAX_RETRIES` (3) and `STORAGE_RETRY_TIMEOUT_SECS` (20), each
+  bounded and refused at startup when out of range. A stalled backend fails
+  within retry timeout + backoff + request timeout (55 s by default). The
+  client refuses plain HTTP except to a `STORAGE_EMULATOR_HOST`.
+  `ObjectStoreVault::new_gcs` takes the settings.
+* Storage errors are retryable or fatal. `StorageError::Backend` is
+  replaced by `Unavailable` (an `object_store` failure that outlasted the
+  client's retries; the API returns 503 with `Retry-After: 5`) and `Fatal`
+  (credentials, permissions, invalid paths, unsupported operations and
+  configuration; 502). The admin tenant listing now reports a storage
+  outage as 503. `platform-api/tests/common/mod.rs` gains `FlakyVault`,
+  which can fail `put`, `get`, `delete`, `list` and `usage`, and each drive
+  operation has an outage test.
 * `docs/DEVELOPMENT.md`: prerequisites (WSL2 on Windows), the first build,
   everyday test commands, running `cargo deny` and `npm audit` before a
   push, what each `scripts/check.sh` step checks and how to fix it, where
@@ -19,6 +35,11 @@ uses [Semantic Versioning](https://semver.org/).
 * CI compiles every fuzz target on each pull request, and runs a gitleaks
   secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
   runs the same scan when gitleaks is installed.
+* `VaultStore::put_if_absent`, a create-only write (`PutMode::Create`;
+  `x-goog-if-generation-match: 0` on GCS). `StorageError` gains
+  `AlreadyExists` and `PreconditionFailed`, which the API returns as 409
+  instead of 502. `ObjectStoreVault::new` takes any
+  `Arc<dyn ObjectStore>`.
 * `platform-api/tests/common/mod.rs`: shared token minters (HS256, and a
   cached RS256 keypair), request helpers, and app builders for the API
   integration tests.
@@ -63,6 +84,14 @@ uses [Semantic Versioning](https://semver.org/).
   binary. From `backend/`,
   `DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstack`
   starts it.
+
+### Fixed
+
+* A drive delete that fails partway can be retried: `DELETE
+  /api/v1/drive/objects/{id}` now deletes the chunks before the manifest,
+  so after a failure the object is still found and the retry removes the
+  rest. Before, the manifest went first, the retry got 404 and the chunks
+  were stranded.
 
 ### Security
 

@@ -1928,6 +1928,7 @@ dependencies = [
  "bytes",
  "futures",
  "object_store",
+ "platform-config",
  "platform-core",
  "thiserror",
 ]

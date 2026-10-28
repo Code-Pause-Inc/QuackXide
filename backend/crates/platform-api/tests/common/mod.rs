@@ -1,5 +1,6 @@
 //! Helpers shared by the `platform-api` integration tests: token minting,
-//! request helpers, and app builders. Each test binary uses a subset.
+//! request helpers, app builders, and a fault-injecting vault. Each test
+//! binary uses a subset.
 
 #![allow(dead_code)]
 
@@ -9,9 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
@@ -24,7 +27,7 @@ use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, VaultStore};
+use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
 use quackxide_engine::EngineSettings;
 use sha2::Sha256;
 use tower::ServiceExt;
@@ -108,6 +111,18 @@ pub async fn send(
     headers: &[(&str, String)],
     body: Vec<u8>,
 ) -> (StatusCode, Vec<u8>) {
+    let (status, _, body) = send_with_headers(app, method, uri, headers, body).await;
+    (status, body)
+}
+
+/// As [`send`], also returning the response headers.
+pub async fn send_with_headers(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, String)],
+    body: Vec<u8>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let mut builder = Request::builder().method(method).uri(uri);
     for (name, value) in headers {
         builder = builder.header(*name, value);
@@ -115,13 +130,14 @@ pub async fn send(
     let request = builder.body(Body::from(body)).expect("request");
     let response = app.clone().oneshot(request).await.expect("response");
     let status = response.status();
+    let response_headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
         .await
         .expect("body")
         .to_bytes();
-    (status, bytes.to_vec())
+    (status, response_headers, bytes.to_vec())
 }
 
 /// As [`send`], with the body parsed as JSON (`Null` if it is not).
@@ -286,4 +302,81 @@ pub async fn research_app(
 /// The insecure development attestation, for builders that take one.
 pub fn dev_attestation() -> Arc<dyn AttestationProvider> {
     Arc::new(DevAttestation::allow_insecure_dev())
+}
+
+// ── Fault injection ──
+
+/// Which vault operations a [`FlakyVault`] fails. `put` covers both `put`
+/// and `put_if_absent`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Faults {
+    pub put: bool,
+    pub get: bool,
+    pub delete: bool,
+    pub list: bool,
+    pub usage: bool,
+}
+
+/// A transient backend outage (the API answers 503 with `Retry-After`).
+pub fn outage() -> StorageError {
+    StorageError::Unavailable("simulated outage".into())
+}
+
+/// A permanent backend failure, such as revoked credentials (502).
+pub fn misconfigured() -> StorageError {
+    StorageError::Fatal("simulated permission denied".into())
+}
+
+/// In-memory vault whose chosen operations fail with `error`.
+pub struct FlakyVault {
+    inner: ObjectStoreVault,
+    faults: Faults,
+    error: fn() -> StorageError,
+}
+
+impl FlakyVault {
+    pub fn new(faults: Faults, error: fn() -> StorageError) -> Self {
+        Self {
+            inner: ObjectStoreVault::new_in_memory(),
+            faults,
+            error,
+        }
+    }
+
+    fn check(&self, fails: bool) -> Result<(), StorageError> {
+        if fails { Err((self.error)()) } else { Ok(()) }
+    }
+}
+
+/// A [`FlakyVault`] failing `faults` with [`outage`].
+pub fn flaky_vault(faults: Faults) -> Arc<dyn VaultStore> {
+    Arc::new(FlakyVault::new(faults, outage))
+}
+
+#[async_trait]
+impl VaultStore for FlakyVault {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.check(self.faults.put)?;
+        self.inner.put(path, ciphertext).await
+    }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.check(self.faults.put)?;
+        self.inner.put_if_absent(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        self.check(self.faults.get)?;
+        self.inner.get(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        self.check(self.faults.delete)?;
+        self.inner.delete(path).await
+    }
+    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        self.check(self.faults.list)?;
+        self.inner.list(prefix).await
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.check(self.faults.usage)?;
+        self.inner.usage(prefix).await
+    }
 }

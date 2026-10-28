@@ -72,11 +72,24 @@ Client key architecture:
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
   `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  Storage errors are classified: missing objects are 404, lost
+  create-only writes 409, transient failures (after the storage client's
+  own retries) 503 with `Retry-After`, and permanent ones (credentials,
+  permissions, configuration) 502. The GCS client's timeouts and retries
+  are set from `STORAGE_*` settings (`backend/.env.example`), each bounded,
+  so a stalled backend fails within retry timeout + backoff + request
+  timeout (55 s by default). It refuses plain HTTP except to a local
+  emulator.
 * **JWT tenant boundary** — tenant identity enters the API only as the
   verified `tid` claim; handlers never read a tenant from paths or bodies.
   No secret configured ⇒ authenticated routes refuse with 503 (fail closed).
   Integration tests verify that cross-tenant reads, lists, and deletes are
   refused.
+
+Deleting an object removes its chunks first and its manifest last, so a
+delete that fails partway leaves the object listed and a retry finishes it.
+Until then the object's download fails, since some chunks are gone. An
+object whose manifest is gone is a 404.
 
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
