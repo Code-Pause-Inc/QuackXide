@@ -267,6 +267,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejecting_provider_refuses_even_when_not_required() {
+        // A build without the simulator must never fall back to running unattested.
+        let result = gate_execution(&RejectingProvider, false, &fresh_nonce()).await;
+        assert!(
+            matches!(result, Err(EnclaveError::Rejected(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn strict_dev_attestation_fails_closed() {
         let provider = DevAttestation::strict();
         assert!(provider.produce_evidence(b"nonce").await.is_err());

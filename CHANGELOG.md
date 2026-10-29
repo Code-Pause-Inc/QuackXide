@@ -194,7 +194,8 @@ uses [Semantic Versioning](https://semver.org/).
   simulator compiles only with `platform-enclave`'s `simulated` feature
   (enabled by `platform-api`'s `dev`, or `platform-connectors`'
   `simulated`): a build without it refuses every attestation when
-  `TEE_ATTESTATION_REQUIRED=false`, and the connector pipeline now refuses
+  `TEE_ATTESTATION_REQUIRED=false`, so does a dev build whose
+  `sim-attestation` is unreachable, and the connector pipeline now refuses
   a rejected attestation in dev mode instead of syncing unattested. A local
   `connector-worker` therefore needs `--features simulated`,
   `SIM_ATTESTATION_URL` and a running `sim-attestation` (README). CI checks

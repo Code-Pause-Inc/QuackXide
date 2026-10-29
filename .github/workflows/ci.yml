@@ -167,7 +167,9 @@ jobs:
       - name: The release build has no attestation simulator
         run: |
           for crate in platform-api platform-connectors; do
-            if cargo tree --manifest-path backend/Cargo.toml --locked -p "$crate" -e normal,features -i platform-enclave | grep -q 'feature "simulated"'; then
+            # Captured first, so a failing cargo tree fails the step instead of passing it.
+            tree=$(cargo tree --manifest-path backend/Cargo.toml --locked -p "$crate" -e normal,features -i platform-enclave)
+            if grep -q 'feature "simulated"' <<<"$tree"; then
               echo "::error::the release build of $crate enables platform-enclave's simulated feature"
               exit 1
             fi

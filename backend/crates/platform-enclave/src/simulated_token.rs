@@ -308,8 +308,10 @@ impl SimulatedTokenProvider {
     }
 }
 
+// `Rejected`, not `Unavailable`: the gates let `Unavailable` through as
+// development evidence, and a configured simulator that fails must refuse.
 fn unavailable() -> EnclaveError {
-    EnclaveError::Unavailable("simulated attestation service unreachable".into())
+    EnclaveError::Rejected("simulated attestation service unreachable".into())
 }
 
 #[async_trait]
@@ -406,6 +408,23 @@ mod tests {
         });
         assert!(
             crate::gate_execution(&debug, false, &[1u8; 32])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_simulator_is_refused_even_when_not_required() {
+        // A configured simulator that does not answer must refuse, not run unattested.
+        let unreachable = SimulatedTokenProvider::from_url(
+            "http://127.0.0.1:9",
+            "https://sim.test",
+            ReleasePolicy {
+                allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+            },
+        );
+        assert!(
+            crate::gate_execution(&unreachable, false, &[1u8; 32])
                 .await
                 .is_err()
         );
