@@ -365,7 +365,7 @@ traits; durable backends replace them without touching call sites.
 
 ## Cryptography posture
 
-* All primitives come from RustCrypto (`aes-gcm`, `hmac`, `p384`, `sha2`,
+* All primitives come from RustCrypto (`aes-gcm`, `hmac`, `sha2`,
   `rsa`) and the `hpke` crate; TOTP is RFC 6238 over the existing HMAC stack
   and is tested against the RFC's own vectors.
 * Suites are pinned at single seams (one `TenantKem` type alias, one
