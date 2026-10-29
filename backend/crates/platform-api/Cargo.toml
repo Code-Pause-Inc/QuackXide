@@ -26,6 +26,10 @@ required-features = ["dev"]
 name = "query-demo"
 required-features = ["dev"]
 
+[[bin]]
+name = "sim-attestation"
+required-features = ["dev"]
+
 [package]
 name = "platform-api"
 default-run = "platform-api"
