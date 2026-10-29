@@ -13,11 +13,11 @@ use p384::ecdsa::{Signature, SigningKey};
 use rand::Rng as _;
 use rand::rngs::OsRng;
 
+use crate::binding::{REPORT_DATA_BYTES, ReportDataBinding};
 use crate::report::{
     CHIP_ID_BYTES, GuestPolicy, MEASUREMENT_BYTES, P384_SCALAR_BYTES,
-    P384_SIGNATURE_COMPONENT_PADDED_BYTES, REPORT_DATA_BYTES, ReportDataBinding,
-    SNP_REPORT_SIGNED_BYTES, SNP_REPORT_VERSION, SNP_SIG_ALGO_ECDSA_P384_SHA384, SnpReport,
-    TcbVersion, report_data_from_nonce,
+    P384_SIGNATURE_COMPONENT_PADDED_BYTES, SNP_REPORT_SIGNED_BYTES, SNP_REPORT_VERSION,
+    SNP_SIG_ALGO_ECDSA_P384_SHA384, SnpReport, TcbVersion, report_data_from_nonce,
 };
 use crate::verifier::{
     ArkCertificate, AskCertificate, AttestationVerifier, SnpCertChain, TrustRoot, VcekCertificate,

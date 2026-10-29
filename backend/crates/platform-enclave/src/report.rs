@@ -8,9 +8,9 @@
 //!   bytes each; `0x330..0x4A0` reserved zero).
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::EnclaveError;
+use crate::binding::REPORT_DATA_BYTES;
 
 /// Total size of an AMD SEV-SNP binary `ATTESTATION_REPORT`.
 pub const SNP_REPORT_BYTES: usize = 1184;
@@ -20,8 +20,6 @@ pub const SNP_REPORT_SIGNED_BYTES: usize = 0x2A0;
 pub const SNP_REPORT_VERSION: u32 = 2;
 /// `ATTESTATION_REPORT.SIGNATURE_ALGO` value for ECDSA P-384 with SHA-384.
 pub const SNP_SIG_ALGO_ECDSA_P384_SHA384: u32 = 1;
-/// Size of `REPORT_DATA` in bytes.
-pub const REPORT_DATA_BYTES: usize = 64;
 /// Size of `MEASUREMENT` (SHA-384 launch digest) in bytes.
 pub const MEASUREMENT_BYTES: usize = 48;
 /// Size of `CHIP_ID` in bytes.
@@ -30,8 +28,6 @@ pub const CHIP_ID_BYTES: usize = 64;
 pub const P384_SIGNATURE_COMPONENT_PADDED_BYTES: usize = 72;
 /// Size of an unpadded P-384 scalar (384 bits = 48 bytes).
 pub const P384_SCALAR_BYTES: usize = 48;
-
-const REPORT_DATA_DOMAIN_TAG: &[u8] = b"quackxide-snp-report-data-v1";
 
 // Field offsets within the 1184-byte report (AMD SEV-SNP ABI Table 22).
 const OFF_VERSION: usize = 0x000;
@@ -141,41 +137,6 @@ impl TcbVersion {
             snp: ((raw >> 48) & 0xFF) as u8,
             microcode: ((raw >> 56) & 0xFF) as u8,
         }
-    }
-}
-
-/// Canonical 64-byte `REPORT_DATA` binding for key release and browser
-/// attestation verification.
-///
-/// - `bytes[0..32]`: 32-byte freshness `nonce` supplied by the relying party.
-/// - `bytes[32..64]`: SHA-256 digest binding the enclave's ephemeral HPKE
-///   public key, result-signing public key, TLS certificate SPKI SHA-256, and
-///   deployment configuration digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportDataBinding {
-    pub nonce: [u8; 32],
-    pub enclave_hpke_public_key: [u8; 32],
-    pub result_signing_public_key: [u8; 32],
-    pub tls_cert_sha256: [u8; 32],
-    pub config_digest: [u8; 32],
-}
-
-impl ReportDataBinding {
-    /// Compute the 64-byte `REPORT_DATA` field that goes into `/dev/sev-guest`
-    /// (or `SimulatedSnp`).
-    pub fn to_report_data(&self) -> [u8; REPORT_DATA_BYTES] {
-        let mut hasher = Sha256::new();
-        hasher.update(REPORT_DATA_DOMAIN_TAG);
-        hasher.update(self.enclave_hpke_public_key);
-        hasher.update(self.result_signing_public_key);
-        hasher.update(self.tls_cert_sha256);
-        hasher.update(self.config_digest);
-        let binding_hash = hasher.finalize();
-
-        let mut out = [0u8; REPORT_DATA_BYTES];
-        out[..32].copy_from_slice(&self.nonce);
-        out[32..64].copy_from_slice(&binding_hash);
-        out
     }
 }
 

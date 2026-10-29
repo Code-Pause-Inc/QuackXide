@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use rand::Rng;
 
+pub mod binding;
 pub mod report;
 pub mod simulated;
 #[cfg(feature = "simulated")]
@@ -16,10 +17,11 @@ pub mod simulated_token;
 pub mod token;
 pub mod verifier;
 
+pub use binding::{REPORT_DATA_BYTES, ReportDataBinding};
 pub use report::{
-    CHIP_ID_BYTES, GuestPolicy, MEASUREMENT_BYTES, REPORT_DATA_BYTES, ReportDataBinding,
-    SNP_REPORT_BYTES, SNP_REPORT_SIGNED_BYTES, SNP_REPORT_VERSION, SNP_SIG_ALGO_ECDSA_P384_SHA384,
-    SnpReport, TcbVersion, report_data_from_nonce,
+    CHIP_ID_BYTES, GuestPolicy, MEASUREMENT_BYTES, SNP_REPORT_BYTES, SNP_REPORT_SIGNED_BYTES,
+    SNP_REPORT_VERSION, SNP_SIG_ALGO_ECDSA_P384_SHA384, SnpReport, TcbVersion,
+    report_data_from_nonce,
 };
 pub use simulated::{
     DEFAULT_SIMULATED_CHIP_ID, DEFAULT_SIMULATED_MEASUREMENT, DEFAULT_SIMULATED_TCB, SimulatedSnp,
