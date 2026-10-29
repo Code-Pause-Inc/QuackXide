@@ -143,12 +143,23 @@ impl TokenSigner {
         issued_at: u64,
         lifetime: Duration,
     ) -> String {
+        self.sign_claims(&self.claims_json(audience, nonces, issued_at, lifetime))
+    }
+
+    /// The claims [`Self::sign_at`] signs, for tests that edit them first.
+    pub fn claims_json(
+        &self,
+        audience: &str,
+        nonces: &[String],
+        issued_at: u64,
+        lifetime: Duration,
+    ) -> Value {
         // Google sends one nonce as a string and several as an array.
         let eat_nonce = match nonces {
             [one] => Value::String(one.clone()),
             many => json!(many),
         };
-        let claims = json!({
+        json!({
             "iss": self.issuer,
             "aud": audience,
             "iat": issued_at,
@@ -162,10 +173,14 @@ impl TokenSigner {
                 "confidential_space": { "support_attributes": self.claims.support_attributes },
                 "container": { "image_digest": self.claims.image_digest },
             },
-        });
+        })
+    }
+
+    /// Sign arbitrary claims with this signer's key.
+    pub fn sign_claims(&self, claims: &Value) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.kid.clone());
-        encode(&header, &claims, &self.encoding_key).expect("RS256 signing")
+        encode(&header, claims, &self.encoding_key).expect("RS256 signing")
     }
 }
 

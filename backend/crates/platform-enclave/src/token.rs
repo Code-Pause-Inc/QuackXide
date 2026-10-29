@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 
@@ -149,8 +149,9 @@ pub struct TokenVerifier {
 }
 
 impl TokenVerifier {
-    /// Build a verifier. Keys without a `kid` are ignored; a key set with no
-    /// usable RSA key is refused.
+    /// Build a verifier from the RSA keys in `keys` that have a `kid`; other
+    /// keys are skipped, as in `platform-auth`'s JWKS loader. A set with no
+    /// such key is refused.
     pub fn new(
         keys: &JwkSet,
         issuer: &str,
@@ -159,7 +160,9 @@ impl TokenVerifier {
     ) -> Result<Self, TokenError> {
         let mut by_kid = HashMap::new();
         for jwk in &keys.keys {
-            let Some(kid) = jwk.common.key_id.clone() else {
+            let (Some(kid), AlgorithmParameters::RSA(_)) =
+                (jwk.common.key_id.clone(), &jwk.algorithm)
+            else {
                 continue;
             };
             let key = DecodingKey::from_jwk(jwk).map_err(|_| TokenError::BadKeySet)?;
@@ -531,6 +534,95 @@ mod tests {
             let message = err(&token).to_string();
             assert!(!message.contains("MARKER"), "{message}");
         }
+    }
+
+    fn verifier_from(keys: serde_json::Value) -> Result<TokenVerifier, TokenError> {
+        let keys: JwkSet = serde_json::from_value(keys).unwrap();
+        TokenVerifier::new(
+            &keys,
+            ISSUER,
+            SIMULATED_AUDIENCE,
+            ReleasePolicy {
+                allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+            },
+        )
+    }
+
+    fn rsa_jwk_json() -> serde_json::Value {
+        serde_json::to_value(&signer().jwks().keys[0]).unwrap()
+    }
+
+    fn ec_jwk_json() -> serde_json::Value {
+        serde_json::json!({"kty": "EC", "crv": "P-256", "kid": "ec-1",
+            "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+            "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"})
+    }
+
+    #[test]
+    fn empty_key_set_is_refused() {
+        assert_eq!(
+            verifier_from(serde_json::json!({"keys": []})).err(),
+            Some(TokenError::BadKeySet)
+        );
+    }
+
+    #[test]
+    fn keys_without_kid_are_refused() {
+        let mut jwk = rsa_jwk_json();
+        jwk.as_object_mut().unwrap().remove("kid");
+        let result = verifier_from(serde_json::json!({"keys": [jwk]}));
+        assert_eq!(result.err(), Some(TokenError::BadKeySet));
+    }
+
+    #[test]
+    fn ec_only_key_set_is_refused() {
+        let result = verifier_from(serde_json::json!({"keys": [ec_jwk_json()]}));
+        assert_eq!(result.err(), Some(TokenError::BadKeySet));
+    }
+
+    #[test]
+    fn oct_only_key_set_is_refused() {
+        let oct = serde_json::json!({"kty": "oct", "k": "c2VjcmV0", "kid": "oct-1"});
+        let result = verifier_from(serde_json::json!({"keys": [oct]}));
+        assert_eq!(result.err(), Some(TokenError::BadKeySet));
+    }
+
+    #[test]
+    fn mixed_key_set_keeps_its_rsa_keys() {
+        let keys = serde_json::json!({"keys": [ec_jwk_json(), rsa_jwk_json()]});
+        let verifier = verifier_from(keys).unwrap();
+        assert!(verifier.verify(&valid_token(), &[nonce()]).is_ok());
+    }
+
+    fn claims_without(claim: &str) -> String {
+        let mut claims = signer().claims_json(
+            SIMULATED_AUDIENCE,
+            &[nonce()],
+            now(),
+            Duration::from_secs(600),
+        );
+        claims.as_object_mut().unwrap().remove(claim);
+        signer().sign_claims(&claims)
+    }
+
+    #[test]
+    fn missing_exp_is_refused() {
+        assert_eq!(err(&claims_without("exp")), TokenError::Malformed);
+    }
+
+    #[test]
+    fn missing_nbf_is_refused() {
+        assert_eq!(err(&claims_without("nbf")), TokenError::Malformed);
+    }
+
+    #[test]
+    fn missing_iss_is_refused() {
+        assert_eq!(err(&claims_without("iss")), TokenError::Malformed);
+    }
+
+    #[test]
+    fn missing_aud_is_refused() {
+        assert_eq!(err(&claims_without("aud")), TokenError::Malformed);
     }
 
     #[test]
