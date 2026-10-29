@@ -65,9 +65,16 @@ Client key architecture:
 * **AAD discipline** — every AES-GCM operation binds
   `tenant|object|role(|chunk-index)`, so a vault cannot reorder chunks,
   splice records across objects, or re-attach wrapped keys undetected.
-* **Crypto-agility seam** — the crypto core sits behind `lib/crypto/core.ts`
-  + the worker protocol; a Rust→wasm32 build of the backend's own `hpke`
-  crate slots in there without touching UI code.
+* **Crypto-agility seam** — the crypto core sits behind `lib/crypto/core.ts`,
+  `lib/crypto/envelope.ts` and the worker protocol. `envelope.ts` loads the
+  wasm32 build of the backend's own envelope code (`envelope-wasm`, built by
+  `scripts/build-wasm.sh`) and seals to a tenant's raw public key, so the
+  browser and the enclave share one implementation. Seal needs no private
+  key, and the module never sees the KEK or file keys. The frame magic
+  names the suite, so a new suite changes no caller. Only the worker loads
+  the module (an ESLint rule refuses its glue elsewhere); no worker
+  operation exposes sealing to the UI yet. Opening in the browser is not
+  built.
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
@@ -324,7 +331,8 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-core | Typed ids (`TenantId`, `ObjectId`, `ConnectorSlug`), `ZkMode` | I/O, crypto |
 | platform-config | Env → `PlatformConfig` (brand/server/storage/research) | Hardcoded brand strings |
 | platform-telemetry | JSON tracing init, `SECURITY_AUDIT_EVENT` emitter | Secrets/customer content in events |
-| platform-crypto | AEAD seal/open, HPKE suite pin, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
+| platform-crypto | AEAD seal/open, HPKE suite pin, envelope `info` strings, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
+| envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and `info` strings, for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys, the drive KEK or file keys; I/O or logging |
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait | Raw-string storage paths |
 | platform-enclave | `AttestationProvider` seam, fail-closed dev stub | "Trust me" attestation bypasses |

@@ -122,9 +122,16 @@ cp .env.example .env
 cargo run -p platform-api        # /healthz, /readyz, /api/v1/meta; metrics on 127.0.0.1:9464/metrics
 ```
 
-Frontend (Node, pinned in `.nvmrc`), from `frontend/`:
+Frontend (Node, pinned in `.nvmrc`), from `frontend/`. The crypto worker
+loads a wasm build of the backend's envelope code, which
+`scripts/build-wasm.sh` writes into `frontend/src/lib/crypto/wasm/` (not
+committed). It needs the `wasm32-unknown-unknown` target, which
+`rust-toolchain.toml` lists, and the `wasm-bindgen` CLI at the version
+`backend/Cargo.lock` pins. Rerun it after changing the envelope code.
 
 ```sh
+cargo install --locked wasm-bindgen-cli --version 0.2.126   # once
+../scripts/build-wasm.sh
 cp .env.example .env
 npm install && npm run dev       # http://localhost:5173
 ```

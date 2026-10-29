@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# check.sh — full validation: backend fmt/check/clippy/test, frontend
-# typecheck/lint/test/build, the white-label guards, the secret scan, and the
-# attribution guard.
+# check.sh — full validation: backend fmt/check/clippy/test, the browser
+# envelope module (wasm), frontend typecheck/lint/test/build, the white-label
+# guards, the secret scan, and the attribution guard.
 # Must pass before every push.
 # =============================================================================
 set -euo pipefail
@@ -19,6 +19,12 @@ cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-target
 
 echo "== backend: cargo test =="
 cargo test --manifest-path "$ROOT/backend/Cargo.toml" --workspace --locked
+
+echo "== wasm: clippy for the browser target (warnings are errors) =="
+cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" -p envelope-wasm --target wasm32-unknown-unknown --locked -- -D warnings
+
+echo "== wasm: browser envelope module =="
+"$ROOT/scripts/build-wasm.sh"
 
 echo "== frontend: clean install =="
 (cd "$ROOT/frontend" && npm ci --no-audit --no-fund)
