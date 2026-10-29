@@ -92,6 +92,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* GCS emulator writes (`STORAGE_EMULATOR_HOST`) no longer ask the GCE
+  metadata server for a credential: `object_store` 0.13 skips signing on
+  reads only, so the emulator client now carries a placeholder credential.
 * A drive delete that fails partway can be retried: `DELETE
   /api/v1/drive/objects/{id}` now deletes the chunks before the manifest,
   so after a failure the object is still found and the retry removes the
