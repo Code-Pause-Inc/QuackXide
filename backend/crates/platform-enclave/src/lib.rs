@@ -36,9 +36,10 @@ pub use verifier::{
 pub enum TeePlatform {
     /// AMD SEV-SNP (GCP Confidential VM) — the production platform.
     SevSnp,
-    /// Protocol-faithful simulated SEV-SNP (binary report + P-384 chain
-    /// verified by [`AttestationVerifier`]). Accepted only when hardware
-    /// attestation is not required; never valid in production.
+    /// Simulated evidence: SEV-SNP reports from [`SimulatedSnp`], or
+    /// Confidential Space tokens from the `simulated` feature's provider.
+    /// Accepted only when hardware attestation is not required; never valid
+    /// in production.
     Simulated,
     /// Explicitly-insecure local development stand-in. Never valid in prod.
     Development,
@@ -55,6 +56,9 @@ pub struct AttestationEvidence {
     pub report: Vec<u8>,
     /// Serialized `ARK -> ASK -> VCEK` certificate chain accompanying `report`.
     pub cert_chain: Vec<u8>,
+    /// Confidential Space attestation token (simulated tokens today); empty
+    /// for SEV-SNP and development evidence.
+    pub token: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +124,7 @@ impl AttestationProvider for DevAttestation {
             nonce: nonce.to_vec(),
             report: Vec::new(),
             cert_chain: Vec::new(),
+            token: String::new(),
         })
     }
 }
@@ -209,14 +214,47 @@ pub async fn gate_execution(
     }
 }
 
-/// The SNP provider when attestation is required, otherwise [`SimulatedSnp`]
-/// so development and CI exercise the full binary report + verifier protocol.
+/// Refuses every request. Used when attestation is not required but no
+/// simulator is available, so nothing runs on fabricated or missing evidence.
+struct RejectingProvider;
+
+#[async_trait]
+impl AttestationProvider for RejectingProvider {
+    async fn produce_evidence(&self, _nonce: &[u8]) -> Result<AttestationEvidence, EnclaveError> {
+        // `Rejected`, not `Unavailable`: the gates let `Unavailable` through
+        // as development evidence when attestation is not required.
+        Err(EnclaveError::Rejected(
+            "simulated attestation unavailable: build with the dev feature and set SIM_ATTESTATION_URL"
+                .into(),
+        ))
+    }
+}
+
+/// The SNP provider when attestation is required. Otherwise the simulated
+/// token provider, in builds with the `simulated` feature and
+/// `SIM_ATTESTATION_URL` set, and a provider that refuses in all other cases.
 pub fn provider_for(attestation_required: bool) -> std::sync::Arc<dyn AttestationProvider> {
     if attestation_required {
-        std::sync::Arc::new(SnpAttestation::new())
-    } else {
-        std::sync::Arc::new(SimulatedSnp::from_env())
+        return std::sync::Arc::new(SnpAttestation::new());
     }
+    #[cfg(feature = "simulated")]
+    if let Ok(url) = std::env::var("SIM_ATTESTATION_URL")
+        && !url.trim().is_empty()
+    {
+        let issuer = std::env::var("SIM_ATTESTATION_ISSUER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| simulated_token::DEFAULT_SIM_ISSUER.to_owned());
+        let policy = token::ReleasePolicy {
+            allowed_image_digests: vec![simulated_token::SIMULATED_IMAGE_DIGEST.to_owned()],
+        };
+        return std::sync::Arc::new(simulated_token::SimulatedTokenProvider::from_url(
+            url.trim(),
+            &issuer,
+            policy,
+        ));
+    }
+    std::sync::Arc::new(RejectingProvider)
 }
 
 #[cfg(test)]
@@ -264,6 +302,7 @@ mod tests {
                 nonce: nonce.to_vec(),
                 report: Vec::new(),
                 cert_chain: Vec::new(),
+                token: String::new(),
             })
         }
     }

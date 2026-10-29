@@ -326,6 +326,7 @@ impl SimulatedSnp {
             nonce: binding.nonce.to_vec(),
             report: report.to_vec(),
             cert_chain,
+            token: String::new(),
         })
     }
 }
@@ -347,6 +348,7 @@ impl AttestationProvider for SimulatedSnp {
             nonce: nonce.to_vec(),
             report: report.to_vec(),
             cert_chain,
+            token: String::new(),
         })
     }
 
