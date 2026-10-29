@@ -141,10 +141,10 @@ served bundle, and a compromised steward device is out of scope.
 
 KMS returns an X-Wing shared secret, not an HPKE context, so `hpke`'s open
 path cannot be used for KMS-wrapped data keys. This record does not
-invent a construction for it. If ADR 0004 option A is accepted, the
+invent a construction for it. Under ADR 0004 option A, the
 construction for KMS-wrapped data keys (for example the HPKE key schedule
 computed from the decapsulated shared secret, if a maintained library
-exposes it) is decided in ADR 0004's open question 3 or a later record,
+exposes it) is decided in ADR 0004's open question 2 or a later record,
 with the same vector requirements. The browser and connector paths above
 do not depend on it.
 
@@ -161,9 +161,9 @@ ADR 0001's target column names "tokens, attestation-bound material":
   signs with both Ed25519 (`ed25519-dalek`) and ML-DSA-65 (`ml-dsa`), and a
   verifier requires both signatures over the same domain-separated message.
   The encoding is decided by the item that builds it.
-* **Third-party classical signatures** (AMD's certificate chain in P47,
-  Google's attestation tokens under ADR 0004) are out of scope: the
-  project verifies them and cannot change them.
+* **Third-party classical signatures** (Google's attestation tokens
+  under ADR 0004, verified in P47) are out of scope: the project verifies
+  them and cannot change them.
 
 ### What "established" means
 

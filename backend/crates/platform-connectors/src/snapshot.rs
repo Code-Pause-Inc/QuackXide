@@ -30,13 +30,14 @@ pub struct SnapshotManifest {
     pub objects: Vec<ObjectId>,
 }
 
-/// HPKE `info` binding for a snapshot manifest.
+/// HPKE `info` binding for a snapshot manifest
+/// ([`platform_crypto::info::snapshot_manifest`]).
 pub fn manifest_info(
     tenant: &TenantId,
     slug: &ConnectorSlug,
     version: &SnapshotVersion,
 ) -> Vec<u8> {
-    format!("tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}").into_bytes()
+    platform_crypto::info::snapshot_manifest(tenant, slug, version)
 }
 
 /// Writes one snapshot. Nothing it writes is visible to queries until

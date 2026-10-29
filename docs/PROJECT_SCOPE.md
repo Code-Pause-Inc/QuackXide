@@ -45,8 +45,8 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | --- | --- | --- |
 | Portal and sign-in | **Harden** / **Build** | Portal components exist; sign-in shares the managed sign-in work above. |
 | Grant check | **Harden** | `GrantRegistry`, steward-scoped, revocable, no existence oracle. |
-| Attestation | **Build** | AMD SEV-SNP report verification. The provider currently refuses (fails closed). |
-| Key release | **Build** | Production `EnclaveKeyProvider`. Query endpoints return 503 until wired; the path is proven by `DevKeyProvider` and `query-demo`. |
+| Attestation | **Build** | Verification of Google's Confidential Space attestation token on Intel TDX (ADR 0004). The provider currently refuses (fails closed). |
+| Key release | **Build** | Production `EnclaveKeyProvider`: Cloud KMS unwraps each dataset's data key only for the attested workload (ADR 0004). Query endpoints return 503 until wired; the path is proven by `DevKeyProvider` and `query-demo`. |
 | Query | **Harden** | DataFusion inside `QueryScope`, plaintext zeroized after use. |
 | Disclosure control | **Harden** | Plan gate, genuine-count check, `MinCountThreshold`, budget ledger. |
 | Result | **Harden** | Aggregates, suppressed-row count, and remaining budget. |
@@ -57,7 +57,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Item | State | Notes |
 | --- | --- | --- |
 | Durable registries | **Build** | Tenant, grant, budget, and catalog registries are in-memory behind traits; add durable backends without touching call sites. |
-| Deployment | **Build** | Reproducible deployment of `platform-api`, with the query engine in-process, into an attested SEV-SNP Confidential VM, with TLS terminating inside the VM and the frontend served from the same origin (ADR 0005). |
+| Deployment | **Build** | Reproducible deployment of `platform-api`, with the query engine in-process, as a Confidential Space workload on an attested Intel TDX Confidential VM, with TLS terminating inside the VM and the frontend served from the same origin (ADR 0005). |
 | Benchmarks | **Build** | None exist. Measure query latency, encryption throughput, and enclave overhead against synthetic datasets, and track them for regressions. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
 | DataFusion upgrade | **Built** | DataFusion 55, Arrow/Parquet 59, and `object_store` 0.13 ([ADR 0008](adr/0008-datafusion-55-upgrade.md)); `thrift`, `paste`, and `rustls-pemfile` advisories cleared; disclosure allowlist and `tests/bypass.rs` verified. |
@@ -66,9 +66,10 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 
 ## Stack
 
-Rust, Apache DataFusion, Arrow, Parquet, Axum; AMD SEV-SNP; AES-256-GCM and
-HPKE, with hybrid X25519 + ML-KEM-768 and Ed25519 + ML-DSA-65 as the target
-suites; React 19, TypeScript, Web Crypto, Vite, Tailwind. Established
+Rust, Apache DataFusion, Arrow, Parquet, Axum; Intel TDX with Confidential
+Space and Cloud KMS; AES-256-GCM and HPKE, with hybrid X25519 + ML-KEM-768
+and Ed25519 + ML-DSA-65 as the target suites; React 19, TypeScript, Web
+Crypto, Vite, Tailwind. Established
 libraries only (as ADR 0007 defines them), and no silent downgrade to
 classical-only cryptography.
 
@@ -89,8 +90,8 @@ The first complete release is done when all of the following hold:
 1. A steward can sign in, upload a dataset that is encrypted in the browser
    under the hybrid post-quantum suite, and see it stored as ciphertext.
 2. A researcher can sign in, request and receive a grant, and run an
-   aggregate query that passes attestation on genuine SEV-SNP hardware,
-   receives the key inside the enclave only, and returns a
+   aggregate query that passes attestation on genuine Intel TDX hardware,
+   receives the dataset key inside the enclave only, and returns a
    disclosure-controlled result sealed to the researcher's key.
 3. Every step of both lifecycles is **Built**; no step returns 503 for
    missing wiring in a production build.

@@ -10,6 +10,10 @@ Follow `docs/DEVELOPMENT.md`: prerequisites (including WSL2 on Windows),
 the git hooks, everyday commands, running `cargo deny` and `npm audit`
 locally, and what to do when `scripts/check.sh` fails.
 
+The frontend needs the browser envelope module, built by
+`scripts/build-wasm.sh` (see "Development" in `README.md` for the
+`wasm-bindgen` CLI it needs).
+
 ## Before every push
 
 Run `scripts/check.sh`. It builds and tests the backend and frontend, lints

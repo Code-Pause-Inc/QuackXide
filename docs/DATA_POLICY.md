@@ -16,7 +16,10 @@ test environment use **synthetic or public data only**.
    "Alex Sample") on reserved `.example` domains.
 3. **No credentials.** No API keys, tokens, private keys, passwords, or
    `.env` files. Only `*.env.example` templates with empty values are
-   committed.
+   committed. Cross-implementation test vectors are the one exception: they
+   may carry key material derived from a seed published in the same file
+   or its generator, labelled test-only and never used for real data (for
+   example `fixtures/envelope/`).
 4. **Public datasets only with a license that allows it.** A public dataset
    may be used when its license permits redistribution and its source and
    license are recorded next to it.

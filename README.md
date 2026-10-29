@@ -57,7 +57,7 @@ key that opens the data.
 
 1. **Ingress.** Drive files are encrypted in the browser (Web Crypto,
    non-extractable keys, AES-256-GCM). Connector pipelines sync external
-   sources into attested SEV-SNP memory, shape them into Parquet, and seal
+   sources into attested enclave memory, shape them into Parquet, and seal
    them to the tenant's HPKE key before anything persists.
 2. **Storage.** Ciphertext only, in HPKE envelopes with versioned framing
    and context binding. Storage paths are built only from typed tenant ids,
@@ -81,7 +81,7 @@ Every security decision, including denials, is written to a
 | `docs/PROJECT_SCOPE.md` | Release scope and definition of done |
 | `docs/V1_PLAN.md` | v1.0 plan: work items, order, and the issues they map to |
 | `docs/DATA_POLICY.md` | Synthetic and public data only |
-| `docs/SIMULATED_TEE_GCP_GUIDE.md` | Simulated SEV-SNP TEE to Google Cloud Confidential VM implementation guide |
+| `docs/SIMULATED_TEE_GCP_GUIDE.md` | The simulated SEV-SNP TEE and its production counterparts (Confidential Space on TDX, Cloud KMS) |
 | `docs/adr/` | Architecture decision records |
 
 ## Layout
@@ -99,14 +99,15 @@ backend/crates/
   platform-tenancy/       Tenants, grants, budgets, dataset catalog
   platform-billing/       Merchant-of-Record webhook verification
   quackxide-engine/       QueryScope, plan gate, disclosure policies
-  platform-api/           HTTP edge, key-release relying party (bin/key-release), tests
-                          dev-only research stack, feature "dev" (bin/devstack, src/dev.rs)
+  platform-api/           HTTP edge, enclave identity, tests
+                          dev-only, feature "dev": research stack (bin/devstack, src/dev.rs),
+                          key-release stand-in (bin/key-release, src/key_release/stand_in.rs), bin/query-demo
   synth-data/             Seeded synthetic test and benchmark data (dev-only)
 frontend/src/
   lib/crypto/             Web Crypto worker (keys never touch the UI thread)
   lib/vault/              Ciphertext-only vault clients (local / http)
   components/             Drive, researcher portal, steward console, admin
-Dockerfile                Multi-stage enclave-api and key-release targets (Confidential Space labels)
+Dockerfile                Dev-only simulated TEE images (enclave-api, key-release), built with feature "dev"
 docker-compose.simulated-tee.yml  3-plane local Simulated SEV-SNP TEE stack
 scripts/test-simulated-tee.sh     End-to-end Docker smoke + tamper-refusal verification
 scripts/check.sh          Validation gate — run before every push
@@ -122,9 +123,16 @@ cp .env.example .env
 cargo run -p platform-api        # /healthz, /readyz, /api/v1/meta; metrics on 127.0.0.1:9464/metrics
 ```
 
-Frontend (Node, pinned in `.nvmrc`), from `frontend/`:
+Frontend (Node, pinned in `.nvmrc`), from `frontend/`. The crypto worker
+loads a wasm build of the backend's envelope code, which
+`scripts/build-wasm.sh` writes into `frontend/src/lib/crypto/wasm/` (not
+committed). It needs the `wasm32-unknown-unknown` target, which
+`rust-toolchain.toml` lists, and the `wasm-bindgen` CLI at the version
+`backend/Cargo.lock` pins. Rerun it after changing the envelope code.
 
 ```sh
+cargo install --locked wasm-bindgen-cli --version 0.2.126   # once
+../scripts/build-wasm.sh
 cp .env.example .env
 npm install && npm run dev       # http://localhost:5173
 ```
@@ -141,13 +149,13 @@ sed -i.bak "s/^JWT_HS256_SECRET=.*/JWT_HS256_SECRET=\"$(openssl rand -hex 32)\"/
 cargo run -p platform-api                    # terminal 1
 cargo run -p platform-api --bin devtoken     # terminal 2: prints a token
 # frontend/.env: VITE_VAULT_MODE="http", VITE_DEV_JWT="<token>"
-cargo run -p platform-api --bin query-demo   # sealed-query round trip over SimulatedSnp + KeyReleaseRelyingParty
+cargo run -p platform-api --features dev --bin query-demo   # sealed-query round trip over SimulatedSnp + KeyReleaseRelyingParty
 ```
 
 ### Local research stack (dev only)
 
 `devstack` runs the API with the research routes wired and seeded, so the
-steward and researcher lifecycle runs on one machine without SEV-SNP
+steward and researcher lifecycle runs on one machine without TEE
 hardware. It is insecure by design: tenant keys live in process memory, TEE
 evidence is fabricated, and all state is in memory and lost when it stops.
 It is built only with the `dev` feature, listens only on a loopback
@@ -190,14 +198,13 @@ so these steps use `curl`.
 
 `docker-compose.simulated-tee.yml` runs the 3-plane Confidential Computing
 topology locally across isolated networks (`public_net` and `internal: true`
-`enclave_internal_net`) with `read_only: true`, `cap_drop: ["ALL"]`, and
-Google Cloud Confidential Space `tee.launch_policy.*` image labels:
+`enclave_internal_net`) with `read_only: true` and `cap_drop: ["ALL"]`:
 
 * **`enclave-api`** — Confidential workload container (`platform-api`) using
   `SimulatedSnp` to sign 1184-byte binary SEV-SNP reports binding its
   ephemeral X25519 HPKE key and P-384 result-signing key into `REPORT_DATA`.
-* **`key-release-service`** — Standalone relying party (`bin/key-release`)
-  that verifies the `ARK -> ASK -> VCEK` P-384 chain, `MEASUREMENT`,
+* **`key-release-service`** — The stand-in for Cloud KMS (`bin/key-release`,
+  ADR 0004): a relying party that verifies the `ARK -> ASK -> VCEK` P-384 chain, `MEASUREMENT`,
   `GuestPolicy` (`DEBUG=0`, `MIGRATE_MA=0`), `TcbVersion`, and single-use
   challenge nonce before wrapping a tenant's private key via HPKE
   (`key-release-v1`) for a single query.
@@ -205,12 +212,16 @@ Google Cloud Confidential Space `tee.launch_policy.*` image labels:
   `STORAGE_EMULATOR_HOST`) holding only HPKE-sealed manifests and Parquet
   snapshots.
 
-The simulation runs the real protocol (report format, verifier, attested key
-release, sealed queries) on any machine. It does not protect anything: the
-host can read the simulated enclave's memory, so it is for development and CI
-only. `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence, the
-production trust root rejects simulated chains, and query and research
-responses report `"tee_platform": "simulated"`.
+The simulation runs its protocol (report format, verifier, key release
+through the stand-in, sealed queries) on any machine. It does not protect
+anything: the host can read the simulated enclave's memory, and the
+stand-in accepts tenant private keys over plain HTTP, so it is for
+development and CI only. Both images are built with the `dev` feature, and
+`key-release` and `query-demo` exist only in such builds; a build without
+`dev` refuses to start when `KEY_RELEASE_URL` is set.
+`TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence, the production
+trust root rejects simulated chains, and query and research responses report
+`"tee_platform": "simulated"`.
 
 Run the full Docker stack or execute the automated happy-path and
 tamper-refusal (`MEASUREMENT` mismatch + `GuestPolicy::DEBUG=1`) suite:
@@ -221,8 +232,7 @@ docker compose -f docker-compose.simulated-tee.yml up --build
 ```
 
 See `docs/SIMULATED_TEE_GCP_GUIDE.md` for how each simulated component maps to
-Google Cloud Confidential Space, Confidential VMs (AMD SEV-SNP), Cloud KMS,
-and VPC Service Controls.
+Confidential Space on Intel TDX, Cloud KMS, and VPC Service Controls.
 
 Synthetic data (dev-only), from `backend/`:
 
@@ -252,15 +262,16 @@ production release (details in `docs/PROJECT_SCOPE.md`):
 
 * **Sign-in** — RS256/JWKS verification and TOTP exist; the managed
   sign-in service does not. Development uses HS256 tokens.
-* **Attestation** — 1184-byte binary SEV-SNP report parsing, `ARK -> ASK -> VCEK`
-  P-384 certificate chain verification (`AttestationVerifier`), and
-  protocol-faithful `SimulatedSnp` are implemented. Hardware `/dev/sev-guest`
-  report acquisition (`SnpAttestation` when `TEE_ATTESTATION_REQUIRED=true`)
-  and browser-side quote verification remain before production cutover.
-* **Key release** — attestation-gated HPKE key release
-  (`KeyReleaseRelyingParty`, `AttestedKeyProvider`, `bin/key-release`) with
-  once-per-query key sessions and zeroize-on-drop is implemented; Cloud KMS /
-  HSM backing for the relying party remains.
+* **Attestation** — production runs as a Confidential Space workload on
+  Intel TDX (ADR 0004). Verifying Google's attestation token, in the
+  enclave and in the browser, remains. For the simulated TEE, 1184-byte
+  SEV-SNP report parsing, `ARK -> ASK -> VCEK` P-384 chain verification
+  (`AttestationVerifier`) and `SimulatedSnp` are implemented.
+* **Key release** — in production, Cloud KMS unwraps each dataset's data
+  key only for the attested workload (ADR 0004); this remains. The
+  simulated TEE's stand-in (`KeyReleaseRelyingParty`, `AttestedKeyProvider`,
+  `bin/key-release`), with once-per-query key sessions and zeroize-on-drop,
+  is implemented and built only with the `dev` feature.
 * **Durability** — registries are in-memory behind traits.
 * **Encrypted results** — query responses carry an attested P-384
   `enclave_signature` over JSON/TLS; client-key HPKE result encryption remains.

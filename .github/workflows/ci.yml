@@ -23,6 +23,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: wasm-bindgen@0.2.126
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
@@ -45,6 +50,12 @@ jobs:
         with:
           workspaces: backend
       - run: cargo test --manifest-path backend/Cargo.toml --workspace --locked
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: wasm-bindgen@0.2.126
+      - run: scripts/build-wasm.sh
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
@@ -93,6 +104,12 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: wasm-bindgen@0.2.126
+      - run: scripts/build-wasm.sh
       - name: Frontend coverage
         working-directory: frontend
         run: |
@@ -126,21 +143,43 @@ jobs:
             echo "::error::platform-api is missing from the build report; the check cannot run"
             exit 1
           fi
-          for bin in devstack; do
+          for bin in devstack key-release query-demo; do
             if grep -qx "$bin" <<<"$built"; then
               echo "::error::the default-feature release build produced the dev-only binary $bin"
               exit 1
             fi
           done
-      - name: devstack cannot be built without the dev feature
+      - name: Dev-only binaries cannot be built without the dev feature
         run: |
-          if cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api --bin devstack 2> devstack.err; then
-            echo "::error::devstack built without --features dev"
+          for bin in devstack key-release query-demo; do
+            if cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api --bin "$bin" 2> "$bin.err"; then
+              echo "::error::$bin built without --features dev"
+              exit 1
+            fi
+            if ! grep -qE 'requires the features.*dev' "$bin.err"; then
+              cat "$bin.err"
+              echo "::error::building $bin failed, but not because the dev feature is off"
+              exit 1
+            fi
+          done
+      # The key-release service is the simulated TEE's stand-in for Cloud KMS
+      # (ADR 0004). A release platform-api must refuse to start when pointed at it.
+      - name: The release platform-api refuses the dev-only KEY_RELEASE_URL
+        working-directory: ${{ runner.temp }}
+        run: |
+          set +e
+          KEY_RELEASE_URL=http://127.0.0.1:9 BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+            timeout 30 "$GITHUB_WORKSPACE/backend/target/release/platform-api" > platform-api.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+            cat platform-api.log
+            echo "::error::the release platform-api started with KEY_RELEASE_URL set"
             exit 1
           fi
-          if ! grep -qE 'requires the features.*dev' devstack.err; then
-            cat devstack.err
-            echo "::error::building devstack failed, but not because the dev feature is off"
+          if ! grep -q 'KEY_RELEASE_URL is dev-only' platform-api.log; then
+            cat platform-api.log
+            echo "::error::the release platform-api exited, but not because KEY_RELEASE_URL is dev-only"
             exit 1
           fi
 

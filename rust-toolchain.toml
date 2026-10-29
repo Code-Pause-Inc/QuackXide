@@ -1,4 +1,6 @@
 [toolchain]
 channel = "1.94.1"
 components = ["rustfmt", "clippy"]
+# The browser envelope module (backend/crates/envelope-wasm).
+targets = ["wasm32-unknown-unknown"]
 profile = "minimal"
