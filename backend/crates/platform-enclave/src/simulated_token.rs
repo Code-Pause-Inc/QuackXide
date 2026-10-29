@@ -105,6 +105,17 @@ impl TokenSigner {
         }
     }
 
+    /// The same key and issuer with different claims (tamper tests).
+    pub fn with_claims(&self, claims: SimulatedClaims) -> Self {
+        Self {
+            issuer: self.issuer.clone(),
+            claims,
+            kid: self.kid.clone(),
+            encoding_key: self.encoding_key.clone(),
+            jwk: self.jwk.clone(),
+        }
+    }
+
     pub fn issuer(&self) -> &str {
         &self.issuer
     }

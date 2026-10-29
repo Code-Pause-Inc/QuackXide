@@ -13,6 +13,7 @@ pub mod report;
 pub mod simulated;
 #[cfg(feature = "simulated")]
 pub mod simulated_token;
+pub mod token;
 pub mod verifier;
 
 pub use report::{
