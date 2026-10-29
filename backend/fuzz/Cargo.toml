@@ -14,7 +14,8 @@ platform-auth = { path = "../crates/platform-auth" }
 platform-billing = { path = "../crates/platform-billing" }
 platform-connectors = { path = "../crates/platform-connectors" }
 platform-crypto = { path = "../crates/platform-crypto" }
-platform-enclave = { path = "../crates/platform-enclave" }
+# `simulated` supplies the token signer the attestation_token target verifies against.
+platform-enclave = { path = "../crates/platform-enclave", features = ["simulated"] }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -53,6 +54,13 @@ bench = false
 [[bin]]
 name = "snp_report"
 path = "fuzz_targets/snp_report.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attestation_token"
+path = "fuzz_targets/attestation_token.rs"
 test = false
 doc = false
 bench = false
