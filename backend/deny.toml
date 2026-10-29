@@ -22,8 +22,9 @@ ignore = [
     # crypto-bigint timing (fixed in >= 0.7.6): 0.5 comes in through
     # elliptic-curve 0.13 (p256 via jsonwebtoken 11 and hpke, p384 via
     # jsonwebtoken 11). The HPKE suite is X25519, and no ES256/ES384 token is
-    # signed or accepted: platform tokens and attestation tokens are RS256
-    # only. Revisit when the hpke upgrade (P35) and p384 0.14 land.
+    # signed or accepted: platform tokens are RS256 or HS256, attestation
+    # tokens RS256. Revisit with the hpke upgrade (P35) and a jsonwebtoken
+    # release on elliptic-curve 0.14.
     { id = "RUSTSEC-2026-0387", reason = "no P-256/P-384 arithmetic on secrets; elliptic-curve 0.13 pins crypto-bigint 0.5" },
     # zstd and zstd-safe (fixed in zstd >= 0.14.3, zstd-safe >= 8.2.0):
     # arrow, parquet and DataFusion 55 pin zstd 0.13. arrow-ipc and parquet

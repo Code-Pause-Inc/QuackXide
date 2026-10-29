@@ -51,7 +51,6 @@ test = false
 doc = false
 bench = false
 
-
 [[bin]]
 name = "attestation_token"
 path = "fuzz_targets/attestation_token.rs"

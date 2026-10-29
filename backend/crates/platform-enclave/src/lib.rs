@@ -18,8 +18,8 @@ pub use binding::{REPORT_DATA_BYTES, ReportDataBinding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeePlatform {
-    /// Hardware evidence. Today only [`SnpAttestation`] tags it, and that
-    /// provider always refuses; P48 replaces it with Confidential Space on TDX.
+    /// Hardware evidence. No provider produces it today ([`SnpAttestation`]
+    /// always refuses); P48 replaces it with Confidential Space on TDX.
     SevSnp,
     /// Simulated Confidential Space tokens from the `simulated` feature's
     /// provider. Accepted only when hardware attestation is not required;
@@ -173,8 +173,8 @@ pub fn fresh_nonce() -> [u8; 32] {
 ///   regardless of `require_attestation`.
 /// - `TeePlatform::Simulated`: rejected when `require_attestation` is `true`
 ///   (never valid in production). When `require_attestation` is `false`, the
-///   binary report and certificate chain are verified via
-///   `provider.verify_evidence` — any verification failure refuses execution.
+///   token is verified via `provider.verify_evidence` — any verification
+///   failure refuses execution.
 /// - `TeePlatform::Development`: rejected when `require_attestation` is `true`;
 ///   proceeds when `false`.
 pub async fn gate_execution(
