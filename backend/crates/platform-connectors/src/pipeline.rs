@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 use platform_crypto::TenantPublicKey;
-use platform_enclave::{AttestationProvider, TeePlatform, fresh_nonce};
+use platform_enclave::{AttestationProvider, EnclaveError, TeePlatform, fresh_nonce};
 use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
 
@@ -152,7 +152,9 @@ impl EnclavePipeline {
                     "evidence platform is not SEV-SNP".into(),
                 ))
             }
-            Err(err) if !self.require_attestation => {
+            // Only a missing TEE may run unattested in dev, as in `gate_execution`;
+            // a provider that rejects (including a build without the simulator) refuses.
+            Err(err @ EnclaveError::Unavailable(_)) if !self.require_attestation => {
                 security_audit_event(
                     AuditKind::TeeAttestation,
                     Some(tenant),

@@ -277,6 +277,39 @@ async fn dev_evidence_cannot_satisfy_required_attestation() {
     assert!(matches!(err, PipelineError::AttestationRefused(_)));
 }
 
+/// A provider that refuses outright, as a build without the simulator does.
+struct RejectingAttestation;
+
+#[async_trait]
+impl platform_enclave::AttestationProvider for RejectingAttestation {
+    async fn produce_evidence(
+        &self,
+        _nonce: &[u8],
+    ) -> Result<platform_enclave::AttestationEvidence, platform_enclave::EnclaveError> {
+        Err(platform_enclave::EnclaveError::Rejected("refused".into()))
+    }
+}
+
+#[tokio::test]
+async fn rejected_provider_refuses_sync_even_when_not_required() {
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let pipeline = EnclavePipeline::new(Arc::new(RejectingAttestation), vault.clone(), false);
+    let keypair = TenantKeypair::generate();
+    let job = SyncJob {
+        tenant: TenantId::generate(),
+        tenant_public_key: keypair.public_key(),
+        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
+    };
+
+    let err = pipeline.run_sync(&job).await.expect_err("must refuse");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+    let stored = vault
+        .list(&TenantPaths::tenant_root(job.tenant))
+        .await
+        .expect("list");
+    assert!(stored.is_empty(), "nothing may be written on refusal");
+}
+
 #[tokio::test]
 async fn simulated_snp_sync_verifies_in_dev_and_refuses_bad_policy_or_required_hardware() {
     use platform_enclave::{GuestPolicy, SimulatedSnp, SimulatedSnpConfig};
