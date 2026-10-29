@@ -8,6 +8,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `platform_enclave::token::TokenVerifier` verifies Confidential Space
+  attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
+  with issuer, audience, validity (60 s clock-skew leeway), the expected
+  nonces, and the release policy (`GCP_INTEL_TDX`, `CONFIDENTIAL_SPACE`,
+  `disabled-since-boot`, `STABLE`, an allowed image digest). Tokens over
+  16 KiB are refused before parsing, and errors name a class, never token
+  contents. A dev-only signer (`simulated_token`, feature `simulated`)
+  issues tokens for tests, and the `attestation_token` fuzz target covers
+  the verifier.
 * The drive listing (`GET /api/v1/drive/objects`) is bounded: it returns at
   most 1000 objects (`MAX_LISTED_OBJECTS`) and reads their manifests 16 at a
   time instead of one by one. A drive holding more is refused with 422 "too

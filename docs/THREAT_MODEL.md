@@ -129,7 +129,9 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   cryptographic primitives. The post-quantum crates (`x-wing`, `ml-kem`,
   `ml-dsa`) and `hpke` have no independent audit; ADR 0007 records this
   as an accepted risk and the cross-implementation vectors that check
-  them.
+  them. Attestation tokens are verified with `jsonwebtoken` (RustCrypto
+  backend), and Google's attestation service is trusted for what its
+  tokens claim (ADR 0004).
 * **Collusion between a steward and a researcher.** A steward can share
   their own data by other means.
 
