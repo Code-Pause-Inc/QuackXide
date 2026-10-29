@@ -99,6 +99,21 @@ jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 Neither project runs a real browser; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
 
+### Envelope vectors
+
+`fixtures/envelope/` holds the vectors that keep the browser and the backend
+on one envelope format. `hpk1.json` (test-only recipient keys derived from
+published seeds, enrollment keys, `info` strings, and envelopes that open or
+must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
+which fails when the file and its generator disagree; regenerate with
+`UPDATE_ENVELOPE_VECTORS=1 cargo test -p envelope-wasm --test vectors`.
+`hpk1-browser-sealed.json` holds envelopes sealed by the wasm module
+(`node scripts/browser-sealed-vectors.mjs` from `frontend/`, after
+`scripts/build-wasm.sh`), which the Rust test must open.
+`frontend/src/lib/crypto/envelope.test.ts` checks the same files against the
+wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
+enrollment cases through the enrollment route.
+
 ### Fuzz targets
 
 `backend/fuzz` holds the targets for the untrusted-input parsers. It sits

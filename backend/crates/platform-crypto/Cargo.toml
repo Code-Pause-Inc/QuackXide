@@ -11,13 +11,19 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["server"]
+# AEAD sealing, blind indexes and TOTP. The browser build (`envelope-wasm`)
+# turns it off and gets only the HPKE envelopes and their `info` strings.
+server = ["dep:aes-gcm", "dep:hmac", "dep:sha1", "dep:sha2"]
+
 [dependencies]
-aes-gcm.workspace = true
+aes-gcm = { workspace = true, optional = true }
 hpke.workspace = true
-hmac.workspace = true
+hmac = { workspace = true, optional = true }
 rand.workspace = true
-sha1.workspace = true
-sha2.workspace = true
+sha1 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 zeroize.workspace = true
 thiserror.workspace = true
 
