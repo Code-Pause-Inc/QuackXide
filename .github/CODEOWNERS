@@ -1,14 +1,22 @@
-# Security-critical paths require review from the maintainer. Everything
-# else is reviewed by the core team.
+# Security-critical paths require review from a code owner: the maintainer
+# or the security reviewer. Either one's approval satisfies the rule, but no
+# one can approve their own pull request. Everything else is reviewed by the
+# core team. Later lines take precedence over earlier ones.
 
-/backend/crates/platform-crypto/               @AxolDad
-/backend/crates/platform-enclave/              @AxolDad
-/backend/crates/platform-auth/                 @AxolDad
-/backend/crates/quackxide-engine/src/policy.rs @AxolDad
-/backend/crates/quackxide-engine/src/disclosure.rs @AxolDad
-/frontend/src/lib/crypto/                      @AxolDad
-/scripts/                                      @AxolDad
-/.github/                                      @AxolDad
-/backend/deny.toml                             @AxolDad
+/backend/crates/platform-crypto/               @AxolDad @abendrothj
+/backend/crates/platform-enclave/              @AxolDad @abendrothj
+/backend/crates/platform-auth/                 @AxolDad @abendrothj
+/backend/crates/quackxide-engine/src/policy.rs @AxolDad @abendrothj
+/backend/crates/quackxide-engine/src/disclosure.rs @AxolDad @abendrothj
+/frontend/src/lib/crypto/                      @AxolDad @abendrothj
+/scripts/                                      @AxolDad @abendrothj
+/.github/                                      @AxolDad @abendrothj
+/backend/deny.toml                             @AxolDad @abendrothj
+
+# Maintainer only: who owns what, the attribution policy, and licensing.
+/.github/CODEOWNERS                            @AxolDad
+/.github/workflows/attribution-guard.yml       @AxolDad
+/scripts/attribution-guard.sh                  @AxolDad
+/scripts/hooks/                                @AxolDad
 /LICENSE-*                                     @AxolDad
 /NOTICE                                        @AxolDad
