@@ -3,7 +3,7 @@
 //! attestation-verifying relying party (`KeyReleaseRelyingParty` +
 //! `AttestedKeyProvider`), and prints an aggregate result.
 //!
-//!   cargo run -p platform-api --bin query-demo
+//!   cargo run -p platform-api --features dev --bin query-demo
 
 use std::sync::Arc;
 

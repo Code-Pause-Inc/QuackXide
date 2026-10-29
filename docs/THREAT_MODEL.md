@@ -23,6 +23,7 @@ production requirements, including its failure paths.
 | Dataset plaintext | Steward's browser before upload; enclave memory during a query | Never persisted in the clear; zeroized after use |
 | Dataset ciphertext | Object store (`tenants/{t}/…`) | HPKE envelopes / AES-256-GCM, context-bound AAD |
 | Steward private keys | Steward's browser (Web Crypto, non-extractable) | Never sent to the server |
+| Dataset data keys | Beside each dataset, wrapped to a Cloud KMS key; unwrapped only in enclave memory for one query | KMS decapsulates only for the attested workload (ADR 0004); its private key cannot be exported |
 | Research grants and budgets | `platform-tenancy` registries | Steward-scoped; no existence oracle |
 | Aggregate results | Researcher portal | Plan gate, genuine-count check, cohort suppression, budget |
 | Audit stream | `SECURITY_AUDIT_EVENT` log target | Identifiers and outcomes only; no content |
@@ -67,15 +68,23 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 
 Goal: read dataset content from infrastructure the operator controls.
 
+The controls rely on Google for hardware verification, workload identity
+and key custody (ADR 0004): the enclave is a Confidential Space workload
+on Intel TDX, and Cloud KMS releases data keys only to it. The
+administrator of the KMS key project can authorize another image, which
+could then decrypt; policy changes and break-glass access are audited
+(P77).
+
 | Attack | Control | Status |
 | --- | --- | --- |
 | Read the object store | Ciphertext only; envelopes sealed to a key the operator does not hold | Built |
 | Read API host disk or logs | Plaintext never persisted; audit events carry no content, SQL, or filenames, and are written whatever `RUST_LOG` says; DataFusion and sqlparser output, which can quote SQL, never reaches the logs; engine errors keep no upstream text | Built, tested (`tests/log_leak.rs`, `audit_records_ignore_the_operational_filter`) |
 | Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
-| Run a query outside a genuine enclave | Attestation gate with `TEE_ATTESTATION_REQUIRED=true` | Seam built; **SEV-SNP report verification to build** — fails closed until then |
-| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; the production trust root rejects simulated chains; responses report `tee_platform` | Built, tested; **refusal at startup to build** |
-| Obtain the steward's key for a query | Key released only into an attested enclave (`EnclaveKeyProvider`) | Seam built; **production key release to build** — returns 503 until then |
+| Run a query outside a genuine enclave, or a modified binary inside one | Attestation gate with `TEE_ATTESTATION_REQUIRED=true`; Google's attestation token must name TDX hardware, a production Confidential Space image, debug disabled and an allowed image digest | Seam built; **token verification to build** — fails closed until then |
+| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; the production trust root rejects simulated chains; responses report `tee_platform`. The key-release stand-in, which accepts tenant private keys over HTTP, compiles only with the `dev` feature, and a build without it refuses to start when `KEY_RELEASE_URL` is set | Built, tested (CI `release build has no dev binaries`); **refusal of simulated evidence at startup to build** |
+| Obtain a dataset's key for a query | Cloud KMS unwraps the dataset's data key only for the attested workload, per query, with nothing cached (ADR 0004); the steward's private key never leaves their browser | Seam built (`EnclaveKeyProvider`); **production key release to build** — returns 503 until then |
+| Authorize a modified image | The KMS key and its release policy live in a separate key project that no deployment identity administers (ADR 0004) | **Residual risk** for the key project's administrator — see below |
 | Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** — results currently leave as JSON over TLS |
 | Swap or replay ciphertext between objects | HPKE `info` / AES-GCM AAD bind tenant, object, role, and chunk | Built, tested |
 
@@ -119,9 +128,9 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
 
 * **Compromise of the steward's own device or browser.** The steward holds
   the key; malware on that device can read what the steward can read.
-* **Side channels against the TEE.** QuackXide relies on AMD SEV-SNP
-  guarantees and the attestation chain; microarchitectural attacks on the
-  hardware itself are outside this model.
+* **Side channels against the TEE.** QuackXide relies on Intel TDX
+  guarantees and Google's attestation service; microarchitectural attacks
+  on the hardware itself are outside this model.
 * **Denial of service.** Availability is not a security goal of this
   release.
 * **Correctness of the underlying libraries.** RustCrypto, `hpke`,
@@ -166,6 +175,11 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   writer. An operator can therefore write a fabricated snapshot, or delete
   the newest manifest so queries read an older one. Closing this needs
   an enclave signing key bound to attestation.
+* **The key project's administrator.** Whoever administers the KMS key
+  project can add an image digest to the release policy, and that image
+  can then decrypt. This is the maintainer; changes are audited (P77),
+  not prevented. Google is trusted for hardware verification, workload
+  identity and key custody, and the platform is tied to GCP.
 * **Differencing across snapshots.** Querying before and after a dataset
   update can reveal the rows that changed, bounded by the budget like any
   other overlapping-query differencing.

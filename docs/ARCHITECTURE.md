@@ -27,8 +27,9 @@ operator credential yields ciphertext only.
 ## Deployment topology (target)
 
 ADR 0005 fixes the boundary. `platform-api`, with the query engine
-in-process, runs inside an attested SEV-SNP Confidential VM; "the enclave"
-in this document means that process inside that VM. TLS terminates in
+in-process, runs as a Confidential Space workload on an attested Intel TDX
+Confidential VM (ADR 0004); "the enclave" in this document means that
+process inside that VM. TLS terminates in
 `platform-api`, and the frontend is served from the same origin. Every
 setting the operator can pass to the VM is untrusted: security-relevant
 settings are constants, bounded in code, or part of a deployment
@@ -108,7 +109,7 @@ it does not know filenames, content, or keys.
 ### 2. Connectors (confidential ingress)
 
 ```
-External APIs      TEE enclave (SEV-SNP, attested)                Object store
+External APIs      TEE enclave (TDX, attested)                    Object store
 ─────────────      ─────────────────────────────────              ────────────
 OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (RAM only)
                    HPKE seal to tenant public key ───────────────▶ tenants/{t}/connectors/{slug}/snapshots/{v}/{obj}.parquet
@@ -120,10 +121,11 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 
 * **Attestation gate first.** Every sync starts at
   `EnclavePipeline::attestation_gate`. With `TEE_ATTESTATION_REQUIRED=true`,
-  only genuine SEV-SNP evidence passes — development evidence or attestation
-  failure refuses the sync (tested). The SNP provider currently probes the
-  guest device and still refuses pending report-verification work: fail
-  closed until proven attested.
+  only hardware evidence passes — development evidence or attestation
+  failure refuses the sync (tested). No production provider exists yet: the
+  current hardware provider probes for an SEV-SNP guest device and refuses,
+  and verifying Google's Confidential Space token (P47, P48) is to build.
+  Fail closed until proven attested.
 * **Zero-MFA sync**: RFC 6749 refresh-token grant for user-enrolled sources
   (consent + MFA happen once at enrollment); RFC 6749 §4.4
   client-credentials for machine-to-machine sources. Secrets live in
@@ -200,14 +202,21 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   refuses every query.
 * **Key-release trust boundary.** The server cannot decrypt tenant data on
   its own (envelopes are sealed to a private key it does not hold at rest).
-  When `KEY_RELEASE_URL` is configured, `AttestedKeyProvider` acquires a
-  per-query `ReleasedKeySession` from `KeyReleaseRelyingParty`: it fetches a
+  In a `dev` build, when `KEY_RELEASE_URL` is configured,
+  `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
+  `KeyReleaseRelyingParty`: it fetches a
   single-use challenge nonce, binds the nonce and its in-RAM `EnclaveIdentity`
   HPKE public key into a 64-byte `ReportDataBinding`, presents the signed
   1184-byte `SnpReport` and `SnpCertChain` to the relying party, and unwraps
   the HPKE-sealed tenant key into a zeroize-on-drop `TenantKeypair` for the
   duration of that query. When `KEY_RELEASE_URL` is unset, the query endpoint
-  fails closed with 503.
+  fails closed with 503. That relying party is the development and
+  simulation stand-in (ADR 0004): it and its clients compile only with the
+  `dev` feature, and a build without it refuses to start when
+  `KEY_RELEASE_URL` is set. In production each dataset has its own
+  data key, wrapped to a Cloud KMS key that decapsulates only for the
+  attested Confidential Space workload, once per query; the steward's
+  private key never leaves their browser. That path is to build (P50).
 
 `FEATURE_ZK_ENABLED` sets the platform default and is `true` when unset.
 Disabling it permits row-level queries and removes the no-naked-data
@@ -224,7 +233,7 @@ Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403
                  attestation gate
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
-                 steward's key released into enclave → decrypt steward's Parquet (RAM)
+                 key released into enclave → decrypt steward's Parquet (RAM)
                  QueryScope, ZkMode FORCED Enabled:
                      plan gate: aggregate-only (no row egress)
                      plan gate: COUNT(*) AS n present and genuine (not a literal)
@@ -463,8 +472,9 @@ kinds only: no tenant ids, paths, messages, SQL text or engine name.
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public
   constructor; ids are UUID-validated at parse time.
 * Fail closed is the default everywhere: unset auth secret → 503; unwired
-  key release → 503; unverifiable attestation → refusal; fabricated dev
-  evidence requires an explicit, logged `allow_insecure_dev()`.
+  key release → 503; `KEY_RELEASE_URL` without the `dev` feature → refusal
+  to start; unverifiable attestation → refusal; fabricated dev evidence
+  requires an explicit, logged `allow_insecure_dev()`.
 * Workspace-wide `unsafe_code = "deny"`.
 * `scripts/check.sh` fails the build if the engine name appears in the
   shipped frontend bundle (white-label guard) or the deployment domain
