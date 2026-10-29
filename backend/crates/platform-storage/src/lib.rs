@@ -21,7 +21,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::StaticCredentialProvider;
+use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
 use object_store::{
@@ -282,7 +283,15 @@ impl ObjectStoreVault {
                     format!("http://{trimmed}")
                 };
                 options = options.with_allow_http(base_url.starts_with("http://"));
-                builder = builder.with_base_url(&base_url).with_skip_signature(true);
+                // object_store 0.13 skips signing on reads only; writes still ask
+                // for a credential, which would fall back to the GCE metadata server.
+                let placeholder = GcpCredential {
+                    bearer: "emulator".to_owned(),
+                };
+                builder = builder
+                    .with_base_url(&base_url)
+                    .with_skip_signature(true)
+                    .with_credentials(Arc::new(StaticCredentialProvider::new(placeholder)));
             }
         }
         let builder = builder.with_client_options(options);
@@ -893,6 +902,55 @@ mod tests {
             max_retries,
             retry_timeout: std::time::Duration::from_secs(retry_secs),
         }
+    }
+
+    /// A local server answering every request with 200 and an ETag, as an
+    /// emulator does to a successful write.
+    async fn accepting_gcs() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        if stream.readable().await.is_err() {
+                            return;
+                        }
+                        match stream.try_read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                            Err(_) => return,
+                        }
+                    }
+                    let reply = b"HTTP/1.1 200 OK\r\netag: \"1\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = stream.writable().await;
+                    let _ = stream.try_write(reply);
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn emulator_writes_need_no_cloud_credentials() {
+        let url = accepting_gcs().await;
+        let vault = ObjectStoreVault::new_gcs_with_emulator("bucket", Some(&url), &client(2, 0, 2))
+            .expect("vault");
+        vault
+            .put(
+                &TenantPaths::drive_manifest(tenant_a(), object_1()),
+                Bytes::from_static(b"ciphertext"),
+            )
+            .await
+            .expect("a write to the emulator must not ask a metadata server for credentials");
     }
 
     #[tokio::test]
