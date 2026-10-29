@@ -301,7 +301,7 @@ impl ConnectorQueryService {
                     AuditKind::TeeAttestation,
                     Some(tenant),
                     "simulated",
-                    &format!("simulated SEV-SNP evidence verified for {label} (dev only)"),
+                    &format!("simulated evidence verified for {label} (dev only)"),
                 );
                 Ok(platform_enclave::TeePlatform::Simulated)
             }

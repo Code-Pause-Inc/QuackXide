@@ -107,7 +107,7 @@ frontend/src/
   lib/crypto/             Web Crypto worker (keys never touch the UI thread)
   lib/vault/              Ciphertext-only vault clients (local / http)
   components/             Drive, researcher portal, steward console, admin
-Dockerfile                Dev-only simulated TEE images (enclave-api, key-release), built with feature "dev"
+Dockerfile                Dev-only simulated TEE images (enclave-api, key-release, sim-attestation), built with feature "dev"
 docker-compose.simulated-tee.yml  Local simulated TEE stack (dev only)
 scripts/test-simulated-tee.sh     End-to-end Docker smoke + tamper-refusal verification
 scripts/check.sh          Validation gate — run before every push

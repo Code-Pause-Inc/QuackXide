@@ -1899,7 +1899,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "jsonwebtoken",
- "p384",
  "rand 0.8.8",
  "reqwest",
  "rsa",

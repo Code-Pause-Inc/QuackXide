@@ -3136,7 +3136,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "jsonwebtoken",
- "p384",
  "platform-enclave",
  "rand 0.8.7",
  "reqwest",
