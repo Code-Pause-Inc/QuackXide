@@ -51,12 +51,6 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "snp_report"
-path = "fuzz_targets/snp_report.rs"
-test = false
-doc = false
-bench = false
 
 [[bin]]
 name = "attestation_token"
