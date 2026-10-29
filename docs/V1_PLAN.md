@@ -65,6 +65,7 @@ The work that takes QuackXide from v0.1.0 to its first production release (`docs
 | P84 | #49 | Simulated SEV-SNP mode for development and CI |
 | P46 | #98 | Test the attestation-refusal path on query and research routes |
 | P69 | #99 | DataFusion, Arrow, Parquet and `object_store` upgrade |
+| P70 | #132 | CI hygiene: locked builds, secret scanning, and fuzz targets compiled on every PR |
 | P75 | #100 | Readiness, operational metrics and graceful shutdown |
 
 Items not listed are not posted yet.

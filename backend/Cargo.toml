@@ -14,6 +14,7 @@ members = [
     "crates/quackxide-engine",
     "crates/platform-api",
     "crates/synth-data",
+    "crates/envelope-wasm",
 ]
 exclude = ["fuzz"]
 
@@ -65,7 +66,7 @@ anyhow = "1"
 
 # ── telemetry ────────────────────────────────────────────────────────────────
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry", "std"] }
 
 # ── configuration ────────────────────────────────────────────────────────────
 dotenvy = "0.15"
@@ -92,6 +93,12 @@ subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 rand = "0.8"
+# The browser build of the envelope code (`envelope-wasm`). `scripts/build-wasm.sh`
+# refuses a `wasm-bindgen` CLI whose version differs from this one.
+wasm-bindgen = "=0.2.126"
+# `rand` 0.8's `OsRng` uses getrandom 0.2; on wasm32 it needs the JavaScript
+# backend (`crypto.getRandomValues`).
+getrandom = { version = "0.2", features = ["js"] }
 
 # ── auth + storage backends ─────────────────────────────────────────────────
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
@@ -112,9 +119,20 @@ datafusion = "55"                                                 # arrow/parque
 
 # ── testing ─────────────────────────────────────────────────────────────────
 proptest = "1"
-# Seeded RNG for synth-data; 0.3 pairs with rand 0.8 (rand_core 0.6).
-rand_chacha = "0.3"
+# Seeded RNG for synth-data. synth-data uses rand_chacha's own rand_core
+# re-export, so this need not match `rand` above.
+rand_chacha = "0.10"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The browser build of `envelope-wasm` (`scripts/build-wasm.sh`): small, no
+# debug info, no symbol names.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+debug = false
+strip = true
+panic = "abort"

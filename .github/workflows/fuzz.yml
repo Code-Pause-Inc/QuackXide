@@ -18,9 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-fuzz
+      # cargo-fuzz has no --locked flag; a locked fetch first fails if
+      # Cargo.lock is stale, so the run below never rewrites it.
+      - name: Dependencies match Cargo.lock
+        working-directory: backend/fuzz
+        run: cargo +nightly fetch --locked
       - name: Fuzz ${{ matrix.target }} for 5 minutes
         working-directory: backend/fuzz
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300

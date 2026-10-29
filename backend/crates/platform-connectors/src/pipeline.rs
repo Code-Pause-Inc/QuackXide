@@ -54,10 +54,10 @@ pub struct SyncReport {
     pub written: Vec<WrittenObject>,
 }
 
-/// Canonical HPKE `info` binding for a connector object. The browser-side
-/// reader must derive the identical string to open the envelope.
+/// HPKE `info` binding for a connector object
+/// ([`platform_crypto::info::connector_object`]).
 pub fn envelope_info(tenant: &TenantId, slug: &ConnectorSlug, object: &ObjectId) -> Vec<u8> {
-    format!("tenant-envelope-v1|{tenant}|{slug}|{object}").into_bytes()
+    platform_crypto::info::connector_object(tenant, slug, object)
 }
 
 pub struct EnclavePipeline {

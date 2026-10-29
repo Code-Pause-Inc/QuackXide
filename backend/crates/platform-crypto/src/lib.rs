@@ -5,17 +5,31 @@
 //! server cannot decrypt drive content. This crate provides only AEAD sealing
 //! for data transiently held in enclave RAM, HPKE envelopes to a tenant
 //! public key, keyed blind indexes, and TOTP.
+//!
+//! The `server` feature (on by default) carries AEAD sealing, blind indexes
+//! and TOTP. Without it the crate is the HPKE envelope code and its `info`
+//! strings alone, which is what the browser's wasm build (`envelope-wasm`)
+//! compiles.
 
+#[cfg(feature = "server")]
 use aes_gcm::aead::{Aead, KeyInit, Payload};
+#[cfg(feature = "server")]
 use aes_gcm::{Aes256Gcm, Nonce};
+#[cfg(feature = "server")]
 use hmac::{Hmac, Mac};
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
+use rand::{CryptoRng, RngCore};
+#[cfg(feature = "server")]
 use sha2::Sha256;
+use std::io::{self, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub mod info;
+#[cfg(feature = "server")]
 mod totp;
+#[cfg(feature = "server")]
 pub use totp::{TOTP_DIGITS, TOTP_SECRET_BYTES, TOTP_STEP_SECS, TotpSecret};
 
 /// AES-256-GCM parameter sizes, kept in lockstep with the browser client
@@ -39,6 +53,8 @@ pub enum CryptoError {
     InvalidPublicKey,
     #[error("invalid envelope framing")]
     InvalidEnvelope,
+    #[error("invalid envelope info field")]
+    InvalidInfoField,
     // Content-free by design: never carry key material or data fragments.
     #[error("seal failed")]
     SealFailed,
@@ -75,6 +91,62 @@ impl std::fmt::Debug for SecretBytes {
     }
 }
 
+/// In-memory sink that never leaves plaintext in freed memory: growth moves
+/// into a fresh allocation and zeroizes the old one, and drop zeroizes.
+pub struct ZeroizingWriter {
+    buf: Vec<u8>,
+}
+
+impl ZeroizingWriter {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    pub fn into_secret(mut self) -> SecretBytes {
+        SecretBytes::new(std::mem::take(&mut self.buf))
+    }
+}
+
+impl Write for ZeroizingWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let needed = self
+            .buf
+            .len()
+            .checked_add(data.len())
+            .ok_or_else(|| io::Error::other("zeroizing buffer overflow"))?;
+        if needed > self.buf.capacity() {
+            let mut next = Vec::with_capacity(needed.max(self.buf.capacity().saturating_mul(2)));
+            next.extend_from_slice(&self.buf);
+            // Zeroizes the full capacity of the old allocation before it is freed.
+            self.buf.zeroize();
+            self.buf = next;
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ZeroizingWriter {
+    fn drop(&mut self) {
+        self.buf.zeroize();
+    }
+}
+
+#[cfg(feature = "server")]
 /// AEAD-seal `plaintext` under a 256-bit key with the given 96-bit nonce and
 /// additional authenticated data. Nonces MUST be unique per key.
 pub fn aead_seal(
@@ -95,6 +167,7 @@ pub fn aead_seal(
         .map_err(|_| CryptoError::SealFailed)
 }
 
+#[cfg(feature = "server")]
 /// Open an AEAD-sealed message. Returns zeroize-on-drop plaintext.
 pub fn aead_open(
     key: &[u8; AES_KEY_BYTES],
@@ -115,6 +188,7 @@ pub fn aead_open(
         .map_err(|_| CryptoError::OpenFailed)
 }
 
+#[cfg(feature = "server")]
 /// Deterministic blind index keyed per tenant and field (HMAC-SHA256
 /// truncated to 128 bits), for equality lookups over ciphertext.
 pub fn blind_index(index_key: &[u8], value: &[u8]) -> [u8; BLIND_INDEX_BYTES] {
@@ -131,15 +205,43 @@ pub fn blind_index(index_key: &[u8], value: &[u8]) -> [u8; BLIND_INDEX_BYTES] {
 
 // ── HPKE tenant envelopes ───────────────────────────────────────────────────
 //
-// Enclave pipelines seal output to the tenant's public key before anything
-// leaves enclave RAM (single-shot base mode). Framing:
-// `b"HPK1" || encapped_key(32) || ciphertext`. Binding context travels in
-// HPKE `info`, so an envelope replayed under another object fails to open.
+// Enclave pipelines and the steward's browser seal to a tenant's public key
+// (single-shot base mode). Framing: `magic || encapped_key || ciphertext`,
+// where the magic names exactly one suite ([`EnvelopeSuite`]). Binding
+// context travels in HPKE `info` ([`info`]), so an envelope replayed under
+// another object fails to open.
 
 pub const HPKE_ENVELOPE_MAGIC: [u8; 4] = *b"HPK1";
 pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
 const MAGIC_BYTES: usize = HPKE_ENVELOPE_MAGIC.len();
 const ENCAPPED_KEY_BYTES: usize = 32;
+
+/// An envelope suite, named on the wire by its frame magic. Readers choose
+/// the suite from the magic and refuse any magic they do not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeSuite {
+    /// `HPK1`: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
+    Hpk1,
+}
+
+impl EnvelopeSuite {
+    /// The suite new envelopes are sealed with.
+    pub const CURRENT: Self = Self::Hpk1;
+
+    pub fn magic(self) -> [u8; MAGIC_BYTES] {
+        match self {
+            Self::Hpk1 => HPKE_ENVELOPE_MAGIC,
+        }
+    }
+
+    /// The suite a framed envelope declares. Unknown magic is refused.
+    pub fn of_envelope(envelope: &[u8]) -> Result<Self, CryptoError> {
+        match envelope.get(..MAGIC_BYTES) {
+            Some(magic) if magic == HPKE_ENVELOPE_MAGIC => Ok(Self::Hpk1),
+            _ => Err(CryptoError::InvalidEnvelope),
+        }
+    }
+}
 
 type KemPublicKey = <TenantKem as KemTrait>::PublicKey;
 type KemPrivateKey = <TenantKem as KemTrait>::PrivateKey;
@@ -174,30 +276,44 @@ pub fn hpke_seal_to_tenant(
     info: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    hpke_seal_to_tenant_with_rng(recipient, info, plaintext, &mut rand::rngs::OsRng)
+}
+
+/// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
+/// committed test-vector generator passes a seeded RNG; everything else
+/// calls [`hpke_seal_to_tenant`].
+pub fn hpke_seal_to_tenant_with_rng<R: CryptoRng + RngCore>(
+    recipient: &TenantPublicKey,
+    info: &[u8],
+    plaintext: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>, CryptoError> {
     let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, TenantKem, _>(
         &OpModeS::Base,
         &recipient.0,
         info,
         plaintext,
         b"",
-        &mut rand::rngs::OsRng,
+        rng,
     )
     .map_err(|_| CryptoError::SealFailed)?;
 
     let mut envelope = Vec::with_capacity(MAGIC_BYTES + ENCAPPED_KEY_BYTES + ciphertext.len());
-    envelope.extend_from_slice(&HPKE_ENVELOPE_MAGIC);
+    envelope.extend_from_slice(&EnvelopeSuite::CURRENT.magic());
     envelope.extend_from_slice(&encapped.to_bytes());
     envelope.extend_from_slice(&ciphertext);
     Ok(envelope)
 }
 
 fn parse_envelope(envelope: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
-    if envelope.len() < MAGIC_BYTES + ENCAPPED_KEY_BYTES + GCM_TAG_BYTES
-        || envelope[..MAGIC_BYTES] != HPKE_ENVELOPE_MAGIC
-    {
-        return Err(CryptoError::InvalidEnvelope);
+    match EnvelopeSuite::of_envelope(envelope)? {
+        EnvelopeSuite::Hpk1 => {
+            if envelope.len() < MAGIC_BYTES + ENCAPPED_KEY_BYTES + GCM_TAG_BYTES {
+                return Err(CryptoError::InvalidEnvelope);
+            }
+            Ok(envelope[MAGIC_BYTES..].split_at(ENCAPPED_KEY_BYTES))
+        }
     }
-    Ok(envelope[MAGIC_BYTES..].split_at(ENCAPPED_KEY_BYTES))
 }
 
 /// Test/dev-only tenant keypair. Production tenant private keys are
@@ -210,6 +326,17 @@ pub struct TenantKeypair {
 impl TenantKeypair {
     pub fn generate() -> Self {
         let (private_key, public_key) = TenantKem::gen_keypair(&mut rand::rngs::OsRng);
+        Self {
+            private_key,
+            public_key,
+        }
+    }
+
+    /// RFC 9180 `DeriveKeyPair` from input keying material. Used only for
+    /// the test-only recipients of the committed vectors, whose seeds are
+    /// public.
+    pub fn derive(ikm: &[u8]) -> Self {
+        let (private_key, public_key) = TenantKem::derive_keypair(ikm);
         Self {
             private_key,
             public_key,
@@ -270,9 +397,12 @@ impl Drop for TenantKeypair {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "server")]
     const KEY: [u8; AES_KEY_BYTES] = [7u8; AES_KEY_BYTES];
+    #[cfg(feature = "server")]
     const NONCE: [u8; GCM_NONCE_BYTES] = [3u8; GCM_NONCE_BYTES];
 
+    #[cfg(feature = "server")]
     #[test]
     fn seal_open_round_trip() {
         let sealed = aead_seal(&KEY, &NONCE, b"tenant:a", b"ledger row").expect("seal");
@@ -281,6 +411,7 @@ mod tests {
         assert_eq!(opened.expose(), b"ledger row");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn tampered_ciphertext_is_rejected() {
         let mut sealed = aead_seal(&KEY, &NONCE, b"aad", b"payload").expect("seal");
@@ -291,6 +422,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wrong_aad_is_rejected() {
         let sealed = aead_seal(&KEY, &NONCE, b"tenant:a", b"payload").expect("seal");
@@ -300,6 +432,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn blind_index_is_deterministic_and_key_separated() {
         let a1 = blind_index(b"tenant-key-1", b"acme corp");
@@ -317,6 +450,24 @@ mod tests {
         let debugged = format!("{secret:?}");
         assert!(!debugged.contains("super secret"));
         assert!(debugged.contains("redacted"));
+    }
+
+    #[test]
+    fn zeroizing_writer_grows_without_losing_bytes() {
+        let mut writer = ZeroizingWriter::with_capacity(4);
+        let mut expected = Vec::new();
+        for chunk in [
+            &b"ab"[..],
+            b"cdefg",
+            b"",
+            b"hijklmnopqrstuvwxyz",
+            b"0123456789",
+        ] {
+            writer.write_all(chunk).expect("write");
+            expected.extend_from_slice(chunk);
+        }
+        assert!(writer.buf.capacity() > 4, "growth must have occurred");
+        assert_eq!(writer.into_secret().expose(), expected.as_slice());
     }
 
     #[test]
@@ -367,6 +518,38 @@ mod tests {
             keypair.open_envelope(b"info", b"XXXXtooshort"),
             Err(CryptoError::InvalidEnvelope)
         ));
+    }
+
+    #[test]
+    fn envelope_suite_comes_from_the_frame_magic() {
+        let keypair = TenantKeypair::generate();
+        let envelope = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"x").expect("seal");
+        assert_eq!(
+            EnvelopeSuite::of_envelope(&envelope).expect("suite"),
+            EnvelopeSuite::Hpk1
+        );
+        assert_eq!(EnvelopeSuite::CURRENT.magic(), *b"HPK1");
+        for unknown in [&b"HPK2"[..], b"hpk1", b"HPK", b""] {
+            assert!(matches!(
+                EnvelopeSuite::of_envelope(unknown),
+                Err(CryptoError::InvalidEnvelope)
+            ));
+        }
+        let mut relabelled = envelope.clone();
+        relabelled[..4].copy_from_slice(b"HPK2");
+        assert!(matches!(
+            keypair.open_envelope(b"i", &relabelled),
+            Err(CryptoError::InvalidEnvelope)
+        ));
+    }
+
+    #[test]
+    fn derived_keypairs_are_deterministic_and_seed_separated() {
+        let a1 = TenantKeypair::derive(b"seed a").public_key().to_raw();
+        let a2 = TenantKeypair::derive(b"seed a").public_key().to_raw();
+        let b = TenantKeypair::derive(b"seed b").public_key().to_raw();
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
     }
 
     #[test]
@@ -465,6 +648,7 @@ mod tests {
                 prop_assert_eq!(parsed.is_ok(), raw.len() == X25519_PUBLIC_KEY_BYTES);
             }
 
+            #[cfg(feature = "server")]
             #[test]
             fn aead_round_trips_and_rejects_tamper(
                 key: [u8; AES_KEY_BYTES],
@@ -487,6 +671,7 @@ mod tests {
                 prop_assert!(aead_open(&key, &nonce, &aad, &sealed).is_err());
             }
 
+            #[cfg(feature = "server")]
             #[test]
             fn arbitrary_aead_ciphertexts_never_open(
                 key: [u8; AES_KEY_BYTES],

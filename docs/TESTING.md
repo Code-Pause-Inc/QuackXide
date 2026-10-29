@@ -47,9 +47,11 @@ enable it and `cargo test` needs no flag.
 
 `tests/common/mod.rs` holds the shared helpers; a test file uses them with
 `mod common;`. It has the HS256 token minters (`token_for`, `admin_token`,
-taking the file's secret), the request helpers (`send`, `send_json`, `call`,
-`post`, `post_query`), and the app builders (`app_state`, `synced_vault`,
-`research_app`). Use them rather than writing new ones, and add a helper
+taking the file's secret), the request helpers (`send`, `send_with_headers`,
+`send_json`, `call`, `post`, `post_query`), the app builders (`app_state`,
+`synced_vault`, `research_app`), and `FlakyVault`, an in-memory vault that
+fails the operations chosen in `Faults` with a transient (`outage`) or
+permanent (`misconfigured`) storage error. Use them rather than writing new ones, and add a helper
 there when a second file needs it. Tests that need RS256 tokens use its
 `rs256_token` and `rs256_verifier` (see [Managed sign-in](#managed-sign-in)).
 
@@ -97,6 +99,21 @@ jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 Neither project runs a real browser; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
 
+### Envelope vectors
+
+`fixtures/envelope/` holds the vectors that keep the browser and the backend
+on one envelope format. `hpk1.json` (test-only recipient keys derived from
+published seeds, enrollment keys, `info` strings, and envelopes that open or
+must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
+which fails when the file and its generator disagree; regenerate with
+`UPDATE_ENVELOPE_VECTORS=1 cargo test -p envelope-wasm --test vectors`.
+`hpk1-browser-sealed.json` holds envelopes sealed by the wasm module
+(`node scripts/browser-sealed-vectors.mjs` from `frontend/`, after
+`scripts/build-wasm.sh`), which the Rust test must open.
+`frontend/src/lib/crypto/envelope.test.ts` checks the same files against the
+wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
+enrollment cases through the enrollment route.
+
 ### Fuzz targets
 
 `backend/fuzz` holds the targets for the untrusted-input parsers. It sits
@@ -108,7 +125,9 @@ cd backend/fuzz
 cargo +nightly fuzz run <target>
 ```
 
-The targets run weekly in CI. P70 adds a build check on every pull request.
+Every pull request checks that each target compiles (`cargo check
+--manifest-path backend/fuzz/Cargo.toml --locked --bins`, on stable), and
+the targets run weekly in CI.
 A new parser of untrusted input gets a target.
 
 ## Negative tests and audit assertions
@@ -171,9 +190,23 @@ per test binary in a `OnceLock`. Do not use `keygen::fixtures`: it is
 
 ### GCS
 
-Use the in-memory `ObjectStoreVault::new_in_memory()`. Failure paths
-(conditional-write conflicts, transient errors) use the fault-injecting test
-double from P41.
+Use the in-memory `ObjectStoreVault::new_in_memory()`. For a storage
+failure seen by the API, use `FlakyVault` from `tests/common/mod.rs`; each
+drive operation has an outage test in `drive_api.rs`. To check how an
+`object_store` error is classified, wrap a store and pass it to
+`ObjectStoreVault::new`, as `FaultyStore` in `platform-storage/src/lib.rs`
+does. Timeouts and retries need the real HTTP client: point
+`ObjectStoreVault::new_gcs_with_emulator` at a local listener that stalls or
+answers 503, as `fake_gcs` in `platform-storage/src/lib.rs` and
+`stalled_storage_fails_within_the_documented_bound` in `drive_api.rs` do.
+
+`InMemory` enforces `VaultStore::put_if_absent` natively, but the GCS
+emulator does not: fake-gcs-server ignores `ifGenerationMatch`. So check
+create-only writes against a real bucket by hand (the P12 development
+bucket) whenever the create-only path or the `object_store` version
+changes. Write an object with `put_if_absent` and then write it again: the
+second write must fail with `StorageError::AlreadyExists` and leave the
+first object unchanged.
 
 ## Acceptance tests for definition-of-done items 1-3
 

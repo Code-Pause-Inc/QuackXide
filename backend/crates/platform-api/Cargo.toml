@@ -43,6 +43,7 @@ platform-tenancy.workspace = true
 quackxide-engine.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
@@ -71,3 +72,4 @@ platform-api = { path = ".", features = ["dev"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
+tracing-subscriber.workspace = true

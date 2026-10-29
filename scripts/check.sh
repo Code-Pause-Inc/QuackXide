@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# check.sh — full validation: backend fmt/check/clippy/test, frontend
-# typecheck/test/build, the white-label guards, and the attribution guard.
+# check.sh — full validation: backend fmt/check/clippy/test, the browser
+# envelope module (wasm), frontend typecheck/lint/test/build, the white-label
+# guards, the secret scan, and the attribution guard.
 # Must pass before every push.
 # =============================================================================
 set -euo pipefail
@@ -11,19 +12,28 @@ echo "== backend: rustfmt =="
 cargo fmt --manifest-path "$ROOT/backend/Cargo.toml" --all -- --check
 
 echo "== backend: cargo check (workspace, all targets) =="
-cargo check --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-targets
+cargo check --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-targets --locked
 
 echo "== backend: clippy (warnings are errors) =="
-cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-targets -- -D warnings
+cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-targets --locked -- -D warnings
 
 echo "== backend: cargo test =="
-cargo test --manifest-path "$ROOT/backend/Cargo.toml" --workspace
+cargo test --manifest-path "$ROOT/backend/Cargo.toml" --workspace --locked
+
+echo "== wasm: clippy for the browser target (warnings are errors) =="
+cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" -p envelope-wasm --target wasm32-unknown-unknown --locked -- -D warnings
+
+echo "== wasm: browser envelope module =="
+"$ROOT/scripts/build-wasm.sh"
 
 echo "== frontend: clean install =="
 (cd "$ROOT/frontend" && npm ci --no-audit --no-fund)
 
 echo "== frontend: typecheck =="
 (cd "$ROOT/frontend" && npm run typecheck)
+
+echo "== frontend: lint (warnings are errors) =="
+(cd "$ROOT/frontend" && npm run lint)
 
 echo "== frontend: unit tests =="
 (cd "$ROOT/frontend" && npm test)
@@ -62,6 +72,14 @@ if git -C "$ROOT" ls-files \
     | grep -v '/fixtures/'; then
     echo "FAIL: data file outside a fixtures/ directory"
     exit 1
+fi
+
+echo "== secret scan: no credentials in history (docs/DATA_POLICY.md) =="
+# CI always runs it; locally it runs only when gitleaks is installed.
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks git --no-banner --redact --config "$ROOT/.gitleaks.toml" "$ROOT"
+else
+    echo "skipped: gitleaks is not installed (CI runs it on every pull request)"
 fi
 
 echo "== attribution guard: tools are never credited =="

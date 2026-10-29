@@ -14,3 +14,6 @@ coverage/
 # Editor/OS noise
 .DS_Store
 *.swp
+
+# Browser envelope module, built by scripts/build-wasm.sh
+frontend/src/lib/crypto/wasm/
