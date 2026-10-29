@@ -174,9 +174,12 @@ test. The issues named below build them; this guide only records the choice.
 
 * **In CI:** recorded Confidential Space attestation tokens, captured on
   the TDX cloud environment (#36 phase B, and P48) and checked by the
-  token verifier (P47). The simulated SEV-SNP mode (P84, #49) runs the
-  attestation and key-release protocol for development and lifecycle
-  tests.
+  token verifier (P47). The simulated TEE (P84, #49) issues
+  Confidential Space-shaped tokens and runs the same verifier and release
+  policy for development and lifecycle tests. In tests, sign tokens with
+  `platform_enclave::simulated_token::TokenSigner` (feature `simulated`,
+  on in every test build) and verify them with a `TokenVerifier` built from
+  its `jwks()`; `with_claims` reuses the key for tamper cases.
 * **On hardware:** the manual or dispatched hardware test job (P71).
 
 ### Managed sign-in

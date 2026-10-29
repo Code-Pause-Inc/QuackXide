@@ -19,7 +19,7 @@ The work that takes QuackXide from v0.1.0 to its first production release (`docs
 | Query reaches the enclave where the data is opened | P15, P51, P67 |
 | Enclave attested, key released, query run | P14, P47, P48, P49, P50, P52, P53, P54, P57, P58 |
 | Results sealed in the enclave and opened in the browser | P55, P56 |
-| The same flow without hardware | P84 (simulated SEV-SNP), P8, P72 |
+| The same flow without hardware | P84 (simulated Confidential Space), P8, P72 |
 
 **Milestone.** `v1.0 - first production release`, for all issues in this file except the final section ("Proposed outside v1.0").
 
@@ -62,7 +62,7 @@ The work that takes QuackXide from v0.1.0 to its first production release (`docs
 | P25 | #45 | Audit stream always on; no SQL or data values in operational logs |
 | P26 | #46 | Zeroize platform credentials held in configuration |
 | P27 | #47 | Access-request approval converges after a partial failure, and never fails open |
-| P84 | #49 | Simulated SEV-SNP mode for development and CI |
+| P84 | #49 | Simulated Confidential Space TEE for development and CI |
 | P46 | #98 | Test the attestation-refusal path on query and research routes |
 | P69 | #99 | DataFusion, Arrow, Parquet and `object_store` upgrade |
 | P70 | #132 | CI hygiene: locked builds, secret scanning, and fuzz targets compiled on every PR |
@@ -356,7 +356,7 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50, P85 and P77's restart-and-f
 
 **Sequencing.** The browser half uses the proxy from P7.
 
-**Security impact.** Adds a binary that runs without hardware attestation; it must be impossible to build or start in production (feature-gated, refuses without explicit opt-in). P18 later moves `devtoken` and `query-demo` behind the same mechanism, and P84 replaces `DevAttestation::allow_insecure_dev()` in this server with the simulated SEV-SNP mode, so the dev server runs the real attestation protocol.
+**Security impact.** Adds a binary that runs without hardware attestation; it must be impossible to build or start in production (feature-gated, refuses without explicit opt-in). P18 later moves `devtoken` and `query-demo` behind the same mechanism, and P84 replaces `DevAttestation::allow_insecure_dev()` in this server with the simulated Confidential Space TEE, so the dev server runs the production evidence path.
 **ADR.** Not required.
 
 **Notes.** A one-command wrapper script under `scripts/` (code-owned) and a filesystem vault shared with `connector-worker` are out of scope.
@@ -495,33 +495,29 @@ Streams 3 and 4 are the largest; P69, P62, P29, P50, P85 and P77's restart-and-f
 
 ---
 
-### P84. Simulated SEV-SNP mode for development and CI
+### P84. Simulated Confidential Space TEE for development and CI
 **Labels:** build · area:enclave · area:ops · rust
 **Size:** M · **Priority:** team enablement · **Owner:** stream 4, with a stream 3 secondary reviewer
 
-**Summary.** Without hardware, the research flow runs with no TEE steps at all. The dev wiring uses `DevAttestation::allow_insecure_dev()` (`backend/crates/platform-enclave/src/lib.rs:45-80`), which fabricates `Development` evidence that `gate_execution` accepts without verification when attestation is not required (`lib.rs:130-144`), and keys come from in-process dev providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`, `backend/crates/platform-api/src/query.rs:49-113`). So contributors build sealing, key release and browser verification against a path that skips all of them, and nothing exercises the protocol until hardware is available (P12, P48). A simulated SEV-SNP mode runs the same protocol the production path runs (SNP-format evidence, the real verifier, attested key release) on any machine. It simulates the protocol, not the protection: the host can read the simulated enclave's memory, and the docs say so.
+**Summary.** Production evidence under ADR 0004 is Google's Confidential Space attestation token, checked by P47's verifier and by the release policy, so the simulator issues the same kind of token. Without it, contributors would build sealing, key release and browser verification against a path that skips all of them (`DevAttestation::allow_insecure_dev()` fabricates `Development` evidence, and the dev key providers hold keys in process), and nothing would exercise the evidence path until hardware is available (P12, P48). It simulates the evidence path, not the protection: the host can read the simulated enclave's memory, and the docs say so.
 
 **Done when**
-- **Stage 1: simulated evidence.**
-  - A dev-only `SimulatedSnp` `AttestationProvider` in `platform-enclave`, reachable only through the dev mechanism from P18 (until P18 lands, the `dev` feature from P8), produces evidence in the format P48 produces on hardware: SNP attestation-report bytes with caller-supplied 64-byte REPORT_DATA, plus the certificate chain.
-  - Reports are signed by a throwaway ARK to ASK to VCEK chain generated at process start, with an established, maintained library (no hand-written signature or certificate code; `unsafe` stays denied, `backend/Cargo.toml:27-28`). No key is committed (`docs/DATA_POLICY.md` rule 3). This is the one synthetic-chain generator in the repository: P47's `test-support` tests use it, or, if P47 builds it first, this issue reuses P47's.
-  - Measurement, guest policy, TCB and REPORT_DATA are set from dev configuration, so the negative cases (debug policy, wrong measurement, TCB below minimum, wrong REPORT_DATA) can be produced on demand.
-  - A new `TeePlatform::Simulated` variant (or an equivalent marker) travels with the evidence. `gate_execution`, `ConnectorQueryService::gate` (`query.rs:201-234`) and `EnclavePipeline::attestation_gate` (`backend/crates/platform-connectors/src/pipeline.rs:87-141`) accept it only in development mode and never treat it as `SevSnp`.
-- **Stage 2: the real verifier.** Once P47 lands, the dev server verifies simulated reports with P47's `AttestationVerifier`, configured in development mode with the simulated root as its trust root. A test shows the production verifier configuration rejects a report signed by the simulated chain.
-- **Dev server.** P8's dev server uses `SimulatedSnp` in place of `DevAttestation::allow_insecure_dev()`. When P50 lands, its key release goes through P50's release-service stand-in with the same protocol (relying-party nonce, verified report, key wrapped to the enclave's ephemeral key), and the dev server stops using `MultiTenantDevKeyProvider` (recorded in P50).
-- **Visibly simulated.** `tee.attestation` audit events record the platform as simulated; research and query responses carry a marker the portal reads; and the portal shows a persistent "Simulated TEE: development only, no hardware protection" notice whenever the marker is present. `audit_coverage.rs` asserts the simulated outcome.
-- **Never in production.** P18's production check refuses to start when `SimulatedSnp` or the simulated trust root would be used, with a test. A CI step shows a default-feature release build contains neither.
-- **Negative tests.** A tampered report, wrong REPORT_DATA, a debug policy, a wrong measurement and a report from a different simulated chain are each refused on the query path and the sync path.
-- `README.md` "Development" and the guide from P3 explain what the simulation proves (the protocol, the verifier, key release, sealing and browser verification run end to end) and what it does not (confidentiality from the host), and `docs/THREAT_MODEL.md` lists it as a development-only path.
+- **Simulated tokens.** A dev-only `sim-attestation` service plays Google's part: it signs RS256 tokens with the claims and layout Google's attestation service uses (`hwmodel`, `swname`, `dbgstat`, support attributes, image digest, nonces) under a throwaway key generated at start, and publishes the key set. Its request shape matches the Confidential Space launcher's, so P48 changes only the transport. Claims are set from dev configuration, so the negative cases (debug image, wrong image digest, non-TDX hardware) can be produced on demand. There is one token signer in the repository, shared with P47's tests.
+- **The real verifier.** The simulated provider and the key-release stand-in verify tokens with P47's verifier and the production release policy; a test shows a verifier holding another key set refuses them. `TeePlatform::Simulated` travels with the evidence, and the gates refuse it when attestation is required.
+- **Key release.** P50's release-service stand-in releases only after a token passes, with a single-use relying-party nonce and the binding of ADR 0004 ("Freshness and binding").
+- **Visibly simulated.** `tee.attestation` audit events record the platform as simulated; research and query responses carry a marker the portal reads; and the portal shows a persistent "Simulated TEE: development only, no hardware protection" notice.
+- **Never in production.** The simulator compiles only behind a dev-only feature. A CI step shows a default-feature release build does not enable it, and that a release `connector-worker` refuses every sync when attestation is not required; P18's production check later refuses to start when it would be used.
+- **Negative tests.** A debug image, an unlisted image digest, non-TDX hardware, a wrong nonce, an expired token and a token from another key set are each refused on the query path and the sync path, and `scripts/test-simulated-tee.sh` checks the first three end to end.
+- `README.md` "Development" and the guide from P3 explain what the simulation proves (the evidence path, the verifier, key release, sealing and browser verification run end to end) and what it does not (confidentiality from the host, real hardware evidence), and `docs/SIMULATED_TEE_GCP_GUIDE.md` maps each simulated component to its production counterpart.
 
-**Where.** `backend/crates/platform-enclave/src/lib.rs`, `backend/crates/platform-enclave/Cargo.toml`, `backend/crates/platform-api/src/query.rs`, the dev server from P8, `backend/crates/platform-connectors/src/pipeline.rs`, `backend/crates/platform-api/tests/audit_coverage.rs`, `frontend/src/components/research/`, `README.md`, `docs/THREAT_MODEL.md`.
+**Where.** `backend/crates/platform-enclave/src/` (`simulated_token.rs`, `lib.rs`), `backend/crates/platform-api/src/key_release/stand_in.rs`, `backend/crates/platform-api/src/bin/sim-attestation.rs`, `backend/crates/platform-connectors/src/pipeline.rs`, `Dockerfile`, `docker-compose.simulated-tee.yml`, `scripts/test-simulated-tee.sh`, `.github/workflows/ci.yml`, `README.md`, `docs/`.
 
-**Depends on:** P8 (the dev server it plugs into); P47 (stage 2 only).
+**Depends on:** P8 (the dev server it plugs into); P47 (the verifier).
 
-**Sequencing.** Stage 1 starts as soon as P8's dev server exists. P85, P55, P56 and P72 stage B are developed against this mode first; P48, P50 and P68 then run the same protocol on hardware.
+**Sequencing.** P85, P55, P56 and P72 stage B are developed against this mode first; P48, P50 and P68 then run the same evidence path on hardware.
 
-**Security impact.** Lets every enclave, sealing and browser-verification control be built and tested against the real protocol before hardware exists, without adding any path that production can reach.
-**ADR.** Not required (P18's mechanism gates it).
+**Security impact.** Lets every enclave, sealing and browser-verification control be built and tested against the production evidence path before hardware exists, without adding any path that production can reach.
+**ADR.** Not required (ADR 0004 records the evidence; the dev-only feature gates it).
 
 ---
 
@@ -661,7 +657,7 @@ Each of these is drafted by one student and accepted by @AxolDad. An ADR-only PR
 **Done when**
 - An ADR records one mechanism. ADR 0005 requires that a release build cannot enter development mode and never loads `.env`, so a switch read from the environment alone does not qualify. Recommended: a non-default Cargo feature that gates `DevKeyProvider`, `MultiTenantDevKeyProvider` (`platform-api/src/query.rs:49-113`), `DevAttestation::allow_insecure_dev`, the `.env` loader and the `devtoken`/`query-demo` binaries (`[[bin]] required-features`), never enabled by `release.yml`. The integration tests that use these paths (`platform-api/tests/{audit_coverage,drive_api,admin_api,research_api,query_api,catalog_api}.rs`, `platform-connectors/tests/pipeline_e2e.rs`, and `backend/fuzz`) enable it, and `scripts/check.sh` also builds and lints the default (production) feature set. `backend/.env.example` opts into development explicitly.
 - Startup in `platform-api` and `connector-worker` is factored out of `main()` into a testable function that calls one validation function (for example `PlatformConfig::check_production`), which later issues extend. Not inside `from_source`, so tests can still build any config.
-- In production mode each binary refuses to start, with a clear error and a `service.start` audit event recording the refusal, when: `JWT_HS256_SECRET` is set; `STORAGE_BUCKET` is unset; `TEE_ATTESTATION_REQUIRED=false`; `provider_for` would return the dev provider; the simulated SEV-SNP provider or its trust root (P84) would be used; or (for `connector-worker`) the demo tenant or fixture sources would be used. Each refusal has a test that drives `PlatformConfig::from_source`.
+- In production mode each binary refuses to start, with a clear error and a `service.start` audit event recording the refusal, when: `JWT_HS256_SECRET` is set; `STORAGE_BUCKET` is unset; `TEE_ATTESTATION_REQUIRED=false`; `provider_for` would return the dev provider; the simulated attestation provider (P84) would be used; or (for `connector-worker`) the demo tenant or fixture sources would be used. Each refusal has a test that drives `PlatformConfig::from_source`.
 - Later issues add their own refusals through this function: no verification keys (P28); no production key provider or research stores (P51); in-memory registries (P62) and in-memory identity and session stores (P63); no TLS certificate when TLS terminates in-process (P67). Until those land, production mode cannot boot; development mode is used, and the PR says so.
 - Frontend: a release build mode (for example `vite build --mode release` or `VITE_PLATFORM_ENV=production`) fails unless `VITE_VAULT_MODE` is explicitly `http`, and fails if `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is non-empty. It runs as a dedicated step in `release.yml`, not in `check.sh`'s dev build. (Runtime configuration of the bundle is P66.)
 - `docs/ARCHITECTURE.md` defines production mode; `README.md:153` and definition-of-done item 3 use the defined term (with P80).
@@ -1347,7 +1343,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - A token verifier in `platform-enclave`, separate from `AttestationProvider` and from the simulated TEE's SEV-SNP `AttestationVerifier`, built on established, maintained libraries (no hand-written JWT, JWS or certificate code; reuse the workspace's JWT stack in `platform-auth` if it fits; `unsafe` is denied workspace-wide; new crates pass `cargo deny check` and dependency review). Input: the token, expected audience, expected nonces, and policy. Output: a `VerifiedToken` (image digest, hardware model, debug state, support attributes, nonces) that only the verifier can construct, or an error.
 - It checks: the signature against Google's token-signing keys; issuer, audience, expiry and not-before; `hwmodel == GCP_INTEL_TDX`, `swname == CONFIDENTIAL_SPACE`, `dbgstat == disabled-since-boot` and the `STABLE` support attribute; the nonces against the binding in ADR 0004 ("Freshness and binding"); and the image digest through a policy interface whose allowed values come from the attested deployment configuration (ADR 0005), through `platform-config`, and fail closed when missing. Tests use fixture values; P49 supplies production values.
 - How Google's token-signing keys are pinned, fetched or cached is defined (ADR 0004 open question 3); unreachable, expired or unknown keys fail closed, with tests.
-- Hardware-free test support: a `test-support` Cargo feature on `platform-enclave`, enabled only from `[dev-dependencies]` (resolver 2 keeps it out of normal builds; not `cfg(test)`, which other crates' integration tests cannot see), signs tokens with chosen claims under a throwaway key generated at test time (no key committed, `docs/DATA_POLICY.md` rule 3). The trusted key set is a parameter only under `test-support`; a test shows a production verifier rejects a token signed by the test key. A CI step proves release binaries build without the feature.
+- Hardware-free test support: a non-default `simulated` Cargo feature on `platform-enclave` (enabled from `[dev-dependencies]` and by `platform-api`'s `dev`, never in a release build; not `cfg(test)`, which other crates' integration tests cannot see) signs tokens with chosen claims under a throwaway key generated at run time (no key committed, `docs/DATA_POLICY.md` rule 3). It is the same signer P84's simulator uses. The verifier always takes its key set as a parameter; a test shows a verifier holding another key set rejects a token signed by the simulator's key. A CI step proves release builds do not enable the feature.
 - Negative tests (test-key tokens first, then P12 phase B's recorded tokens if committed; P48 adds its own): valid; wrong audience; wrong or missing nonce; expired; image digest not allowed; debug image; hardware other than TDX; missing `STABLE`; bad signature; unknown signing key. All pass under `cargo test --workspace` on `ubuntu-24.04-arm` and macOS.
 - An `attestation_token` fuzz target (the existing `snp_report` target stays for the simulated TEE): a file in `backend/fuzz/fuzz_targets/`, a `[[bin]]` entry in `backend/fuzz/Cargo.toml`, and an entry in the matrix in `.github/workflows/fuzz.yml`.
 - The Confidential Space glossary terms (attestation token, image digest, workload identity federation) are added to the guide from P3.
