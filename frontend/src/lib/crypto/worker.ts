@@ -11,6 +11,7 @@ import { LocalVault } from "../vault/localVault";
 import type { VaultClient } from "../vault/types";
 import { generateHpkeKeypair, generateMasterKey, isX25519Supported, keyFingerprint } from "./core";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
+import { loadEnvelopeModule } from "./envelope";
 import { loadDeviceKeys, saveDeviceKeys, type DeviceKeys } from "./keystore";
 import { parseWorkerRequest } from "./protocol";
 import type { InitResult, WorkerRequest, WorkerResponse } from "./protocol";
@@ -74,6 +75,14 @@ async function handleInit(): Promise<InitResult> {
   const { keys, created } = await ensureKeys();
   const x25519Supported = keys.hpkePublicKeyRaw !== null || (await isX25519Supported());
   const hpkePublicKeyB64 = keys.hpkePublicKeyRaw ? toB64(keys.hpkePublicKeyRaw) : null;
+
+  // Load the envelope module now so a browser that cannot run it is reported
+  // here, not first on an upload. Seals stay refused until it loads.
+  try {
+    await loadEnvelopeModule();
+  } catch (err) {
+    console.warn("envelope module failed to load (sealing unavailable)", err);
+  }
 
   // Enroll the public key so enclave pipelines can seal connector data to
   // this tenant. Best-effort: an unreachable backend must not block the drive.
