@@ -190,7 +190,9 @@ uses [Semantic Versioning](https://semver.org/).
   production `TokenVerifier` and release policy, refetching the key set (at
   most every 5 s) on an unknown key id. `KeyReleaseRequest` and
   `GET /api/v1/attestation` carry a `token` instead of `report_b64` and
-  `cert_chain_b64`, and `PUT /v1/keys` returns the enrolled public key. The
+  `cert_chain_b64`, and `PUT /v1/keys` returns the enrolled public key.
+  The stand-in answers a refused release with 403 and an unreachable key
+  set with 503; the enclave's query endpoints answer 503 in both cases. The
   simulator compiles only with `platform-enclave`'s `simulated` feature
   (enabled by `platform-api`'s `dev`, or `platform-connectors`'
   `simulated`): a build without it refuses every attestation when

@@ -675,3 +675,80 @@ async fn unenrolled_tenant_is_refused() {
     );
     assert_eq!(rp.release_count(), 0);
 }
+
+#[tokio::test]
+async fn refused_token_answers_403_and_unreachable_key_set_503() {
+    let identity = EnclaveIdentity::generate();
+    let debug = signer().with_claims(SimulatedClaims {
+        dbgstat: "enabled".into(),
+        ..SimulatedClaims::default()
+    });
+    for (rp, token_signer, expected) in [
+        (static_rp(), &debug, StatusCode::FORBIDDEN),
+        (
+            relying_party(Arc::new(UnreachableSource)),
+            signer(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let tenant = enrolled(&rp);
+        let challenge = rp.issue_challenge();
+        let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+        let token = token_signer.sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+        let req = request(tenant, &identity, &challenge.nonce_b64, token);
+        let (status, _) = post_release(rp, serde_json::to_vec(&req).unwrap()).await;
+        assert_eq!(status, expected);
+    }
+}
+
+#[tokio::test]
+async fn query_still_answers_503_when_the_stand_in_refuses() {
+    // The stand-in's 403 is between enclave and stand-in; the caller sees 503.
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let attestation = provider(SimulatedClaims::default());
+    let tenant = TenantId::generate();
+    let public_key = TenantKeypair::generate().public_key();
+    let mut snapshot = SnapshotWriter::begin(
+        &*vault,
+        tenant,
+        &public_key,
+        ConnectorSlug::new("quickbooks").unwrap(),
+    );
+    snapshot
+        .put("invoices", &sample_parquet_batch(1, 3))
+        .await
+        .expect("put");
+    snapshot.commit().await.expect("commit");
+    // The stand-in has no key for this tenant, so it refuses.
+    let key_provider = Arc::new(AttestedKeyProvider::new(
+        Arc::new(EnclaveIdentity::generate()),
+        attestation.clone(),
+        Arc::new(InProcessKeyReleaseClient(static_rp())),
+    ));
+    let query = ConnectorQueryService::new(
+        vault.clone(),
+        key_provider,
+        attestation,
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+        },
+        false,
+    );
+    let app = build_app(AppState {
+        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
+        vault,
+        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        query: Some(Arc::new(query)),
+        provisioning: None,
+    });
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/v1/query",
+        &[auth(&token_for(tenant)), json_header()],
+        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}

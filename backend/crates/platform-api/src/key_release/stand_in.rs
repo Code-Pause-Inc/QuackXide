@@ -289,12 +289,12 @@ impl KeyReleaseRelyingParty {
                 "denied",
                 "invalid tenant_id in key-release request",
             );
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
 
         let nonce = decode_32(&req.nonce_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed challenge nonce");
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
 
         // Consume single-use challenge nonce and enforce TTL.
@@ -307,40 +307,40 @@ impl KeyReleaseRelyingParty {
         };
         let Some(issued_at) = issued_at else {
             self.audit_denial(tenant, "unknown or replayed challenge nonce");
-            return Err(ApiError::AttestationUnavailable);
+            return Err(ApiError::Forbidden);
         };
         if issued_at.elapsed() > self.challenge_ttl {
             self.audit_denial(tenant, "expired challenge nonce");
-            return Err(ApiError::AttestationUnavailable);
+            return Err(ApiError::Forbidden);
         }
 
         let enclave_hpke_pk_raw = decode_32(&req.enclave_hpke_public_key_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed enclave HPKE public key");
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
         let enclave_hpke_pk = TenantPublicKey::from_raw(&enclave_hpke_pk_raw).map_err(|_| {
             self.audit_denial(tenant, "invalid X25519 enclave HPKE public key");
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
 
         let result_signing_pk = decode_32(&req.result_signing_public_key_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed result-signing public key");
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
         let tls_cert_sha256 = decode_32(&req.tls_cert_sha256_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed TLS certificate digest");
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
         let config_digest = decode_32(&req.config_digest_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed config digest");
-            ApiError::AttestationUnavailable
+            ApiError::Forbidden
         })?;
 
         if let Some(expected_cfg) = &self.expected_config_digest
             && !bool::from(expected_cfg.ct_eq(&config_digest))
         {
             self.audit_denial(tenant, "deployment config digest mismatch");
-            return Err(ApiError::AttestationUnavailable);
+            return Err(ApiError::Forbidden);
         }
 
         // Recompute the 64-byte binding the token's nonces must carry.
@@ -354,9 +354,10 @@ impl KeyReleaseRelyingParty {
         let expected_nonces = nonces_from_bytes(&expected_binding.to_report_data())
             .map_err(|_| ApiError::AttestationUnavailable)?;
         let verifier = self.verifier_for(&req.token).await.map_err(|err| {
-            let outcome = match err {
-                TokenError::KeySetUnavailable => "failed",
-                _ => "denied",
+            // An unreachable key set is an outage (503); anything else is a refusal (403).
+            let (outcome, status) = match err {
+                TokenError::KeySetUnavailable => ("failed", ApiError::AttestationUnavailable),
+                _ => ("denied", ApiError::Forbidden),
             };
             security_audit_event(
                 AuditKind::KeyRelease,
@@ -364,13 +365,13 @@ impl KeyReleaseRelyingParty {
                 outcome,
                 &err.to_string(),
             );
-            ApiError::AttestationUnavailable
+            status
         })?;
         verifier
             .verify(&req.token, &expected_nonces)
             .map_err(|err| {
                 self.audit_denial(tenant, &err.to_string());
-                ApiError::AttestationUnavailable
+                ApiError::Forbidden
             })?;
 
         let keys = self
@@ -379,7 +380,7 @@ impl KeyReleaseRelyingParty {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(tenant_secret) = keys.get(&tenant) else {
             self.audit_denial(tenant, "no key enrolled for tenant");
-            return Err(ApiError::AttestationUnavailable);
+            return Err(ApiError::Forbidden);
         };
 
         let info = key_release_info(tenant, &nonce);
@@ -603,7 +604,13 @@ impl AttestedKeyProvider {
             config_digest_b64: B64.encode(self.identity.config_digest()),
         };
 
-        let resp = self.client.release_key(&req).await?;
+        // A refusal (403) or outage (503) at the stand-in is "attestation
+        // unavailable" to the enclave's caller.
+        let resp = self
+            .client
+            .release_key(&req)
+            .await
+            .map_err(|_| ApiError::AttestationUnavailable)?;
         let wrapped_bytes = B64
             .decode(&resp.wrapped_key_b64)
             .map_err(|_| ApiError::AttestationUnavailable)?;
