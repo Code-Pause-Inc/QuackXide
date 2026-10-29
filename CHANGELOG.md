@@ -8,6 +8,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `platform_enclave::token::TokenVerifier` verifies Confidential Space
+  attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
+  with issuer, audience, validity (60 s clock-skew leeway), the expected
+  nonces, and the release policy (`GCP_INTEL_TDX`, `CONFIDENTIAL_SPACE`,
+  `disabled-since-boot`, `STABLE`, an allowed image digest). Tokens over
+  16 KiB are refused before parsing, and errors name a class, never token
+  contents. A dev-only signer (`simulated_token`, feature `simulated`)
+  issues tokens for tests, and the `attestation_token` fuzz target covers
+  the verifier.
 * Browser envelope sealing: `envelope-wasm` builds `platform-crypto`'s HPKE
   envelope seal for wasm32, and the crypto worker loads it through
   `frontend/src/lib/crypto/envelope.ts` to seal to a tenant's raw public

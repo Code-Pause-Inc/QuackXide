@@ -11,10 +11,20 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# DEV ONLY. The simulated attestation token signer, which signs
+# Confidential Space-shaped tokens with a throwaway key. Never a default
+# feature; test builds enable it.
+simulated = ["dep:rsa"]
+
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+jsonwebtoken.workspace = true
 p384.workspace = true
 rand.workspace = true
+rsa = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -24,4 +34,7 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# This crate with `simulated` on, for tests only (resolver 2 applies it only
+# when tests are built).
+platform-enclave = { path = ".", features = ["simulated"] }
 tokio.workspace = true
