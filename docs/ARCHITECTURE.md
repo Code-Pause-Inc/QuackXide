@@ -124,8 +124,10 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   only hardware evidence passes — development evidence or attestation
   failure refuses the sync (tested). No production provider exists yet: the
   current hardware provider probes for an SEV-SNP guest device and refuses,
-  and verifying Google's Confidential Space token (P47, P48) is to build.
-  Fail closed until proven attested.
+  and acquiring Google's Confidential Space token on hardware (P48) is to
+  build. Fail closed until proven attested. When attestation is not
+  required, a dev build verifies simulated tokens; a build without the
+  simulator refuses every sync (tested in CI).
 * **Zero-MFA sync**: RFC 6749 refresh-token grant for user-enrolled sources
   (consent + MFA happen once at enrollment); RFC 6749 §4.4
   client-credentials for machine-to-machine sources. Secrets live in
@@ -204,12 +206,13 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   its own (envelopes are sealed to a private key it does not hold at rest).
   In a `dev` build, when `KEY_RELEASE_URL` is configured,
   `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
-  `KeyReleaseRelyingParty`: it fetches a
-  single-use challenge nonce, binds the nonce and its in-RAM `EnclaveIdentity`
-  HPKE public key into a 64-byte `ReportDataBinding`, presents the signed
-  1184-byte `SnpReport` and `SnpCertChain` to the relying party, and unwraps
-  the HPKE-sealed tenant key into a zeroize-on-drop `TenantKeypair` for the
-  duration of that query. When `KEY_RELEASE_URL` is unset, the query endpoint
+  `KeyReleaseRelyingParty`: it fetches a single-use challenge nonce, binds
+  the nonce and its in-RAM `EnclaveIdentity` public keys into a 64-byte
+  `ReportDataBinding`, presents a simulated Confidential Space token
+  carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
+  key into a zeroize-on-drop `TenantKeypair` for the duration of that
+  query. The relying party checks the token with the production verifier
+  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query endpoint
   fails closed with 503. That relying party is the development and
   simulation stand-in (ADR 0004): it and its clients compile only with the
   `dev` feature, and a build without it refuses to start when
@@ -349,7 +352,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and `info` strings, for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys, the drive KEK or file keys; I/O or logging |
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait | Raw-string storage paths |
-| platform-enclave | `AttestationProvider` seam, fail-closed dev stub | "Trust me" attestation bypasses |
+| platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
 | platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out | Plaintext persistence |
 | platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
 | platform-billing | MoR (Paddle) webhook signature verification, replay guard | Webhook secrets in Debug output |

@@ -1,11 +1,15 @@
-//! Integration tests for Step 2:
-//! - Public enclave attestation endpoint (`GET /api/v1/attestation`) (`P85` / `P50`)
-//! - Attestation-gated key release (`KeyReleaseRelyingParty`, `InProcessKeyReleaseClient`,
-//!   `HttpKeyReleaseClient`, `AttestedKeyProvider`) (`P50` / `P51`)
+//! Integration tests for the simulated TEE's token-gated key release:
+//! - Public enclave attestation endpoint (`GET /api/v1/attestation`) (`P85`)
+//! - The key-release stand-in (`KeyReleaseRelyingParty`, its clients and
+//!   `AttestedKeyProvider`), verifying simulated Confidential Space tokens
+//!   (ADR 0004, P47)
 //! - Once-per-query key release session scoping (`QueryKeySession`)
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -19,23 +23,24 @@ use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::key_release::{
-    AttestationBundle, AttestedKeyProvider, EnclaveIdentity, EnrollTenantKeyRequest,
-    HttpKeyReleaseClient, InProcessKeyReleaseClient, KeyReleaseClient, KeyReleaseRelyingParty,
-    KeyReleaseRequest,
+    AttestationBundle, AttestedKeyProvider, EnclaveIdentity, HttpKeyReleaseClient, HttpKeySource,
+    InProcessKeyReleaseClient, KeyReleaseRelyingParty, KeyReleaseRequest, KeySource,
+    StaticKeySource, sim_attestation_router,
 };
 use platform_api::query::ConnectorQueryService;
 use platform_api::research::ResearchStores;
 use platform_api::{AppState, build_app};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
-use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::snapshot::SnapshotWriter;
-use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
-use platform_crypto::TenantKeypair;
-use platform_enclave::{
-    AttestationProvider, AttestationVerifier, GuestPolicy, ReportDataBinding, SNP_REPORT_BYTES,
-    SimulatedSnp, SimulatedSnpConfig, SnpCertChain, TeePlatform, TrustRoot,
+use platform_crypto::{TenantKeypair, TenantPublicKey};
+use platform_enclave::AttestationProvider;
+use platform_enclave::simulated_token::{
+    SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
+};
+use platform_enclave::token::{
+    JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError, TokenVerifier, nonces_from_bytes,
 };
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::InMemoryTenantRegistry;
@@ -46,7 +51,8 @@ use tower::ServiceExt;
 const SECRET: &str = "key-release-itest-secret";
 const ISS: &str = "urn:platform:auth";
 const AUD: &str = "urn:platform:drive";
-const SIM_NOW: u64 = 1_700_000_000;
+const SIM_ISSUER: &str = "http://sim-attestation.test";
+const MARKER: &str = "MARKERxMARKERxMARKER";
 
 fn token_for(tenant: TenantId) -> String {
     platform_auth::mint_token(SECRET, ISS, AUD, tenant, "itest", 3600).expect("mint")
@@ -109,24 +115,132 @@ fn sample_parquet_batch(start_id: i64, rows: i64) -> Vec<u8> {
     buf
 }
 
+fn signer() -> &'static TokenSigner {
+    static SIGNER: OnceLock<TokenSigner> = OnceLock::new();
+    SIGNER.get_or_init(|| TokenSigner::generate(SIM_ISSUER, SimulatedClaims::default()))
+}
+
+fn rotated_signer() -> &'static TokenSigner {
+    static SIGNER: OnceLock<TokenSigner> = OnceLock::new();
+    SIGNER.get_or_init(|| TokenSigner::generate(SIM_ISSUER, SimulatedClaims::default()))
+}
+
+fn policy() -> ReleasePolicy {
+    ReleasePolicy {
+        allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+    }
+}
+
+fn provider(claims: SimulatedClaims) -> Arc<SimulatedTokenProvider> {
+    Arc::new(SimulatedTokenProvider::in_process(
+        Arc::new(signer().with_claims(claims)),
+        policy(),
+    ))
+}
+
+fn relying_party(source: Arc<dyn KeySource>) -> Arc<KeyReleaseRelyingParty> {
+    Arc::new(KeyReleaseRelyingParty::new(source, SIM_ISSUER, policy()))
+}
+
+fn static_rp() -> Arc<KeyReleaseRelyingParty> {
+    relying_party(Arc::new(StaticKeySource(signer().jwks())))
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A release request for `tenant` bound to `identity` and the challenge
+/// `nonce_b64`, carrying `token`.
+fn request(
+    tenant: TenantId,
+    identity: &EnclaveIdentity,
+    nonce_b64: &str,
+    token: String,
+) -> KeyReleaseRequest {
+    KeyReleaseRequest {
+        tenant_id: tenant.to_string(),
+        nonce_b64: nonce_b64.to_owned(),
+        token,
+        enclave_hpke_public_key_b64: B64.encode(identity.enclave_hpke_public_key()),
+        result_signing_public_key_b64: B64.encode(identity.result_signing_public_key()),
+        tls_cert_sha256_b64: B64.encode(identity.tls_cert_sha256()),
+        config_digest_b64: B64.encode(identity.config_digest()),
+    }
+}
+
+fn binding_nonces(identity: &EnclaveIdentity, nonce_b64: &str) -> Vec<String> {
+    let nonce: [u8; 32] = B64.decode(nonce_b64).unwrap().try_into().unwrap();
+    nonces_from_bytes(&identity.binding_for_nonce(nonce).to_report_data()).unwrap()
+}
+
+/// Ask `rp` to release `tenant`'s key with a token from `token_signer`.
+async fn release_with(
+    rp: &KeyReleaseRelyingParty,
+    token_signer: &TokenSigner,
+    tenant: TenantId,
+) -> Result<(), &'static str> {
+    let identity = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+    let token = token_signer.sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    rp.release_key(&request(tenant, &identity, &challenge.nonce_b64, token))
+        .await
+        .map(|_| ())
+        .map_err(|_| "refused")
+}
+
+fn enrolled(rp: &KeyReleaseRelyingParty) -> TenantId {
+    let tenant = TenantId::generate();
+    rp.insert_tenant_key(tenant, &TenantKeypair::generate());
+    tenant
+}
+
+/// A key source that serves `first`, then `then` on every later fetch.
+struct RotatingSource {
+    first: JwkSet,
+    then: JwkSet,
+    fetches: AtomicUsize,
+}
+
+#[async_trait]
+impl KeySource for RotatingSource {
+    async fn fetch(&self) -> Result<JwkSet, TokenError> {
+        let n = self.fetches.fetch_add(1, Ordering::SeqCst);
+        Ok(if n == 0 {
+            self.first.clone()
+        } else {
+            self.then.clone()
+        })
+    }
+}
+
+struct UnreachableSource;
+
+#[async_trait]
+impl KeySource for UnreachableSource {
+    async fn fetch(&self) -> Result<JwkSet, TokenError> {
+        Err(TokenError::KeySetUnavailable)
+    }
+}
+
 #[tokio::test]
-async fn attestation_endpoint_returns_verifiable_snp_bundle_bound_to_caller_nonce_and_identity() {
+async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let snp = Arc::new(SimulatedSnp::new());
+    let attestation = provider(SimulatedClaims::default());
     let identity = Arc::new(EnclaveIdentity::with_metadata([0x11; 32], [0x42; 32]));
-    let relying_party = Arc::new(
-        KeyReleaseRelyingParty::new(snp.verifier(SIM_NOW), false)
-            .with_expected_config_digest([0x42; 32]),
-    );
     let key_provider = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
-        snp.clone(),
-        Arc::new(InProcessKeyReleaseClient(relying_party)),
+        attestation.clone(),
+        Arc::new(InProcessKeyReleaseClient(static_rp())),
     ));
     let query = ConnectorQueryService::new(
         vault.clone(),
         key_provider,
-        snp.clone(),
+        attestation,
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
@@ -134,7 +248,6 @@ async fn attestation_endpoint_returns_verifiable_snp_bundle_bound_to_caller_nonc
         false,
     )
     .with_enclave_identity(identity.clone());
-
     let app = build_app(AppState {
         config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
         vault,
@@ -144,63 +257,44 @@ async fn attestation_endpoint_returns_verifiable_snp_bundle_bound_to_caller_nonc
     });
 
     let nonce = [0u8; 32];
-    let nonce_b64 = B64.encode(nonce);
     let (status, body) = send(
         &app,
         "GET",
-        &format!("/api/v1/attestation?nonce_b64={nonce_b64}"),
+        &format!("/api/v1/attestation?nonce_b64={}", B64.encode(nonce)),
         &[],
         Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-
     let bundle: AttestationBundle = serde_json::from_slice(&body).expect("json");
     assert_eq!(bundle.platform, "simulated");
+    assert_eq!(bundle.tls_cert_sha256_b64, B64.encode([0x11; 32]));
+    assert_eq!(bundle.config_digest_b64, B64.encode([0x42; 32]));
     assert_eq!(
         bundle.enclave_hpke_public_key_b64,
         B64.encode(identity.enclave_hpke_public_key())
     );
-    assert_eq!(
-        bundle.result_signing_public_key_b64,
-        B64.encode(identity.result_signing_public_key())
-    );
-    assert_eq!(bundle.tls_cert_sha256_b64, B64.encode([0x11; 32]));
-    assert_eq!(bundle.config_digest_b64, B64.encode([0x42; 32]));
 
-    let report_bytes = B64.decode(&bundle.report_b64).expect("report_b64");
-    assert_eq!(report_bytes.len(), SNP_REPORT_BYTES);
-    let cert_chain_bytes = B64.decode(&bundle.cert_chain_b64).expect("cert_chain_b64");
-    let chain = SnpCertChain::from_bytes(&cert_chain_bytes).expect("cert chain");
+    // The token verifies against the signer's keys, bound to the caller's
+    // nonce and the enclave's keys.
+    let verifier =
+        TokenVerifier::new(&signer().jwks(), SIM_ISSUER, SIMULATED_AUDIENCE, policy()).unwrap();
+    let expected = nonces_from_bytes(&identity.binding_for_nonce(nonce).to_report_data()).unwrap();
+    verifier
+        .verify(&bundle.token, &expected)
+        .expect("bundle token must verify");
 
-    let expected_binding = identity.binding_for_nonce(nonce);
-    let verified = snp
-        .verifier(SIM_NOW)
-        .verify(&report_bytes, &chain, &expected_binding.to_report_data())
-        .expect("bundle must pass full cryptographic verification");
-    assert_eq!(verified.platform(), TeePlatform::Simulated);
-
-    // Invalid base64 or wrong-length nonces fail with 400.
-    let (status, _) = send(
-        &app,
-        "GET",
-        "/api/v1/attestation?nonce_b64=not-valid-base64!!!",
-        &[],
-        Vec::new(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    let short_nonce = B64.encode([1u8; 16]);
-    let (status, _) = send(
-        &app,
-        "GET",
-        &format!("/api/v1/attestation?nonce_b64={short_nonce}"),
-        &[],
-        Vec::new(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for bad in ["not-valid-base64!!!".to_owned(), B64.encode([1u8; 16])] {
+        let (status, _) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/attestation?nonce_b64={bad}"),
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]
@@ -212,46 +306,42 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
 
     // Seal a 3-object snapshot so we can prove key release happens ONCE per query,
     // not 1 (manifest) + 3 (objects) = 4 times.
-    let snp = Arc::new(SimulatedSnp::new());
+    let attestation = provider(SimulatedClaims::default());
     let slug = ConnectorSlug::new("quickbooks").unwrap();
     let steward_pk = steward_key.public_key();
     let mut snapshot = SnapshotWriter::begin(&*vault, steward, &steward_pk, slug.clone());
-    snapshot
-        .put("invoices_part1", &sample_parquet_batch(1, 5))
-        .await
-        .expect("put 1");
-    snapshot
-        .put("invoices_part2", &sample_parquet_batch(6, 5))
-        .await
-        .expect("put 2");
-    snapshot
-        .put("invoices_part3", &sample_parquet_batch(11, 5))
-        .await
-        .expect("put 3");
+    for (name, start) in [
+        ("invoices_part1", 1),
+        ("invoices_part2", 6),
+        ("invoices_part3", 11),
+    ] {
+        snapshot
+            .put(name, &sample_parquet_batch(start, 5))
+            .await
+            .expect("put");
+    }
     snapshot.commit().await.expect("commit 3-object snapshot");
 
-    // Start the standalone KeyReleaseRelyingParty on an ephemeral local TCP port.
-    let relying_party = Arc::new(KeyReleaseRelyingParty::new(snp.verifier(SIM_NOW), false));
-    relying_party.insert_tenant_key(steward, &steward_key);
+    // The stand-in on an ephemeral local TCP port.
+    let rp = static_rp();
+    rp.insert_tenant_key(steward, &steward_key);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
-    let rp_router = relying_party.clone().router();
-    let server_handle = tokio::spawn(async move {
+    let rp_router = rp.clone().router();
+    let server = tokio::spawn(async move {
         let _ = axum::serve(listener, rp_router).await;
     });
 
     let identity = Arc::new(EnclaveIdentity::generate());
-    let http_client = Arc::new(HttpKeyReleaseClient::new(format!("http://{addr}")));
     let key_provider = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
-        snp.clone(),
-        http_client,
+        attestation.clone(),
+        Arc::new(HttpKeyReleaseClient::new(format!("http://{addr}"))),
     ));
-
     let query = ConnectorQueryService::new(
         vault.clone(),
         key_provider.clone(),
-        snp.clone(),
+        attestation,
         EngineSettings {
             zk: ZkMode::Enabled,
             max_concurrent_queries: 4,
@@ -260,7 +350,6 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
     )
     .with_enclave_identity(identity)
     .with_research(ResearchStores::in_memory(), 11, 100);
-
     let app = build_app(AppState {
         config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
         vault,
@@ -272,7 +361,6 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         ))),
     });
 
-    // 1. Steward runs an aggregate query across all 3 sealed Parquet objects.
     let (status, body) = send(
         &app,
         "POST",
@@ -283,16 +371,13 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(parsed["row_count"], 1);
     assert_eq!(parsed["rows"][0]["n"], 15);
     assert_eq!(parsed["rows"][0]["total"], 15_000);
-
-    // Despite opening 1 manifest + 3 Parquet envelopes, key release happened exactly ONCE.
+    // One manifest + three objects opened, one key release.
     assert_eq!(key_provider.release_count(), 1);
-    assert_eq!(relying_party.release_count(), 1);
+    assert_eq!(rp.release_count(), 1);
 
-    // 2. Steward grants researcher access and researcher queries the steward's dataset.
-    let grant_req = serde_json::json!({
+    let grant = serde_json::json!({
         "researcher_tenant": researcher.to_string(),
         "connector": "quickbooks"
     });
@@ -301,12 +386,11 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         "POST",
         "/api/v1/grants",
         &[auth(&token_for(steward)), json_header()],
-        serde_json::to_vec(&grant_req).unwrap(),
+        serde_json::to_vec(&grant).unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-
-    let req_body = serde_json::json!({
+    let research = serde_json::json!({
         "steward_tenant": steward.to_string(),
         "connector": "quickbooks",
         "sql": "SELECT status, COUNT(*) AS n FROM quickbooks GROUP BY status"
@@ -316,233 +400,335 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         "POST",
         "/api/v1/research/query",
         &[auth(&token_for(researcher)), json_header()],
-        serde_json::to_vec(&req_body).unwrap(),
+        serde_json::to_vec(&research).unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(key_provider.release_count(), 2);
-    assert_eq!(relying_party.release_count(), 2);
+    assert_eq!(rp.release_count(), 2);
 
-    server_handle.abort();
+    server.abort();
 }
 
 #[tokio::test]
-async fn key_release_relying_party_rejects_nonce_replay_mitm_key_swap_and_policy_violations() {
-    let tenant = TenantId::generate();
-    let tenant_key = TenantKeypair::generate();
-    let snp = SimulatedSnp::new();
-    let expected_cfg = [0xAA; 32];
-    let rp = KeyReleaseRelyingParty::new(snp.verifier(SIM_NOW), false)
-        .with_expected_config_digest(expected_cfg);
+async fn release_succeeds_with_a_valid_token() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    release_with(&rp, signer(), tenant).await.expect("release");
+    assert_eq!(rp.release_count(), 1);
+}
 
-    // Enroll via the HTTP `/v1/keys` endpoint to verify enrollment round-trip as well.
-    let router = Arc::new(rp).router();
-    let enroll_req = EnrollTenantKeyRequest {
-        tenant_id: tenant.to_string(),
-        private_key_b64: B64.encode(tenant_key.to_private_key_bytes().expose()),
-    };
-    let (status, _) = send(
-        &router,
+#[tokio::test]
+async fn replayed_challenge_is_refused() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    let req = request(tenant, &identity, &challenge.nonce_b64, token);
+    assert!(rp.release_key(&req).await.is_ok(), "first use");
+    assert!(
+        rp.release_key(&req).await.is_err(),
+        "replay must be refused"
+    );
+}
+
+#[tokio::test]
+async fn token_bound_to_other_keys_is_refused() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let attested = EnclaveIdentity::generate();
+    let attacker = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    let nonces = binding_nonces(&attested, &challenge.nonce_b64);
+    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    // Same token, but the release asks for the key to be sealed to the attacker's key.
+    let req = request(tenant, &attacker, &challenge.nonce_b64, token);
+    assert!(rp.release_key(&req).await.is_err());
+    assert_eq!(rp.release_count(), 0);
+}
+
+async fn refused_for(claims: SimulatedClaims) {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    assert!(
+        release_with(&rp, &signer().with_claims(claims), tenant)
+            .await
+            .is_err()
+    );
+    assert_eq!(rp.release_count(), 0);
+}
+
+#[tokio::test]
+async fn debug_token_is_refused() {
+    refused_for(SimulatedClaims {
+        dbgstat: "enabled".into(),
+        ..SimulatedClaims::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_image_digest_is_refused() {
+    refused_for(SimulatedClaims {
+        image_digest: format!("sha256:{}", "0".repeat(64)),
+        ..SimulatedClaims::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn non_tdx_token_is_refused() {
+    refused_for(SimulatedClaims {
+        hwmodel: "GCP_AMD_SEV".into(),
+        ..SimulatedClaims::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn expired_token_is_refused() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+    let token = signer().sign_at(
+        SIMULATED_AUDIENCE,
+        &nonces,
+        now() - 7200,
+        Duration::from_secs(60),
+    );
+    let req = request(tenant, &identity, &challenge.nonce_b64, token);
+    assert!(rp.release_key(&req).await.is_err());
+}
+
+#[tokio::test]
+async fn unknown_kid_refetches_once_then_succeeds() {
+    let source = Arc::new(RotatingSource {
+        first: signer().jwks(),
+        then: rotated_signer().jwks(),
+        fetches: AtomicUsize::new(0),
+    });
+    let rp = Arc::new(
+        KeyReleaseRelyingParty::new(source.clone(), SIM_ISSUER, policy())
+            .with_refetch_interval(Duration::ZERO),
+    );
+    let tenant = enrolled(&rp);
+    release_with(&rp, signer(), tenant).await.expect("old key");
+    // The simulator restarted with a new key.
+    release_with(&rp, rotated_signer(), tenant)
+        .await
+        .expect("refetched key");
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unknown_kid_after_refetch_is_refused() {
+    let source = Arc::new(RotatingSource {
+        first: signer().jwks(),
+        then: signer().jwks(),
+        fetches: AtomicUsize::new(0),
+    });
+    let rp = Arc::new(KeyReleaseRelyingParty::new(
+        source.clone(),
+        SIM_ISSUER,
+        policy(),
+    ));
+    let tenant = enrolled(&rp);
+    assert!(release_with(&rp, rotated_signer(), tenant).await.is_err());
+    // A second unknown key inside the refetch interval does not fetch again.
+    assert!(release_with(&rp, rotated_signer(), tenant).await.is_err());
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unreachable_key_set_is_refused_and_audited_as_failed() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let rp = relying_party(Arc::new(UnreachableSource));
+    let tenant = enrolled(&rp);
+    assert!(release_with(&rp, signer(), tenant).await.is_err());
+    assert!(
+        capture.contains("crypto.key_release", "failed"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+async fn post_release(rp: Arc<KeyReleaseRelyingParty>, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+    send(&rp.router(), "POST", "/v1/release", &[json_header()], body).await
+}
+
+#[tokio::test]
+async fn oversized_release_body_is_refused() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    let req = request(
+        tenant,
+        &identity,
+        &challenge.nonce_b64,
+        "a".repeat(16 * 1024 + 1),
+    );
+    let (status, _) = post_release(rp.clone(), serde_json::to_vec(&req).unwrap()).await;
+    assert!(!status.is_success(), "{status}");
+    assert_eq!(rp.release_count(), 0);
+}
+
+#[tokio::test]
+async fn refusal_bodies_carry_no_token_text() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    for token in [
+        format!("{MARKER}.{MARKER}.{MARKER}"),
+        signer().sign(
+            SIMULATED_AUDIENCE,
+            &[MARKER.to_owned()],
+            Duration::from_secs(600),
+        ),
+    ] {
+        let req = request(tenant, &identity, &challenge.nonce_b64, token);
+        let (status, body) = post_release(rp.clone(), serde_json::to_vec(&req).unwrap()).await;
+        assert!(!status.is_success());
+        assert!(!String::from_utf8_lossy(&body).contains("MARKER"));
+    }
+}
+
+#[tokio::test]
+async fn enroll_returns_the_public_key() {
+    let rp = static_rp();
+    let keypair = TenantKeypair::generate();
+    let body = serde_json::json!({
+        "tenant_id": TenantId::generate().to_string(),
+        "private_key_b64": B64.encode(keypair.to_private_key_bytes().expose()),
+    });
+    let (status, body) = send(
+        &rp.router(),
         "PUT",
         "/v1/keys",
         &[json_header()],
-        serde_json::to_vec(&enroll_req).unwrap(),
+        serde_json::to_vec(&body).unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    // Rebuild direct handle for fine-grained protocol negative tests.
-    let rp = KeyReleaseRelyingParty::new(snp.verifier(SIM_NOW), false)
-        .with_expected_config_digest(expected_cfg);
-    rp.insert_tenant_key(tenant, &tenant_key);
-    let identity = EnclaveIdentity::with_metadata([0u8; 32], expected_cfg);
-
-    // 1. Unknown/unissued challenge nonce is rejected.
-    let fake_nonce = [0x11u8; 32];
-    let binding = identity.binding_for_nonce(fake_nonce);
-    let evidence = snp
-        .produce_evidence(&binding.to_report_data())
-        .await
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let public = B64
+        .decode(parsed["public_key_b64"].as_str().unwrap())
         .unwrap();
-    assert!(
-        rp.release_key(&KeyReleaseRequest {
-            tenant_id: tenant.to_string(),
-            nonce_b64: B64.encode(fake_nonce),
-            report_b64: B64.encode(&evidence.report),
-            cert_chain_b64: B64.encode(&evidence.cert_chain),
-            enclave_hpke_public_key_b64: B64.encode(identity.enclave_hpke_public_key()),
-            result_signing_public_key_b64: B64.encode(identity.result_signing_public_key()),
-            tls_cert_sha256_b64: B64.encode([0u8; 32]),
-            config_digest_b64: B64.encode(expected_cfg),
-        })
-        .is_err()
-    );
-
-    // 2. Valid challenge succeeds once, and replay of the same nonce is rejected.
-    let challenge = rp.issue_challenge();
-    let nonce_vec = B64.decode(&challenge.nonce_b64).unwrap();
-    let nonce: [u8; 32] = nonce_vec.try_into().unwrap();
-    let binding = identity.binding_for_nonce(nonce);
-    let evidence = snp
-        .produce_evidence(&binding.to_report_data())
-        .await
-        .unwrap();
-    let valid_req = KeyReleaseRequest {
-        tenant_id: tenant.to_string(),
-        nonce_b64: challenge.nonce_b64.clone(),
-        report_b64: B64.encode(&evidence.report),
-        cert_chain_b64: B64.encode(&evidence.cert_chain),
-        enclave_hpke_public_key_b64: B64.encode(identity.enclave_hpke_public_key()),
-        result_signing_public_key_b64: B64.encode(identity.result_signing_public_key()),
-        tls_cert_sha256_b64: B64.encode([0u8; 32]),
-        config_digest_b64: B64.encode(expected_cfg),
-    };
-    let released = rp
-        .release_key(&valid_req)
-        .ok()
-        .expect("first release must succeed");
-    assert!(!released.wrapped_key_b64.is_empty());
-
-    assert!(
-        rp.release_key(&valid_req).is_err(),
-        "replayed challenge nonce must fail"
-    );
-
-    // 3. MITM key-swap attack: attacker takes a genuine enclave report but substitutes
-    // their own HPKE public key in the request so the relying party wraps the tenant key to them.
-    let challenge = rp.issue_challenge();
-    let nonce: [u8; 32] = B64
-        .decode(&challenge.nonce_b64)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let binding = identity.binding_for_nonce(nonce);
-    let evidence = snp
-        .produce_evidence(&binding.to_report_data())
-        .await
-        .unwrap();
-    let attacker_key = TenantKeypair::generate();
-    assert!(
-        rp.release_key(&KeyReleaseRequest {
-            tenant_id: tenant.to_string(),
-            nonce_b64: challenge.nonce_b64,
-            report_b64: B64.encode(&evidence.report),
-            cert_chain_b64: B64.encode(&evidence.cert_chain),
-            enclave_hpke_public_key_b64: B64.encode(attacker_key.public_key().to_raw()),
-            result_signing_public_key_b64: B64.encode(identity.result_signing_public_key()),
-            tls_cert_sha256_b64: B64.encode([0u8; 32]),
-            config_digest_b64: B64.encode(expected_cfg),
-        })
-        .is_err(),
-        "MITM HPKE key substitution must fail REPORT_DATA binding"
-    );
-
-    // 4. Config digest mismatch is rejected.
-    let challenge = rp.issue_challenge();
-    let nonce: [u8; 32] = B64
-        .decode(&challenge.nonce_b64)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let wrong_cfg_identity = EnclaveIdentity::with_metadata([0u8; 32], [0xBB; 32]);
-    let binding = wrong_cfg_identity.binding_for_nonce(nonce);
-    let evidence = snp
-        .produce_evidence(&binding.to_report_data())
-        .await
-        .unwrap();
-    assert!(
-        rp.release_key(&KeyReleaseRequest {
-            tenant_id: tenant.to_string(),
-            nonce_b64: challenge.nonce_b64,
-            report_b64: B64.encode(&evidence.report),
-            cert_chain_b64: B64.encode(&evidence.cert_chain),
-            enclave_hpke_public_key_b64: B64.encode(wrong_cfg_identity.enclave_hpke_public_key()),
-            result_signing_public_key_b64: B64
-                .encode(wrong_cfg_identity.result_signing_public_key()),
-            tls_cert_sha256_b64: B64.encode([0u8; 32]),
-            config_digest_b64: B64.encode([0xBB; 32]),
-        })
-        .is_err(),
-        "wrong config digest must be rejected"
-    );
-
-    // 5. Expired challenge nonce is rejected.
-    let short_ttl_rp = KeyReleaseRelyingParty::new(snp.verifier(SIM_NOW), false)
-        .with_challenge_ttl(Duration::from_millis(1));
-    short_ttl_rp.insert_tenant_key(tenant, &tenant_key);
-    let challenge = short_ttl_rp.issue_challenge();
-    tokio::time::sleep(Duration::from_millis(15)).await;
-    let nonce: [u8; 32] = B64
-        .decode(&challenge.nonce_b64)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let binding = ReportDataBinding {
-        nonce,
-        enclave_hpke_public_key: *identity.enclave_hpke_public_key(),
-        result_signing_public_key: *identity.result_signing_public_key(),
-        tls_cert_sha256: [0u8; 32],
-        config_digest: [0u8; 32],
-    };
-    let evidence = snp
-        .produce_evidence(&binding.to_report_data())
-        .await
-        .unwrap();
-    assert!(
-        short_ttl_rp
-            .release_key(&KeyReleaseRequest {
-                tenant_id: tenant.to_string(),
-                nonce_b64: challenge.nonce_b64,
-                report_b64: B64.encode(&evidence.report),
-                cert_chain_b64: B64.encode(&evidence.cert_chain),
-                enclave_hpke_public_key_b64: B64.encode(identity.enclave_hpke_public_key()),
-                result_signing_public_key_b64: B64.encode(identity.result_signing_public_key()),
-                tls_cert_sha256_b64: B64.encode([0u8; 32]),
-                config_digest_b64: B64.encode([0u8; 32]),
-            })
-            .is_err(),
-        "expired challenge must fail"
+    assert_eq!(
+        TenantPublicKey::from_raw(&public).unwrap().to_raw(),
+        keypair.public_key().to_raw()
     );
 }
 
 #[tokio::test]
-async fn query_endpoint_fails_closed_when_key_release_rejects_measurement_debug_or_unenrolled_tenant()
- {
-    let tenant = TenantId::generate();
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
-
-    let good_snp = Arc::new(SimulatedSnp::new());
-    let pipeline = EnclavePipeline::new(good_snp.clone(), vault.clone(), false);
-    pipeline
-        .run_sync(&SyncJob {
-            tenant,
-            tenant_public_key: keypair.public_key(),
-            source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
-        })
-        .await
-        .expect("seal");
-
-    // Case 1: Enclave runs with a measurement not approved by the relying party.
-    let bad_measurement_snp = Arc::new(SimulatedSnp::with_config(SimulatedSnpConfig {
-        measurement: [0xEE; 48],
-        ..SimulatedSnpConfig::default()
-    }));
-    let rp = Arc::new(KeyReleaseRelyingParty::new(
-        good_snp.verifier(SIM_NOW),
-        false,
+async fn http_sim_attestation_service_serves_tokens_and_keys_end_to_end() {
+    // The sim-attestation service over HTTP, as in the compose stack.
+    let sim = Arc::new(TokenSigner::generate(
+        SIM_ISSUER,
+        SimulatedClaims::default(),
     ));
-    rp.insert_tenant_key(tenant, &keypair);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = sim_attestation_router(sim);
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let attestation = SimulatedTokenProvider::from_url(&base, SIM_ISSUER, policy());
+    let rp = relying_party(Arc::new(HttpKeySource::new(&base)));
+    let tenant = enrolled(&rp);
     let identity = Arc::new(EnclaveIdentity::generate());
-    let bad_provider = Arc::new(AttestedKeyProvider::new(
+    let key_provider = AttestedKeyProvider::new(
         identity,
-        bad_measurement_snp,
-        Arc::new(InProcessKeyReleaseClient(rp)),
+        Arc::new(attestation),
+        Arc::new(InProcessKeyReleaseClient(rp.clone())),
+    );
+    use platform_api::query::EnclaveKeyProvider as _;
+    assert!(
+        key_provider.begin_query_session(tenant).await.is_ok(),
+        "release over HTTP"
+    );
+    assert_eq!(rp.release_count(), 1);
+
+    // The provider's own check passes against the fetched keys too.
+    let gate_provider = SimulatedTokenProvider::from_url(&base, SIM_ISSUER, policy());
+    let evidence = gate_provider.produce_evidence(&[3u8; 32]).await.unwrap();
+    gate_provider
+        .verify_evidence(&evidence, &[3u8; 32])
+        .unwrap();
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn unenrolled_tenant_is_refused() {
+    let rp = static_rp();
+    assert!(
+        release_with(&rp, signer(), TenantId::generate())
+            .await
+            .is_err()
+    );
+    assert_eq!(rp.release_count(), 0);
+}
+
+#[tokio::test]
+async fn refused_token_answers_403_and_unreachable_key_set_503() {
+    let identity = EnclaveIdentity::generate();
+    let debug = signer().with_claims(SimulatedClaims {
+        dbgstat: "enabled".into(),
+        ..SimulatedClaims::default()
+    });
+    for (rp, token_signer, expected) in [
+        (static_rp(), &debug, StatusCode::FORBIDDEN),
+        (
+            relying_party(Arc::new(UnreachableSource)),
+            signer(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let tenant = enrolled(&rp);
+        let challenge = rp.issue_challenge();
+        let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+        let token = token_signer.sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+        let req = request(tenant, &identity, &challenge.nonce_b64, token);
+        let (status, _) = post_release(rp, serde_json::to_vec(&req).unwrap()).await;
+        assert_eq!(status, expected);
+    }
+}
+
+#[tokio::test]
+async fn query_still_answers_503_when_the_stand_in_refuses() {
+    // The stand-in's 403 is between enclave and stand-in; the caller sees 503.
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let attestation = provider(SimulatedClaims::default());
+    let tenant = TenantId::generate();
+    let public_key = TenantKeypair::generate().public_key();
+    let mut snapshot = SnapshotWriter::begin(
+        &*vault,
+        tenant,
+        &public_key,
+        ConnectorSlug::new("quickbooks").unwrap(),
+    );
+    snapshot
+        .put("invoices", &sample_parquet_batch(1, 3))
+        .await
+        .expect("put");
+    snapshot.commit().await.expect("commit");
+    // The stand-in has no key for this tenant, so it refuses.
+    let key_provider = Arc::new(AttestedKeyProvider::new(
+        Arc::new(EnclaveIdentity::generate()),
+        attestation.clone(),
+        Arc::new(InProcessKeyReleaseClient(static_rp())),
     ));
     let query = ConnectorQueryService::new(
         vault.clone(),
-        bad_provider,
-        good_snp.clone(),
+        key_provider,
+        attestation,
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
@@ -551,7 +737,7 @@ async fn query_endpoint_fails_closed_when_key_release_rejects_measurement_debug_
     );
     let app = build_app(AppState {
         config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault: vault.clone(),
+        vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
         query: Some(Arc::new(query)),
         provisioning: None,
@@ -565,276 +751,4 @@ async fn query_endpoint_fails_closed_when_key_release_rejects_measurement_debug_
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-
-    // Case 2: Relying party requires production AMD hardware (`require_hardware_sev_snp = true`),
-    // rejecting `SimulatedSnp` evidence even if everything else matches.
-    let prod_rp = Arc::new(KeyReleaseRelyingParty::new(
-        good_snp.verifier(SIM_NOW),
-        true,
-    ));
-    prod_rp.insert_tenant_key(tenant, &keypair);
-    let prod_provider = Arc::new(AttestedKeyProvider::new(
-        Arc::new(EnclaveIdentity::generate()),
-        good_snp.clone(),
-        Arc::new(InProcessKeyReleaseClient(prod_rp)),
-    ));
-    let prod_query = ConnectorQueryService::new(
-        vault.clone(),
-        prod_provider,
-        good_snp.clone(),
-        EngineSettings {
-            zk: ZkMode::Disabled,
-            max_concurrent_queries: 4,
-        },
-        false,
-    );
-    let prod_app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault: vault.clone(),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: Some(Arc::new(prod_query)),
-        provisioning: None,
-    });
-    let (status, _) = send(
-        &prod_app,
-        "POST",
-        "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
-        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-
-    // Case 3: Relying party configured with a mismatched ProductionAmd ARK root rejects the chain.
-    let amd_root_rp = Arc::new(KeyReleaseRelyingParty::new(
-        AttestationVerifier::new(
-            TrustRoot::ProductionAmd {
-                ark_public_keys_sec1: vec![vec![0x04; 97]],
-            },
-            SimulatedSnp::default_policy(SIM_NOW),
-        ),
-        false,
-    ));
-    amd_root_rp.insert_tenant_key(tenant, &keypair);
-    let amd_root_provider = Arc::new(AttestedKeyProvider::new(
-        Arc::new(EnclaveIdentity::generate()),
-        good_snp.clone(),
-        Arc::new(InProcessKeyReleaseClient(amd_root_rp)),
-    ));
-    let amd_root_query = ConnectorQueryService::new(
-        vault.clone(),
-        amd_root_provider,
-        good_snp.clone(),
-        EngineSettings {
-            zk: ZkMode::Disabled,
-            max_concurrent_queries: 4,
-        },
-        false,
-    );
-    let amd_root_app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault: vault.clone(),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: Some(Arc::new(amd_root_query)),
-        provisioning: None,
-    });
-    let (status, _) = send(
-        &amd_root_app,
-        "POST",
-        "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
-        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-
-    // Case 4: Tenant key not enrolled in the relying party -> fails closed with 503.
-    let empty_rp = Arc::new(KeyReleaseRelyingParty::new(
-        good_snp.verifier(SIM_NOW),
-        false,
-    ));
-    let unenrolled_provider = Arc::new(AttestedKeyProvider::new(
-        Arc::new(EnclaveIdentity::generate()),
-        good_snp.clone(),
-        Arc::new(InProcessKeyReleaseClient(empty_rp)),
-    ));
-    let unenrolled_query = ConnectorQueryService::new(
-        vault.clone(),
-        unenrolled_provider,
-        good_snp,
-        EngineSettings {
-            zk: ZkMode::Disabled,
-            max_concurrent_queries: 4,
-        },
-        false,
-    );
-    let unenrolled_app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault,
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: Some(Arc::new(unenrolled_query)),
-        provisioning: None,
-    });
-    let (status, _) = send(
-        &unenrolled_app,
-        "POST",
-        "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
-        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-
-    // Case 5: GuestPolicy with DEBUG=1 is rejected by the relying party.
-    let debug_snp = SimulatedSnp::with_config(SimulatedSnpConfig {
-        policy: GuestPolicy::production_default().with_debug(true),
-        ..SimulatedSnpConfig::default()
-    });
-    let debug_rp = Arc::new(KeyReleaseRelyingParty::new(
-        debug_snp.verifier(SIM_NOW),
-        false,
-    ));
-    debug_rp.insert_tenant_key(tenant, &keypair);
-    let debug_client = InProcessKeyReleaseClient(debug_rp);
-    let challenge = debug_client
-        .issue_challenge()
-        .await
-        .ok()
-        .expect("challenge");
-    let nonce: [u8; 32] = B64
-        .decode(&challenge.nonce_b64)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let debug_id = EnclaveIdentity::generate();
-    let evidence = debug_snp
-        .produce_evidence(&debug_id.binding_for_nonce(nonce).to_report_data())
-        .await
-        .unwrap();
-    let res = debug_client
-        .release_key(&KeyReleaseRequest {
-            tenant_id: tenant.to_string(),
-            nonce_b64: challenge.nonce_b64,
-            report_b64: B64.encode(&evidence.report),
-            cert_chain_b64: B64.encode(&evidence.cert_chain),
-            enclave_hpke_public_key_b64: B64.encode(debug_id.enclave_hpke_public_key()),
-            result_signing_public_key_b64: B64.encode(debug_id.result_signing_public_key()),
-            tls_cert_sha256_b64: B64.encode([0u8; 32]),
-            config_digest_b64: B64.encode([0u8; 32]),
-        })
-        .await;
-    assert!(res.is_err());
-}
-
-#[tokio::test]
-async fn cross_container_seed_derivation_and_env_tamper_refusal_over_http() {
-    use platform_api::query::EnclaveKeyProvider as _;
-    use platform_enclave::MEASUREMENT_BYTES;
-
-    let tenant = TenantId::generate();
-    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
-
-    // Separate instances initialized purely via SIMULATED_SNP_SEED (as in separate Docker containers).
-    let enclave_snp = Arc::new(SimulatedSnp::from_source(|k| match k {
-        "SIMULATED_SNP_SEED" => Some("quackxide-docker-sim-seed-v1".into()),
-        _ => None,
-    }));
-    let rp_snp = SimulatedSnp::from_source(|k| match k {
-        "SIMULATED_SNP_SEED" => Some("quackxide-docker-sim-seed-v1".into()),
-        _ => None,
-    });
-
-    // Seal synthetic QuickBooks data using enclave_snp.
-    let pipeline = EnclavePipeline::new(enclave_snp.clone(), vault.clone(), false);
-    pipeline
-        .run_sync(&SyncJob {
-            tenant,
-            tenant_public_key: keypair.public_key(),
-            source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
-        })
-        .await
-        .expect("seal");
-
-    // Start relying party HTTP server using rp_snp's derived ARK trust root.
-    let rp = Arc::new(KeyReleaseRelyingParty::new(rp_snp.verifier(SIM_NOW), false));
-    rp.insert_tenant_key(tenant, &keypair);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let rp_router = rp.router();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, rp_router).await;
-    });
-    let base_url = format!("http://{addr}");
-
-    // 1. Happy path across containers: enclave_snp report verifies against rp_snp over HTTP.
-    let identity = Arc::new(EnclaveIdentity::generate());
-    let keys = Arc::new(AttestedKeyProvider::new(
-        identity.clone(),
-        enclave_snp.clone(),
-        Arc::new(HttpKeyReleaseClient::new(&base_url)),
-    ));
-    let service = Arc::new(
-        ConnectorQueryService::new(
-            vault.clone(),
-            keys,
-            enclave_snp,
-            EngineSettings {
-                zk: ZkMode::Disabled,
-                max_concurrent_queries: 4,
-            },
-            false,
-        )
-        .with_enclave_identity(identity),
-    );
-    let app = build_app(AppState {
-        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
-        vault: vault.clone(),
-        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
-        query: Some(service),
-        provisioning: None,
-    });
-    let (status, _) = send(
-        &app,
-        "POST",
-        "/api/v1/query",
-        &[auth(&token_for(tenant)), json_header()],
-        br#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_vec(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // 2. Container tampered measurement via SIMULATED_SNP_MEASUREMENT_HEX is refused over HTTP.
-    let tampered_meas_snp = Arc::new(SimulatedSnp::from_source(|k| match k {
-        "SIMULATED_SNP_SEED" => Some("quackxide-docker-sim-seed-v1".into()),
-        "SIMULATED_SNP_MEASUREMENT_HEX" => Some("aa".repeat(MEASUREMENT_BYTES)),
-        _ => None,
-    }));
-    let bad_meas_id = Arc::new(EnclaveIdentity::generate());
-    let bad_meas_keys = AttestedKeyProvider::new(
-        bad_meas_id,
-        tampered_meas_snp,
-        Arc::new(HttpKeyReleaseClient::new(&base_url)),
-    );
-    assert!(
-        bad_meas_keys.begin_query_session(tenant).await.is_err(),
-        "tampered SIMULATED_SNP_MEASUREMENT_HEX must be refused by relying party"
-    );
-
-    // 3. Container debug policy via SIMULATED_SNP_DEBUG=true is refused over HTTP.
-    let debug_env_snp = Arc::new(SimulatedSnp::from_source(|k| match k {
-        "SIMULATED_SNP_SEED" => Some("quackxide-docker-sim-seed-v1".into()),
-        "SIMULATED_SNP_DEBUG" => Some("true".into()),
-        _ => None,
-    }));
-    let debug_env_id = Arc::new(EnclaveIdentity::generate());
-    let debug_env_keys = AttestedKeyProvider::new(
-        debug_env_id,
-        debug_env_snp,
-        Arc::new(HttpKeyReleaseClient::new(&base_url)),
-    );
-    assert!(
-        debug_env_keys.begin_query_session(tenant).await.is_err(),
-        "SIMULATED_SNP_DEBUG=true must be refused by relying party"
-    );
 }

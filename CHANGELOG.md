@@ -107,8 +107,9 @@ uses [Semantic Versioning](https://semver.org/).
 * Query and research responses include `tee_platform`, the platform that
   passed the attestation gate: `amd-sev-snp`, `simulated` or `development`.
 * `devstack`, a dev-only server that runs the research lifecycle on one
-  machine: the API with the research routes on in-process dev keys and
-  fabricated attestation, seeded with a synthetic cohort, its catalog
+  machine: the API with the research routes on the simulated TEE
+  (in-process simulated tokens, with tenant keys released by the
+  key-release stand-in), seeded with a synthetic cohort, its catalog
   listing, and a token each for a steward and a researcher. It is built
   only with `platform-api`'s `dev` feature, refuses to start without
   `DEVSTACK_ALLOW_INSECURE=1` and `JWT_HS256_SECRET`, and listens only on
@@ -190,6 +191,34 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The simulated TEE issues Confidential Space-shaped attestation tokens
+  instead of SEV-SNP reports (ADR 0004). A dev-only `sim-attestation`
+  service plays Google's part (`POST /v1/token`, `GET /jwks`); the enclave's
+  `SimulatedTokenProvider` and the key-release stand-in check tokens with the
+  production `TokenVerifier` and release policy, refetching the key set (at
+  most every 5 s) on an unknown key id. `KeyReleaseRequest` and
+  `GET /api/v1/attestation` carry a `token` instead of `report_b64` and
+  `cert_chain_b64`, and `PUT /v1/keys` returns the enrolled public key.
+  The stand-in answers a refused release with 403 and an unreachable key
+  set with 503; the enclave's query endpoints answer 503 in both cases. The
+  simulator compiles only with `platform-enclave`'s `simulated` feature
+  (enabled by `platform-api`'s `dev`, or `platform-connectors`'
+  `simulated`): a build without it refuses every attestation when
+  `TEE_ATTESTATION_REQUIRED=false`, so does a dev build whose
+  `sim-attestation` is unreachable, and the connector pipeline now refuses
+  a rejected attestation in dev mode instead of syncing unattested. A local
+  `connector-worker` therefore needs `--features simulated`,
+  `SIM_ATTESTATION_URL` and a running `sim-attestation` (README). CI checks
+  that release builds do not enable the simulator and that a release
+  `connector-worker` refuses unattested syncs. `scripts/test-simulated-tee.sh`
+  passes again: its stack drops `fake-gcs` (version 1.49.3 refuses the
+  uploads `object_store` 0.13 sends) and keeps snapshots in the in-memory
+  vault, and checks a debug image, an unlisted image digest and non-TDX
+  hardware. README no longer claims query responses carry an
+  `enclave_signature`; none is produced.
+* GCS emulator writes (`STORAGE_EMULATOR_HOST`) no longer ask the GCE
+  metadata server for a credential: `object_store` 0.13 skips signing on
+  reads only, so the emulator client now carries a placeholder credential.
 * The simulated TEE's key-release service is dev-only (ADR 0004): the
   relying party, its clients and `AttestedKeyProvider`
   (`key_release::stand_in`), and the `key-release` and `query-demo`

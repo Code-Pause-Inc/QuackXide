@@ -1,6 +1,6 @@
 //! DEV demo: seals a QuickBooks fixture with the connector pipeline on the
-//! simulated SEV-SNP TEE (`SimulatedSnp`), releases the tenant key via the
-//! attestation-verifying relying party (`KeyReleaseRelyingParty` +
+//! simulated TEE (an in-process `SimulatedTokenProvider`), releases the tenant
+//! key via the token-verifying stand-in (`KeyReleaseRelyingParty` +
 //! `AttestedKeyProvider`), and prints an aggregate result.
 //!
 //!   cargo run -p platform-api --features dev --bin query-demo
@@ -9,13 +9,17 @@ use std::sync::Arc;
 
 use platform_api::key_release::{
     AttestedKeyProvider, EnclaveIdentity, InProcessKeyReleaseClient, KeyReleaseRelyingParty,
+    StaticKeySource,
 };
 use platform_api::query::ConnectorQueryService;
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
-use platform_enclave::SimulatedSnp;
+use platform_enclave::simulated_token::{
+    SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
+};
+use platform_enclave::token::ReleasePolicy;
 use platform_storage::{ObjectStoreVault, VaultStore};
 use quackxide_engine::EngineSettings;
 
@@ -26,10 +30,20 @@ async fn main() -> anyhow::Result<()> {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
     let tenant = TenantId::generate();
-    let simulated_snp = Arc::new(SimulatedSnp::new());
+    let signer = Arc::new(TokenSigner::generate(
+        "urn:query-demo:sim",
+        SimulatedClaims::default(),
+    ));
+    let policy = ReleasePolicy {
+        allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+    };
+    let simulated = Arc::new(SimulatedTokenProvider::in_process(
+        signer.clone(),
+        policy.clone(),
+    ));
 
     // Seal fixture connector data into the vault on the simulated TEE.
-    let pipeline = EnclavePipeline::new(simulated_snp.clone(), vault.clone(), false);
+    let pipeline = EnclavePipeline::new(simulated.clone(), vault.clone(), false);
     let job = SyncJob {
         tenant,
         tenant_public_key: keypair.public_key(),
@@ -44,15 +58,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Enroll the tenant key with the key-release relying party (separate from enclave RAM).
     let relying_party = Arc::new(KeyReleaseRelyingParty::new(
-        simulated_snp.verifier(1_000),
-        false,
+        Arc::new(StaticKeySource(signer.jwks())),
+        signer.issuer(),
+        policy,
     ));
     relying_party.insert_tenant_key(tenant, &keypair);
 
     let identity = Arc::new(EnclaveIdentity::generate());
     let keys = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
-        simulated_snp.clone(),
+        simulated.clone(),
         Arc::new(InProcessKeyReleaseClient(relying_party)),
     ));
 
@@ -60,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let service = ConnectorQueryService::new(
         vault,
         keys,
-        simulated_snp,
+        simulated,
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
