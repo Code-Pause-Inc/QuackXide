@@ -109,10 +109,10 @@ impl EnclavePipeline {
                         AuditKind::TeeAttestation,
                         Some(tenant),
                         "denied",
-                        "simulated SEV-SNP evidence cannot satisfy required hardware attestation",
+                        "simulated evidence cannot satisfy required hardware attestation",
                     );
                     return Err(PipelineError::AttestationRefused(
-                        "evidence platform is simulated, not hardware SEV-SNP".into(),
+                        "evidence platform is simulated, not hardware".into(),
                     ));
                 }
                 if let Err(err) = self.attestation.verify_evidence(&evidence, &nonce) {
@@ -120,7 +120,7 @@ impl EnclavePipeline {
                         AuditKind::TeeAttestation,
                         Some(tenant),
                         "denied",
-                        "simulated SEV-SNP evidence failed verification",
+                        "simulated evidence failed verification",
                     );
                     return Err(PipelineError::AttestationRefused(err.to_string()));
                 }
@@ -128,7 +128,7 @@ impl EnclavePipeline {
                     AuditKind::TeeAttestation,
                     Some(tenant),
                     "simulated",
-                    "simulated SEV-SNP evidence verified for sync (dev only)",
+                    "simulated evidence verified for sync (dev only)",
                 );
                 Ok(())
             }

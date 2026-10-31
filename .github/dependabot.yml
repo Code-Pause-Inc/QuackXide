@@ -16,11 +16,9 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "object_store"
         update-types: ["version-update:semver-major"]
-      # sha2 0.11 and p384 0.14 move to digest 0.11 / elliptic-curve 0.14 while
-      # hpke 0.12 and hmac 0.12 require the 0.10 traits; tracked under ADR 0007 (P35).
+      # sha2 0.11 moves to digest 0.11 while hpke 0.12 and hmac 0.12 require
+      # the 0.10 traits; tracked under ADR 0007 (P35).
       - dependency-name: "sha2"
-        update-types: ["version-update:semver-major"]
-      - dependency-name: "p384"
         update-types: ["version-update:semver-major"]
     groups:
       query-engine:

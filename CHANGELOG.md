@@ -184,6 +184,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The SEV-SNP simulation is retired: `SimulatedSnp`, the SEV-SNP report
+  parser and P-384 chain verifier (`report`, `verifier`, `TrustRoot`), the
+  `snp_report` fuzz target and the `SIMULATED_SNP_*` settings are removed,
+  and `AttestationEvidence` drops `report` and `cert_chain`. The simulated
+  TEE uses Confidential Space tokens only. `SnpAttestation`, which always
+  refuses, and `TeePlatform::SevSnp` stay until P48. `decode_hex_array`
+  moves to the crate root.
 * The simulated TEE issues Confidential Space-shaped attestation tokens
   instead of SEV-SNP reports (ADR 0004). A dev-only `sim-attestation`
   service plays Google's part (`POST /v1/token`, `GET /jwks`); the enclave's

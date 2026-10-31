@@ -22,7 +22,6 @@ simulated = ["dep:rsa", "dep:reqwest"]
 async-trait.workspace = true
 base64.workspace = true
 jsonwebtoken.workspace = true
-p384.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
