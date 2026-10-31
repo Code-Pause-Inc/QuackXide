@@ -43,3 +43,38 @@ impl ReportDataBinding {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding() -> ReportDataBinding {
+        ReportDataBinding {
+            nonce: [0x11; 32],
+            enclave_hpke_public_key: [0x22; 32],
+            result_signing_public_key: [0x33; 32],
+            tls_cert_sha256: [0x44; 32],
+            config_digest: [0x55; 32],
+        }
+    }
+
+    #[test]
+    fn binding_carries_the_nonce_and_commits_every_enclave_key() {
+        let base = binding().to_report_data();
+        assert_eq!(base[..32], [0x11; 32]);
+        // A swapped key (for example a MITM's HPKE key) changes the digest half.
+        let mutations: [fn(&mut ReportDataBinding); 4] = [
+            |b| b.enclave_hpke_public_key[0] ^= 1,
+            |b| b.result_signing_public_key[0] ^= 1,
+            |b| b.tls_cert_sha256[0] ^= 1,
+            |b| b.config_digest[0] ^= 1,
+        ];
+        for mutate in mutations {
+            let mut changed = binding();
+            mutate(&mut changed);
+            let data = changed.to_report_data();
+            assert_eq!(data[..32], base[..32]);
+            assert_ne!(data[32..], base[32..]);
+        }
+    }
+}

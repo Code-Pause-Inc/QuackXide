@@ -324,8 +324,6 @@ impl AttestationProvider for SimulatedTokenProvider {
         Ok(AttestationEvidence {
             platform: TeePlatform::Simulated,
             nonce: nonce.to_vec(),
-            report: Vec::new(),
-            cert_chain: Vec::new(),
             token,
         })
     }
@@ -430,8 +428,6 @@ impl AttestationProvider for TamperedTokenProvider {
         Ok(AttestationEvidence {
             platform: TeePlatform::Simulated,
             nonce: nonce.to_vec(),
-            report: Vec::new(),
-            cert_chain: Vec::new(),
             token,
         })
     }

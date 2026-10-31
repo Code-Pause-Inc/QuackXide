@@ -48,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
     let require_attestation = config.features.tee_attestation_required;
     let attestation = platform_enclave::provider_for(require_attestation);
     if !require_attestation {
-        tracing::warn!("TEE_ATTESTATION_REQUIRED=false — syncs run UNATTESTED (dev only)");
+        tracing::warn!(
+            "TEE_ATTESTATION_REQUIRED=false — syncs attest through the simulated TEE (dev builds with SIM_ATTESTATION_URL) or are refused"
+        );
     }
 
     let (tenant, tenant_public_key) = demo_tenant()?;
