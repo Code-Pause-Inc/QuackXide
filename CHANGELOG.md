@@ -128,6 +128,13 @@ uses [Semantic Versioning](https://semver.org/).
   so after a failure the object is still found and the retry removes the
   rest. Before, the manifest went first, the retry got 404 and the chunks
   were stranded.
+* An access-request approval that fails partway can be retried: `POST
+  /api/v1/research/requests/{id}/approve` on a request that is already
+  approved re-runs the idempotent grant and budget steps for its steward
+  and returns 200. Before, the request was marked approved first, so when
+  the grant or budget step then failed (502) the retry got 404 and the
+  request stayed approved with no grant. A deny after a failed approval
+  is refused, so no grant is ever minted for a pending or denied request.
 
 ### Security
 

@@ -277,12 +277,17 @@ same response, so nothing leaks existence. Budget standing is visible to the
 grant's parties only; top-up is steward-only. Metering rides the
 `engine.query` event and doubles as the billing meter.
 
+
+
 **Catalog** (`platform_tenancy::CatalogRegistry`, frontend Research tab):
 publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. Researchers file access requests (idempotent while
 pending); approval mints the grant through the same code path as a direct
-grant. `research.catalog` events carry identifiers only.
+grant. The approval is recorded first, so a failure partway leaves an
+approved request without a usable grant, never a grant behind a pending or
+denied one, and the steward's retry re-runs the idempotent grant and budget
+steps. Denied is terminal. `research.catalog` events carry identifiers only.
 
 **Residual risk:** overlapping-query differencing. See
 `docs/THREAT_MODEL.md`.

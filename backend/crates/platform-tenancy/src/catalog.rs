@@ -121,7 +121,10 @@ pub trait CatalogRegistry: Send + Sync {
 
     /// Resolve a Pending request (approve or deny). Only the listing's
     /// steward may; unknown ids, other stewards' requests, and
-    /// already-resolved requests are indistinguishable (`None`).
+    /// already-resolved requests are indistinguishable (`None`). Approved
+    /// and Denied requests are never re-resolved: Denied is terminal, and a
+    /// caller retrying an approval's grant and budget steps finds the
+    /// Approved request with `list_requests_for`.
     async fn resolve(
         &self,
         steward: TenantId,
@@ -420,6 +423,17 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
+        // Re-approving isn't actionable either. The request stays Approved
+        // and listed for its steward, which is how an approval retry finds it.
+        assert!(
+            registry
+                .resolve(steward, &request.request_id, true)
+                .await
+                .expect("ok")
+                .is_none()
+        );
+        let listed = registry.list_requests_for(steward).await.expect("list");
+        assert_eq!(listed[0].status, RequestStatus::Approved);
 
         // Resolved history doesn't block a fresh request.
         let fresh = registry
