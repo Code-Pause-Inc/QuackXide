@@ -3139,6 +3139,7 @@ dependencies = [
  "p384",
  "platform-enclave",
  "rand 0.8.7",
+ "reqwest",
  "rsa",
  "serde",
  "serde_json",

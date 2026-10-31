@@ -3,10 +3,11 @@
 //! the checks a dev-only server runs before it starts.
 //!
 //! Nothing here is confidential. The vault is in memory, tenant keys are held
-//! in process memory ([`MultiTenantDevKeyProvider`]), the grant, budget and
-//! catalog registries are in memory, and by default TEE evidence is
-//! fabricated ([`DevAttestation::allow_insecure_dev`]) and accepted because
-//! attestation is not required. Release builds do not enable the `dev`
+//! in process memory, and the grant, budget and catalog registries are in
+//! memory. By default the query service runs on the simulated TEE: an
+//! in-process signer issues Confidential Space-shaped tokens, the production
+//! verifier checks them, and the key-release stand-in releases tenant keys
+//! only to a token that passes. Release builds do not enable the `dev`
 //! feature, so none of this is compiled into them.
 
 use std::fmt;
@@ -18,22 +19,33 @@ use platform_connectors::pipeline::PipelineError;
 use platform_connectors::snapshot::SnapshotWriter;
 use platform_core::{ConnectorSlug, SnapshotVersion, TenantId};
 use platform_crypto::TenantKeypair;
-use platform_enclave::{AttestationProvider, DevAttestation};
+use platform_enclave::AttestationProvider;
+use platform_enclave::simulated_token::{
+    SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
+};
+use platform_enclave::token::ReleasePolicy;
 use platform_storage::{ObjectStoreVault, VaultStore};
 use quackxide_engine::EngineSettings;
 
+use crate::key_release::{
+    AttestedKeyProvider, EnclaveIdentity, InProcessKeyReleaseClient, KeyReleaseRelyingParty,
+    StaticKeySource,
+};
 use crate::query::{ConnectorQueryService, MultiTenantDevKeyProvider};
 use crate::research::ResearchStores;
 
 /// Process-environment variable a dev-only server requires, set to `1`.
 pub const OPT_IN_VAR: &str = "DEVSTACK_ALLOW_INSECURE";
 
+/// Issuer of the in-process simulated attestation tokens.
+const SIM_ISSUER: &str = "urn:devstack:sim";
+
 /// An in-memory vault and the tenant keys that open it, held in process
 /// memory. [`DevResearchStack::query_service`] turns it into the
 /// research-enabled query service.
 pub struct DevResearchStack {
     vault: Arc<dyn VaultStore>,
-    keys: MultiTenantDevKeyProvider,
+    keys: Vec<(TenantId, TenantKeypair)>,
 }
 
 impl DevResearchStack {
@@ -41,7 +53,7 @@ impl DevResearchStack {
     pub fn new() -> Self {
         Self {
             vault: Arc::new(ObjectStoreVault::new_in_memory()),
-            keys: MultiTenantDevKeyProvider::new(),
+            keys: Vec::new(),
         }
     }
 
@@ -67,30 +79,54 @@ impl DevResearchStack {
             SnapshotWriter::begin(&*self.vault, tenant, &public_key, connector.clone());
         snapshot.put(dataset, parquet).await?;
         let version = snapshot.commit().await?;
-        self.keys.insert(tenant, keypair);
+        self.keys.push((tenant, keypair));
         Ok(version)
     }
 
-    /// The query service with research access on: in-memory catalog,
-    /// access requests, grants and budgets, behind fabricated `Development`
-    /// attestation, which passes because attestation is not required.
+    /// The query service with research access on (in-memory catalog,
+    /// access requests, grants and budgets) on the simulated TEE. Each query
+    /// attests with a simulated token, and the in-process key-release
+    /// stand-in releases the tenant's key only after that token verifies.
     pub fn query_service(
         self,
         settings: EngineSettings,
         min_cohort: u64,
         default_budget: u64,
     ) -> ConnectorQueryService {
-        self.query_service_with_attestation(
-            settings,
-            min_cohort,
-            default_budget,
-            Arc::new(DevAttestation::allow_insecure_dev()),
-            false,
-        )
+        let signer = Arc::new(TokenSigner::generate(
+            SIM_ISSUER,
+            SimulatedClaims::default(),
+        ));
+        let policy = ReleasePolicy {
+            allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+        };
+        let attestation = Arc::new(SimulatedTokenProvider::in_process(
+            signer.clone(),
+            policy.clone(),
+        ));
+        let relying_party = Arc::new(KeyReleaseRelyingParty::new(
+            Arc::new(StaticKeySource(signer.jwks())),
+            signer.issuer(),
+            policy,
+        ));
+        for (tenant, keypair) in &self.keys {
+            relying_party.insert_tenant_key(*tenant, keypair);
+        }
+        let identity = Arc::new(EnclaveIdentity::generate());
+        let keys = Arc::new(AttestedKeyProvider::new(
+            identity.clone(),
+            attestation.clone(),
+            Arc::new(InProcessKeyReleaseClient(relying_party)),
+        ));
+        // Simulated tokens never satisfy required attestation.
+        ConnectorQueryService::new(self.vault, keys, attestation, settings, false)
+            .with_research(ResearchStores::in_memory(), min_cohort, default_budget)
+            .with_enclave_identity(identity)
     }
 
-    /// As [`query_service`](Self::query_service), with the attestation
-    /// gate's provider and whether it requires SEV-SNP evidence.
+    /// The query service with research access on, with the attestation
+    /// gate's provider and whether it requires hardware evidence. Tenant keys
+    /// open straight from process memory, with no key release.
     pub fn query_service_with_attestation(
         self,
         settings: EngineSettings,
@@ -99,9 +135,13 @@ impl DevResearchStack {
         attestation: Arc<dyn AttestationProvider>,
         require_attestation: bool,
     ) -> ConnectorQueryService {
+        let mut keys = MultiTenantDevKeyProvider::new();
+        for (tenant, keypair) in self.keys {
+            keys.insert(tenant, keypair);
+        }
         ConnectorQueryService::new(
             self.vault,
-            Arc::new(self.keys),
+            Arc::new(keys),
             attestation,
             settings,
             require_attestation,

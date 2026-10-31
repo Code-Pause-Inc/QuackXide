@@ -277,6 +277,127 @@ async fn dev_evidence_cannot_satisfy_required_attestation() {
     assert!(matches!(err, PipelineError::AttestationRefused(_)));
 }
 
+/// A provider that refuses outright, as a build without the simulator does.
+struct RejectingAttestation;
+
+#[async_trait]
+impl platform_enclave::AttestationProvider for RejectingAttestation {
+    async fn produce_evidence(
+        &self,
+        _nonce: &[u8],
+    ) -> Result<platform_enclave::AttestationEvidence, platform_enclave::EnclaveError> {
+        Err(platform_enclave::EnclaveError::Rejected("refused".into()))
+    }
+}
+
+#[tokio::test]
+async fn rejected_provider_refuses_sync_even_when_not_required() {
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let pipeline = EnclavePipeline::new(Arc::new(RejectingAttestation), vault.clone(), false);
+    let keypair = TenantKeypair::generate();
+    let job = SyncJob {
+        tenant: TenantId::generate(),
+        tenant_public_key: keypair.public_key(),
+        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
+    };
+
+    let err = pipeline.run_sync(&job).await.expect_err("must refuse");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+    let stored = vault
+        .list(&TenantPaths::tenant_root(job.tenant))
+        .await
+        .expect("list");
+    assert!(stored.is_empty(), "nothing may be written on refusal");
+}
+
+fn token_provider(
+    claims: platform_enclave::simulated_token::SimulatedClaims,
+) -> Arc<platform_enclave::simulated_token::SimulatedTokenProvider> {
+    use platform_enclave::simulated_token::{
+        SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
+    };
+    static SIGNER: std::sync::OnceLock<TokenSigner> = std::sync::OnceLock::new();
+    let signer =
+        SIGNER.get_or_init(|| TokenSigner::generate("urn:sync:sim", SimulatedClaims::default()));
+    Arc::new(SimulatedTokenProvider::in_process(
+        Arc::new(signer.with_claims(claims)),
+        platform_enclave::token::ReleasePolicy {
+            allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+        },
+    ))
+}
+
+async fn sync_with(
+    provider: Arc<dyn platform_enclave::AttestationProvider>,
+    require_attestation: bool,
+) -> Result<(), PipelineError> {
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let pipeline = EnclavePipeline::new(provider, vault, require_attestation);
+    let job = SyncJob {
+        tenant: TenantId::generate(),
+        tenant_public_key: TenantKeypair::generate().public_key(),
+        source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
+    };
+    pipeline.run_sync(&job).await.map(|_| ())
+}
+
+#[tokio::test]
+async fn simulated_token_sync_verifies_in_dev() {
+    use platform_enclave::simulated_token::SimulatedClaims;
+    assert!(
+        sync_with(token_provider(SimulatedClaims::default()), false)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn simulated_token_for_a_debug_image_refuses_the_sync() {
+    use platform_enclave::simulated_token::SimulatedClaims;
+    let debug = token_provider(SimulatedClaims {
+        dbgstat: "enabled".into(),
+        ..SimulatedClaims::default()
+    });
+    let err = sync_with(debug, false).await.expect_err("must refuse");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+}
+
+#[tokio::test]
+async fn sync_refuses_every_tampered_simulated_token() {
+    use platform_enclave::simulated_token::{
+        SIMULATED_IMAGE_DIGEST, SimulatedClaims, Tamper, TamperedTokenProvider, TokenSigner,
+    };
+    let signer = Arc::new(TokenSigner::generate(
+        "urn:sync:sim",
+        SimulatedClaims::default(),
+    ));
+    for tamper in Tamper::ALL {
+        let provider = TamperedTokenProvider::new(
+            signer.clone(),
+            platform_enclave::token::ReleasePolicy {
+                allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+            },
+            tamper,
+        );
+        let err = sync_with(Arc::new(provider), false)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, PipelineError::AttestationRefused(_)),
+            "{tamper:?}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn simulated_token_cannot_satisfy_required_attestation() {
+    use platform_enclave::simulated_token::SimulatedClaims;
+    let err = sync_with(token_provider(SimulatedClaims::default()), true)
+        .await
+        .expect_err("must refuse");
+    assert!(matches!(err, PipelineError::AttestationRefused(_)));
+}
+
 #[tokio::test]
 async fn simulated_snp_sync_verifies_in_dev_and_refuses_bad_policy_or_required_hardware() {
     use platform_enclave::{GuestPolicy, SimulatedSnp, SimulatedSnpConfig};

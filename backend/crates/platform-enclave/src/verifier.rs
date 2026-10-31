@@ -11,10 +11,10 @@ use p384::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::binding::REPORT_DATA_BYTES;
 use crate::report::{
-    CHIP_ID_BYTES, MEASUREMENT_BYTES, P384_SCALAR_BYTES, REPORT_DATA_BYTES,
-    SNP_REPORT_SIGNED_BYTES, SNP_REPORT_VERSION, SNP_SIG_ALGO_ECDSA_P384_SHA384, SnpReport,
-    TcbVersion,
+    CHIP_ID_BYTES, MEASUREMENT_BYTES, P384_SCALAR_BYTES, SNP_REPORT_SIGNED_BYTES,
+    SNP_REPORT_VERSION, SNP_SIG_ALGO_ECDSA_P384_SHA384, SnpReport, TcbVersion,
 };
 use crate::{EnclaveError, TeePlatform};
 
