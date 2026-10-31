@@ -174,6 +174,10 @@ pub struct TenantView {
     storage_bytes: u64,
 }
 
+/// Every tenant with its storage usage. Cost: one usage lookup per tenant,
+/// and each lookup lists every object under the tenant's prefix, so a
+/// request reads the whole bucket's object listing. Acceptable for the v1
+/// admin console; it is not paginated or cached.
 pub async fn list_tenants(provisioning: &ProvisioningService) -> Result<Value, ApiError> {
     let records = provisioning
         .registry
@@ -187,8 +191,7 @@ pub async fn list_tenants(provisioning: &ProvisioningService) -> Result<Value, A
         let usage = provisioning
             .vault
             .usage(&TenantPaths::tenant_root(record.tenant_id))
-            .await
-            .map_err(|_| ApiError::Backend)?;
+            .await?;
         views.push(TenantView {
             record,
             storage_object_count: usage.object_count,

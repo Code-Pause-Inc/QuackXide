@@ -6,23 +6,20 @@ in `docs/PROJECT_SCOPE.md`.
 
 ## Setup
 
-* Backend: Rust, pinned in `rust-toolchain.toml` (rustup installs it on
-  first use), from `backend/`.
-* Frontend: Node, pinned in `.nvmrc`, from `frontend/`.
-* Enable the repository's git hooks once per clone:
+Follow `docs/DEVELOPMENT.md`: prerequisites (including WSL2 on Windows),
+the git hooks, everyday commands, running `cargo deny` and `npm audit`
+locally, and what to do when `scripts/check.sh` fails.
 
-  ```bash
-  git config core.hooksPath scripts/hooks
-  ```
-
-See "Development" in `README.md` for running the API and frontend locally.
+The frontend needs the browser envelope module, built by
+`scripts/build-wasm.sh` (see "Development" in `README.md` for the
+`wasm-bindgen` CLI it needs).
 
 ## Before every push
 
 Run `scripts/check.sh`. It builds and tests the backend and frontend, lints
 both with warnings as errors (clippy for the backend, ESLint via `npm run lint`
 for the frontend), and runs the white-label, config, data, and attribution
-guards.
+guards. "Why check.sh failed" in `docs/DEVELOPMENT.md` covers each step.
 
 `typescript-eslint` does not support TypeScript 7 yet, so in `frontend/` the
 `typescript` package is an alias for `@typescript/typescript6` (the TS 6 API

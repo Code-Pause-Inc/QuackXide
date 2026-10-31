@@ -6,17 +6,15 @@ mod common;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
-use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::{AppState, build_app};
 use platform_core::TenantId;
-use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
+use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::{InMemoryTenantRegistry, TenantRegistry};
 
-use common::{bearer, config_with_mor_secret, json_header, send_json};
+use common::{Faults, bearer, config_with_mor_secret, json_header, send_json};
 
 const SECRET: &str = "jwt-secret";
 const PADDLE_SECRET: &str = "pdl_ntfset_webhook_secret";
@@ -250,47 +248,11 @@ async fn admin_can_list_tenants_and_toggle_connectors() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// In-memory vault whose `put` and/or `usage` fail as a backend outage.
-struct FlakyVault {
-    inner: ObjectStoreVault,
-    fail_put: bool,
-    fail_usage: bool,
-}
-
-fn outage() -> StorageError {
-    StorageError::Backend("simulated outage".into())
-}
-
-#[async_trait]
-impl VaultStore for FlakyVault {
-    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
-        if self.fail_put {
-            return Err(outage());
-        }
-        self.inner.put(path, ciphertext).await
-    }
-    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
-        self.inner.get(path).await
-    }
-    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
-        self.inner.delete(path).await
-    }
-    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
-        self.inner.list(prefix).await
-    }
-    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
-        if self.fail_usage {
-            return Err(outage());
-        }
-        self.inner.usage(prefix).await
-    }
-}
-
 fn flaky(fail_put: bool, fail_usage: bool) -> Arc<dyn VaultStore> {
-    Arc::new(FlakyVault {
-        inner: ObjectStoreVault::new_in_memory(),
-        fail_put,
-        fail_usage,
+    common::flaky_vault(Faults {
+        put: fail_put,
+        usage: fail_usage,
+        ..Faults::default()
     })
 }
 
@@ -318,7 +280,7 @@ async fn failed_usage_lookup_is_an_error_not_zero() {
 
     let (status, json) =
         send_json(&app, "GET", "/admin/tenants", &[admin_auth()], Vec::new()).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "json: {json}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "json: {json}");
     assert!(json.get("tenants").is_none());
 }
 

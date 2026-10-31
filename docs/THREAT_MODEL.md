@@ -23,6 +23,7 @@ production requirements, including its failure paths.
 | Dataset plaintext | Steward's browser before upload; enclave memory during a query | Never persisted in the clear; zeroized after use |
 | Dataset ciphertext | Object store (`tenants/{t}/…`) | HPKE envelopes / AES-256-GCM, context-bound AAD |
 | Steward private keys | Steward's browser (Web Crypto, non-extractable) | Never sent to the server |
+| Dataset data keys | Beside each dataset, wrapped to a Cloud KMS key; unwrapped only in enclave memory for one query | KMS decapsulates only for the attested workload (ADR 0004); its private key cannot be exported |
 | Research grants and budgets | `platform-tenancy` registries | Steward-scoped; no existence oracle |
 | Aggregate results | Researcher portal | Plan gate, genuine-count check, cohort suppression, budget |
 | Audit stream | `SECURITY_AUDIT_EVENT` log target | Identifiers and outcomes only; no content |
@@ -67,15 +68,23 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 
 Goal: read dataset content from infrastructure the operator controls.
 
+The controls rely on Google for hardware verification, workload identity
+and key custody (ADR 0004): the enclave is a Confidential Space workload
+on Intel TDX, and Cloud KMS releases data keys only to it. The
+administrator of the KMS key project can authorize another image, which
+could then decrypt; policy changes and break-glass access are audited
+(P77).
+
 | Attack | Control | Status |
 | --- | --- | --- |
 | Read the object store | Ciphertext only; envelopes sealed to a key the operator does not hold | Built |
 | Read API host disk or logs | Plaintext never persisted; audit events carry no content, SQL, or filenames, and are written whatever `RUST_LOG` says; DataFusion and sqlparser output, which can quote SQL, never reaches the logs; engine errors keep no upstream text | Built, tested (`tests/log_leak.rs`, `audit_records_ignore_the_operational_filter`) |
 | Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
-| Run a query outside a genuine enclave | Attestation gate with `TEE_ATTESTATION_REQUIRED=true` | Seam built; **SEV-SNP report verification to build** — fails closed until then |
-| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; the production trust root rejects simulated chains; responses report `tee_platform` | Built, tested; **refusal at startup to build** |
-| Obtain the steward's key for a query | Key released only into an attested enclave (`EnclaveKeyProvider`) | Seam built; **production key release to build** — returns 503 until then |
+| Run a query outside a genuine enclave, or a modified binary inside one | Attestation gate with `TEE_ATTESTATION_REQUIRED=true`; Google's attestation token must name TDX hardware, a production Confidential Space image, debug disabled and an allowed image digest | Seam built; **token verification to build** — fails closed until then |
+| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; the production trust root rejects simulated chains; responses report `tee_platform`. The key-release stand-in, which accepts tenant private keys over HTTP, compiles only with the `dev` feature, and a build without it refuses to start when `KEY_RELEASE_URL` is set | Built, tested (CI `release build has no dev binaries`); **refusal of simulated evidence at startup to build** |
+| Obtain a dataset's key for a query | Cloud KMS unwraps the dataset's data key only for the attested workload, per query, with nothing cached (ADR 0004); the steward's private key never leaves their browser | Seam built (`EnclaveKeyProvider`); **production key release to build** — returns 503 until then |
+| Authorize a modified image | The KMS key and its release policy live in a separate key project that no deployment identity administers (ADR 0004) | **Residual risk** for the key project's administrator — see below |
 | Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** — results currently leave as JSON over TLS |
 | Swap or replay ciphertext between objects | HPKE `info` / AES-GCM AAD bind tenant, object, role, and chunk | Built, tested |
 
@@ -92,7 +101,13 @@ Goal: gain access through the API.
 | Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
 | Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
 | Forged billing webhooks | Signature verification with replay tolerance | Built, tested |
-| Account takeover of a steward or researcher | Managed sign-in with MFA (TOTP module exists) | **To build** |
+| Account takeover of a steward, researcher or administrator | Sign-in through Auth0, then the platform's TOTP before any `access` token is issued, for every role including administrators (ADR 0006); TOTP replay and rate limits; recovery only by audited administrator reset, with an out-of-band identity check, no self-reset and at least two administrators | **To build** (P29, P30) — TOTP module exists |
+| Theft of the token signing key, which can mint any `tid` and `adm` token | Key held in Cloud KMS and released only to the attested identity-service Confidential VM (ADR 0006, ADR 0004 option A); never on an API replica | **To build** (P29) |
+| Self-assigned administrator access | `adm` set only from a server-side allowlist keyed by the provider's `(iss, sub)`, never from a provider attribute (ADR 0006) | **To build** (P29) |
+| Access by a suspended or unknown tenant | The exchange and `require_tenant` / `require_admin` refuse unknown or Suspended tenants with 403 (ADR 0006) | **To build** (P29) — today any validly signed `tid` passes |
+| Login CSRF or a replayed sign-in response | Authorization code with PKCE (S256), single-use `state` and OIDC `nonce` checked by the identity service, exact-match redirect URIs; no token in a URL (ADR 0006) | **To build** (P13, P29, P32) |
+| Stolen or replayed refresh token | Rotation on every use; reuse revokes the token family; sign-out and administrator disable revoke immediately (ADR 0006) | **To build** (P30) |
+| Token theft from browser storage | Access token held in memory only, never `localStorage`, `sessionStorage` or IndexedDB; provider tokens never reach the browser (ADR 0006) | **To build** (P31, P32) |
 
 ### A4. Future cryptanalytic adversary ("harvest now, decrypt later")
 
@@ -102,7 +117,7 @@ exist.
 | Attack | Control | Status |
 | --- | --- | --- |
 | Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, ADR 0007) | **To build** — current suite is X25519 only |
-| Forge signatures | Hybrid Ed25519 + ML-DSA-65 | **To build** — current tokens use RS256 |
+| Forge signatures | Hybrid Ed25519 + ML-DSA-65, including platform tokens (ADR 0006, P37) | **To build** — current tokens use RS256 |
 | Silent downgrade to classical-only | Versioned framing (`HPK2`); hybrid readers refuse `HPK1` and X25519-only keys, with no migration mode (ADR 0007) | **To build** |
 
 The suite seams (`TenantKem`, the `JwtVerifier` construction site, the
@@ -113,9 +128,9 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
 
 * **Compromise of the steward's own device or browser.** The steward holds
   the key; malware on that device can read what the steward can read.
-* **Side channels against the TEE.** QuackXide relies on AMD SEV-SNP
-  guarantees and the attestation chain; microarchitectural attacks on the
-  hardware itself are outside this model.
+* **Side channels against the TEE.** QuackXide relies on Intel TDX
+  guarantees and Google's attestation service; microarchitectural attacks
+  on the hardware itself are outside this model.
 * **Denial of service.** Availability is not a security goal of this
   release.
 * **Correctness of the underlying libraries.** RustCrypto, `hpke`,
@@ -123,7 +138,9 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   cryptographic primitives. The post-quantum crates (`x-wing`, `ml-kem`,
   `ml-dsa`) and `hpke` have no independent audit; ADR 0007 records this
   as an accepted risk and the cross-implementation vectors that check
-  them.
+  them. Attestation tokens are verified with `jsonwebtoken` (RustCrypto
+  backend), and Google's attestation service is trusted for what its
+  tokens claim (ADR 0004).
 * **Collusion between a steward and a researcher.** A steward can share
   their own data by other means.
 
@@ -160,6 +177,11 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   writer. An operator can therefore write a fabricated snapshot, or delete
   the newest manifest so queries read an older one. Closing this needs
   an enclave signing key bound to attestation.
+* **The key project's administrator.** Whoever administers the KMS key
+  project can add an image digest to the release policy, and that image
+  can then decrypt. This is the maintainer; changes are audited (P77),
+  not prevented. Google is trusted for hardware verification, workload
+  identity and key custody, and the platform is tied to GCP.
 * **Differencing across snapshots.** Querying before and after a dataset
   update can reveal the rows that changed, bounded by the budget like any
   other overlapping-query differencing.

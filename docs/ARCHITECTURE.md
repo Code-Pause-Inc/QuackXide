@@ -27,8 +27,9 @@ operator credential yields ciphertext only.
 ## Deployment topology (target)
 
 ADR 0005 fixes the boundary. `platform-api`, with the query engine
-in-process, runs inside an attested SEV-SNP Confidential VM; "the enclave"
-in this document means that process inside that VM. TLS terminates in
+in-process, runs as a Confidential Space workload on an attested Intel TDX
+Confidential VM (ADR 0004); "the enclave" in this document means that
+process inside that VM. TLS terminates in
 `platform-api`, and the frontend is served from the same origin. Every
 setting the operator can pass to the VM is untrusted: security-relevant
 settings are constants, bounded in code, or part of a deployment
@@ -65,18 +66,42 @@ Client key architecture:
 * **AAD discipline** — every AES-GCM operation binds
   `tenant|object|role(|chunk-index)`, so a vault cannot reorder chunks,
   splice records across objects, or re-attach wrapped keys undetected.
-* **Crypto-agility seam** — the crypto core sits behind `lib/crypto/core.ts`
-  + the worker protocol; a Rust→wasm32 build of the backend's own `hpke`
-  crate slots in there without touching UI code.
+* **Crypto-agility seam** — the crypto core sits behind `lib/crypto/core.ts`,
+  `lib/crypto/envelope.ts` and the worker protocol. `envelope.ts` loads the
+  wasm32 build of the backend's own envelope code (`envelope-wasm`, built by
+  `scripts/build-wasm.sh`) and seals to a tenant's raw public key, so the
+  browser and the enclave share one implementation. Seal needs no private
+  key, and the module never sees the KEK or file keys. The frame magic
+  names the suite, so a new suite changes no caller. Only the worker loads
+  the module (an ESLint rule refuses its glue elsewhere); no worker
+  operation exposes sealing to the UI yet. Opening in the browser is not
+  built.
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
   `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  Storage errors are classified: missing objects are 404, lost
+  create-only writes 409, transient failures (after the storage client's
+  own retries) 503 with `Retry-After`, and permanent ones (credentials,
+  permissions, configuration) 502. The GCS client's timeouts and retries
+  are set from `STORAGE_*` settings (`backend/.env.example`), each bounded,
+  so a stalled backend fails within retry timeout + backoff + request
+  timeout (55 s by default). It refuses plain HTTP except to a local
+  emulator.
 * **JWT tenant boundary** — tenant identity enters the API only as the
   verified `tid` claim; handlers never read a tenant from paths or bodies.
   No secret configured ⇒ authenticated routes refuse with 503 (fail closed).
   Integration tests verify that cross-tenant reads, lists, and deletes are
   refused.
+
+A drive listing returns at most 1000 objects (`MAX_LISTED_OBJECTS`), newest
+first, reading their manifests 16 at a time. A drive holding more is refused
+with 422 rather than listed in part; v1 has no pagination.
+
+Deleting an object removes its chunks first and its manifest last, so a
+delete that fails partway leaves the object listed and a retry finishes it.
+Until then the object's download fails, since some chunks are gone. An
+object whose manifest is gone is a 404.
 
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
@@ -84,7 +109,7 @@ it does not know filenames, content, or keys.
 ### 2. Connectors (confidential ingress)
 
 ```
-External APIs      TEE enclave (SEV-SNP, attested)                Object store
+External APIs      TEE enclave (TDX, attested)                    Object store
 ─────────────      ─────────────────────────────────              ────────────
 OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (RAM only)
                    HPKE seal to tenant public key ───────────────▶ tenants/{t}/connectors/{slug}/snapshots/{v}/{obj}.parquet
@@ -96,10 +121,11 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 
 * **Attestation gate first.** Every sync starts at
   `EnclavePipeline::attestation_gate`. With `TEE_ATTESTATION_REQUIRED=true`,
-  only genuine SEV-SNP evidence passes — development evidence or attestation
-  failure refuses the sync (tested). The SNP provider currently probes the
-  guest device and still refuses pending report-verification work: fail
-  closed until proven attested.
+  only hardware evidence passes — development evidence or attestation
+  failure refuses the sync (tested). No production provider exists yet: the
+  current hardware provider probes for an SEV-SNP guest device and refuses,
+  and verifying Google's Confidential Space token (P47, P48) is to build.
+  Fail closed until proven attested.
 * **Zero-MFA sync**: RFC 6749 refresh-token grant for user-enrolled sources
   (consent + MFA happen once at enrollment); RFC 6749 §4.4
   client-credentials for machine-to-machine sources. Secrets live in
@@ -176,14 +202,21 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   refuses every query.
 * **Key-release trust boundary.** The server cannot decrypt tenant data on
   its own (envelopes are sealed to a private key it does not hold at rest).
-  When `KEY_RELEASE_URL` is configured, `AttestedKeyProvider` acquires a
-  per-query `ReleasedKeySession` from `KeyReleaseRelyingParty`: it fetches a
+  In a `dev` build, when `KEY_RELEASE_URL` is configured,
+  `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
+  `KeyReleaseRelyingParty`: it fetches a
   single-use challenge nonce, binds the nonce and its in-RAM `EnclaveIdentity`
   HPKE public key into a 64-byte `ReportDataBinding`, presents the signed
   1184-byte `SnpReport` and `SnpCertChain` to the relying party, and unwraps
   the HPKE-sealed tenant key into a zeroize-on-drop `TenantKeypair` for the
   duration of that query. When `KEY_RELEASE_URL` is unset, the query endpoint
-  fails closed with 503.
+  fails closed with 503. That relying party is the development and
+  simulation stand-in (ADR 0004): it and its clients compile only with the
+  `dev` feature, and a build without it refuses to start when
+  `KEY_RELEASE_URL` is set. In production each dataset has its own
+  data key, wrapped to a Cloud KMS key that decapsulates only for the
+  attested Confidential Space workload, once per query; the steward's
+  private key never leaves their browser. That path is to build (P50).
 
 `FEATURE_ZK_ENABLED` sets the platform default and is `true` when unset.
 Disabling it permits row-level queries and removes the no-naked-data
@@ -200,7 +233,7 @@ Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403
                  attestation gate
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
-                 steward's key released into enclave → decrypt steward's Parquet (RAM)
+                 key released into enclave → decrypt steward's Parquet (RAM)
                  QueryScope, ZkMode FORCED Enabled:
                      plan gate: aggregate-only (no row egress)
                      plan gate: COUNT(*) AS n present and genuine (not a literal)
@@ -254,6 +287,52 @@ grant. `research.catalog` events carry identifiers only.
 **Residual risk:** overlapping-query differencing. See
 `docs/THREAT_MODEL.md`.
 
+## Authorization model (target)
+
+ADR 0006 decides how a person signs in and what the API
+trusts. None of this is built yet; today the API accepts any validly
+signed token whose `typ` is `access`.
+
+```
+browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
+   │                        │ code
+   │                        ▼
+   │                identity service ── exchanges code, verifies Auth0 ID token (JWKS)
+   │                        │            looks up (iss, sub) → tid, adm
+   │◀── preauth ────────────┤            refuses unknown or Suspended tenants
+   │── TOTP code ──────────▶│
+   │◀── access + refresh ───┘
+   │
+   └── Authorization: Bearer <access> ──▶ platform-api (verifies platform tokens only)
+```
+
+* **One verifier, one format.** The API verifies only platform tokens
+  minted by the identity service, a separate binary in its own attested
+  Confidential VM (`sub`, `tid`, `iss`, `aud`, `exp`,
+  `adm`, `typ`). Auth0 tokens never reach the browser or the API. Only the
+  identity service fetches Auth0's keys, and only it holds the platform
+  signing key, released by Cloud KMS only to the attested identity-service
+  workload (ADR 0004 option A); API replicas hold public material only.
+* **Token types.** `preauth` is issued after Auth0 sign-in and is good
+  only for the second-factor step. `access` is issued only after the
+  second factor and is the only type `authenticate` accepts. `refresh`
+  rotates on every use, and reuse of a rotated token revokes its family.
+* **Tenant identity.** Each signed-in person maps to exactly one tenant
+  through the identity registry, keyed by the provider's `(iss, sub)`,
+  never by email. `tid` remains the only source of tenant identity in the
+  API, and an unknown or Suspended tenant is refused.
+* **Roles.** Steward and researcher stay grant relationships between
+  tenants (see "Research access"); tokens carry no role claims. `adm`
+  grants cross-tenant administrative powers and comes only from a
+  server-side allowlist, never from a provider attribute.
+* **Second factor.** The platform's TOTP, required for stewards,
+  researchers and administrators before any `access` token is issued.
+* **Browser session.** The access token is held in memory and passed to
+  the crypto worker; never `localStorage`, `sessionStorage` or IndexedDB.
+  No token is ever placed in a URL.
+* **Signatures.** Platform tokens use hybrid Ed25519 + ML-DSA-65
+  (ADR 0006, built in P37); see "Cryptography posture".
+
 ## Crate boundaries (backend/crates/)
 
 | Crate | Owns | Never contains |
@@ -261,7 +340,8 @@ grant. `research.catalog` events carry identifiers only.
 | platform-core | Typed ids (`TenantId`, `ObjectId`, `ConnectorSlug`), `ZkMode` | I/O, crypto |
 | platform-config | Env → `PlatformConfig` (brand/server/storage/research) | Hardcoded brand strings |
 | platform-telemetry | JSON tracing init, `SECURITY_AUDIT_EVENT` emitter | Secrets/customer content in events |
-| platform-crypto | AEAD seal/open, HPKE suite pin, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
+| platform-crypto | AEAD seal/open, HPKE suite pin, envelope `info` strings, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
+| envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and `info` strings, for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys, the drive KEK or file keys; I/O or logging |
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait | Raw-string storage paths |
 | platform-enclave | `AttestationProvider` seam, fail-closed dev stub | "Trust me" attestation bypasses |
@@ -392,8 +472,9 @@ kinds only: no tenant ids, paths, messages, SQL text or engine name.
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public
   constructor; ids are UUID-validated at parse time.
 * Fail closed is the default everywhere: unset auth secret → 503; unwired
-  key release → 503; unverifiable attestation → refusal; fabricated dev
-  evidence requires an explicit, logged `allow_insecure_dev()`.
+  key release → 503; `KEY_RELEASE_URL` without the `dev` feature → refusal
+  to start; unverifiable attestation → refusal; fabricated dev evidence
+  requires an explicit, logged `allow_insecure_dev()`.
 * Workspace-wide `unsafe_code = "deny"`.
 * `scripts/check.sh` fails the build if the engine name appears in the
   shipped frontend bundle (white-label guard) or the deployment domain

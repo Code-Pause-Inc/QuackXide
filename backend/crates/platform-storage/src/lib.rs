@@ -21,10 +21,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::StaticCredentialProvider;
+use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{
+    BackoffConfig, ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    RetryConfig,
+};
+use platform_config::StorageClientConfig;
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 
 /// A storage path that can only be constructed through [`TenantPaths`] (or
@@ -173,8 +178,28 @@ impl TenantPaths {
 pub enum StorageError {
     #[error("object not found")]
     NotFound,
+    /// A create-only write found an object already at the path.
+    #[error("object already exists")]
+    AlreadyExists,
+    /// A conditional write's precondition did not hold.
+    #[error("storage precondition failed")]
+    PreconditionFailed,
+    /// Transient: the backend failed or could not be reached after the
+    /// client's own retries. The same request may succeed later.
     #[error("storage backend unavailable: {0}")]
-    Backend(String),
+    Unavailable(String),
+    /// Permanent until an operator acts: credentials, permissions, an
+    /// invalid path, an unsupported operation or configuration. Retrying
+    /// the same request does not help.
+    #[error("storage backend failed: {0}")]
+    Fatal(String),
+}
+
+impl StorageError {
+    /// Whether the same request may succeed if retried later.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
 }
 
 /// Aggregate ciphertext footprint under a prefix (admin storage reporting).
@@ -189,6 +214,11 @@ pub struct StorageUsage {
 #[async_trait]
 pub trait VaultStore: Send + Sync {
     async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError>;
+    /// Create-only write: stores `ciphertext` only if nothing exists at
+    /// `path`, and otherwise fails with [`StorageError::AlreadyExists`]
+    /// without touching the stored object. The check and the write are one
+    /// atomic backend operation.
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError>;
     async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError>;
     async fn delete(&self, path: &VaultPath) -> Result<(), StorageError>;
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError>;
@@ -203,27 +233,46 @@ pub struct ObjectStoreVault {
 }
 
 impl ObjectStoreVault {
+    /// Vault over an already-built `object_store` backend.
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self { store }
+    }
+
     /// Dev/test backend; contents vanish on process exit.
     pub fn new_in_memory() -> Self {
-        Self {
-            store: Arc::new(InMemory::new()),
-        }
+        Self::new(Arc::new(InMemory::new()))
     }
 
     /// Google Cloud Storage backend. Credentials resolve from the environment
     /// or the GCE metadata server unless `STORAGE_EMULATOR_HOST` points at a
-    /// local GCS emulator (`fsouza/fake-gcs-server`).
-    pub fn new_gcs(bucket: &str) -> Result<Self, StorageError> {
+    /// local GCS emulator (`fsouza/fake-gcs-server`). Timeouts and retries
+    /// come from `client`, never from `object_store`'s defaults.
+    pub fn new_gcs(bucket: &str, client: &StorageClientConfig) -> Result<Self, StorageError> {
         let emulator = std::env::var("STORAGE_EMULATOR_HOST").ok();
-        Self::new_gcs_with_emulator(bucket, emulator.as_deref())
+        Self::new_gcs_with_emulator(bucket, emulator.as_deref(), client)
     }
 
-    /// Construct a GCS-backed vault with an optional local emulator host override.
+    /// Construct a GCS-backed vault with an optional local emulator host
+    /// override. Plain HTTP is allowed only to an emulator.
     pub fn new_gcs_with_emulator(
         bucket: &str,
         emulator_host: Option<&str>,
+        client: &StorageClientConfig,
     ) -> Result<Self, StorageError> {
-        let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        let mut options = ClientOptions::new()
+            .with_timeout(client.request_timeout)
+            .with_connect_timeout(client.connect_timeout)
+            .with_allow_http(false);
+        let mut builder = GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(bucket)
+            .with_retry(RetryConfig {
+                backoff: BackoffConfig {
+                    max_backoff: client.max_backoff(),
+                    ..BackoffConfig::default()
+                },
+                max_retries: client.max_retries as usize,
+                retry_timeout: client.retry_timeout,
+            });
         if let Some(raw_host) = emulator_host {
             let trimmed = raw_host.trim().trim_end_matches('/');
             if !trimmed.is_empty() {
@@ -233,15 +282,23 @@ impl ObjectStoreVault {
                 } else {
                     format!("http://{trimmed}")
                 };
-                builder = builder.with_base_url(&base_url).with_skip_signature(true);
+                options = options.with_allow_http(base_url.starts_with("http://"));
+                // object_store 0.13 skips signing on reads only; writes still ask
+                // for a credential, which would fall back to the GCE metadata server.
+                let placeholder = GcpCredential {
+                    bearer: "emulator".to_owned(),
+                };
+                builder = builder
+                    .with_base_url(&base_url)
+                    .with_skip_signature(true)
+                    .with_credentials(Arc::new(StaticCredentialProvider::new(placeholder)));
             }
         }
+        let builder = builder.with_client_options(options);
         let store = builder
             .build()
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        Ok(Self {
-            store: Arc::new(store),
-        })
+            .map_err(|e| StorageError::Fatal(e.to_string()))?;
+        Ok(Self::new(Arc::new(store)))
     }
 
     async fn list_meta(
@@ -260,10 +317,18 @@ fn store_path(path: &VaultPath) -> StorePath {
     StorePath::from(path.as_str())
 }
 
+/// Classify an `object_store` error. Its HTTP client has already retried
+/// 5xx, 429 and timeouts and turns 401, 403, 404, 409 and 412 into their own
+/// variants, so `Generic` is a failure that outlasted those retries.
+/// Anything not known to be transient is fatal.
 fn map_err(err: object_store::Error) -> StorageError {
+    use object_store::Error as E;
     match err {
-        object_store::Error::NotFound { .. } => StorageError::NotFound,
-        other => StorageError::Backend(other.to_string()),
+        E::NotFound { .. } => StorageError::NotFound,
+        E::AlreadyExists { .. } => StorageError::AlreadyExists,
+        E::Precondition { .. } => StorageError::PreconditionFailed,
+        E::Generic { .. } | E::JoinError { .. } => StorageError::Unavailable(err.to_string()),
+        other => StorageError::Fatal(other.to_string()),
     }
 }
 
@@ -272,6 +337,20 @@ impl VaultStore for ObjectStoreVault {
     async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
         self.store
             .put(&store_path(path), PutPayload::from(ciphertext))
+            .await
+            .map(|_| ())
+            .map_err(map_err)
+    }
+
+    /// `PutMode::Create`: `InMemory` checks natively; GCS sends
+    /// `x-goog-if-generation-match: 0`.
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.store
+            .put_opts(
+                &store_path(path),
+                PutPayload::from(ciphertext),
+                PutOptions::from(PutMode::Create),
+            )
             .await
             .map(|_| ())
             .map_err(map_err)
@@ -312,6 +391,7 @@ impl VaultStore for ObjectStoreVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::str::FromStr;
 
     fn tenant_a() -> TenantId {
@@ -498,6 +578,423 @@ mod tests {
         assert_eq!(b_list[0], b_path);
     }
 
+    #[tokio::test]
+    async fn put_if_absent_creates_once_and_never_overwrites() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let path = TenantPaths::tenant_enrollment(tenant_a());
+
+        vault
+            .put_if_absent(&path, Bytes::from_static(b"first"))
+            .await
+            .expect("first create");
+        assert!(matches!(
+            vault
+                .put_if_absent(&path, Bytes::from_static(b"second"))
+                .await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            vault.get(&path).await.expect("get"),
+            Bytes::from_static(b"first")
+        );
+
+        let other = TenantPaths::tenant_enrollment(tenant_b());
+        vault
+            .put(&other, Bytes::from_static(b"plain put"))
+            .await
+            .expect("put");
+        assert!(matches!(
+            vault.put_if_absent(&other, Bytes::from_static(b"x")).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            vault.get(&other).await.expect("get"),
+            Bytes::from_static(b"plain put")
+        );
+    }
+
+    /// Store on which every operation fails with a chosen `object_store`
+    /// error, as GCS reports a failed generation match or an outage.
+    #[derive(Debug)]
+    struct FaultyStore {
+        error: fn() -> object_store::Error,
+    }
+
+    impl std::fmt::Display for FaultyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FaultyStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FaultyStore {
+        async fn put_opts(
+            &self,
+            _: &StorePath,
+            _: PutPayload,
+            _: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            Err((self.error)())
+        }
+        async fn put_multipart_opts(
+            &self,
+            _: &StorePath,
+            _: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Err((self.error)())
+        }
+        async fn get_opts(
+            &self,
+            _: &StorePath,
+            _: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            Err((self.error)())
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<StorePath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<StorePath>> {
+            let error = self.error;
+            Box::pin(locations.map(move |_| Err(error())))
+        }
+        fn list(
+            &self,
+            _: Option<&StorePath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            Box::pin(futures::stream::once(std::future::ready(Err(
+                (self.error)(),
+            ))))
+        }
+        async fn list_with_delimiter(
+            &self,
+            _: Option<&StorePath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            Err((self.error)())
+        }
+        async fn copy_opts(
+            &self,
+            _: &StorePath,
+            _: &StorePath,
+            _: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            Err((self.error)())
+        }
+    }
+
+    fn faulty(error: fn() -> object_store::Error) -> ObjectStoreVault {
+        ObjectStoreVault::new(Arc::new(FaultyStore { error }))
+    }
+
+    /// Every vault operation's error, on a store that fails them all.
+    async fn every_operation_fails(error: fn() -> object_store::Error) -> Vec<StorageError> {
+        let vault = faulty(error);
+        let path = TenantPaths::drive_manifest(tenant_a(), object_1());
+        let prefix = TenantPaths::tenant_root(tenant_a());
+        let bytes = || Bytes::from_static(b"ciphertext");
+        vec![
+            vault.put(&path, bytes()).await.expect_err("put"),
+            vault
+                .put_if_absent(&path, bytes())
+                .await
+                .expect_err("put_if_absent"),
+            vault.get(&path).await.expect_err("get"),
+            vault.delete(&path).await.expect_err("delete"),
+            vault.list(&prefix).await.expect_err("list"),
+            vault.usage(&prefix).await.expect_err("usage"),
+        ]
+    }
+
+    fn generic() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "test",
+            source: "503 after retries".into(),
+        }
+    }
+
+    fn permission_denied() -> object_store::Error {
+        object_store::Error::PermissionDenied {
+            path: "p".into(),
+            source: "403".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_operation_classifies_backend_errors() {
+        for err in every_operation_fails(generic).await {
+            assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+            assert!(err.is_retryable());
+        }
+        for err in every_operation_fails(permission_denied).await {
+            assert!(matches!(err, StorageError::Fatal(_)), "{err:?}");
+            assert!(!err.is_retryable());
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_write_errors_are_classified() {
+        let vault = faulty(|| object_store::Error::AlreadyExists {
+            path: "p".into(),
+            source: "generation mismatch".into(),
+        });
+        let path = TenantPaths::tenant_enrollment(tenant_a());
+        assert!(matches!(
+            vault.put_if_absent(&path, Bytes::from_static(b"key")).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        let vault = faulty(|| object_store::Error::Precondition {
+            path: "p".into(),
+            source: "etag mismatch".into(),
+        });
+        assert!(matches!(
+            vault.put_if_absent(&path, Bytes::from_static(b"key")).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn map_err_classifies_every_object_store_error() {
+        use object_store::Error as E;
+        let source = || -> Box<dyn std::error::Error + Send + Sync> { "cause".into() };
+        let aborted = tokio::spawn(std::future::pending::<()>());
+        aborted.abort();
+        let join_error = aborted.await.expect_err("aborted task");
+
+        let cases: Vec<(E, &str)> = vec![
+            (
+                E::NotFound {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "not_found",
+            ),
+            (
+                E::AlreadyExists {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "already_exists",
+            ),
+            (
+                E::Precondition {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "precondition_failed",
+            ),
+            (
+                E::Generic {
+                    store: "s",
+                    source: source(),
+                },
+                "unavailable",
+            ),
+            (E::JoinError { source: join_error }, "unavailable"),
+            (
+                E::PermissionDenied {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "fatal",
+            ),
+            (
+                E::Unauthenticated {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "fatal",
+            ),
+            (E::NotSupported { source: source() }, "fatal"),
+            (
+                E::NotModified {
+                    path: "p".into(),
+                    source: source(),
+                },
+                "fatal",
+            ),
+            (
+                E::NotImplemented {
+                    operation: "op".into(),
+                    implementer: "s".into(),
+                },
+                "fatal",
+            ),
+            (
+                E::UnknownConfigurationKey {
+                    store: "s",
+                    key: "k".into(),
+                },
+                "fatal",
+            ),
+            (
+                E::InvalidPath {
+                    source: object_store::path::Error::EmptySegment {
+                        path: "a//b".into(),
+                    },
+                },
+                "fatal",
+            ),
+        ];
+        for (err, expected) in cases {
+            let shown = format!("{err:?}");
+            let class = match map_err(err) {
+                StorageError::NotFound => "not_found",
+                StorageError::AlreadyExists => "already_exists",
+                StorageError::PreconditionFailed => "precondition_failed",
+                StorageError::Unavailable(_) => "unavailable",
+                StorageError::Fatal(_) => "fatal",
+            };
+            assert_eq!(class, expected, "{shown}");
+        }
+    }
+
+    /// A local "GCS" that holds every connection open and never answers, or
+    /// answers every request with 503. Returns its address and a count of
+    /// the requests it received.
+    async fn fake_gcs(answer_503: bool) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                if !answer_503 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    held.push(stream);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        if stream.readable().await.is_err() {
+                            return;
+                        }
+                        match stream.try_read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                            Err(_) => return,
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let reply = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = stream.writable().await;
+                    let _ = stream.try_write(reply);
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn client(request_secs: u64, max_retries: u32, retry_secs: u64) -> StorageClientConfig {
+        StorageClientConfig {
+            request_timeout: std::time::Duration::from_secs(request_secs),
+            connect_timeout: std::time::Duration::from_secs(1),
+            max_retries,
+            retry_timeout: std::time::Duration::from_secs(retry_secs),
+        }
+    }
+
+    /// A local server answering every request with 200 and an ETag, as an
+    /// emulator does to a successful write.
+    async fn accepting_gcs() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        if stream.readable().await.is_err() {
+                            return;
+                        }
+                        match stream.try_read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                            Err(_) => return,
+                        }
+                    }
+                    let reply = b"HTTP/1.1 200 OK\r\netag: \"1\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = stream.writable().await;
+                    let _ = stream.try_write(reply);
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn emulator_writes_need_no_cloud_credentials() {
+        let url = accepting_gcs().await;
+        let vault = ObjectStoreVault::new_gcs_with_emulator("bucket", Some(&url), &client(2, 0, 2))
+            .expect("vault");
+        vault
+            .put(
+                &TenantPaths::drive_manifest(tenant_a(), object_1()),
+                Bytes::from_static(b"ciphertext"),
+            )
+            .await
+            .expect("a write to the emulator must not ask a metadata server for credentials");
+    }
+
+    #[tokio::test]
+    async fn stalled_backend_fails_within_the_configured_bound() {
+        let (url, _) = fake_gcs(false).await;
+        let settings = client(1, 1, 1);
+        let vault = ObjectStoreVault::new_gcs_with_emulator("bucket", Some(&url), &settings)
+            .expect("vault");
+        let started = std::time::Instant::now();
+        let err = vault
+            .get(&TenantPaths::drive_manifest(tenant_a(), object_1()))
+            .await
+            .expect_err("a stalled backend never answers");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+        assert!(elapsed >= settings.request_timeout, "{elapsed:?}");
+        // One second of slack for scheduling.
+        assert!(
+            elapsed <= settings.worst_case() + std::time::Duration::from_secs(1),
+            "{elapsed:?} exceeds {:?}",
+            settings.worst_case()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_retried_exactly_max_retries_times() {
+        use std::sync::atomic::Ordering;
+        for max_retries in [0, 2] {
+            let (url, requests) = fake_gcs(true).await;
+            let vault = ObjectStoreVault::new_gcs_with_emulator(
+                "bucket",
+                Some(&url),
+                &client(5, max_retries, 30),
+            )
+            .expect("vault");
+            let err = vault
+                .get(&TenantPaths::drive_manifest(tenant_a(), object_1()))
+                .await
+                .expect_err("every answer is a 503");
+            assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+            assert_eq!(requests.load(Ordering::SeqCst), max_retries as usize + 1);
+        }
+    }
+
     #[test]
     fn gcs_vault_accepts_storage_emulator_host_override() {
         for host in [
@@ -505,8 +1002,12 @@ mod tests {
             "fake-gcs:4443",
             "http://127.0.0.1:4443/",
         ] {
-            ObjectStoreVault::new_gcs_with_emulator("quackxide-vault", Some(host))
-                .expect("emulator-backed GCS client builds without GCP credentials");
+            ObjectStoreVault::new_gcs_with_emulator(
+                "quackxide-vault",
+                Some(host),
+                &StorageClientConfig::default(),
+            )
+            .expect("emulator-backed GCS client builds without GCP credentials");
         }
     }
 }

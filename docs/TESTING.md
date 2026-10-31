@@ -47,9 +47,11 @@ enable it and `cargo test` needs no flag.
 
 `tests/common/mod.rs` holds the shared helpers; a test file uses them with
 `mod common;`. It has the HS256 token minters (`token_for`, `admin_token`,
-taking the file's secret), the request helpers (`send`, `send_json`, `call`,
-`post`, `post_query`), and the app builders (`app_state`, `synced_vault`,
-`research_app`). Use them rather than writing new ones, and add a helper
+taking the file's secret), the request helpers (`send`, `send_with_headers`,
+`send_json`, `call`, `post`, `post_query`), the app builders (`app_state`,
+`synced_vault`, `research_app`), and `FlakyVault`, an in-memory vault that
+fails the operations chosen in `Faults` with a transient (`outage`) or
+permanent (`misconfigured`) storage error. Use them rather than writing new ones, and add a helper
 there when a second file needs it. Tests that need RS256 tokens use its
 `rs256_token` and `rs256_verifier` (see [Managed sign-in](#managed-sign-in)).
 
@@ -96,6 +98,21 @@ runs `*.test.ts` and has no DOM. The `dom` project runs `*.test.tsx` under
 jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 Neither project runs a real browser; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
+
+### Envelope vectors
+
+`fixtures/envelope/` holds the vectors that keep the browser and the backend
+on one envelope format. `hpk1.json` (test-only recipient keys derived from
+published seeds, enrollment keys, `info` strings, and envelopes that open or
+must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
+which fails when the file and its generator disagree; regenerate with
+`UPDATE_ENVELOPE_VECTORS=1 cargo test -p envelope-wasm --test vectors`.
+`hpk1-browser-sealed.json` holds envelopes sealed by the wasm module
+(`node scripts/browser-sealed-vectors.mjs` from `frontend/`, after
+`scripts/build-wasm.sh`), which the Rust test must open.
+`frontend/src/lib/crypto/envelope.test.ts` checks the same files against the
+wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
+enrollment cases through the enrollment route.
 
 ### Fuzz targets
 
@@ -149,16 +166,17 @@ with the reason.
 
 ## What CI cannot exercise
 
-GitHub-hosted runners have no SEV-SNP hardware, no account at the managed
+GitHub-hosted runners have no Intel TDX hardware, no account at the managed
 sign-in provider, and no GCS bucket. These substitutes are agreed for every
 test. The issues named below build them; this guide only records the choice.
 
-### SEV-SNP hardware
+### Confidential Space on TDX
 
-* **In CI:** recorded attestation reports, captured on the SEV-SNP cloud
-  environment (#36 phase B, and P48) and checked by the portable verifier
-  (P47). The simulated SEV-SNP mode (P84, #49) runs the same protocol for
-  development and lifecycle tests.
+* **In CI:** recorded Confidential Space attestation tokens, captured on
+  the TDX cloud environment (#36 phase B, and P48) and checked by the
+  token verifier (P47). The simulated SEV-SNP mode (P84, #49) runs the
+  attestation and key-release protocol for development and lifecycle
+  tests.
 * **On hardware:** the manual or dispatched hardware test job (P71).
 
 ### Managed sign-in
@@ -173,9 +191,23 @@ per test binary in a `OnceLock`. Do not use `keygen::fixtures`: it is
 
 ### GCS
 
-Use the in-memory `ObjectStoreVault::new_in_memory()`. Failure paths
-(conditional-write conflicts, transient errors) use the fault-injecting test
-double from P41.
+Use the in-memory `ObjectStoreVault::new_in_memory()`. For a storage
+failure seen by the API, use `FlakyVault` from `tests/common/mod.rs`; each
+drive operation has an outage test in `drive_api.rs`. To check how an
+`object_store` error is classified, wrap a store and pass it to
+`ObjectStoreVault::new`, as `FaultyStore` in `platform-storage/src/lib.rs`
+does. Timeouts and retries need the real HTTP client: point
+`ObjectStoreVault::new_gcs_with_emulator` at a local listener that stalls or
+answers 503, as `fake_gcs` in `platform-storage/src/lib.rs` and
+`stalled_storage_fails_within_the_documented_bound` in `drive_api.rs` do.
+
+`InMemory` enforces `VaultStore::put_if_absent` natively, but the GCS
+emulator does not: fake-gcs-server ignores `ifGenerationMatch`. So check
+create-only writes against a real bucket by hand (the P12 development
+bucket) whenever the create-only path or the `object_store` version
+changes. Write an object with `put_if_absent` and then write it again: the
+second write must fail with `StorageError::AlreadyExists` and leave the
+first object unchanged.
 
 ## Acceptance tests for definition-of-done items 1-3
 
@@ -183,7 +215,7 @@ double from P41.
   and keystore in real browsers. Stage B runs the steward and researcher
   lifecycles against the local stack on the simulated TEE.
 * **P82:** the v1.0 acceptance run. It runs P72's specs once against staging
-  on genuine SEV-SNP hardware, and records the evidence in the acceptance
+  on genuine Intel TDX hardware, and records the evidence in the acceptance
   checklist.
 
 If P72 moves to v1.1, the acceptance test for items 1-3 is the manual
