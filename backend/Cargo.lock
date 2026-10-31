@@ -3134,8 +3134,12 @@ name = "platform-enclave"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "jsonwebtoken",
  "p384",
+ "platform-enclave",
  "rand 0.8.7",
+ "rsa",
  "serde",
  "serde_json",
  "sha2 0.10.9",

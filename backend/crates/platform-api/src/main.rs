@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let query = match config.enclave.key_release_url.as_deref() {
+        #[cfg(feature = "dev")]
         Some(url) => {
             tracing::info!(
                 key_release_url = %url,
@@ -87,6 +88,14 @@ async fn main() -> anyhow::Result<()> {
                 config.research.default_query_budget,
             );
             Some(Arc::new(service))
+        }
+        // The key-release service is the simulated TEE's stand-in for Cloud
+        // KMS (ADR 0004); a production build must not release keys through it.
+        #[cfg(not(feature = "dev"))]
+        Some(_) => {
+            let reason = "KEY_RELEASE_URL is dev-only: the key-release stand-in exists only with the dev feature (ADR 0004)";
+            security_audit_event(AuditKind::ServiceStart, None, "denied", reason);
+            anyhow::bail!("refusing to start: {reason}");
         }
         None => {
             tracing::info!(
