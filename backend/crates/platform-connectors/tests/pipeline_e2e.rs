@@ -328,7 +328,7 @@ fn token_provider(
 }
 
 async fn sync_with(
-    provider: Arc<platform_enclave::simulated_token::SimulatedTokenProvider>,
+    provider: Arc<dyn platform_enclave::AttestationProvider>,
     require_attestation: bool,
 ) -> Result<(), PipelineError> {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
@@ -360,6 +360,33 @@ async fn simulated_token_for_a_debug_image_refuses_the_sync() {
     });
     let err = sync_with(debug, false).await.expect_err("must refuse");
     assert!(matches!(err, PipelineError::AttestationRefused(_)));
+}
+
+#[tokio::test]
+async fn sync_refuses_every_tampered_simulated_token() {
+    use platform_enclave::simulated_token::{
+        SIMULATED_IMAGE_DIGEST, SimulatedClaims, Tamper, TamperedTokenProvider, TokenSigner,
+    };
+    let signer = Arc::new(TokenSigner::generate(
+        "urn:sync:sim",
+        SimulatedClaims::default(),
+    ));
+    for tamper in Tamper::ALL {
+        let provider = TamperedTokenProvider::new(
+            signer.clone(),
+            platform_enclave::token::ReleasePolicy {
+                allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+            },
+            tamper,
+        );
+        let err = sync_with(Arc::new(provider), false)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, PipelineError::AttestationRefused(_)),
+            "{tamper:?}: {err:?}"
+        );
+    }
 }
 
 #[tokio::test]

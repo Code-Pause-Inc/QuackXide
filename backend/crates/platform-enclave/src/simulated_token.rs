@@ -5,7 +5,8 @@
 //! [`TokenSigner::jwks`] publishes the matching key set.
 //! [`SimulatedTokenProvider`] is the enclave side: it asks a signer, in
 //! process or through the `sim-attestation` service, for tokens bound to its
-//! nonces and verifies them with the production [`TokenVerifier`]. Compiled
+//! nonces and verifies them with the production [`TokenVerifier`].
+//! [`TamperedTokenProvider`] produces the tokens refusal tests need. Compiled
 //! only with the `simulated` feature.
 
 use std::sync::{Arc, RwLock};
@@ -344,6 +345,103 @@ impl AttestationProvider for SimulatedTokenProvider {
             .verify(&evidence.token, &nonces)
             .map(|_| ())
             .map_err(|e| EnclaveError::Rejected(e.to_string()))
+    }
+}
+
+/// One way a simulated token can fail verification. Each must be refused on
+/// the query path and the sync path (P84).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tamper {
+    DebugImage,
+    UnlistedImageDigest,
+    NonTdxHardware,
+    WrongNonce,
+    Expired,
+    OtherKeySet,
+}
+
+impl Tamper {
+    pub const ALL: [Tamper; 6] = [
+        Tamper::DebugImage,
+        Tamper::UnlistedImageDigest,
+        Tamper::NonTdxHardware,
+        Tamper::WrongNonce,
+        Tamper::Expired,
+        Tamper::OtherKeySet,
+    ];
+}
+
+/// Simulated evidence tampered one way, for refusal tests: its tokens fail
+/// `tamper`'s check, and it verifies them as [`SimulatedTokenProvider`] does,
+/// with the honest signer's key set and `policy`.
+pub struct TamperedTokenProvider {
+    tamper: Tamper,
+    signer: TokenSigner,
+    honest: SimulatedTokenProvider,
+}
+
+impl TamperedTokenProvider {
+    pub fn new(signer: Arc<TokenSigner>, policy: ReleasePolicy, tamper: Tamper) -> Self {
+        let claims = |edit: fn(&mut SimulatedClaims)| {
+            let mut claims = SimulatedClaims::default();
+            edit(&mut claims);
+            signer.with_claims(claims)
+        };
+        let tampered = match tamper {
+            Tamper::DebugImage => claims(|c| c.dbgstat = "enabled".into()),
+            Tamper::UnlistedImageDigest => {
+                claims(|c| c.image_digest = format!("sha256:{}", "f".repeat(64)))
+            }
+            Tamper::NonTdxHardware => claims(|c| c.hwmodel = "GCP_AMD_SEV".into()),
+            Tamper::WrongNonce | Tamper::Expired => claims(|_| ()),
+            Tamper::OtherKeySet => {
+                TokenSigner::generate(signer.issuer(), SimulatedClaims::default())
+            }
+        };
+        Self {
+            tamper,
+            signer: tampered,
+            honest: SimulatedTokenProvider::in_process(signer, policy),
+        }
+    }
+}
+
+#[async_trait]
+impl AttestationProvider for TamperedTokenProvider {
+    async fn produce_evidence(&self, nonce: &[u8]) -> Result<AttestationEvidence, EnclaveError> {
+        let bound_to: Vec<u8> = match self.tamper {
+            Tamper::WrongNonce => nonce.iter().map(|b| !b).collect(),
+            _ => nonce.to_vec(),
+        };
+        let nonces =
+            nonces_from_bytes(&bound_to).map_err(|e| EnclaveError::Rejected(e.to_string()))?;
+        let lifetime = Duration::from_secs(3600);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let issued_at = match self.tamper {
+            // Expired an hour ago, well past the verifier's leeway.
+            Tamper::Expired => now.saturating_sub(2 * lifetime.as_secs()),
+            _ => now,
+        };
+        let token = self
+            .signer
+            .sign_at(SIMULATED_AUDIENCE, &nonces, issued_at, lifetime);
+        Ok(AttestationEvidence {
+            platform: TeePlatform::Simulated,
+            nonce: nonce.to_vec(),
+            report: Vec::new(),
+            cert_chain: Vec::new(),
+            token,
+        })
+    }
+
+    fn verify_evidence(
+        &self,
+        evidence: &AttestationEvidence,
+        expected_nonce: &[u8],
+    ) -> Result<(), EnclaveError> {
+        self.honest.verify_evidence(evidence, expected_nonce)
     }
 }
 
