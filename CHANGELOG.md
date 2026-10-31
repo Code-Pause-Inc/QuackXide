@@ -107,8 +107,9 @@ uses [Semantic Versioning](https://semver.org/).
 * Query and research responses include `tee_platform`, the platform that
   passed the attestation gate: `amd-sev-snp`, `simulated` or `development`.
 * `devstack`, a dev-only server that runs the research lifecycle on one
-  machine: the API with the research routes on in-process dev keys and
-  fabricated attestation, seeded with a synthetic cohort, its catalog
+  machine: the API with the research routes on the simulated TEE
+  (in-process simulated tokens, with tenant keys released by the
+  key-release stand-in), seeded with a synthetic cohort, its catalog
   listing, and a token each for a steward and a researcher. It is built
   only with `platform-api`'s `dev` feature, refuses to start without
   `DEVSTACK_ALLOW_INSECURE=1` and `JWT_HS256_SECRET`, and listens only on

@@ -156,8 +156,10 @@ cargo run -p platform-api --features dev --bin query-demo   # sealed-query round
 
 `devstack` runs the API with the research routes wired and seeded, so the
 steward and researcher lifecycle runs on one machine without TEE
-hardware. It is insecure by design: tenant keys live in process memory, TEE
-evidence is fabricated, and all state is in memory and lost when it stops.
+hardware. It is insecure by design: tenant keys live in process memory, the
+TEE is simulated (in-process tokens checked by the production verifier, with
+keys released by the key-release stand-in), and all state is in memory and
+lost when it stops.
 It is built only with the `dev` feature, listens only on a loopback
 `BIND_ADDR`, and refuses to start unless the command sets
 `DEVSTACK_ALLOW_INSECURE=1` (a value in `.env` does not count) and

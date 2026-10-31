@@ -34,12 +34,17 @@ template:
 
 * `DevResearchStack::new()` is an in-memory vault with no tenant keys;
 * `commit_snapshot` seals a dataset to a tenant's keypair, commits it as
-  that tenant's connector snapshot, and keeps the keypair in a
-  `MultiTenantDevKeyProvider` so queries can open it;
-* `query_service` adds in-memory grant, budget and catalog registries and
-  attestation from `DevAttestation::allow_insecure_dev()`;
+  that tenant's connector snapshot, and keeps the keypair so queries can
+  open it;
+* `query_service` adds in-memory grant, budget and catalog registries on
+  the simulated TEE: simulated tokens, with keys from the in-process
+  key-release stand-in;
   `query_service_with_attestation` takes the attestation provider and
-  whether attestation is required, for attestation-refusal tests.
+  whether attestation is required, for attestation-refusal tests, and
+  opens keys from process memory.
+
+`platform_enclave::simulated_token::TamperedTokenProvider` produces each
+token the verifier must refuse (`Tamper::ALL`), for refusal tests.
 
 `platform_api::dev` exists only with the `dev` feature. `platform-api`
 lists itself as a dev-dependency with that feature on, so test builds
