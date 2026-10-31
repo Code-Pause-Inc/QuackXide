@@ -10,7 +10,7 @@ use axum::{Extension, Json};
 use platform_core::{ConnectorSlug, TenantId};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
-    BudgetLedger, CatalogError, CatalogRegistry, GrantRegistry, ListingDetails,
+    BudgetLedger, CatalogError, CatalogRegistry, GrantRegistry, ListingDetails, RequestStatus,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -179,9 +179,21 @@ impl ConnectorQueryService {
         Ok(json!({ "requests": requests }))
     }
 
-    /// Resolve a pending request. Approval mints the grant + budget through
-    /// the same path as a direct grant (idempotent, so a retried approval
-    /// after a partial failure converges); denial only records the outcome.
+    /// Resolve an access request. Only its steward may; other tenants and
+    /// unknown ids get the same "not found" (no existence oracle).
+    ///
+    /// Approval marks the request Approved first, then mints the grant and
+    /// budget through the same path as a direct grant. If a later step
+    /// fails, the request stays Approved without a usable grant (fail
+    /// closed) and the steward retries: approving an already-Approved
+    /// request re-runs every step after `resolve` (slug, listing, grant and
+    /// budget), all idempotent, so the retry converges. The re-run
+    /// re-activates the grant if the steward has revoked it since, as a
+    /// direct re-grant does.
+    ///
+    /// Denial acts only on a Pending request and only records the outcome.
+    /// Denied is terminal and an Approved request cannot be denied, so no
+    /// grant is ever minted for a Pending or Denied request.
     pub async fn resolve_access_request(
         &self,
         steward: TenantId,
@@ -189,13 +201,30 @@ impl ConnectorQueryService {
         approve: bool,
         budget_override: Option<u64>,
     ) -> Result<Value, ApiError> {
-        let request = self
-            .catalog()?
+        let catalog = self.catalog()?;
+        let request = match catalog
             .resolve(steward, request_id, approve)
             .await
             .map_err(|_| ApiError::Backend)?
-            .ok_or(ApiError::NotFound)?;
-
+        {
+            Some(request) => request,
+            // An earlier approval recorded Approved, then failed. Re-run the
+            // steps below for the request's own steward only:
+            // `list_requests_for` also returns requests where the caller is
+            // the researcher. Denied stays terminal.
+            None if approve => catalog
+                .list_requests_for(steward)
+                .await
+                .map_err(|_| ApiError::Backend)?
+                .into_iter()
+                .find(|r| {
+                    r.request_id == request_id
+                        && r.steward_tenant == steward
+                        && r.status == RequestStatus::Approved
+                })
+                .ok_or(ApiError::NotFound)?,
+            None => return Err(ApiError::NotFound),
+        };
         if !approve {
             security_audit_event(
                 AuditKind::ResearchCatalog,
