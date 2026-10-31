@@ -1,17 +1,23 @@
-# Security-critical paths require review from a code owner: the maintainer
-# or the security reviewer. Either one's approval satisfies the rule, but no
-# one can approve their own pull request. Everything else is reviewed by the
-# core team. Later lines take precedence over earlier ones.
+# Security-critical paths require review from a code owner. Each area has
+# the maintainer and two team members who work in that code, so nobody
+# waits on their own pull request: GitHub never counts the author's own
+# approval. Everything else is reviewed by the core team. Later lines take
+# precedence over earlier ones.
 
-/backend/crates/platform-crypto/               @AxolDad @abendrothj
-/backend/crates/platform-enclave/              @AxolDad @abendrothj
-/backend/crates/platform-auth/                 @AxolDad @abendrothj
-/backend/crates/quackxide-engine/src/policy.rs @AxolDad @abendrothj
-/backend/crates/quackxide-engine/src/disclosure.rs @AxolDad @abendrothj
-/frontend/src/lib/crypto/                      @AxolDad @abendrothj
-/scripts/                                      @AxolDad @abendrothj
-/.github/                                      @AxolDad @abendrothj
-/backend/deny.toml                             @AxolDad @abendrothj
+# Cryptography.
+/backend/crates/platform-crypto/               @AxolDad @gabrielzubovsky @abendrothj
+/frontend/src/lib/crypto/                      @AxolDad @gabrielzubovsky @abendrothj
+
+# Enclave, build and CI.
+/backend/crates/platform-enclave/              @AxolDad @abendrothj @angelina0i0
+/scripts/                                      @AxolDad @abendrothj @angelina0i0
+/.github/                                      @AxolDad @abendrothj @angelina0i0
+/backend/deny.toml                             @AxolDad @abendrothj @angelina0i0
+
+# Authentication and the disclosure policy.
+/backend/crates/platform-auth/                 @AxolDad @angelina0i0 @will5526
+/backend/crates/quackxide-engine/src/policy.rs @AxolDad @angelina0i0 @will5526
+/backend/crates/quackxide-engine/src/disclosure.rs @AxolDad @angelina0i0 @will5526
 
 # Maintainer only: who owns what, the attribution policy, and licensing.
 /.github/CODEOWNERS                            @AxolDad
