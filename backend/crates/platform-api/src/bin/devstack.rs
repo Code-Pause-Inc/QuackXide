@@ -1,11 +1,14 @@
 //! DEV ONLY — local research stack: the API with the research routes wired
 //! (catalog, access requests, grants, budgets, research queries) and seeded,
-//! so the steward and researcher lifecycle runs on one machine without
-//! SEV-SNP hardware.
+//! so the steward and researcher lifecycle runs on one machine without TEE
+//! hardware.
 //!
-//! Nothing here is confidential. Tenant keys are held in process memory, TEE
-//! evidence is fabricated (`DevAttestation::allow_insecure_dev`), and the
-//! vault and registries are in memory, so everything is lost on exit. The
+//! Nothing here is confidential. Queries run on the simulated TEE: an
+//! in-process signer issues Confidential Space-shaped tokens, the production
+//! verifier checks them, and the key-release stand-in releases tenant keys
+//! held in process memory only after a token passes. That exercises the
+//! evidence path, not the protection. The vault and registries are in
+//! memory, so everything is lost on exit. The
 //! binary is built only with the `dev` feature and refuses to start unless:
 //!
 //! * `DEVSTACK_ALLOW_INSECURE=1` is set in the command's environment (a value
@@ -145,8 +148,8 @@ async fn main() -> anyhow::Result<()> {
 /// log and a `service.start` audit record.
 fn warn_insecure() {
     const WARNING: &str = "devstack is INSECURE and for DEVELOPMENT ONLY: tenant keys are held \
-                           in process memory and TEE evidence is fabricated. Never load real \
-                           data into it or expose it beyond this machine.";
+                           in process memory and the TEE is simulated. Never load real data \
+                           into it or expose it beyond this machine.";
     eprintln!("\n*** {WARNING} ***\n");
     tracing::warn!("{WARNING}");
     security_audit_event(
@@ -265,5 +268,6 @@ mod tests {
         let released = result["rows"].as_array().map(Vec::len).unwrap_or(0);
         assert!(suppressed >= 1, "nothing suppressed: {result}");
         assert!(released >= 1, "nothing released: {result}");
+        assert_eq!(result["tee_platform"], "simulated", "{result}");
     }
 }

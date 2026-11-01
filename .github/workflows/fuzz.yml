@@ -14,11 +14,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [paddle_signature, ndjson, hpke_envelope, jwt_verify, snp_report, attestation_token]
+        target: [paddle_signature, ndjson, hpke_envelope, jwt_verify, attestation_token]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-fuzz
       # cargo-fuzz has no --locked flag; a locked fetch first fails if

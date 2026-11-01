@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke and tamper-refusal verification for the local Docker
-# Simulated AMD SEV-SNP TEE topology (docker-compose.simulated-tee.yml).
+# simulated TEE (docker-compose.simulated-tee.yml): simulated Confidential
+# Space tokens, checked by the token verifier before key release (ADR 0004).
 set -euo pipefail
 
 COMPOSE_FILE="docker-compose.simulated-tee.yml"
@@ -8,6 +9,10 @@ TENANT_ID="6f2c8a2e-1111-4222-8333-444455556666"
 JWT_SECRET="simulated-tee-local-jwt-secret-32b!!"
 
 cleanup() {
+  local status=$?
+  if [[ ${status} -ne 0 ]]; then
+    docker compose -f "${COMPOSE_FILE}" logs --tail 20 >&2 || true
+  fi
   docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -42,79 +47,86 @@ wait_for_http() {
   return 1
 }
 
-echo "==> [1/5] Building and starting fake-gcs and key-release-service..."
-docker compose -f "${COMPOSE_FILE}" up -d --build fake-gcs key-release-service
+QUERY='{"connector":"quickbooks","sql":"SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency ORDER BY currency"}'
 
-echo "==> [2/5] Creating 'quackxide-vault' bucket in fake-gcs and enrolling demo tenant..."
-curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=quackxide-sim" \
+query_status() {
+  curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8080/api/v1/query" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "${QUERY}"
+}
+
+# Restart sim-attestation with one claim changed and expect queries to fail closed.
+expect_tamper_refused() {
+  local name="$1" var="$2" value="$3"
+  env "${var}=${value}" docker compose -f "${COMPOSE_FILE}" up -d --force-recreate sim-attestation >/dev/null
+  # Without this, a 503 could mean the service is not up yet rather than a refusal.
+  wait_for_http "http://127.0.0.1:8070/healthz"
+  local code
+  code=$(query_status)
+  if [[ "${code}" != "503" ]]; then
+    echo "ERROR: expected HTTP 503 with ${name}, got ${code}" >&2
+    exit 1
+  fi
+  echo "    ${name} refused with HTTP 503."
+}
+
+echo "==> [1/5] Building all images; starting sim-attestation and key-release-service..."
+# Build every image now, so later stages never start one built from older code.
+docker compose -f "${COMPOSE_FILE}" build
+docker compose -f "${COMPOSE_FILE}" up -d sim-attestation key-release-service
+wait_for_http "http://127.0.0.1:8070/healthz"
+wait_for_http "http://127.0.0.1:8090/healthz"
+
+echo "==> [2/5] Enrolling the demo tenant's key with key-release-service..."
+PRIVATE_KEY_B64=$(openssl rand -base64 32)
+ENROLL_JSON=$(curl -fsS -X PUT "http://127.0.0.1:8090/v1/keys" \
   -H "Content-Type: application/json" \
-  -d '{"name":"quackxide-vault"}' >/dev/null
-
-ENROLL_JSON=$(curl -fsS -X POST "http://127.0.0.1:8090/v1/key-release/tenants" \
-  -H "Content-Type: application/json" \
-  -d "{\"tenant_id\":\"${TENANT_ID}\"}")
-
+  -d "{\"tenant_id\":\"${TENANT_ID}\",\"private_key_b64\":\"${PRIVATE_KEY_B64}\"}")
 TENANT_PUBKEY_B64=$(printf '%s' "${ENROLL_JSON}" | sed -n 's/.*"public_key_b64":"\([^"]*\)".*/\1/p')
 if [[ -z "${TENANT_PUBKEY_B64}" ]]; then
   echo "ERROR: failed to extract public_key_b64 from key-release-service response: ${ENROLL_JSON}" >&2
   exit 1
 fi
 
-echo "==> [3/5] Starting enclave-api and sealing synthetic QuickBooks fixture into fake-gcs..."
+echo "==> [3/5] Starting enclave-api and sealing the synthetic QuickBooks fixture into its vault..."
 DEMO_TENANT_ID="${TENANT_ID}" \
 DEMO_TENANT_PUBLIC_KEY_B64="${TENANT_PUBKEY_B64}" \
   docker compose -f "${COMPOSE_FILE}" up -d enclave-api
-
 wait_for_http "http://127.0.0.1:8080/healthz"
 
 TOKEN=$(mint_jwt "${TENANT_ID}")
 
-echo "==> [4/5] Verifying public attestation quote and confidential query happy path..."
-ATTEST_RESP=$(curl -fsS "http://127.0.0.1:8080/api/v1/attestation?nonce=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-if ! printf '%s' "${ATTEST_RESP}" | grep -q '"report_b64"'; then
-  echo "ERROR: expected report_b64 in /api/v1/attestation response: ${ATTEST_RESP}" >&2
+echo "==> [4/5] Verifying the attestation token and the confidential query happy path..."
+NONCE_B64=$(openssl rand -base64 32)
+ATTEST_RESP=$(curl -fsS -G "http://127.0.0.1:8080/api/v1/attestation" --data-urlencode "nonce_b64=${NONCE_B64}")
+if ! printf '%s' "${ATTEST_RESP}" | grep -q '"token":"ey'; then
+  echo "ERROR: expected a token in /api/v1/attestation response: ${ATTEST_RESP}" >&2
   exit 1
 fi
 
 QUERY_RESP=$(curl -fsS -X POST "http://127.0.0.1:8080/api/v1/query" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"connector":"quickbooks","sql":"SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency ORDER BY currency"}')
-
-if ! printf '%s' "${QUERY_RESP}" | grep -q '"enclave_signature"'; then
-  echo "ERROR: expected enclave_signature in query response: ${QUERY_RESP}" >&2
+  -d "${QUERY}")
+if ! printf '%s' "${QUERY_RESP}" | grep -q '"rows"'; then
+  echo "ERROR: expected result rows in query response: ${QUERY_RESP}" >&2
   exit 1
 fi
-echo "    Happy path verified (signed enclave response received)."
+echo "    Happy path verified (token-gated key release and query)."
 
-echo "==> [5/5] Verifying fail-closed tamper refusal (MEASUREMENT mismatch & DEBUG=1)..."
-TAMPERED_MEAS=$(printf 'ff%.0s' {1..96})
-SIMULATED_SNP_MEASUREMENT_HEX="${TAMPERED_MEAS}" \
-  docker compose -f "${COMPOSE_FILE}" up -d --force-recreate enclave-api
-wait_for_http "http://127.0.0.1:8080/healthz"
+echo "==> [5/5] Verifying fail-closed refusal of tampered tokens..."
+expect_tamper_refused "a debug image" SIM_TOKEN_DBGSTAT enabled
+expect_tamper_refused "an unlisted image digest" SIM_TOKEN_IMAGE_DIGEST "sha256:$(printf '0%.0s' {1..64})"
+expect_tamper_refused "non-TDX hardware" SIM_TOKEN_HWMODEL GCP_AMD_SEV
 
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8080/api/v1/query" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"connector":"quickbooks","sql":"SELECT COUNT(*) FROM quickbooks"}')
-if [[ "${HTTP_CODE}" != "503" ]]; then
-  echo "ERROR: expected HTTP 503 on tampered MEASUREMENT, got ${HTTP_CODE}" >&2
+docker compose -f "${COMPOSE_FILE}" up -d --force-recreate sim-attestation >/dev/null
+wait_for_http "http://127.0.0.1:8070/healthz"
+CODE=$(query_status)
+if [[ "${CODE}" != "200" ]]; then
+  echo "ERROR: expected HTTP 200 after restoring default claims, got ${CODE}" >&2
   exit 1
 fi
-echo "    MEASUREMENT mismatch refused with HTTP 503."
+echo "    Default claims accepted again after the simulator restarted with a new key."
 
-SIMULATED_SNP_DEBUG="true" \
-  docker compose -f "${COMPOSE_FILE}" up -d --force-recreate enclave-api
-wait_for_http "http://127.0.0.1:8080/healthz"
-
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8080/api/v1/query" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"connector":"quickbooks","sql":"SELECT COUNT(*) FROM quickbooks"}')
-if [[ "${HTTP_CODE}" != "503" ]]; then
-  echo "ERROR: expected HTTP 503 on GuestPolicy::DEBUG=1, got ${HTTP_CODE}" >&2
-  exit 1
-fi
-echo "    GuestPolicy::DEBUG=1 refused with HTTP 503."
-
-echo "==> All Simulated TEE Docker verification checks passed."
+echo "==> All simulated TEE Docker verification checks passed."

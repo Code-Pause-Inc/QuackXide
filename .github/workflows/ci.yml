@@ -25,7 +25,7 @@ jobs:
           workspaces: backend
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: wasm-bindgen@0.2.126
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -52,7 +52,7 @@ jobs:
       - run: cargo test --manifest-path backend/Cargo.toml --workspace --locked
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: wasm-bindgen@0.2.126
       - run: scripts/build-wasm.sh
@@ -91,7 +91,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov
       - name: Backend coverage
@@ -106,7 +106,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: wasm-bindgen@0.2.126
       - run: scripts/build-wasm.sh
@@ -143,7 +143,7 @@ jobs:
             echo "::error::platform-api is missing from the build report; the check cannot run"
             exit 1
           fi
-          for bin in devstack key-release query-demo; do
+          for bin in devstack key-release query-demo sim-attestation; do
             if grep -qx "$bin" <<<"$built"; then
               echo "::error::the default-feature release build produced the dev-only binary $bin"
               exit 1
@@ -151,7 +151,7 @@ jobs:
           done
       - name: Dev-only binaries cannot be built without the dev feature
         run: |
-          for bin in devstack key-release query-demo; do
+          for bin in devstack key-release query-demo sim-attestation; do
             if cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api --bin "$bin" 2> "$bin.err"; then
               echo "::error::$bin built without --features dev"
               exit 1
@@ -162,6 +162,35 @@ jobs:
               exit 1
             fi
           done
+      # Feature edges a release build uses. Dev edges are left out: test builds
+      # turn `dev`, and with it the simulator, on.
+      - name: The release build has no attestation simulator
+        run: |
+          for crate in platform-api platform-connectors; do
+            # Captured first, so a failing cargo tree fails the step instead of passing it.
+            tree=$(cargo tree --manifest-path backend/Cargo.toml --locked -p "$crate" -e normal,features -i platform-enclave)
+            if grep -q 'feature "simulated"' <<<"$tree"; then
+              echo "::error::the release build of $crate enables platform-enclave's simulated feature"
+              exit 1
+            fi
+          done
+      - name: The release connector-worker refuses unattested syncs
+        run: |
+          cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-connectors --bin connector-worker
+          cd "$RUNNER_TEMP"
+          set +e
+          TEE_ATTESTATION_REQUIRED=false timeout 20 "$GITHUB_WORKSPACE/backend/target/release/connector-worker" > worker.log 2>&1
+          set -e
+          if ! grep '"audit_kind":"tee.attestation"' worker.log | grep -q '"outcome":"denied"'; then
+            cat worker.log
+            echo "::error::the release connector-worker did not refuse attestation"
+            exit 1
+          fi
+          if grep '"audit_kind":"connector.sync"' worker.log | grep -q '"outcome":"ok"'; then
+            cat worker.log
+            echo "::error::the release connector-worker synced without attestation"
+            exit 1
+          fi
       # The key-release service is the simulated TEE's stand-in for Cloud KMS
       # (ADR 0004). A release platform-api must refuse to start when pointed at it.
       - name: The release platform-api refuses the dev-only KEY_RELEASE_URL

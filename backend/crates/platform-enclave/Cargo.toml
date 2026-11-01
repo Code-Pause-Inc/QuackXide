@@ -13,17 +13,17 @@ workspace = true
 
 [features]
 default = []
-# DEV ONLY. The simulated attestation token signer, which signs
-# Confidential Space-shaped tokens with a throwaway key. Never a default
-# feature; test builds enable it.
-simulated = ["dep:rsa"]
+# DEV ONLY. The simulated attestation token signer and provider, which sign
+# and fetch Confidential Space-shaped tokens with a throwaway key. Never a
+# default feature; `platform-api`'s `dev` feature and test builds enable it.
+simulated = ["dep:rsa", "dep:reqwest"]
 
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
 jsonwebtoken.workspace = true
-p384.workspace = true
 rand.workspace = true
+reqwest = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

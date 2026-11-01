@@ -15,6 +15,10 @@ use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
+use platform_enclave::simulated_token::{
+    SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
+};
+use platform_enclave::token::ReleasePolicy;
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_telemetry::capture::AuditCapture;
@@ -25,6 +29,25 @@ use common::{app_state, bearer, dev_attestation, json_header, send, synced_vault
 
 const SECRET: &str = "audit-itest-secret";
 const PADDLE_SECRET: &str = "pdl_ntfset_audit_secret";
+
+fn sim_signer() -> &'static TokenSigner {
+    static SIGNER: std::sync::OnceLock<TokenSigner> = std::sync::OnceLock::new();
+    SIGNER.get_or_init(|| TokenSigner::generate("urn:audit:sim", SimulatedClaims::default()))
+}
+
+fn sim_policy() -> ReleasePolicy {
+    ReleasePolicy {
+        allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+    }
+}
+
+/// A simulated token provider whose tokens carry `claims`.
+fn sim(claims: SimulatedClaims) -> Arc<SimulatedTokenProvider> {
+    Arc::new(SimulatedTokenProvider::in_process(
+        Arc::new(sim_signer().with_claims(claims)),
+        sim_policy(),
+    ))
+}
 
 fn token_for(tenant: TenantId) -> String {
     common::token_for(SECRET, tenant)
@@ -269,18 +292,16 @@ async fn attestation_refusal_is_audited() {
 }
 
 #[tokio::test]
-async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_hardware() {
-    use platform_enclave::{GuestPolicy, SimulatedSnp, SimulatedSnpConfig};
-
+async fn simulated_tokens_audit_simulated_outcome_and_refuse_invalid_or_required_hardware() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
 
-    // 1. Valid SimulatedSnp on query path (require_attestation = false) verifies the binary report
-    // and emits outcome = "simulated".
+    // 1. A valid simulated token on the query path (require_attestation = false)
+    // verifies and emits outcome = "simulated".
     let app = full_app_with_attestation(
         tenant,
         ZkMode::Disabled,
-        Arc::new(SimulatedSnp::new()),
+        sim(SimulatedClaims::default()),
         false,
     )
     .await;
@@ -300,13 +321,12 @@ async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_
         capture.events()
     );
 
-    // 2. SimulatedSnp with DEBUG policy enabled is rejected by the verifier even in dev mode.
-    let debug_sim = SimulatedSnp::with_config(SimulatedSnpConfig {
-        policy: GuestPolicy::production_default().with_debug(true),
-        ..SimulatedSnpConfig::default()
+    // 2. A token reporting a debug image is rejected by the verifier even in dev mode.
+    let debug_sim = sim(SimulatedClaims {
+        dbgstat: "enabled".into(),
+        ..SimulatedClaims::default()
     });
-    let bad_app =
-        full_app_with_attestation(tenant, ZkMode::Disabled, Arc::new(debug_sim), false).await;
+    let bad_app = full_app_with_attestation(tenant, ZkMode::Disabled, debug_sim, false).await;
     let (status, _) = send(
         &bad_app,
         "POST",
@@ -317,11 +337,11 @@ async fn simulated_snp_audits_simulated_outcome_and_refuses_invalid_or_required_
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
-    // 3. Valid SimulatedSnp is rejected when hardware attestation is required (production mode).
+    // 3. A valid simulated token is rejected when hardware attestation is required (production mode).
     let prod_app = full_app_with_attestation(
         tenant,
         ZkMode::Disabled,
-        Arc::new(SimulatedSnp::new()),
+        sim(SimulatedClaims::default()),
         true,
     )
     .await;
@@ -386,14 +406,14 @@ async fn provisioning_webhook_is_audited() {
 async fn key_release_handshake_audits_ok_and_denied_outcomes() {
     use platform_api::key_release::{
         AttestedKeyProvider, EnclaveIdentity, InProcessKeyReleaseClient, KeyReleaseRelyingParty,
+        StaticKeySource,
     };
-    use platform_enclave::{SimulatedSnp, SimulatedSnpConfig};
 
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let keypair = TenantKeypair::generate();
-    let snp = Arc::new(SimulatedSnp::new());
+    let snp = sim(SimulatedClaims::default());
 
     let pipeline = EnclavePipeline::new(snp.clone(), vault.clone(), false);
     pipeline
@@ -406,8 +426,9 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         .expect("seal");
 
     let rp = Arc::new(KeyReleaseRelyingParty::new(
-        snp.verifier(1_700_000_000),
-        false,
+        Arc::new(StaticKeySource(sim_signer().jwks())),
+        sim_signer().issuer(),
+        sim_policy(),
     ));
     rp.insert_tenant_key(tenant, &keypair);
     let ok_provider = Arc::new(AttestedKeyProvider::new(
@@ -445,11 +466,11 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         capture.events()
     );
 
-    // Unapproved measurement triggers a key-release denial that is audited on both RP and enclave sides.
-    let bad_snp = Arc::new(SimulatedSnp::with_config(SimulatedSnpConfig {
-        measurement: [0xFF; 48],
-        ..SimulatedSnpConfig::default()
-    }));
+    // An unapproved image digest triggers a key-release denial that is audited.
+    let bad_snp = sim(SimulatedClaims {
+        image_digest: format!("sha256:{}", "f".repeat(64)),
+        ..SimulatedClaims::default()
+    });
     let denied_provider = Arc::new(AttestedKeyProvider::new(
         Arc::new(EnclaveIdentity::generate()),
         bad_snp,

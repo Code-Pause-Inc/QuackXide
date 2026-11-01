@@ -243,8 +243,7 @@ impl ConnectorQueryService {
         Ok(AttestationBundle {
             platform: platform_label(evidence.platform).to_owned(),
             nonce_b64: B64.encode(nonce),
-            report_b64: B64.encode(&evidence.report),
-            cert_chain_b64: B64.encode(&evidence.cert_chain),
+            token: evidence.token,
             enclave_hpke_public_key_b64: B64.encode(self.identity.enclave_hpke_public_key()),
             result_signing_public_key_b64: B64.encode(self.identity.result_signing_public_key()),
             tls_cert_sha256_b64: B64.encode(self.identity.tls_cert_sha256()),
@@ -302,7 +301,7 @@ impl ConnectorQueryService {
                     AuditKind::TeeAttestation,
                     Some(tenant),
                     "simulated",
-                    &format!("simulated SEV-SNP evidence verified for {label} (dev only)"),
+                    &format!("simulated evidence verified for {label} (dev only)"),
                 );
                 Ok(platform_enclave::TeePlatform::Simulated)
             }

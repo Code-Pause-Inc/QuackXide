@@ -11,6 +11,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# DEV ONLY. Lets `connector-worker` attest through the simulated TEE
+# (`SIM_ATTESTATION_URL`); without it, unattested runs are refused.
+simulated = ["platform-enclave/simulated"]
+
 [dependencies]
 platform-core.workspace = true
 platform-config.workspace = true
@@ -34,4 +40,5 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+platform-enclave = { workspace = true, features = ["simulated"] }
 proptest.workspace = true

@@ -1,30 +1,37 @@
-# Local Simulated AMD SEV-SNP TEE topology for QuackXide.
+# DEV ONLY. Local simulated TEE topology for QuackXide (ADR 0004).
 #
-# Simulates the 3-plane Google Cloud Confidential Space + Cloud KMS + Cloud
-# Storage architecture locally:
-#   1. enclave-api         -> Confidential Space workload (SimulatedSnp)
-#   2. key-release-service -> Cloud KMS + STS / Attestation Verifier relying party
-#   3. fake-gcs            -> Cloud Storage encrypted vault (STORAGE_EMULATOR_HOST)
+# Simulates Confidential Space on TDX + Cloud KMS locally:
+#   1. enclave-api         -> Confidential Space workload (simulated token provider)
+#   2. sim-attestation     -> Google's attestation service (signs tokens, serves keys)
+#   3. key-release-service -> Cloud KMS stand-in, verifying tokens before release
+# enclave-api uses the in-memory vault: fake-gcs-server does not accept the
+# uploads object_store 0.13 sends.
+#
+# `setup_net` exists only so scripts/test-simulated-tee.sh can enroll a tenant
+# key and wait for sim-attestation from the host: Docker publishes no ports
+# for containers that are only on an internal network.
 
 services:
-  fake-gcs:
-    image: fsouza/fake-gcs-server:1.49.3
-    command:
-      - -scheme
-      - http
-      - -port
-      - "4443"
-      - -backend
-      - memory
-      - -external-url
-      - http://fake-gcs:4443
+  sim-attestation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: sim-attestation
+    environment:
+      SIM_ATTESTATION_BIND_ADDR: "0.0.0.0:8070"
+      SIM_ATTESTATION_ISSUER: "http://sim-attestation:8070"
+      SIM_TOKEN_HWMODEL: "${SIM_TOKEN_HWMODEL:-}"
+      SIM_TOKEN_DBGSTAT: "${SIM_TOKEN_DBGSTAT:-}"
+      SIM_TOKEN_IMAGE_DIGEST: "${SIM_TOKEN_IMAGE_DIGEST:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
     ports:
-      - "127.0.0.1:4443:4443"
+      - "127.0.0.1:8070:8070"
     networks:
       - enclave_internal_net
+      - setup_net
     read_only: true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
+      - /tmp:rw,noexec,nosuid,size=16m
     cap_drop:
       - ALL
     security_opt:
@@ -35,11 +42,14 @@ services:
       context: .
       dockerfile: Dockerfile
       target: key-release
+    depends_on:
+      - sim-attestation
     environment:
       KEY_RELEASE_BIND_ADDR: "0.0.0.0:8090"
       TEE_ATTESTATION_REQUIRED: "false"
-      SIMULATED_SNP_SEED: "${SIMULATED_SNP_SEED:-quackxide-local-simulated-tee-seed-v1}"
-      KEY_RELEASE_EXPECTED_MEASUREMENT_HEX: "${KEY_RELEASE_EXPECTED_MEASUREMENT_HEX:-}"
+      SIM_ATTESTATION_URL: "http://sim-attestation:8070"
+      SIM_ATTESTATION_ISSUER: "http://sim-attestation:8070"
+      KEY_RELEASE_ALLOWED_IMAGE_DIGEST: "${KEY_RELEASE_ALLOWED_IMAGE_DIGEST:-}"
       KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX: "${KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX:-}"
       LOG_FORMAT: "${LOG_FORMAT:-json}"
       RUST_LOG: "${RUST_LOG:-info}"
@@ -47,6 +57,7 @@ services:
       - "127.0.0.1:8090:8090"
     networks:
       - enclave_internal_net
+      - setup_net
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -61,19 +72,16 @@ services:
       dockerfile: Dockerfile
       target: enclave-api
     depends_on:
-      - fake-gcs
+      - sim-attestation
       - key-release-service
     environment:
       BIND_ADDR: "0.0.0.0:8080"
       METRICS_BIND_ADDR: "127.0.0.1:9464"
-      STORAGE_BUCKET: "${STORAGE_BUCKET:-quackxide-vault}"
-      STORAGE_EMULATOR_HOST: "http://fake-gcs:4443"
       KEY_RELEASE_URL: "http://key-release-service:8090"
       TEE_ATTESTATION_REQUIRED: "false"
       FEATURE_ZK_ENABLED: "${FEATURE_ZK_ENABLED:-false}"
-      SIMULATED_SNP_SEED: "${SIMULATED_SNP_SEED:-quackxide-local-simulated-tee-seed-v1}"
-      SIMULATED_SNP_MEASUREMENT_HEX: "${SIMULATED_SNP_MEASUREMENT_HEX:-}"
-      SIMULATED_SNP_DEBUG: "${SIMULATED_SNP_DEBUG:-false}"
+      SIM_ATTESTATION_URL: "http://sim-attestation:8070"
+      SIM_ATTESTATION_ISSUER: "http://sim-attestation:8070"
       ENCLAVE_CONFIG_DIGEST_HEX: "${ENCLAVE_CONFIG_DIGEST_HEX:-}"
       JWT_HS256_SECRET: "${JWT_HS256_SECRET:-simulated-tee-local-jwt-secret-32b!!}"
       JWT_ISSUER: "${JWT_ISSUER:-quackxide.local}"
@@ -100,3 +108,5 @@ networks:
   enclave_internal_net:
     driver: bridge
     internal: true
+  setup_net:
+    driver: bridge
