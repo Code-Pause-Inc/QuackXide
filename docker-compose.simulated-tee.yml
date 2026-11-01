@@ -88,6 +88,7 @@ services:
       JWT_AUDIENCE: "${JWT_AUDIENCE:-quackxide-api}"
       DEMO_TENANT_ID: "${DEMO_TENANT_ID:-}"
       DEMO_TENANT_PUBLIC_KEY_B64: "${DEMO_TENANT_PUBLIC_KEY_B64:-}"
+      RESEARCH_MIN_COHORT_SIZE: "${RESEARCH_MIN_COHORT_SIZE:-}"
       RUST_LOG: "${RUST_LOG:-info}"
     ports:
       - "127.0.0.1:8080:8080"

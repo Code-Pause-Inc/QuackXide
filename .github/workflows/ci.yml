@@ -229,6 +229,13 @@ jobs:
       - name: Check every fuzz target
         run: cargo check --manifest-path backend/fuzz/Cargo.toml --locked --bins
 
+  simulated-tee:
+    name: simulated TEE end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: scripts/test-simulated-tee.sh
+
   secret-scan:
     name: secret scan
     runs-on: ubuntu-latest
