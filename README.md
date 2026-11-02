@@ -93,7 +93,7 @@ backend/crates/
   platform-telemetry/     JSON tracing + SECURITY_AUDIT_EVENT stream
   platform-crypto/        AEAD, HPKE envelopes, blind indexes, TOTP
   platform-auth/          JWT verification (dev HS256, RS256/JWKS) + keygen
-  platform-storage/       Tenant-isolated ciphertext vault (GCS / emulator / in-memory)
+  platform-storage/       Tenant-isolated ciphertext vault (GCS / emulator / in-memory / dev-only local directory)
   platform-enclave/       Attestation gates, Confidential Space token verifier; dev-only token simulator (feature "simulated")
   platform-connectors/    Connector catalog, OAuth2, NDJSON, Parquet-out
   platform-tenancy/       Tenants, grants, budgets, dataset catalog
@@ -217,9 +217,11 @@ locally across isolated networks (`public_net` and `internal: true`
   debug disabled, `STABLE`, allowed image digest) before wrapping a tenant's
   private key via HPKE (`key-release-v1`) for a single query.
 
-`enclave-api` keeps its sealed snapshots in the in-memory vault:
-`fake-gcs-server` 1.49.3 does not accept the uploads `object_store` 0.13
-sends, so no storage emulator is part of the stack.
+`enclave-api` keeps its sealed snapshots in a directory on the
+`enclave_vault` volume (`STORAGE_LOCAL_DIR`, dev builds only), and the test
+script checks that it holds only ciphertext. No GCS emulator is part of the
+stack: `fake-gcs-server` does not accept the uploads `object_store` 0.13
+sends (#153).
 
 The simulation runs production's evidence path (the token verifier, its
 release policy, key release through the stand-in, sealed queries) on any
