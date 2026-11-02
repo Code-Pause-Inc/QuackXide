@@ -234,6 +234,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Warms the builder from the Actions cache, so the script's own
+      # `docker compose build` reuses unchanged layers, above all the
+      # cargo-chef dependency layer.
+      - uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: docker-compose.simulated-tee.yml
+          set: |
+            *.cache-from=type=gha,scope=simulated-tee
+            *.cache-to=type=gha,scope=simulated-tee,mode=max
       - run: scripts/test-simulated-tee.sh
 
   secret-scan:
