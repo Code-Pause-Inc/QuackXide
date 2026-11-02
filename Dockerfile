@@ -40,7 +40,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 nonroot \
-    && useradd --uid 65532 --gid 65532 --shell /usr/sbin/nologin --no-create-home nonroot
+    && useradd --uid 65532 --gid 65532 --shell /usr/sbin/nologin --no-create-home nonroot \
+    && install -d -o 65532 -g 65532 /var/lib/quackxide/vault
 
 COPY --from=builder /workspace/backend/target/release/platform-api /usr/local/bin/platform-api
 COPY --from=builder /workspace/backend/target/release/query-demo /usr/local/bin/query-demo
