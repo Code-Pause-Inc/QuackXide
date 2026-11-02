@@ -96,7 +96,7 @@ P12 phase A → P14 (includes the workload-identity decision) → P47 (starts of
 Chains that feed it:
 - Simulated TEE: P8 → P84 stage 1; P47 → P84 stage 2. Every later enclave, sealing and browser item is developed and tested against P84 before it runs on hardware.
 - Browser-verified enclave and sealed queries: P14, P15, P47, P34 checkpoint B and P84 → P85 (the attestation endpoint and the browser verifier), with P49's published values and P67's TLS-key binding for the production run → P55 → P56.
-- Sealed results: P14 → P33 → P55 → P56. P33 needs P31 (the session token and `tid` in the crypto worker) and P41's conditional-write PR, not the identity service, so this chain runs in parallel with P29.
+- Sealed results: P14 → P55 → P56, with P33 before P55 closes. P55 is built against the current enrollment record; P33 makes that record create-once. P33 needs P31 (the session token and `tid` in the crypto worker) and P41's conditional-write PR, not the identity service, so this chain runs in parallel with P29.
 - Hybrid suite for DoD item 1: P17 → P34 (seal first) and P35 (after P73's `HPK1` baseline) → P36 → P40 closes. P36 also needs P33, so it too waits on P14, P31 and P41's conditional-write PR, not on the identity service. P35 also feeds the main path at P50, which must wrap released keys with the hybrid suite before it closes.
 - Steward upload for DoD item 1: P38 → P39 → P40. P38 reuses the versioned-snapshot layout already merged on `main` (ADR 0003); its remaining hard dependencies are P14 and P69.
 - Sign-in, which DoD items 1 and 2 both begin with: P16 and P13 (provider development tenant) → P29 → P30 → P32, which P40 needs to close and P82 runs end to end; P29 and P30 → P63 → P68. A checkpoint in P5 follows P29's first attempt at the token exchange against the provider's development tenant.
@@ -953,6 +953,7 @@ The first draft's single sign-in issue is split into backend verification, ident
 - Replacing a key is a separate, explicit rotation call that requires a fresh second factor (P30), is audited as a distinct outcome, and is never triggered by worker initialization. Until P30 lands, the rotation call refuses (fail closed). Negative tests in `platform-api/tests` and `audit_coverage.rs`.
 - The v1 multi-device and recovery policy from P14 is implemented (for example: a second device gets a clear refusal), and `KeySetupGate` explains the second-device and unsupported-browser cases.
 - A device without an HPKE key can generate and enroll one later without losing its master key.
+- After a refused re-enrollment, a research result is still sealed to the original key (P55), with a test.
 - Enrollment records are verifiable as P14 specifies: a Rust check (used by `connector-worker` before sealing, if P19 keeps connector ingestion) refuses a record that fails verification (fail closed), with negative tests. If P14 makes a browser sealer depend on a server-stored enrollment, this issue also exposes the same check in the crypto worker; P40 calls it before sealing. Today nothing reads the enrollment: `connector-worker` takes the sealing key from `DEMO_TENANT_PUBLIC_KEY_B64` (`backend/crates/platform-connectors/src/bin/connector-worker.rs:89-118`).
 
 **Where.** `frontend/src/lib/crypto/keystore.ts`, `worker.ts`, `core.ts`; `frontend/src/components/KeySetupGate.tsx`; `backend/crates/platform-api/src/lib.rs` (`put_enrollment`); `backend/crates/platform-storage/src/lib.rs`; `backend/crates/platform-api/tests/`.
@@ -1566,9 +1567,9 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Where.** `backend/crates/platform-api/src/query.rs`, `backend/crates/platform-api/src/lib.rs` (enrollment), `backend/crates/platform-crypto/src/lib.rs`, `docs/adr/`, `docs/THREAT_MODEL.md`, `docs/ARCHITECTURE.md`, `README.md`.
 
-**Depends on:** P14, P15, P85, P54 (result contract), P33, and P35 to close.
+**Depends on:** P14, P15, P85, P54 (result contract); P33 and P35 to close.
 
-**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run.
+**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run. Starts before P33: until P33 lands, the enrollment record that supplies the recipient key's fingerprint can still be overwritten, which is acceptable on the simulated TEE only. Seals with the suite named in the enrollment record, so P35 switches the suite without changing P55's code.
 
 **Security impact.** Closes "Read results at the API edge", recipient-key substitution and result forgery (A2).
 **ADR.** Required (wire format and trust boundary).
