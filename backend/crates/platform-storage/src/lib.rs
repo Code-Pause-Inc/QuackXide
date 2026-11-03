@@ -75,6 +75,35 @@ impl TenantPaths {
         ))
     }
 
+    /// Every tenant's data. Control plane only: the drive orphan sweep lists
+    /// it to find chunk prefixes across tenants; no tenant-scoped operation
+    /// may use it.
+    pub fn all_tenants() -> VaultPath {
+        VaultPath("tenants".to_owned())
+    }
+
+    /// The tenant and object of a [`drive_chunk`](Self::drive_chunk) path.
+    pub fn drive_chunk_parts(path: &VaultPath) -> Option<(TenantId, ObjectId)> {
+        let rest = path.as_str().strip_prefix("tenants/")?;
+        let (tenant, rest) = rest.split_once('/')?;
+        let (object, index) = rest.strip_prefix("drive/objects/")?.split_once('/')?;
+        if index.len() != 8 || !index.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((tenant.parse().ok()?, object.parse().ok()?))
+    }
+
+    /// The tenant and object of a [`drive_manifest`](Self::drive_manifest)
+    /// path.
+    pub fn drive_manifest_parts(path: &VaultPath) -> Option<(TenantId, ObjectId)> {
+        let rest = path.as_str().strip_prefix("tenants/")?;
+        let (tenant, rest) = rest.split_once('/')?;
+        let object = rest
+            .strip_prefix("drive/manifests/")?
+            .strip_suffix(".json")?;
+        Some((tenant.parse().ok()?, object.parse().ok()?))
+    }
+
     /// Prefix of all chunks of one drive object (deletion).
     pub fn drive_object_prefix(tenant: TenantId, object: ObjectId) -> VaultPath {
         VaultPath(format!("tenants/{tenant}/drive/objects/{object}"))
@@ -202,6 +231,14 @@ impl StorageError {
     }
 }
 
+/// One stored object as a listing reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultEntry {
+    pub path: VaultPath,
+    pub size: u64,
+    pub last_modified: chrono::DateTime<chrono::Utc>,
+}
+
 /// Aggregate ciphertext footprint under a prefix (admin storage reporting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StorageUsage {
@@ -222,6 +259,9 @@ pub trait VaultStore: Send + Sync {
     async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError>;
     async fn delete(&self, path: &VaultPath) -> Result<(), StorageError>;
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError>;
+    /// As [`list`](Self::list), with each object's size and last-modified
+    /// time.
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError>;
     /// Object count and total ciphertext bytes under `prefix`.
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError>;
 }
@@ -379,6 +419,19 @@ impl VaultStore for ObjectStoreVault {
             .collect())
     }
 
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        Ok(self
+            .list_meta(prefix)
+            .await?
+            .into_iter()
+            .map(|meta| VaultEntry {
+                path: VaultPath(meta.location.to_string()),
+                size: meta.size,
+                last_modified: meta.last_modified,
+            })
+            .collect())
+    }
+
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         let metas = self.list_meta(prefix).await?;
         Ok(StorageUsage {
@@ -477,6 +530,69 @@ mod tests {
             TenantPaths::connector_snapshot_object_parts(tenant_a(), &slug, &manifest),
             None
         );
+    }
+
+    #[test]
+    fn drive_paths_parse_back_to_tenant_and_object() {
+        let chunk = TenantPaths::drive_chunk(tenant_a(), object_1(), 7);
+        assert_eq!(
+            TenantPaths::drive_chunk_parts(&chunk),
+            Some((tenant_a(), object_1()))
+        );
+        let manifest = TenantPaths::drive_manifest(tenant_a(), object_1());
+        assert_eq!(
+            TenantPaths::drive_manifest_parts(&manifest),
+            Some((tenant_a(), object_1()))
+        );
+        // Each parser accepts only its own kind of path.
+        assert_eq!(TenantPaths::drive_chunk_parts(&manifest), None);
+        assert_eq!(TenantPaths::drive_manifest_parts(&chunk), None);
+        let t = tenant_a();
+        let o = object_1();
+        for raw in [
+            format!("tenants/{t}/drive/objects/{o}"),
+            format!("tenants/{t}/drive/objects/{o}/7"),
+            format!("tenants/{t}/drive/objects/{o}/0000000x"),
+            format!("tenants/{t}/drive/objects/not-a-uuid/00000001"),
+            format!("tenants/not-a-uuid/drive/objects/{o}/00000001"),
+            format!("tenants/{t}/connectors/x/{o}.parquet"),
+            format!("control/tenants/{t}.json"),
+        ] {
+            assert_eq!(
+                TenantPaths::drive_chunk_parts(&VaultPath(raw.clone())),
+                None,
+                "{raw}"
+            );
+            assert_eq!(
+                TenantPaths::drive_manifest_parts(&VaultPath(raw.clone())),
+                None,
+                "{raw}"
+            );
+        }
+        assert!(
+            chunk
+                .as_str()
+                .starts_with(TenantPaths::all_tenants().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_entries_reports_size_and_last_modified() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let before = chrono::Utc::now();
+        let path = TenantPaths::drive_chunk(tenant_a(), object_1(), 0);
+        vault
+            .put(&path, Bytes::from_static(b"12345"))
+            .await
+            .expect("put");
+        let entries = vault
+            .list_entries(&TenantPaths::tenant_root(tenant_a()))
+            .await
+            .expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].size, 5);
+        assert!(entries[0].last_modified >= before - chrono::Duration::seconds(1));
     }
 
     #[test]
@@ -701,6 +817,7 @@ mod tests {
             vault.get(&path).await.expect_err("get"),
             vault.delete(&path).await.expect_err("delete"),
             vault.list(&prefix).await.expect_err("list"),
+            vault.list_entries(&prefix).await.expect_err("list_entries"),
             vault.usage(&prefix).await.expect_err("usage"),
         ]
     }

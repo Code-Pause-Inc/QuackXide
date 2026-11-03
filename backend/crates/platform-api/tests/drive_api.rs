@@ -14,7 +14,9 @@ use platform_api::{AppState, ManifestBody, build_app};
 use platform_core::TenantId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
+use platform_storage::{
+    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+};
 
 use common::{AUD, ISS, bearer, content_type, send};
 
@@ -452,6 +454,9 @@ impl VaultStore for RacingDeleteVault {
         }
         Ok(paths)
     }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.0.list_entries(prefix).await
+    }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.0.usage(prefix).await
     }
@@ -672,6 +677,9 @@ impl VaultStore for FailOnceDeleteVault {
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.inner.list(prefix).await
     }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.inner.list_entries(prefix).await
+    }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.inner.usage(prefix).await
     }
@@ -861,6 +869,9 @@ impl VaultStore for ConcurrencyVault {
     }
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.inner.list(prefix).await
+    }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.inner.list_entries(prefix).await
     }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.inner.usage(prefix).await

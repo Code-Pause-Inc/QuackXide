@@ -548,3 +548,39 @@ async fn drive_listing_past_the_cap_is_audited() {
         capture.events()
     );
 }
+
+#[tokio::test]
+async fn orphan_sweep_deletions_are_audited() {
+    let capture = AuditCapture::install();
+    let vault = ObjectStoreVault::new_in_memory();
+    let tenant = TenantId::generate();
+    vault
+        .put(
+            &platform_storage::TenantPaths::drive_chunk(
+                tenant,
+                platform_core::ObjectId::generate(),
+                0,
+            ),
+            bytes::Bytes::from_static(b"ciphertext"),
+        )
+        .await
+        .expect("put");
+
+    // As if the chunk were older than any upload may take.
+    let later =
+        chrono::Utc::now() + platform_api::sweep::ORPHAN_MIN_AGE + chrono::TimeDelta::minutes(1);
+    let report = platform_api::sweep::sweep_orphaned_chunks(&vault, later)
+        .await
+        .expect("sweep");
+    assert_eq!(report.chunks, 1);
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "data.access"
+                && e.outcome == "ok"
+                && e.detail.starts_with("orphan_sweep")),
+        "{:?}",
+        capture.events()
+    );
+}

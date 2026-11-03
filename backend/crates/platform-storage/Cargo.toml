@@ -15,6 +15,7 @@ workspace = true
 platform-config.workspace = true
 platform-core.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 bytes.workspace = true
 futures.workspace = true
 object_store.workspace = true

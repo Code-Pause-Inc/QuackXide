@@ -28,6 +28,13 @@ uses [Semantic Versioning](https://semver.org/).
   that the Rust and vitest tests both check. `platform-crypto`'s AEAD
   helpers, blind indexes and TOTP move behind its default `server`
   feature.
+* Drive orphan sweep: `platform-api` deletes, every hour, the chunks of
+  drive objects that have no manifest and whose newest chunk is more than
+  24 hours old (`platform_api::sweep::ORPHAN_MIN_AGE`), as an aborted upload
+  leaves them. Each deletion emits a `data.access` audit event.
+  `VaultStore::list_entries` returns each object's size and last-modified
+  time, and `TenantPaths` can parse drive chunk and manifest paths back to
+  their tenant and object.
 * The drive listing (`GET /api/v1/drive/objects`) is bounded: it returns at
   most 1000 objects (`MAX_LISTED_OBJECTS`) and reads their manifests 16 at a
   time instead of one by one. A drive holding more is refused with 422 "too

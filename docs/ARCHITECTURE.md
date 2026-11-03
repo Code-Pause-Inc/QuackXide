@@ -103,6 +103,14 @@ delete that fails partway leaves the object listed and a retry finishes it.
 Until then the object's download fails, since some chunks are gone. An
 object whose manifest is gone is a 404.
 
+An upload that stops before its manifest leaves chunks nothing points to.
+`platform-api` sweeps every hour (`platform_api::sweep`): it deletes an
+object's chunks when the object has no manifest and its newest chunk is
+more than 24 hours old (`ORPHAN_MIN_AGE`, the longest an upload may take),
+checking the manifest again just before deleting, and audits each deletion.
+Ages are the store's last-modified times, so the API host's clock must be
+within hours of the store's.
+
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
 

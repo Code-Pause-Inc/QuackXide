@@ -34,6 +34,7 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+pub mod sweep;
 use admin::ProvisioningService;
 use query::{
     ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
