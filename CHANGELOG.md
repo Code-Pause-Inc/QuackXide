@@ -8,6 +8,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* The simulated TEE stack keeps `enclave-api`'s vault in a directory on a
+  Docker volume (`ObjectStoreVault::new_local_dir`, `STORAGE_LOCAL_DIR`),
+  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext.
+  Only `dev` builds have this backend: a release `platform-api` refuses to
+  start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
+  accepts `object_store` 0.13's uploads (#153).
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), the expected

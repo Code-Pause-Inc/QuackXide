@@ -87,7 +87,7 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 └──────────────────┘ └──────────────────┘
 ```
 
-`enclave-api` keeps sealed snapshots in the in-memory vault. `fake-gcs-server` 1.49.3 routes `object_store` 0.13's simple uploads (`PUT /{bucket}/{object}`) to its JSON upload handler and refuses them, so the stack has no storage emulator; the GCS client is covered by `platform-storage`'s tests against local fake servers.
+`enclave-api` keeps sealed snapshots in a directory on the `enclave_vault` volume (`STORAGE_LOCAL_DIR`, which only `dev` builds accept). `fake-gcs-server` routes `object_store` 0.13's simple uploads (`PUT /{bucket}/{object}`) to its JSON upload handler and refuses them (still so in 1.56.1; #153), so the stack has no storage emulator; the GCS client is covered by `platform-storage`'s tests against local fake servers.
 
 `setup_net` (not internal) connects `key-release-service` and `sim-attestation` to `127.0.0.1` ports, only so the test script can enroll a tenant key and wait for the simulator: Docker publishes no ports for containers that are only on an internal network.
 
@@ -104,12 +104,14 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 ./scripts/test-simulated-tee.sh
 ```
 
-It runs five stages:
+It runs seven stages:
 1. Builds every image and starts `sim-attestation` and `key-release-service`.
 2. Enrolls a tenant key (`PUT /v1/keys`, which returns the public key).
-3. Starts `enclave-api`, which seals the synthetic QuickBooks fixture into its in-memory vault under the tenant's public key.
-4. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
-5. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
+3. Starts `enclave-api`, which seals the synthetic QuickBooks fixture into its vault under the tenant's public key.
+4. Copies the vault out of the container and requires tenant objects with no plaintext: no fixture customer name and no Parquet magic bytes.
+5. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
+6. Runs the research lifecycle: publish, request, approve, a query under disclosure control and a budget, revoke.
+7. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
 
 ---
 

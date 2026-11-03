@@ -3,16 +3,14 @@
 # (docker-compose.simulated-tee.yml): simulated Confidential Space tokens,
 # checked by the token verifier before key release (ADR 0004), the research
 # lifecycle (publish, request, approve, query under disclosure control and a
-# budget, revoke), and refusal of tampered tokens. Needs Docker, curl,
-# openssl and jq.
+# budget, revoke), refusal of tampered tokens, and a vault that holds only
+# ciphertext. Needs Docker, curl, openssl and jq.
 #
 # Not covered yet:
 # - An approval retry after a revoke. On main it still restores access
 #   (#166, fixed by #168); add the check once that merges.
 # - Steward upload into a dataset: the API has none yet (P38). The steward's
 #   data arrives through the sync pipeline, seeded at startup.
-# - Ciphertext at rest: the vault is in memory inside the container, so this
-#   script cannot read it from outside.
 set -euo pipefail
 
 COMPOSE_FILE="docker-compose.simulated-tee.yml"
@@ -30,6 +28,7 @@ cleanup() {
     docker compose -f "${COMPOSE_FILE}" logs --tail 20 >&2 || true
   fi
   docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "${VAULT_COPY:-}"
 }
 trap cleanup EXIT
 
@@ -115,14 +114,14 @@ expect_tamper_refused() {
   echo "    ${name} refused with HTTP 503."
 }
 
-echo "==> [1/6] Building all images; starting sim-attestation and key-release-service..."
+echo "==> [1/7] Building all images; starting sim-attestation and key-release-service..."
 # Build every image now, so later stages never start one built from older code.
 docker compose -f "${COMPOSE_FILE}" build
 docker compose -f "${COMPOSE_FILE}" up -d sim-attestation key-release-service
 wait_for_http "http://127.0.0.1:8070/healthz"
 wait_for_http "http://127.0.0.1:8090/healthz"
 
-echo "==> [2/6] Enrolling the demo tenant's key with key-release-service..."
+echo "==> [2/7] Enrolling the demo tenant's key with key-release-service..."
 PRIVATE_KEY_B64=$(openssl rand -base64 32)
 ENROLL_JSON=$(curl -fsS -X PUT "http://127.0.0.1:8090/v1/keys" \
   -H "Content-Type: application/json" \
@@ -133,16 +132,35 @@ if [[ -z "${TENANT_PUBKEY_B64}" ]]; then
   exit 1
 fi
 
-echo "==> [3/6] Starting enclave-api and sealing the synthetic QuickBooks fixture into its vault..."
+echo "==> [3/7] Starting enclave-api and sealing the synthetic QuickBooks fixture into its vault..."
 DEMO_TENANT_ID="${TENANT_ID}" \
 DEMO_TENANT_PUBLIC_KEY_B64="${TENANT_PUBKEY_B64}" \
 RESEARCH_MIN_COHORT_SIZE="${MIN_COHORT}" \
   docker compose -f "${COMPOSE_FILE}" up -d enclave-api
 wait_for_http "http://127.0.0.1:8080/healthz"
 
+echo "==> [4/7] Checking that the vault holds only ciphertext..."
+# enclave-api's vault is a directory in the enclave_vault volume (#153).
+VAULT_COPY=$(mktemp -d)
+docker compose -f "${COMPOSE_FILE}" cp enclave-api:/var/lib/quackxide/vault/. "${VAULT_COPY}"
+TENANT_DATA="${VAULT_COPY}/tenants/${TENANT_ID}"
+OBJECT_COUNT=$(find "${TENANT_DATA}" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [[ "${OBJECT_COUNT}" -eq 0 ]]; then
+  echo "ERROR: no tenant objects in the vault, so there is nothing to check" >&2
+  exit 1
+fi
+# A fixture customer name, and the magic bytes of a plaintext Parquet file.
+for plaintext in "Sample Customer" "PAR1"; do
+  if grep -rlF -- "${plaintext}" "${TENANT_DATA}" >&2; then
+    echo "ERROR: plaintext \"${plaintext}\" stored in the vault (files above)" >&2
+    exit 1
+  fi
+done
+echo "    ${OBJECT_COUNT} tenant objects stored, none with plaintext."
+
 TOKEN=$(mint_jwt "${TENANT_ID}")
 
-echo "==> [4/6] Verifying the attestation token and the confidential query happy path..."
+echo "==> [5/7] Verifying the attestation token and the confidential query happy path..."
 NONCE_B64=$(openssl rand -base64 32)
 ATTEST_RESP=$(curl -fsS -G "http://127.0.0.1:8080/api/v1/attestation" --data-urlencode "nonce_b64=${NONCE_B64}")
 if ! printf '%s' "${ATTEST_RESP}" | grep -q '"token":"ey'; then
@@ -160,7 +178,7 @@ if ! printf '%s' "${QUERY_RESP}" | grep -q '"rows"'; then
 fi
 echo "    Happy path verified (token-gated key release and query)."
 
-echo "==> [5/6] Verifying the research lifecycle: publish, request, approve, query, revoke..."
+echo "==> [6/7] Verifying the research lifecycle: publish, request, approve, query, revoke..."
 RESEARCHER_TOKEN=$(mint_jwt "${RESEARCHER_ID}")
 RESEARCH_QUERY="{\"steward_tenant\":\"${TENANT_ID}\",\"connector\":\"quickbooks\",\"sql\":\"SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency ORDER BY currency\"}"
 
@@ -202,7 +220,7 @@ expect_response "steward revokes the grant" 200
 api POST /api/v1/research/query "${RESEARCHER_TOKEN}" "${RESEARCH_QUERY}"
 expect_response "query after the revoke is refused" 403
 
-echo "==> [6/6] Verifying fail-closed refusal of tampered tokens..."
+echo "==> [7/7] Verifying fail-closed refusal of tampered tokens..."
 expect_tamper_refused "a debug image" SIM_TOKEN_DBGSTAT enabled
 expect_tamper_refused "an unlisted image digest" SIM_TOKEN_IMAGE_DIGEST "sha256:$(printf '0%.0s' {1..64})"
 expect_tamper_refused "non-TDX hardware" SIM_TOKEN_HWMODEL GCP_AMD_SEV

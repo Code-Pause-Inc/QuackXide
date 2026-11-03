@@ -211,6 +211,36 @@ jobs:
             echo "::error::the release platform-api exited, but not because KEY_RELEASE_URL is dev-only"
             exit 1
           fi
+      # The local-directory vault exists for the simulated TEE stack only, and
+      # no build accepts it together with a bucket.
+      - name: The release platform-api refuses STORAGE_LOCAL_DIR
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p vault
+          # refuses REASON [VAR=VALUE...]: platform-api must exit, naming REASON,
+          # with a denied service.start audit event.
+          refuses() {
+            local reason="$1"
+            shift
+            set +e
+            env "$@" STORAGE_LOCAL_DIR="$PWD/vault" BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+              timeout 30 "$GITHUB_WORKSPACE/backend/target/release/platform-api" > platform-api.log 2>&1
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+              cat platform-api.log
+              echo "::error::the release platform-api started with STORAGE_LOCAL_DIR set ($*)"
+              exit 1
+            fi
+            if ! grep -q "$reason" platform-api.log \
+              || ! grep '"audit_kind":"service.start"' platform-api.log | grep -q '"outcome":"denied"'; then
+              cat platform-api.log
+              echo "::error::the release platform-api exited, but not with a denied audit event for: $reason"
+              exit 1
+            fi
+          }
+          refuses 'STORAGE_LOCAL_DIR is dev-only'
+          refuses 'not both' STORAGE_BUCKET=example-bucket
 
 
   fuzz-build:
