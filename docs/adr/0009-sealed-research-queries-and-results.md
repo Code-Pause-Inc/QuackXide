@@ -46,6 +46,22 @@ rotates) or as PKI tokens that carry their certificate chain in `x5c` and
 verify against a root certificate Google publishes
 ([external resources](https://cloud.google.com/confidential-computing/confidential-space/docs/connect-external-resources)).
 
+### Spike
+
+Run on 2026-11-04 with the pinned toolchain (Rust 1.94.1) on x86_64
+Linux, outside the repository:
+
+| Check | Result |
+| --- | --- |
+| `platform-enclave` alone for `wasm32-unknown-unknown` | Fails only because `getrandom` 0.2 (from `jsonwebtoken` and `rand_core`) lacks its `js` backend |
+| `TokenVerifier` linked into `envelope-wasm`, which enables that backend, release build | Builds; 1.72 MB against 569 KB without it, before `wasm-bindgen` and `wasm-opt`. Not yet run in a browser |
+| How `jsonwebtoken` 11.1 reads the clock on wasm32 | `js_sys::Date` (`validation.rs:179`), not `SystemTime`; `token.rs` reads `SystemTime` only in tests |
+| Google's OIDC key set, fetched cross-origin | `Access-Control-Allow-Origin` echoes the requesting origin; `Cache-Control` max-age about 6 hours |
+| `rustls-webpki` 0.103.16 with `ring` for wasm32 | Builds, with clang for `ring`'s C code |
+| The same, native, on an RSA chain shaped like Google's (4096-bit root, intermediate, leaf) | Accepts a leaf with no extended key usage; refuses a wrong root, an expired chain, and a leaf whose extended key usage it was not told to expect |
+| Google's Confidential Space root certificate | RSA-4096, SHA-256, valid until 2034-01-16 |
+| Extended key usage of real PKI leaf certificates | Unknown. Google's documentation does not state it, its Go sample accepts any, and Project Oak's Rust verifier (`x509-cert` with `x509-verify`) checks none |
+
 ## Decision
 
 ### Enclave keys
@@ -98,7 +114,7 @@ with 400. Each call requests one custom token with that nonce. The body:
 {
   "version": 1,
   "key_id": "…",
-  "token": "<PKI token>",
+  "token": "<OIDC token>",
   "request_key": { "suite": "HPK1", "public_key": "…" },
   "signing_keys": { "ed25519": "…", "ml_dsa_65": "…" },
   "kms_public_key": null,
@@ -115,20 +131,22 @@ Byte fields are base64url without padding.
   worker memory (never persisted) until the token expires or the server
   reports an unknown `key_id`. Each query gets its own freshness from its
   request nonce and the signed result.
-* **PKI tokens, root pinned.** The token is the PKI type. The browser
-  validates its `x5c` chain to Google's Confidential Space root
-  certificate, which is compiled into the release bundle alongside P49's
-  image digests and changes only with a release. The key set never comes
-  from the API, which the operator controls. The library is open question
-  1.
+* **OIDC tokens, key set fetched from Google.** The token is the OIDC
+  type. The worker fetches Google's key set itself, over its own TLS
+  connection to Google, from the key-set URL compiled into the release
+  bundle with the issuer and P49's image digests. It never takes the key
+  set from the API, which the operator controls. It uses the browser's
+  HTTP cache, and refetches once when a token names a key the set does
+  not hold. A development build compiles in the simulator's issuer and
+  key-set URL instead.
 
 ### Browser verification
 
 The worker verifies the bundle with P47's `TokenVerifier`, built for
-wasm32 in the P34 browser module and extended with the PKI chain. In
-order, it checks:
+wasm32 in the P34 browser module. In order, it checks:
 
-1. the chain, signature, issuer, audience and validity window;
+1. the signature against Google's key set, the issuer, audience and
+   validity window;
 2. the hardware (TDX), software (Confidential Space), debug and support
    claims;
 3. the image digest against the compiled-in allowlist;
@@ -238,7 +256,7 @@ threat model records it as a residual.
 | Question | Chosen | Rejected |
 | --- | --- | --- |
 | Challenge freshness | Browser nonce, one token per session | A cached token on a server nonce, checked by age: ADR 0004 requires the browser's nonce |
-| Google's keys | PKI token, root pinned in the release; fallback in open question 1 | OIDC key set pinned: breaks on Google's rotation. OIDC key set served by the API: the operator could substitute it |
+| Google's keys | OIDC token, key set fetched by the browser from Google: works in the spike with no new dependency | PKI token with the root pinned: no live fetch, but needs X.509 chain validation in the browser, clang in CI for `ring`, and the leaf's extended key usage, which only a real token shows (open question 1). OIDC key set pinned: breaks on Google's rotation. OIDC key set served by the API: the operator could substitute it |
 | Sender authentication | Seal, then sign | HPKE auth mode: X-Wing has none. Sign, then seal: the browser would open before checking |
 | Request encoding | JSON inside the frame; the AEAD authenticates the bytes, so no canonical form is needed | CBOR: a new dependency for no gain |
 | `grant_id` | In the clear and in `info` | Sealed only: `info` must be known before the frame opens |
@@ -249,9 +267,14 @@ threat model records it as a residual.
   keys, with the request key's private half in production builds.
 * `ed25519-dalek` and `ml-dsa`, named in ADR 0007, are added and must pass
   `cargo deny check`.
-* `TokenVerifier` gains the PKI path and a wasm32 build. The simulated TEE
-  issues PKI-shaped tokens chained to a test root, compiled in only with
-  the `dev` feature, and P85's negative tests run there first.
+* `TokenVerifier` is built into the browser module, which grows by about
+  1.1 MB before optimisation; P34 and P73 record the shipped size. The
+  simulated TEE keeps issuing OIDC-shaped tokens and serves its key set to
+  development builds, and P85's negative tests run there first.
+* P65's Content Security Policy adds Google's key-set origin to
+  `connect-src`.
+* Verification depends on reaching Google's key-set URL: if the browser
+  cannot fetch it, no query is sent.
 * `info.rs` gains `research_query` and the `query` digest, both pinned by
   vectors under `fixtures/envelope/`.
 * The attestation route requires its nonce, and the research route's
@@ -266,11 +289,8 @@ threat model records it as a residual.
 
 ## Open questions
 
-1. Which established library validates the `x5c` chain in wasm32
-   (`rustls-webpki`, already in `backend/Cargo.lock`, or the RustCrypto
-   `x509-cert` crates)? If neither qualifies, the browser fetches the OIDC
-   key set directly from Google, which needs Google's endpoint to allow
-   cross-origin reads. A spike before review settles this.
-2. Does `jsonwebtoken` 11 with `rust_crypto` build for wasm32 without
-   pulling in an OS random source?
-3. The evidence route's rate limit: P65 sets the values.
+1. Should PKI tokens replace OIDC later? P48 records one real PKI token;
+   if its leaf certificate has no extended key usage, or one that can be
+   named, `rustls-webpki` can validate the chain against the pinned root
+   and a later record can switch.
+2. The evidence route's rate limit: P65 sets the values.
