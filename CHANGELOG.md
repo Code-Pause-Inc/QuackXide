@@ -136,6 +136,12 @@ uses [Semantic Versioning](https://semver.org/).
   the grant or budget step then failed (502) the retry got 404 and the
   request stayed approved with no grant. A deny after a failed approval
   is refused, so no grant is ever minted for a pending or denied request.
+  A retry never re-activates a revoked grant: it is refused with 404, so
+  a re-sent approval (a frontend retry, a double-click or a stale tab)
+  cannot restore access after a revoke; an explicit re-grant or a new
+  request can. Audit records tell a retry from a first approval
+  (`retry=true` in the `research.catalog` detail), and a refused retry or
+  a refused deny of an approved request is recorded as `denied`.
 
 ### Security
 

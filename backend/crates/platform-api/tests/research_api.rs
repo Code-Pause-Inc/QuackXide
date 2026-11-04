@@ -1,8 +1,9 @@
 //! Research-access integration tests: a steward grants a researcher
 //! aggregate access to a sealed dataset; the researcher runs
 //! disclosure-controlled queries (small cohorts suppressed); ungranted and
-//! revoked access is refused; row-level egress is blocked; and an approval
-//! that fails part-way converges when the steward retries it.
+//! revoked access is refused; row-level egress is blocked; an approval
+//! that fails part-way converges when the steward retries it; and a retry
+//! never re-activates a grant the steward has revoked.
 mod common;
 
 use std::sync::Arc;
@@ -667,6 +668,86 @@ async fn approval_retry_by_a_non_steward_is_404() {
     // The steward's own retry is idempotent.
     let (status, _) = post(&app, &approve, &token_for(steward), "{}").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn approval_retry_after_a_revoke_is_refused() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // The steward approves and the researcher has access. Then the steward
+    // revokes the grant the approval minted.
+    let (status, resolved) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "approve: {resolved}");
+    let grant_id = resolved["grant"]["grant_id"].as_str().expect("grant id");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK);
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The old approval arrives again (a retry, a double-click or a stale
+    // tab). It is refused, and access stays revoked.
+    let (status, body) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "stale approve: {body}");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    assert_eq!(
+        grants["grants"][0]["grant_id"], grant_id,
+        "grants: {grants}"
+    );
+    assert_eq!(grants["grants"][0]["revoked"], true, "grants: {grants}");
+
+    // An explicit re-grant still restores access by re-activating the same
+    // grant.
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &stoken,
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {grant}");
+    assert_eq!(grant["grant_id"], grant_id);
+    assert_eq!(grant["revoked"], false);
+    let (status, body) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+}
+
+#[tokio::test]
+async fn half_finished_approval_retry_after_a_revoke_is_refused() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(FailFirstOpen::default()),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // `create` succeeds and `open` fails: the request is Approved and the
+    // grant exists without a budget. The steward revokes it instead of
+    // retrying.
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    let grant_id = grants["grants"][0]["grant_id"].as_str().expect("grant id");
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A late retry must not re-activate the revoked grant.
+    let (status, body) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "late retry: {body}");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

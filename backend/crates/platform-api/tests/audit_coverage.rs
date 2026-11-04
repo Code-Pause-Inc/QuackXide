@@ -1,6 +1,6 @@
 //! Audit-coverage contract: every security-relevant flow (key enrollment,
-//! TEE attestation, provisioning, data access including misses and denials)
-//! emits its SECURITY_AUDIT_EVENT record.
+//! TEE attestation, provisioning, data access including misses and denials,
+//! the research catalog) emits its SECURITY_AUDIT_EVENT record.
 
 mod common;
 
@@ -25,7 +25,7 @@ use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
 
-use common::{app_state, bearer, dev_attestation, json_header, send, synced_vault};
+use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
 
 const SECRET: &str = "audit-itest-secret";
 const PADDLE_SECRET: &str = "pdl_ntfset_audit_secret";
@@ -546,5 +546,113 @@ async fn drive_listing_past_the_cap_is_audited() {
         capture.contains("data.access", "denied"),
         "{:?}",
         capture.events()
+    );
+}
+
+/// Asserts a `research.catalog` event with this outcome and exactly this
+/// detail was captured. `contains()` compares only kind and outcome.
+fn assert_catalog_event(capture: &AuditCapture, outcome: &str, detail: &str) {
+    let events = capture.events();
+    assert!(
+        events.iter().any(|e| {
+            e.audit_kind == "research.catalog" && e.outcome == outcome && e.detail == detail
+        }),
+        "no research.catalog {outcome} event {detail:?} in {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn research_catalog_is_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = common::research_app(
+        SECRET,
+        steward,
+        TenantKeypair::generate(),
+        dev_attestation(),
+        false,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let rtoken = token_for(researcher);
+
+    // Publish a listing, then request access to it.
+    let (status, listing) = post(
+        &app,
+        "/api/v1/catalog",
+        &stoken,
+        r#"{"connector":"health","title":"Cohorts","license_fee_cents":0,"compute_rate_cents":0}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "publish: {listing}");
+    let listing_id = listing["listing_id"].as_str().expect("listing id");
+    let request_uri = format!("/api/v1/catalog/{listing_id}/request");
+    let (status, request) = post(&app, &request_uri, &rtoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "request: {request}");
+    let request_id = request["request_id"].as_str().expect("request id");
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let deny = format!("/api/v1/research/requests/{request_id}/deny");
+
+    // A first approval, then a retry of it.
+    let (status, resolved) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "approve: {resolved}");
+    let grant_id = resolved["grant"]["grant_id"].as_str().expect("grant id");
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Denying the Approved request is refused.
+    let (status, _) = post(&app, &deny, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // After a revoke, a retried approval is refused.
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A fresh request, denied normally.
+    let (status, fresh) = post(&app, &request_uri, &rtoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "request: {fresh}");
+    let fresh_id = fresh["request_id"].as_str().expect("request id");
+    let fresh_deny = format!("/api/v1/research/requests/{fresh_id}/deny");
+    let (status, _) = post(&app, &fresh_deny, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("published listing={listing_id} connector=health"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("requested request={request_id} listing={listing_id} steward={steward}"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("approved request={request_id} researcher={researcher}"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("approved request={request_id} researcher={researcher} retry=true"),
+    );
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("deny refused request={request_id} researcher={researcher} status=approved"),
+    );
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("approve refused request={request_id} grant={grant_id} retry=true reason=revoked"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("denied request={fresh_id} researcher={researcher}"),
     );
 }

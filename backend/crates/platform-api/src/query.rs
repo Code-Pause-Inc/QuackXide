@@ -467,7 +467,7 @@ impl ConnectorQueryService {
         }))
     }
 
-    fn grants(&self) -> Result<&Arc<dyn GrantRegistry>, ApiError> {
+    pub(crate) fn grants(&self) -> Result<&Arc<dyn GrantRegistry>, ApiError> {
         self.grants.as_ref().ok_or(ApiError::ResearchUnavailable)
     }
 
