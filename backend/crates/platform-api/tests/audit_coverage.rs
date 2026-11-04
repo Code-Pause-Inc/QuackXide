@@ -362,7 +362,7 @@ async fn provisioning_webhook_is_audited() {
     let app = full_app(TenantId::generate(), ZkMode::Disabled).await;
 
     let body =
-        br#"{"event_type":"subscription.created","data":{"id":"sub_a","customer_id":"cus_a","items":[{"price":{"id":"pri_x"}}]}}"#
+        br#"{"event_type":"subscription.created","occurred_at":"2026-07-30T12:00:00Z","data":{"id":"sub_a","customer_id":"cus_a","items":[{"price":{"id":"pri_x"}}]}}"#
             .to_vec();
     let (status, _) = send(
         &app,
@@ -384,6 +384,53 @@ async fn provisioning_webhook_is_audited() {
         "{:?}",
         capture.events()
     );
+
+    // Pause, a late resume (stale), then a newer resume.
+    for (event_type, occurred_at) in [
+        ("subscription.paused", "2026-08-02T00:00:00Z"),
+        ("subscription.resumed", "2026-08-01T00:00:00Z"),
+        ("subscription.resumed", "2026-08-03T00:00:00Z"),
+    ] {
+        let body = format!(
+            r#"{{"event_type":"{event_type}","occurred_at":"{occurred_at}","data":{{"id":"sub_a"}}}}"#
+        )
+        .into_bytes();
+        let signature = common::paddle_signature(PADDLE_SECRET, &body);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/admin/webhooks/mor",
+            &[("Paddle-Signature", signature), json_header()],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let status_changes: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.audit_kind == "tenant.provisioned"
+                && e.detail != "provisioned subscription=sub_a plan=pri_x"
+        })
+        .map(|e| (e.outcome, e.detail))
+        .collect();
+    let expected = [
+        (
+            "ok",
+            "suspend subscription=sub_a occurred_at=2026-08-02 00:00:00 UTC",
+        ),
+        (
+            "stale",
+            "resume subscription=sub_a occurred_at=2026-08-01 00:00:00 UTC",
+        ),
+        (
+            "ok",
+            "resume subscription=sub_a occurred_at=2026-08-03 00:00:00 UTC",
+        ),
+    ]
+    .map(|(o, d)| (o.to_owned(), d.to_owned()));
+    assert_eq!(status_changes, expected);
 
     // Bad signature → AuthDecision denied in the audit stream.
     let (status, _) = send(

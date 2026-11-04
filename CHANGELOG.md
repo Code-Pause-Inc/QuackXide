@@ -136,6 +136,14 @@ uses [Semantic Versioning](https://semver.org/).
   the grant or budget step then failed (502) the retry got 404 and the
   request stayed approved with no grant. A deny after a failed approval
   is refused, so no grant is ever minted for a pending or denied request.
+* A paused tenant comes back when its subscription resumes: the MoR
+  webhook maps `subscription.resumed` to reactivation. Before, it was
+  ignored and the tenant stayed Suspended. Paddle does not deliver in
+  order, so status changes apply only when their `occurred_at` is newer
+  than the last one applied (a tie keeps Suspended), and a late or
+  retried event cannot undo a newer pause, cancel or resume. Provisioning
+  events never change an existing tenant's status. Events without a valid
+  RFC 3339 `occurred_at` are refused with 400.
 
 ### Security
 

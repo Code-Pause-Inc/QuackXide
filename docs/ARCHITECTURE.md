@@ -355,7 +355,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
 | platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out | Plaintext persistence |
 | platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
-| platform-billing | MoR (Paddle) webhook signature verification, replay guard | Webhook secrets in Debug output |
+| platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |
 | quackxide-engine | `QueryScope` RAII, plan gate, disclosure policies | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
 | synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |

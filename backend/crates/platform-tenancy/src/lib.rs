@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use platform_core::TenantId;
 use serde::Serialize;
 
@@ -40,6 +41,9 @@ pub enum TenantStatus {
 pub struct TenantRecord {
     pub tenant_id: TenantId,
     pub status: TenantStatus,
+    /// `occurred_at` of the billing event that last set `status`; older
+    /// events arriving later are not applied.
+    pub status_changed_at: Option<DateTime<Utc>>,
     /// Merchant-of-Record subscription id (Paddle) — the idempotency key.
     pub subscription_id: String,
     pub customer_id: String,
@@ -63,7 +67,8 @@ pub(crate) fn new_id() -> String {
 pub trait TenantRegistry: Send + Sync {
     /// Provision a tenant for a subscription. Idempotent on
     /// `subscription_id`: a repeated call (webhook retry) returns the
-    /// existing record and does not mint a new tenant.
+    /// existing record unchanged, never reactivating it, and does not mint
+    /// a new tenant.
     async fn provision(
         &self,
         subscription_id: &str,
@@ -78,11 +83,15 @@ pub trait TenantRegistry: Send + Sync {
     ) -> Result<Option<TenantRecord>, TenancyError>;
     async fn list(&self) -> Result<Vec<TenantRecord>, TenancyError>;
 
-    /// Set status by subscription id (cancellation/pause events).
+    /// Set status by subscription id (cancel, pause and resume events).
+    /// Applies only an event that occurred after the last applied change; on
+    /// a tie, only `Suspended` applies. Returns the record as it stands, so
+    /// a skipped change shows as a status other than the one requested.
     async fn set_status(
         &self,
         subscription_id: &str,
         status: TenantStatus,
+        occurred_at: DateTime<Utc>,
     ) -> Result<Option<TenantRecord>, TenancyError>;
 
     /// Toggle a connector for a tenant (admin console).
@@ -144,6 +153,7 @@ impl TenantRegistry for InMemoryTenantRegistry {
         let record = TenantRecord {
             tenant_id,
             status: TenantStatus::Active,
+            status_changed_at: None,
             subscription_id: subscription_id.to_owned(),
             customer_id: customer_id.to_owned(),
             plan: plan.to_owned(),
@@ -184,14 +194,21 @@ impl TenantRegistry for InMemoryTenantRegistry {
         &self,
         subscription_id: &str,
         status: TenantStatus,
+        occurred_at: DateTime<Utc>,
     ) -> Result<Option<TenantRecord>, TenancyError> {
         let mut inner = self.lock();
         let Some(tenant) = inner.by_subscription.get(subscription_id).copied() else {
             return Ok(None);
         };
         let record = inner.by_tenant.get_mut(&tenant).expect("indexed record");
-        record.status = status;
-        record.updated_at_iso = now_iso();
+        let stale = record.status_changed_at.is_some_and(|last| {
+            occurred_at < last || (occurred_at == last && status == TenantStatus::Active)
+        });
+        if !stale {
+            record.status = status;
+            record.status_changed_at = Some(occurred_at);
+            record.updated_at_iso = now_iso();
+        }
         Ok(Some(record.clone()))
     }
 
@@ -215,6 +232,7 @@ impl TenantRegistry for InMemoryTenantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn registry() -> InMemoryTenantRegistry {
         InMemoryTenantRegistry::new(vec!["quickbooks".into(), "odoo".into()])
@@ -239,6 +257,57 @@ mod tests {
         assert_eq!(reg.list().await.expect("list").len(), 1);
     }
 
+    fn at(day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, day, 0, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_status_applies_only_events_newer_than_the_last_change() {
+        let reg = registry();
+        reg.provision("sub_3", "cus_3", "pro")
+            .await
+            .expect("provision");
+        let status = |rec: Option<TenantRecord>| rec.expect("record").status;
+
+        let set = |s, day| reg.set_status("sub_3", s, at(day));
+        assert_eq!(
+            status(set(TenantStatus::Suspended, 2).await.unwrap()),
+            TenantStatus::Suspended
+        );
+        // Older, and a tie, cannot resume; a tie may still suspend.
+        assert_eq!(
+            status(set(TenantStatus::Active, 1).await.unwrap()),
+            TenantStatus::Suspended
+        );
+        assert_eq!(
+            status(set(TenantStatus::Active, 2).await.unwrap()),
+            TenantStatus::Suspended
+        );
+        assert_eq!(
+            status(set(TenantStatus::Active, 3).await.unwrap()),
+            TenantStatus::Active
+        );
+        assert_eq!(
+            status(set(TenantStatus::Suspended, 2).await.unwrap()),
+            TenantStatus::Active
+        );
+        assert_eq!(
+            status(set(TenantStatus::Suspended, 3).await.unwrap()),
+            TenantStatus::Suspended
+        );
+
+        let again = reg
+            .provision("sub_3", "cus_3", "pro")
+            .await
+            .expect("provision");
+        assert_eq!(
+            again.status,
+            TenantStatus::Suspended,
+            "provision never reactivates"
+        );
+        assert_eq!(again.status_changed_at, Some(at(3)));
+    }
+
     #[tokio::test]
     async fn suspend_by_subscription_and_toggle_connector() {
         let reg = registry();
@@ -248,7 +317,7 @@ mod tests {
             .expect("provision");
 
         let suspended = reg
-            .set_status("sub_2", TenantStatus::Suspended)
+            .set_status("sub_2", TenantStatus::Suspended, at(1))
             .await
             .expect("set")
             .expect("record");
@@ -265,7 +334,7 @@ mod tests {
     async fn set_status_on_unknown_subscription_is_none() {
         let reg = registry();
         assert!(
-            reg.set_status("nope", TenantStatus::Suspended)
+            reg.set_status("nope", TenantStatus::Suspended, at(1))
                 .await
                 .expect("ok")
                 .is_none()

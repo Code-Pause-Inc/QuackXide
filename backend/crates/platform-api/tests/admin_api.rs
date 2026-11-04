@@ -143,7 +143,7 @@ async fn cancellation_webhook_suspends_the_tenant() {
     )
     .await;
 
-    let cancel = br#"{"event_type":"subscription.canceled","data":{"id":"sub_abc"}}"#.to_vec();
+    let cancel = br#"{"event_type":"subscription.canceled","occurred_at":"2026-08-01T00:00:00Z","data":{"id":"sub_abc"}}"#.to_vec();
     let (status, json) = send_json(
         &app,
         "POST",
@@ -164,6 +164,93 @@ async fn cancellation_webhook_suspends_the_tenant() {
         serde_json::to_value(record.status).unwrap(),
         serde_json::json!("suspended")
     );
+}
+
+/// Send a signed `subscription.*` event for `sub_abc`.
+async fn send_status_event(
+    app: &Router,
+    event_type: &str,
+    occurred_at: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({
+        "event_id": format!("evt_{event_type}_{occurred_at}"),
+        "event_type": event_type,
+        "occurred_at": occurred_at,
+        "data": { "id": "sub_abc", "customer_id": "cus_xyz", "status": "active",
+                  "items": [{ "price": { "id": "pri_pro" } }] },
+    })
+    .to_string()
+    .into_bytes();
+    send_json(
+        app,
+        "POST",
+        "/admin/webhooks/mor",
+        &[("Paddle-Signature", paddle_signature(&body)), json_header()],
+        body,
+    )
+    .await
+}
+
+async fn status_of(registry: &Arc<dyn TenantRegistry>) -> serde_json::Value {
+    let record = registry
+        .get_by_subscription("sub_abc")
+        .await
+        .expect("ok")
+        .expect("rec");
+    serde_json::to_value(record.status).unwrap()
+}
+
+#[tokio::test]
+async fn resumed_webhook_reactivates_a_paused_tenant() {
+    let (app, registry) = build(true);
+    assert_eq!(provision_via_webhook(&app).await, StatusCode::OK);
+
+    let (status, _) = send_status_event(&app, "subscription.paused", "2026-08-01T00:00:00Z").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_of(&registry).await, "suspended");
+
+    let (status, json) =
+        send_status_event(&app, "subscription.resumed", "2026-08-02T00:00:00Z").await;
+    assert_eq!(status, StatusCode::OK, "json: {json}");
+    assert_eq!(json["action"], "resumed");
+    assert_eq!(status_of(&registry).await, "active");
+}
+
+#[tokio::test]
+async fn late_webhooks_cannot_undo_a_newer_status_change() {
+    let (app, registry) = build(true);
+    assert_eq!(provision_via_webhook(&app).await, StatusCode::OK);
+    send_status_event(&app, "subscription.paused", "2026-08-02T00:00:00Z").await;
+
+    // Paddle does not guarantee delivery order, and retries for days.
+    send_status_event(&app, "subscription.resumed", "2026-08-01T00:00:00Z").await;
+    assert_eq!(status_of(&registry).await, "suspended");
+    send_status_event(&app, "subscription.resumed", "2026-08-02T00:00:00Z").await;
+    assert_eq!(
+        status_of(&registry).await,
+        "suspended",
+        "a tie stays suspended"
+    );
+    send_status_event(&app, "subscription.created", "2026-07-30T12:00:00Z").await;
+    send_status_event(&app, "subscription.activated", "2026-08-03T00:00:00Z").await;
+    assert_eq!(status_of(&registry).await, "suspended");
+
+    send_status_event(&app, "subscription.resumed", "2026-08-04T00:00:00Z").await;
+    assert_eq!(status_of(&registry).await, "active");
+    send_status_event(&app, "subscription.canceled", "2026-08-03T00:00:00Z").await;
+    assert_eq!(status_of(&registry).await, "active");
+}
+
+#[tokio::test]
+async fn webhook_without_a_valid_occurred_at_is_400_and_changes_nothing() {
+    let (app, registry) = build(true);
+    assert_eq!(provision_via_webhook(&app).await, StatusCode::OK);
+
+    for occurred_at in ["", "yesterday", "2026-08-01"] {
+        let (status, _) = send_status_event(&app, "subscription.paused", occurred_at).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{occurred_at:?}");
+    }
+    assert_eq!(status_of(&registry).await, "active");
 }
 
 #[tokio::test]
