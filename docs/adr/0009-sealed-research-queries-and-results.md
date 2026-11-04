@@ -77,6 +77,9 @@ memory only, in zeroize-on-drop types, never written, logged or exported:
 Any change to a bound value (a restart, a renewed TLS key) produces a new
 key set. Its `key_id` is the binding digest below, base64url-encoded.
 
+The opened request (including the SQL text) and the result payload before
+sealing are zeroized after use, like the query-result buffer today.
+
 ### Binding v2
 
 The token's `eat_nonce` holds two base64url values, as
@@ -101,8 +104,11 @@ SHA-256( "attestation-binding-v2"
 The tag is neutral because the browser module computes it and the
 white-label guard forbids the engine name in the shipped bundle. The
 browser recomputes the config digest from the verified token rather than
-trusting a value in the bundle; which settings it requires is P14's
-policy.
+trusting a value in the bundle. It also refuses a configuration that
+loosens a control: `TEE_ATTESTATION_REQUIRED` and `FEATURE_ZK_ENABLED`
+must be absent or `true`, and `RESEARCH_MIN_COHORT_SIZE` absent or at
+least the compiled-in floor (P54). P14's policy may require more, never
+less.
 
 ### Evidence bundle
 
@@ -186,7 +192,9 @@ browser.
 
 * The grant found for the researcher, steward and connector must have the
   id in `grant_id`.
-* In production mode (P18), a plaintext body is refused.
+* A plaintext body is accepted only in builds with the `dev` feature,
+  decided at compile time like the key-release stand-in; a release build
+  refuses it whatever its configuration.
 
 The enclave refuses in this order, and none of these refusals spends
 budget:
@@ -197,14 +205,28 @@ budget:
 | Frame does not open, or plaintext malformed | 400 |
 | `recipient_key` differs from the researcher's enrolled key | 403 |
 | Grant missing, revoked, or not `grant_id` | as today |
-| `request_nonce` already recorded under this key set | 409 |
+| `request_nonce` already recorded with another envelope, or its query still running | 409 |
 
-Replay protection: each key set keeps its recorded nonces in memory. A
-nonce is inserted, atomically and only if absent, immediately before the
-budget charge (wherever P54 places it), and stays recorded whatever
-follows. Only granted, authenticated requests reach that step, so the set
-grows by 32 bytes per such request, bounded by the rate limit; it empties
-when the key set changes.
+Replay protection and retries: each key set keeps its recorded nonces in
+memory. A nonce is inserted, atomically and only if absent, immediately
+before the budget charge (wherever P54 places it), with the SHA-256 of its
+envelope, and stays recorded whatever follows. Once the query finishes,
+its signed response is stored with it.
+
+* A request whose nonce and envelope digest match a recorded entry gets
+  the stored response again, with no new charge, so a client that lost a
+  response can retry. A replay gains the operator nothing, because the
+  result is sealed to the researcher.
+* The same nonce with a different envelope is refused with 409, and so is
+  a retry while the first query is still running.
+* A query that ended in an error stores that error response. The client
+  retries under a new nonce, and whether that is charged again follows
+  P54's budget order.
+
+Only granted, authenticated requests reach that step, so the store grows
+by one aggregate response per such request, bounded by the rate limit;
+it empties when the key set changes, and a client then re-attests and
+re-sends under a new nonce.
 
 ### Recipient key
 
@@ -212,8 +234,28 @@ when the key set changes.
 `tid`. Audit records carry its fingerprint,
 `SHA-256("recipient-key-v1" ‖ suite ‖ public key)`, never the key. The
 result is sealed with the recipient key's suite, so P35 changes the
-suite without changing this flow. Until P33 makes enrollment create-once,
-the enrolled key can be overwritten; that holds on the simulated TEE only.
+suite without changing this flow.
+
+Anyone can seal a request to the enclave's public key, so what ties a
+result to the researcher is the bearer token and the enrolled key. An
+operator holding a researcher's token and able to overwrite that
+researcher's enrollment could send its own request with its own recipient
+key and read the result. Two things close this:
+
+* **Create-once enrollment (P33).** Until it lands, a release build
+  refuses sealed research queries with 503; only `dev` builds, which run
+  on the simulated TEE, accept them.
+* **TLS inside the VM (ADR 0005, P67).** Until then, bearer tokens are
+  visible wherever TLS ends, and the threat model records that sealed
+  results do not hold against that operator.
+
+### No downgrade
+
+Once P35 ships the hybrid suite, every step refuses the classical one, as
+ADR 0007 requires for stored data: the browser refuses an evidence bundle
+whose request key is `HPK1`, and the enclave refuses an `HPK1` envelope
+and an X25519-only recipient key. There is no fallback mode. The
+signatures are hybrid from the first build.
 
 ### Sealed and signed result
 
@@ -268,9 +310,14 @@ threat model records it as a residual.
 * `ed25519-dalek` and `ml-dsa`, named in ADR 0007, are added and must pass
   `cargo deny check`.
 * `TokenVerifier` is built into the browser module, which grows by about
-  1.1 MB before optimisation; P34 and P73 record the shipped size. The
-  simulated TEE keeps issuing OIDC-shaped tokens and serves its key set to
-  development builds, and P85's negative tests run there first.
+  1.1 MB before optimisation. The simulated TEE keeps issuing OIDC-shaped
+  tokens and serves its key set to development builds, and P85's negative
+  tests run there first.
+* A release-build check confirms the frontend bundle names only Google's
+  issuer and key-set URL, never the simulator's, as CI already checks
+  that a release build has no dev binaries.
+* P73 benchmarks the attestation round trip, browser verification, seal
+  and open, and result signing, and records the shipped module size.
 * P65's Content Security Policy adds Google's key-set origin to
   `connect-src`.
 * Verification depends on reaching Google's key-set URL: if the browser
@@ -280,8 +327,12 @@ threat model records it as a residual.
 * The attestation route requires its nonce, and the research route's
   request and response change shape. The worker gains attest, seal, verify
   and open, and P56 renders the opened result.
-* `docs/THREAT_MODEL.md` updates the A2 rows and adds the served-bundle
-  residual (P85) and the unsealed own-data endpoint.
+* `docs/THREAT_MODEL.md` updates the A2 rows, including the dependence of
+  sealed results on create-once enrollment (P33) and TLS inside the VM
+  (P67), and adds the served-bundle residual (P85) and the unsealed
+  own-data endpoint. Its "Metadata" residual adds the `grant_id` sent in
+  the clear and the sealed result's length, which shows roughly how many
+  groups a result has.
   `docs/ARCHITECTURE.md`'s research flow shows the browser verifying the
   enclave first.
 * A restart invalidates every session's key set: one extra round trip per
