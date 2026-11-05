@@ -263,11 +263,12 @@ Three enforcement layers at one choke point, all in code:
   an individual, or put a subtotal beside its parts in one result.
   After type coercion, every expression must also be one that cannot fail
   at runtime (`policy::expressions_cannot_fail`, ADR 0010): comparisons,
-  boolean logic, `IN`, `LIKE`, `BETWEEN`, integer and float arithmetic,
-  division by a literal other than 0 and −1, `CASE`, `COALESCE`, `NULLIF`,
-  `lower`, `upper`, `TRY_CAST`, and casts that accept every value. A
-  failure on some rows would otherwise answer a question about rows that
-  suppression hides. `tests/bypass.rs` holds the adversarial cases; add to
+  boolean logic, `IN`, `LIKE` with a pattern of at most 1,000 characters,
+  `BETWEEN`, integer and float arithmetic, division by a literal other
+  than 0 and −1, `CASE`, `COALESCE`, `NULLIF`, `lower`, `upper`,
+  `TRY_CAST`, and casts that accept every value; the gate evaluates
+  constant subexpressions itself. A failure on some rows would otherwise
+  answer a question about rows that suppression hides. `tests/bypass.rs` holds the adversarial cases; add to
   it whenever the allowlist changes.
 * **Result level** (`disclosure::DisclosurePolicy`): `MinCountThreshold`
   suppresses sub-`k` cohorts; a perturbation/DP policy composes after it via

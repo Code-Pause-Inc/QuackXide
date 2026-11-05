@@ -21,6 +21,8 @@ only when `id = 'p15' AND salary > 9000` (the single `ceo` row) holds:
 | --- | --- |
 | `WHERE` | `salary / CASE WHEN … THEN 0 ELSE 1 END`, `%`, `CAST('x' AS BIGINT)`, `abs` of `i64::MIN`, `to_timestamp('bad')`, `substr` with a negative length, `repeat` or `lpad` to 2^31 characters |
 | `WHERE`, implicit | `CASE WHEN … THEN id ELSE '1' END = 5`: type coercion casts the string to `Int64` |
+| `WHERE`, constant | `CASE WHEN … THEN -(-9223372036854775807 - 1) ELSE 0 END`: a constant runs as a scalar, where negating `i64::MIN` fails (on a column it wraps) |
+| `WHERE`, `LIKE` | a 50,000-character pattern: Arrow compiles it to a regex when a row reaches it, past the regex size limit |
 | `GROUP BY` | `salary / CASE WHEN … THEN 0 ELSE 1 END` |
 | `HAVING` | `1 / CASE WHEN MAX(salary) > 9000 AND COUNT(*) = 1 THEN 0 ELSE 1 END`, on a cohort of one |
 | Outer `SELECT` | `/` or `CAST` over `MAX(salary)` |
@@ -78,11 +80,16 @@ Allowed expressions, each with allowed operands:
 | `/`, `%` | both operands `Float64`; or both `Int64` with a literal divisor other than 0 and −1 (`i64::MIN / -1` overflows) |
 | `\|\|` | none |
 | `IN (…)` | every list element a literal, or an allowed `CAST` of one |
-| `LIKE`, `ILIKE` | pattern and escape are literals |
+| `LIKE`, `ILIKE` | the pattern is a string literal, or a cast of one, of at most 1,000 characters |
 | `CASE`, `COALESCE`, `NULLIF`, `lower`, `upper` | none |
 | `TRY_CAST` | none |
-| `CAST` | the input is a literal and the gate's own cast of that value succeeds (so the result does not depend on the data or the optimizer); or `Int64` to `Float64`; or `Boolean`, `Int64`, `Float64` or `Utf8` to `Utf8`; or a cast to the input's own type |
+| `CAST` | the input is a literal (a constant, see below); or `Int64` to `Float64`; or `Boolean`, `Int64`, `Float64` or a string type to a string type; or a cast to the input's own type |
 | Aggregate call | already checked by `is_permitted_aggregate` |
+
+Every subtree with no column and no aggregate is a constant. The gate
+evaluates it once, as execution would (as a scalar), and refuses the
+query if that fails, so a constant cannot fail only when some row
+reaches it. "String type" means `Utf8`, `LargeUtf8` or `Utf8View`.
 
 Everything else is refused: every other scalar function, arithmetic on
 any other type (decimals among them), division by a column or an
@@ -122,11 +129,12 @@ allowed types.
   are unchanged.
 * Refusing `repeat`, `lpad` and the other size-taking functions also
   closes the memory exhaustion they allowed.
-* The check relies on two things the tests pin: the analyzer inserts
-  every cast that execution evaluates, and the optimizer adds no
-  expression that can fail on data. A DataFusion upgrade re-runs the
-  bypass suite, and its record lists any change to the allowlisted
-  functions.
+* The check assumes that execution evaluates what the analyzed plan
+  holds: the analyzer inserts every cast execution evaluates, and the
+  optimizer adds no expression that can fail on data. The bypass probes
+  pin known cases, not the assumption itself. A DataFusion upgrade
+  re-runs them, and its record lists any change to the allowlisted
+  functions and to how they evaluate.
 * `SUM` over a decimal column could overflow on the data. Its result
   type adds ten digits of precision, so overflow needs more than 10^10
   maximal values; this is recorded as residual, not refused.
@@ -134,7 +142,8 @@ allowed types.
 ### Trade-offs for researchers and stewards
 
 * **Less SQL works.** Researchers lose division and modulo by a column
-  or an aggregate, string-to-number casts, and every function
+  or an aggregate, string-to-number casts, `LIKE` patterns over 1,000
+  characters, and every function
   outside the list (`substr`, `round`, `abs`, `date_trunc`, regular
   expressions and the rest). Comparisons, `BETWEEN`, `IN`, `LIKE`,
   `CASE`, grouping, and `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` stay.
@@ -166,10 +175,13 @@ allowed types.
 ### What else changes
 
 * `tests/bypass.rs` gets a case for each probe above, run with its
-  condition true and false in research and ZK mode, each refused both
-  times; and cases showing that ordinary filters keep working
-  (`salary > 3.5`, `salary > '3'`, `dept IN ('eng', 'ops')`,
-  `dept LIKE 'e%'`, `salary / 100`).
+  condition true and false through the gate research and ZK mode share,
+  each refused both times; cases showing that ordinary filters keep
+  working (`salary > 3.5`, `salary > '3'`, `dept IN ('eng', 'ops')`,
+  `dept LIKE 'e%'`, `salary / 100`), on `Utf8`, `LargeUtf8` and
+  `Utf8View` columns; and a check that patterns at the length cap always
+  compile. `research_api.rs` sends one probe through the research
+  endpoint.
 * `docs/THREAT_MODEL.md` A1 gains a row for the error oracle, the
   plan-level description in `docs/ARCHITECTURE.md` lists the expression
   allowlist, and `CHANGELOG.md` records the refused SQL under Security.

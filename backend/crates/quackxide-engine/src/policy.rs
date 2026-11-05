@@ -21,11 +21,17 @@
 //! It bounds what leaves the enclave; it complements, not replaces,
 //! attestation and envelope encryption.
 
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Schema};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ScalarValue};
+use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::expr::{AggregateFunction, Cast};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Operator};
+use datafusion::physical_expr::create_physical_expr;
 
 /// Aggregates that return one summary value per group.
 pub const PERMITTED_AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
@@ -49,6 +55,11 @@ pub fn is_aggregate_only(plan: &LogicalPlan) -> bool {
         }
 }
 
+/// Longest `LIKE`/`ILIKE` pattern, in characters. Arrow compiles a pattern
+/// to a regex when a row reaches it, and a longer one can exceed the regex
+/// size limit, failing only for some data.
+pub const MAX_LIKE_PATTERN_CHARS: usize = 1000;
+
 /// Scalar functions that cannot fail on any input.
 const TOTAL_FUNCTIONS: &[&str] = &["coalesce", "nullif", "lower", "upper"];
 
@@ -71,7 +82,35 @@ pub fn expressions_cannot_fail(analyzed: &LogicalPlan) -> bool {
 }
 
 fn expr_cannot_fail(expr: &Expr, schema: &DFSchema) -> bool {
-    matches!(expr.exists(|e| Ok(!node_cannot_fail(e, schema))), Ok(false))
+    matches!(
+        expr.exists(|e| Ok(!node_cannot_fail(e, schema) || !constant_evaluates(e))),
+        Ok(false)
+    )
+}
+
+/// A subtree without columns runs as a scalar, which can fail where the
+/// same operation on a column wraps (negating `i64::MIN`). Evaluate it here,
+/// so whether it fails cannot depend on the data.
+fn constant_evaluates(expr: &Expr) -> bool {
+    if matches!(expr, Expr::Literal(..)) || !expr.column_refs().is_empty() {
+        return true;
+    }
+    match expr.exists(|e| Ok(matches!(e, Expr::AggregateFunction(_)))) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(_) => return false,
+    }
+    let Ok(physical) = create_physical_expr(
+        expr,
+        &DFSchema::empty(),
+        &ExecutionProps::new(),
+        &PhysicalPlanningContext::default(),
+    ) else {
+        return false;
+    };
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
+    RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
+        .is_ok_and(|batch| physical.evaluate(&batch).is_ok())
 }
 
 /// The rule for one expression node; its children are checked separately.
@@ -96,7 +135,7 @@ fn node_cannot_fail(expr: &Expr, schema: &DFSchema) -> bool {
         | Expr::AggregateFunction(_) => true,
         Expr::BinaryExpr(binary) => binary_cannot_fail(binary, schema),
         Expr::Negative(inner) => is_wrapping_number(type_of(inner, schema).as_ref()),
-        Expr::Like(like) => matches!(*like.pattern, Expr::Literal(..)),
+        Expr::Like(like) => like_pattern_cannot_fail(&like.pattern),
         Expr::InList(in_list) => in_list.list.iter().all(|item| match item {
             Expr::Literal(..) => true,
             Expr::Cast(cast) => matches!(*cast.expr, Expr::Literal(..)) && cast_cannot_fail(cast, schema),
@@ -126,12 +165,27 @@ fn binary_cannot_fail(binary: &BinaryExpr, schema: &DFSchema) -> bool {
     }
 }
 
-/// A literal is cast here, so its outcome cannot depend on the data; a
+/// A string literal, possibly cast to the column's string type, no longer
+/// than [`MAX_LIKE_PATTERN_CHARS`].
+fn like_pattern_cannot_fail(pattern: &Expr) -> bool {
+    let literal = match pattern {
+        Expr::Cast(cast) => cast.expr.as_ref(),
+        other => other,
+    };
+    match literal {
+        Expr::Literal(value, _) => value
+            .try_as_str()
+            .is_some_and(|s| s.is_none_or(|s| s.chars().count() <= MAX_LIKE_PATTERN_CHARS)),
+        _ => false,
+    }
+}
+
+/// A cast of a literal is a constant, checked by [`constant_evaluates`]; a
 /// column only by a conversion that accepts every value.
 fn cast_cannot_fail(cast: &Cast, schema: &DFSchema) -> bool {
     let to = cast.field.data_type();
-    if let Expr::Literal(value, _) = cast.expr.as_ref() {
-        return value.cast_to(to).is_ok();
+    if matches!(cast.expr.as_ref(), Expr::Literal(..)) {
+        return true;
     }
     let Some(from) = type_of(&cast.expr, schema) else {
         return false;

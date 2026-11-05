@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, make_array};
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int64Array, LargeStringArray, StringArray, StringViewArray};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -303,6 +303,13 @@ const ERROR_PROBES: &[(&str, &str)] = &[
     ("outer_cast", "SELECT dept, COUNT(*) AS n, CAST(CASE WHEN MAX(salary) > {T} THEN 'x' ELSE '1' END AS BIGINT) AS x FROM people GROUP BY dept"),
     ("order_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END)"),
     ("ratio_over_zero_rows", "SELECT COUNT(*) AS n, SUM(salary) / COUNT(*) AS m FROM people WHERE {P}"),
+    // A constant is evaluated as a scalar, where negating i64::MIN fails.
+    ("where_negate_min_literal", "SELECT dept, COUNT(*) AS n FROM people WHERE CASE WHEN {P} THEN -(-9223372036854775807 - 1) ELSE 0 END > 0 GROUP BY dept"),
+    ("outer_negate_min_literal", "SELECT dept, COUNT(*) AS n, CASE WHEN MAX(salary) > {T} THEN -(-9223372036854775807 - 1) ELSE 0 END AS x FROM people GROUP BY dept"),
+    // A LIKE pattern compiles to a regex when some row reaches it; a long
+    // one exceeds the regex size limit.
+    ("where_like_long_pattern", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND dept LIKE '{LONG}' GROUP BY dept"),
+    ("where_ilike_long_pattern", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND dept ILIKE '{LONG}' GROUP BY dept"),
 ];
 
 #[tokio::test]
@@ -313,7 +320,8 @@ async fn error_probes_are_refused_whatever_the_data() {
         for threshold in ["9000", "9500"] {
             let sql = template
                 .replace("{P}", &format!("id = 'p15' AND salary > {threshold}"))
-                .replace("{T}", threshold);
+                .replace("{T}", threshold)
+                .replace("{LONG}", &"_".repeat(50_000));
             match scope.sql(&sql).await {
                 Err(QueryError::ZkPolicy) => {}
                 Err(err) => failures.push(format!("{name} at {threshold}: {err}")),
@@ -322,6 +330,68 @@ async fn error_probes_are_refused_whatever_the_data() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Every string type accepts the same text expressions. `texts` holds the
+/// `people` departments as `Utf8` (`dept`), `LargeUtf8` (`ldept`) and
+/// `Utf8View` (`vdept`).
+#[rustfmt::skip]
+const TEXT_CASES: &[(&str, &str, Expect)] = &[
+    ("like_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE dept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("like_large_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE ldept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("like_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE vdept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("not_like_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE vdept NOT LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("ilike_large_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE ldept ILIKE 'E%' GROUP BY dept", Rows(1)),
+    ("like_cast_to_varchar", "SELECT dept, COUNT(*) AS n FROM texts WHERE CAST(dept AS VARCHAR) LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("concat_large_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE ldept || '' = 'eng' GROUP BY dept", Rows(1)),
+    ("cast_large_utf8_to_varchar", "SELECT dept, COUNT(*) AS n FROM texts WHERE CAST(ldept AS VARCHAR) = 'eng' GROUP BY dept", Rows(1)),
+    ("lower_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE lower(vdept) = 'eng' GROUP BY dept", Rows(1)),
+    ("in_list_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE vdept IN ('eng', 'ops') GROUP BY dept", Rows(2)),
+];
+
+#[tokio::test]
+async fn text_expressions_work_on_every_string_type() {
+    run(&text_scope(), TEXT_CASES).await;
+}
+
+#[tokio::test]
+async fn like_patterns_up_to_the_cap_run_and_longer_ones_are_refused() {
+    let cap = quackxide_engine::policy::MAX_LIKE_PATTERN_CHARS;
+    let scope = text_scope();
+    for column in ["dept", "ldept", "vdept"] {
+        for op in ["LIKE", "ILIKE"] {
+            let at_cap = format!("e{}", "%".repeat(cap - 1));
+            let sql = format!(
+                "SELECT dept, COUNT(*) AS n FROM texts WHERE {column} {op} '{at_cap}' GROUP BY dept"
+            );
+            check(&scope, &sql, Rows(1))
+                .await
+                .unwrap_or_else(|why| panic!("{column} {op} at cap: {why}"));
+            let over = "_".repeat(cap + 1);
+            let sql = format!(
+                "SELECT dept, COUNT(*) AS n FROM texts WHERE {column} {op} '{over}' GROUP BY dept"
+            );
+            check(&scope, &sql, Rejected)
+                .await
+                .unwrap_or_else(|why| panic!("{column} {op} over cap: {why}"));
+        }
+    }
+}
+
+/// The cap leaves room under the regex size limit even for the costliest
+/// pattern characters, and on non-ASCII data, which takes the regex path.
+#[test]
+fn like_patterns_at_the_cap_always_compile() {
+    use arrow::array::Scalar;
+    use arrow::compute::kernels::comparison::{ilike, like};
+    let cap = quackxide_engine::policy::MAX_LIKE_PATTERN_CHARS;
+    let data = StringArray::from(vec!["é", "ǅ", "k"]);
+    for unit in ["_", "%_", "ǅ", "k", "é_"] {
+        let pattern: String = unit.chars().cycle().take(cap).collect();
+        let pattern = Scalar::new(StringArray::from(vec![pattern]));
+        assert!(like(&data, &pattern).is_ok(), "LIKE {unit:?}");
+        assert!(ilike(&data, &pattern).is_ok(), "ILIKE {unit:?}");
+    }
 }
 
 #[tokio::test]
@@ -458,6 +528,27 @@ fn ungated_scope() -> QueryScope {
             &parquet(&[("id", &ids), ("dept", &depts), ("salary", &salaries)]),
         )
         .expect("register people");
+    scope
+}
+
+/// A zero-knowledge scope (k = `K`) whose `texts` table holds each `people`
+/// department as `Utf8`, `LargeUtf8` and `Utf8View`.
+fn text_scope() -> QueryScope {
+    let mut scope = QueryScope::new(EngineSettings {
+        zk: ZkMode::Enabled,
+        max_concurrent_queries: 1,
+    });
+    let depts = || ROWS.iter().map(|r| r.1);
+    let utf8 = StringArray::from_iter_values(depts());
+    let large = LargeStringArray::from_iter_values(depts());
+    let view = StringViewArray::from_iter_values(depts());
+    scope
+        .register_parquet(
+            "texts",
+            &parquet(&[("dept", &utf8), ("ldept", &large), ("vdept", &view)]),
+        )
+        .expect("register texts");
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: K }));
     scope
 }
 
