@@ -191,6 +191,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `GCP_PROJECT_ID` is removed: nothing read it. The GCS client takes its
+  bucket from `STORAGE_BUCKET` and its credentials from `object_store`'s
+  `GOOGLE_*` environment variables or the metadata server.
 * The SEV-SNP simulation is retired: `SimulatedSnp`, the SEV-SNP report
   parser and P-384 chain verifier (`report`, `verifier`, `TrustRoot`), the
   `snp_report` fuzz target and the `SIMULATED_SNP_*` settings are removed,
