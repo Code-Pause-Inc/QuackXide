@@ -213,6 +213,8 @@ pub fn blind_index(index_key: &[u8], value: &[u8]) -> [u8; BLIND_INDEX_BYTES] {
 
 pub const HPKE_ENVELOPE_MAGIC: [u8; 4] = *b"HPK1";
 pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
+/// A raw X25519 private key: 32 bytes, any value (clamped by the KEM).
+pub const X25519_PRIVATE_KEY_BYTES: usize = 32;
 const MAGIC_BYTES: usize = HPKE_ENVELOPE_MAGIC.len();
 const ENCAPPED_KEY_BYTES: usize = 32;
 
@@ -316,6 +318,66 @@ fn parse_envelope(envelope: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
     }
 }
 
+fn private_key_from_raw(raw: &[u8]) -> Result<KemPrivateKey, CryptoError> {
+    if raw.len() != X25519_PRIVATE_KEY_BYTES {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    KemPrivateKey::from_bytes(raw).map_err(|_| CryptoError::InvalidKeyLength)
+}
+
+/// Overwrite a private key in place; the KEM type does not zeroize itself.
+fn scrub(private_key: &mut KemPrivateKey) {
+    if let Ok(zero) = KemPrivateKey::from_bytes(&[0u8; X25519_PRIVATE_KEY_BYTES]) {
+        *private_key = zero;
+    }
+}
+
+fn open_with(
+    private_key: &KemPrivateKey,
+    info: &[u8],
+    envelope: &[u8],
+) -> Result<SecretBytes, CryptoError> {
+    let (encapped_raw, ciphertext) = parse_envelope(envelope)?;
+    let encapped =
+        KemEncappedKey::from_bytes(encapped_raw).map_err(|_| CryptoError::InvalidEnvelope)?;
+    hpke::single_shot_open::<TenantAead, TenantKdf, TenantKem>(
+        &OpModeR::Base,
+        private_key,
+        &encapped,
+        info,
+        ciphertext,
+        b"",
+    )
+    .map(SecretBytes::new)
+    .map_err(|_| CryptoError::OpenFailed)
+}
+
+/// The public key of a raw tenant private key. The browser derives its
+/// enrollment key this way from the private key it generated
+/// (ADR 0007, "Browser private-key storage").
+pub fn tenant_public_key_from_private(raw: &[u8]) -> Result<TenantPublicKey, CryptoError> {
+    let mut private_key = private_key_from_raw(raw)?;
+    let public_key = TenantKem::sk_to_pk(&private_key);
+    scrub(&mut private_key);
+    Ok(TenantPublicKey(public_key))
+}
+
+/// Open a framed envelope with a raw tenant private key, choosing the suite
+/// from the frame magic. This is the browser's open path: the crypto worker
+/// decrypts the device key just before the call and the key is scrubbed
+/// when it returns. Fails on tamper, wrong recipient, a mismatched `info`
+/// binding or an unknown frame.
+pub fn hpke_open_with_private_key(
+    private_key: &[u8],
+    info: &[u8],
+    envelope: &[u8],
+) -> Result<SecretBytes, CryptoError> {
+    let mut private_key = private_key_from_raw(private_key)?;
+    let opened = open_with(&private_key, info, envelope);
+    scrub(&mut private_key);
+    opened
+}
+
 /// Test/dev-only tenant keypair. Production tenant private keys are
 /// generated non-extractable in the browser and never exist server-side.
 pub struct TenantKeypair {
@@ -369,27 +431,13 @@ impl TenantKeypair {
     /// Open a framed envelope. Fails on tamper, wrong recipient, or a
     /// mismatched `info` binding.
     pub fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, CryptoError> {
-        let (encapped_raw, ciphertext) = parse_envelope(envelope)?;
-        let encapped =
-            KemEncappedKey::from_bytes(encapped_raw).map_err(|_| CryptoError::InvalidEnvelope)?;
-        hpke::single_shot_open::<TenantAead, TenantKdf, TenantKem>(
-            &OpModeR::Base,
-            &self.private_key,
-            &encapped,
-            info,
-            ciphertext,
-            b"",
-        )
-        .map(SecretBytes::new)
-        .map_err(|_| CryptoError::OpenFailed)
+        open_with(&self.private_key, info, envelope)
     }
 }
 
 impl Drop for TenantKeypair {
     fn drop(&mut self) {
-        if let Ok(zero_sk) = KemPrivateKey::from_bytes(&[0u8; X25519_PUBLIC_KEY_BYTES]) {
-            self.private_key = zero_sk;
-        }
+        scrub(&mut self.private_key);
     }
 }
 
@@ -566,6 +614,48 @@ mod tests {
                 .expose(),
             b"x"
         );
+    }
+
+    #[test]
+    fn raw_private_key_opens_what_its_public_key_sealed() {
+        let keypair = TenantKeypair::generate();
+        let raw = keypair.to_private_key_bytes();
+        let public = tenant_public_key_from_private(raw.expose()).expect("public key");
+        assert_eq!(public.to_raw(), keypair.public_key().to_raw());
+
+        let envelope = hpke_seal_to_tenant(&public, b"ctx", b"rows").expect("seal");
+        let opened = hpke_open_with_private_key(raw.expose(), b"ctx", &envelope).expect("open");
+        assert_eq!(opened.expose(), b"rows");
+
+        assert!(matches!(
+            hpke_open_with_private_key(raw.expose(), b"other", &envelope),
+            Err(CryptoError::OpenFailed)
+        ));
+        let other = TenantKeypair::generate().to_private_key_bytes();
+        assert!(matches!(
+            hpke_open_with_private_key(other.expose(), b"ctx", &envelope),
+            Err(CryptoError::OpenFailed)
+        ));
+        let mut relabelled = envelope.clone();
+        relabelled[..4].copy_from_slice(b"HPK2");
+        assert!(matches!(
+            hpke_open_with_private_key(raw.expose(), b"ctx", &relabelled),
+            Err(CryptoError::InvalidEnvelope)
+        ));
+    }
+
+    #[test]
+    fn raw_private_keys_of_the_wrong_length_are_refused() {
+        for raw in [&[][..], &[7u8; 31], &[7u8; 33]] {
+            assert!(matches!(
+                tenant_public_key_from_private(raw),
+                Err(CryptoError::InvalidKeyLength)
+            ));
+            assert!(matches!(
+                hpke_open_with_private_key(raw, b"i", b"HPK1"),
+                Err(CryptoError::InvalidKeyLength)
+            ));
+        }
     }
 
     #[test]

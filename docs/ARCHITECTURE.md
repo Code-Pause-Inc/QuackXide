@@ -60,6 +60,16 @@ Client key architecture:
 * **DEK (per-file key)** — random per file; extractable only in the instant
   before being wrapped under the KEK; every unwrapped copy is created
   non-extractable.
+* **HPKE private key** — the device's tenant key, which envelopes are sealed
+  to. Web Crypto cannot run the envelope suite's KEM, so this key is the
+  exception to the KEK note above (ADR 0007, "Browser private-key
+  storage"). It is 32 random bytes, stored only AES-256-GCM-encrypted under
+  a separate non-extractable **seed key** (encrypt/decrypt only), with AAD
+  `x25519-key-v1|{tenant}|{SHA-256 of the public key}`
+  (`lib/crypto/devicekey.ts`). The worker decrypts it immediately before an
+  open, hands it to wasm, and both copies are zeroed when the open ends.
+  Device records saved before this scheme held a Web Crypto key that could
+  never open anything; the worker replaces it with a new key in this form.
 * **Worker isolation** — all key handling, encryption, and vault I/O run in a
   dedicated Web Worker (`lib/crypto/worker.ts`). The DOM/UI thread exchanges
   only opaque ids, decrypted summaries it asked for, and download Blobs.
@@ -69,13 +79,13 @@ Client key architecture:
 * **Crypto-agility seam** — the crypto core sits behind `lib/crypto/core.ts`,
   `lib/crypto/envelope.ts` and the worker protocol. `envelope.ts` loads the
   wasm32 build of the backend's own envelope code (`envelope-wasm`, built by
-  `scripts/build-wasm.sh`) and seals to a tenant's raw public key, so the
-  browser and the enclave share one implementation. Seal needs no private
-  key, and the module never sees the KEK or file keys. The frame magic
-  names the suite, so a new suite changes no caller. Only the worker loads
-  the module (an ESLint rule refuses its glue elsewhere); no worker
-  operation exposes sealing to the UI yet. Opening in the browser is not
-  built.
+  `scripts/build-wasm.sh`), so the browser and the enclave share one
+  implementation. It seals to a tenant's raw public key, opens with the
+  device's HPKE private key (`openWithDeviceKey`), and derives the public
+  key it enrolls. The module never sees the KEK or file keys. The frame
+  magic names the suite, so a new suite changes no caller. Only the worker
+  loads the module (an ESLint rule refuses its glue elsewhere); no worker
+  operation exposes sealing or opening to the UI yet.
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one

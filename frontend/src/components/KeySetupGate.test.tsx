@@ -8,7 +8,7 @@ import KeySetupGate from "./KeySetupGate";
 const info: InitResult = {
   created: true,
   tenantId: "6f2c8a2e-1111-4222-8333-444455556666",
-  x25519Supported: true,
+  hpkeKeyAvailable: true,
   hpkePublicKeyB64: "AAAA",
   fingerprint: "ab12-cd34-ef56-7890",
 };
@@ -34,17 +34,17 @@ describe("KeySetupGate", () => {
     expect(
       screen.getByText(new RegExp(`including ${brand.publicName} support`)),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/does not support X25519/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/could not load the encryption module/)).not.toBeInTheDocument();
   });
 
-  it("warns when X25519 is unavailable", () => {
+  it("warns when the device has no HPKE key", () => {
     render(
       <KeySetupGate
-        info={{ ...info, x25519Supported: false, hpkePublicKeyB64: null, fingerprint: null }}
+        info={{ ...info, hpkeKeyAvailable: false, hpkePublicKeyB64: null, fingerprint: null }}
         onAcknowledge={vi.fn()}
       />,
     );
-    expect(screen.getByText(/does not support X25519/)).toBeInTheDocument();
+    expect(screen.getByText(/could not load the encryption module/)).toBeInTheDocument();
     expect(screen.queryByText(/fingerprint/i)).not.toBeInTheDocument();
   });
 });
