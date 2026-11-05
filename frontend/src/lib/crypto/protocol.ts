@@ -5,10 +5,12 @@ export interface InitResult {
   /** True when device keys were generated for the first time in this call. */
   created: boolean;
   tenantId: string;
-  x25519Supported: boolean;
-  /** Raw X25519 public key (base64); null without X25519 support. */
+  /** False while the envelope module cannot load on this device, so it has
+   *  no HPKE key yet; the drive works without one. */
+  hpkeKeyAvailable: boolean;
+  /** Raw X25519 public key (base64); null without an HPKE key. */
   hpkePublicKeyB64: string | null;
-  /** Fingerprint of the device public key; null without X25519 support. */
+  /** Fingerprint of the device public key; null without an HPKE key. */
   fingerprint: string | null;
 }
 

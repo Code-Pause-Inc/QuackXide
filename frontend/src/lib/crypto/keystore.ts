@@ -1,9 +1,11 @@
 // Device key persistence. Imported only by the crypto worker, so key handles
 // never reach code that touches the DOM. A non-extractable CryptoKey stays
 // non-extractable in IndexedDB: the browser persists an opaque handle, not
-// script-readable key bytes.
+// script-readable key bytes. The HPKE private key is stored only encrypted
+// under the seed key (devicekey.ts).
 
 import { idbRequest, openDb, txDone } from "../idb";
+import type { DeviceHpkeKey } from "./devicekey";
 
 const DB_NAME = "drive-keys";
 const DB_VERSION = 1;
@@ -13,9 +15,22 @@ const DEVICE_ROW = "device";
 export interface DeviceKeys {
   tenantId: string;
   kek: CryptoKey;
-  hpkePrivateKey: CryptoKey | null;
-  hpkePublicKeyRaw: ArrayBuffer | null;
+  /** Null until the envelope module has loaded once on this device. */
+  hpke: DeviceHpkeKey | null;
   createdAtIso: string;
+}
+
+/** Records saved before ADR 0007's key storage held a non-extractable Web
+ *  Crypto X25519 key, which can never open an envelope. They load with no
+ *  HPKE key, so the worker generates one in the new form. */
+function normalize(record: Record<string, unknown>): DeviceKeys {
+  const { tenantId, kek, hpke, createdAtIso } = record as Partial<DeviceKeys>;
+  return {
+    tenantId: tenantId!,
+    kek: kek!,
+    hpke: hpke ?? null,
+    createdAtIso: createdAtIso!,
+  };
 }
 
 interface KeyRow {
@@ -40,8 +55,8 @@ async function readRow(db: IDBDatabase, name: string): Promise<unknown> {
 export async function loadDeviceKeys(): Promise<DeviceKeys | null> {
   const db = await open();
   try {
-    const record = (await readRow(db, DEVICE_ROW)) as DeviceKeys | undefined;
-    return record ?? null;
+    const record = (await readRow(db, DEVICE_ROW)) as Record<string, unknown> | undefined;
+    return record ? normalize(record) : null;
   } finally {
     db.close();
   }

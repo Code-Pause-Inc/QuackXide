@@ -49,10 +49,10 @@ export default function KeySetupGate({ info, onAcknowledge }: KeySetupGateProps)
         </li>
       </ul>
 
-      {!info.x25519Supported && (
+      {!info.hpkeKeyAvailable && (
         <p className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
-          This browser does not support X25519 yet. Drive encryption works fully; automated
-          connector features will require a newer browser.
+          This browser could not load the encryption module for your data key. Drive encryption
+          works fully; connector and research features need a browser that can run it.
         </p>
       )}
 

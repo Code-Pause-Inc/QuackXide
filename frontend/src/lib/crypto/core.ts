@@ -1,23 +1,20 @@
-// AES-256-GCM and X25519 on Web Crypto. Environment-agnostic (no DOM or
-// worker globals) so it runs in the crypto worker and under Node tests. This
-// is the only module that handles key material.
+// AES-256-GCM on Web Crypto. Environment-agnostic (no DOM or worker
+// globals) so it runs in the crypto worker and under Node tests.
 //
 // Custody rules enforced here:
 // * KEK: non-extractable, usable only to wrap/unwrap DEKs.
 // * DEK: generated extractable so it can be wrapped; unwrapped copies are
 //   non-extractable.
-// * HPKE X25519 private key: non-extractable; only the public half exports.
+// * Seed key: non-extractable, encrypt/decrypt only, separate from the KEK.
+//   It encrypts the device's HPKE private key, which Web Crypto cannot hold
+//   for the envelope suite (ADR 0007, "Browser private-key storage";
+//   devicekey.ts).
 //
 // Every AES-GCM operation binds tenant id, object id, and role via AAD, so a
 // vault cannot splice records across objects, reorder chunks, or swap
 // wrapped keys undetected.
 
-import type {
-  EncryptedPayload,
-  FileManifest,
-  HpkeKeypairHandle,
-  WrappedKey,
-} from "./types";
+import type { EncryptedPayload, FileManifest, WrappedKey } from "./types";
 
 const AES_KEY_BITS = 256;
 export const GCM_IV_BYTES = 12;
@@ -157,26 +154,27 @@ export async function decryptManifest(
   return JSON.parse(textDecoder.decode(bytes)) as FileManifest;
 }
 
-/** X25519 support is newer than AES-GCM; detect it so the drive still works
- *  without it. */
-export async function isX25519Supported(): Promise<boolean> {
-  try {
-    await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
-    return true;
-  } catch {
-    return false;
-  }
+/** Device seed key (ADR 0007): non-extractable AES-256-GCM, encrypt and
+ *  decrypt only, used for nothing but the device's HPKE private key. */
+export function generateSeedKey(): Promise<CryptoKey> {
+  return crypto.subtle.generateKey({ name: "AES-GCM", length: AES_KEY_BITS }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
 }
 
-/** Tenant HPKE keypair (backend suite DHKEM(X25519, HKDF-SHA256)). The
- *  private key is non-extractable; the raw public key is exported for
- *  enrollment. */
-export async function generateHpkeKeypair(): Promise<HpkeKeypairHandle> {
-  const pair = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
-    "deriveBits",
-  ])) as CryptoKeyPair;
-  const publicKeyRaw = await crypto.subtle.exportKey("raw", pair.publicKey);
-  return { privateKey: pair.privateKey, publicKeyRaw };
+function hex(bytes: ArrayBuffer): string {
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** AAD of the encrypted HPKE private key: its suite's key kind, the tenant
+ *  and the SHA-256 of the public key it pairs with, so a stored record
+ *  cannot be moved to another tenant or paired with another public key.
+ *  `x25519-key-v1` is the `HPK1` counterpart of ADR 0007's
+ *  `xwing-seed-v1`. */
+export async function privateKeyAad(tenantId: string, publicKeyRaw: ArrayBuffer): Promise<Aad> {
+  const digest = await crypto.subtle.digest("SHA-256", publicKeyRaw);
+  return utf8(`x25519-key-v1|${tenantId}|${hex(digest)}`);
 }
 
 const FINGERPRINT_BYTES = 8;
