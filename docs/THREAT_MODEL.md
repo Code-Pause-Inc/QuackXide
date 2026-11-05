@@ -58,6 +58,7 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | Picking rows by position below the aggregate (`ORDER BY … LIMIT`/`OFFSET` in a subquery or CTE) | Plan allowlist: only filters and column renames below the aggregate | Built, tested (`tests/bypass.rs`) |
 | Running statements before the gate (`CREATE TABLE … AS`, `DROP TABLE`, `SET`, `PREPARE`) | Statements are refused before planning finishes, so nothing runs ahead of the plan gate | Built, tested (`tests/bypass.rs`) |
 | Spoofed cohort size (`9999 AS n`) | `disclosure::verify_count_column` requires a genuine `COUNT(*) AS n` | Built, tested |
+| Runtime-error oracle (a conditional division by zero or failing cast answers one bit about rows below *k*) | Expression allowlist on the analyzed plan ([ADR 0010](adr/0010-refuse-expressions-that-can-fail-at-runtime.md)) | Built, tested (`tests/bypass.rs`, `research_api.rs`) |
 | Small-cohort queries that isolate individuals | `MinCountThreshold` drops rows with `n < RESEARCH_MIN_COHORT_SIZE` | Built, tested |
 | Unlimited adaptive probing | `BudgetLedger`: charged before execution, no refunds, monotonic per grant | Built, tested |
 | Querying without a grant, or after revocation | `GrantRegistry` check before any decryption (403) | Built, tested |

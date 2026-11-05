@@ -14,6 +14,10 @@
 //!
 //! Each input row belongs to exactly one released group: the allowlist
 //! refuses grouping sets, so no result holds a subtotal beside its parts.
+//! Suppression runs after the whole plan has executed, so the expression
+//! allowlist (`policy::expressions_cannot_fail`, ADR 0010) keeps a failure
+//! on a suppressed row from reaching the caller.
+//!
 //! Thresholds bound single-query disclosure only; differencing across
 //! overlapping queries is limited by the per-grant query budget.
 
