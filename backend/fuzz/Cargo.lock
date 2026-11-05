@@ -1921,6 +1921,7 @@ dependencies = [
  "platform-connectors",
  "platform-crypto",
  "platform-enclave",
+ "serde_json",
 ]
 
 [[package]]
