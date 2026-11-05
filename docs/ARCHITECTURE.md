@@ -103,6 +103,26 @@ delete that fails partway leaves the object listed and a retry finishes it.
 Until then the object's download fails, since some chunks are gone. An
 object whose manifest is gone is a 404.
 
+An upload sends its chunks first and its manifest last. The manifest PUT
+is refused with 409 unless every chunk `0..chunk_count` is stored, so a
+listed object always had all its chunks when it was committed.
+
+An upload that stops before its manifest leaves chunks nothing points to.
+`platform-api` sweeps every hour (`platform_api::sweep`): it deletes an
+object's chunks when the object has no manifest and no chunk of it has been
+written for 24 hours (`ORPHAN_MIN_AGE`). Just before deleting, it checks the
+manifest again and re-lists the object's chunks, so a manifest or chunk
+written since its first listing saves the object. An upload that pauses
+longer than that between chunks loses the chunks it had sent, and its
+manifest is then refused. Each deletion is audited; a run that deletes
+nothing (another replica got there first) audits nothing. One object's
+storage error does not stop the run. The sweep's cross-tenant listing stays
+inside `platform-storage` (`list_drive_entries_all_tenants`), which returns
+only single-tenant drive paths. Ages are the store's last-modified times, so
+the API host's clock must be within hours of the store's. A narrow race
+remains: a chunk re-sent between the sweep's re-list and its deletes can
+still be deleted, and that upload's manifest is then refused.
+
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
 

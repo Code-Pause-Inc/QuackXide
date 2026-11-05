@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Deletes chunks of drive uploads that never wrote a manifest.
+    platform_api::sweep::spawn_sweeper(vault.clone());
+
     let jwt = config.auth.hs256_secret.as_ref().map(|secret| {
         Arc::new(JwtVerifier::hs256(
             secret.expose(),

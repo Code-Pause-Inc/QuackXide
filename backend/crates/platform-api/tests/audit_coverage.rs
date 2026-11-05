@@ -548,3 +548,72 @@ async fn drive_listing_past_the_cap_is_audited() {
         capture.events()
     );
 }
+
+#[tokio::test]
+async fn orphan_sweep_deletions_are_audited() {
+    let capture = AuditCapture::install();
+    let vault = ObjectStoreVault::new_in_memory();
+    let tenant = TenantId::generate();
+    vault
+        .put(
+            &platform_storage::TenantPaths::drive_chunk(
+                tenant,
+                platform_core::ObjectId::generate(),
+                0,
+            ),
+            bytes::Bytes::from_static(b"ciphertext"),
+        )
+        .await
+        .expect("put");
+
+    // As if the chunk were older than any upload may take.
+    let later =
+        chrono::Utc::now() + platform_api::sweep::ORPHAN_MIN_AGE + chrono::TimeDelta::minutes(1);
+    let report = platform_api::sweep::sweep_orphaned_chunks(&vault, later)
+        .await
+        .expect("sweep");
+    assert_eq!(report.chunks, 1);
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "data.access"
+                && e.outcome == "ok"
+                && e.detail.starts_with("orphan_sweep")),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn a_manifest_missing_chunks_is_audited_as_denied() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let app = full_app(tenant, ZkMode::Disabled).await;
+    let manifest = serde_json::json!({
+        "wrapped_key": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "d3JhcHBlZC1rZXk=" },
+        "manifest": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "bWFuaWZlc3Q=" },
+        "chunk_count": 1,
+        "encrypted_size_bytes": 28,
+        "created_at_iso": "2026-07-30T12:00:00.000Z"
+    });
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/api/v1/drive/objects/00000000-aaaa-4bbb-8ccc-000000000001/manifest",
+        &[bearer(&token_for(tenant)), json_header()],
+        manifest.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "data.access"
+                && e.outcome == "denied"
+                && e.detail.contains("missing_chunk=0")),
+        "{:?}",
+        capture.events()
+    );
+}

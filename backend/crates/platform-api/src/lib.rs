@@ -5,6 +5,7 @@
 //! `platform_storage::TenantPaths`, so cross-tenant access cannot be
 //! expressed. Drive payloads are opaque ciphertext to this process.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -34,6 +35,7 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+pub mod sweep;
 use admin::ProvisioningService;
 use query::{
     ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
@@ -672,6 +674,30 @@ async fn put_manifest(
     }
     validate_payload(&body.wrapped_key)?;
     validate_payload(&body.manifest)?;
+
+    // Every chunk the manifest names must be stored. An upload that paused
+    // long enough for the orphan sweep to delete its first chunks would
+    // otherwise commit a file that cannot be downloaded.
+    let stored_chunks: HashSet<platform_storage::VaultPath> = state
+        .vault
+        .list(&TenantPaths::drive_object_prefix(tenant, object_id))
+        .await?
+        .into_iter()
+        .collect();
+    if let Some(missing) = (0..body.chunk_count)
+        .find(|&i| !stored_chunks.contains(&TenantPaths::drive_chunk(tenant, object_id, i)))
+    {
+        security_audit_event(
+            AuditKind::DataAccess,
+            Some(tenant),
+            "denied",
+            &format!(
+                "put_manifest object={object_id} chunk_count={} missing_chunk={missing}",
+                body.chunk_count
+            ),
+        );
+        return Err(ApiError::Conflict);
+    }
 
     let stored = serde_json::to_vec(&body).map_err(|_| ApiError::Backend)?;
     state

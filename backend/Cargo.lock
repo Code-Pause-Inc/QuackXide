@@ -3008,6 +3008,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
  "hmac",
  "http-body-util",
@@ -3156,6 +3157,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "object_store",
  "platform-config",
