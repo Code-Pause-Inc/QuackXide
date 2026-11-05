@@ -39,3 +39,4 @@ What becomes easier or harder, and what must now be true.
 * [0006. Sign-in, identity and token signatures](0006-sign-in-and-tokens.md)
 * [0007. Hybrid suite construction, libraries, browser key storage and migration](0007-hybrid-suite-construction.md)
 * [0008. Upgrade DataFusion, Arrow, Parquet, and `object_store`](0008-datafusion-55-upgrade.md)
+* [0010. Refuse expressions that can fail at runtime in the disclosure gate](0010-refuse-expressions-that-can-fail-at-runtime.md)
