@@ -13,12 +13,19 @@
 //! result could be differenced to recover a suppressed cohort. The `COUNT(*) AS n` and minimum-cohort
 //! gates in [`crate::disclosure`] apply on top of this one.
 //!
+//! [`expressions_cannot_fail`] adds a third check on the analyzed plan:
+//! every expression must be one that cannot fail at runtime, so a query's
+//! outcome (error or result) never depends on rows that suppression would
+//! hide (ADR 0010).
+//!
 //! It bounds what leaves the enclave; it complements, not replaces,
 //! attestation and envelope encryption.
 
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::logical_expr::expr::AggregateFunction;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use arrow::datatypes::DataType;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{DFSchema, ScalarValue};
+use datafusion::logical_expr::expr::{AggregateFunction, Cast};
+use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Operator};
 
 /// Aggregates that return one summary value per group.
 pub const PERMITTED_AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
@@ -40,6 +47,123 @@ pub fn is_aggregate_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::SubqueryAlias(_) => single_input(plan).is_some_and(is_aggregate_only),
             _ => false,
         }
+}
+
+/// Scalar functions that cannot fail on any input.
+const TOTAL_FUNCTIONS: &[&str] = &["coalesce", "nullif", "lower", "upper"];
+
+/// True when no expression in the analyzed (type-coerced) plan can fail at
+/// runtime. It must see the analyzed plan: coercion inserts casts, such as
+/// a string to an integer, that fail on some values. Unknown expression
+/// kinds count as able to fail.
+pub fn expressions_cannot_fail(analyzed: &LogicalPlan) -> bool {
+    let may_fail = analyzed.exists(|node| {
+        let schema = match node.inputs()[..] {
+            [input] => input.schema(),
+            _ => node.schema(),
+        };
+        Ok(!node
+            .expressions()
+            .iter()
+            .all(|expr| expr_cannot_fail(expr, schema)))
+    });
+    matches!(may_fail, Ok(false))
+}
+
+fn expr_cannot_fail(expr: &Expr, schema: &DFSchema) -> bool {
+    matches!(expr.exists(|e| Ok(!node_cannot_fail(e, schema))), Ok(false))
+}
+
+/// The rule for one expression node; its children are checked separately.
+fn node_cannot_fail(expr: &Expr, schema: &DFSchema) -> bool {
+    match expr {
+        Expr::Alias(_)
+        | Expr::Column(_)
+        | Expr::Literal(..)
+        | Expr::Not(_)
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsNotUnknown(_)
+        | Expr::Between(_)
+        | Expr::Case(_)
+        | Expr::TryCast(_)
+        // Its arguments are plain columns or literals (`is_permitted_aggregate`).
+        | Expr::AggregateFunction(_) => true,
+        Expr::BinaryExpr(binary) => binary_cannot_fail(binary, schema),
+        Expr::Negative(inner) => is_wrapping_number(type_of(inner, schema).as_ref()),
+        Expr::Like(like) => matches!(*like.pattern, Expr::Literal(..)),
+        Expr::InList(in_list) => in_list.list.iter().all(|item| match item {
+            Expr::Literal(..) => true,
+            Expr::Cast(cast) => matches!(*cast.expr, Expr::Literal(..)) && cast_cannot_fail(cast, schema),
+            _ => false,
+        }),
+        Expr::Cast(cast) => cast_cannot_fail(cast, schema),
+        Expr::ScalarFunction(function) => TOTAL_FUNCTIONS.contains(&function.name()),
+        _ => false,
+    }
+}
+
+fn binary_cannot_fail(binary: &BinaryExpr, schema: &DFSchema) -> bool {
+    use Operator::*;
+    let left = type_of(&binary.left, schema);
+    let right = type_of(&binary.right, schema);
+    match binary.op {
+        Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or | IsDistinctFrom | IsNotDistinctFrom
+        | StringConcat => true,
+        // Integer arithmetic wraps and float arithmetic follows IEEE 754.
+        Plus | Minus | Multiply => left == right && is_wrapping_number(left.as_ref()),
+        Divide | Modulo => match (left, right) {
+            (Some(DataType::Float64), Some(DataType::Float64)) => true,
+            (Some(DataType::Int64), Some(DataType::Int64)) => is_safe_int_divisor(&binary.right),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A literal is cast here, so its outcome cannot depend on the data; a
+/// column only by a conversion that accepts every value.
+fn cast_cannot_fail(cast: &Cast, schema: &DFSchema) -> bool {
+    let to = cast.field.data_type();
+    if let Expr::Literal(value, _) = cast.expr.as_ref() {
+        return value.cast_to(to).is_ok();
+    }
+    let Some(from) = type_of(&cast.expr, schema) else {
+        return false;
+    };
+    from == *to
+        || (from == DataType::Int64 && *to == DataType::Float64)
+        || (is_string(to)
+            && (is_string(&from)
+                || matches!(
+                    from,
+                    DataType::Boolean | DataType::Int64 | DataType::Float64
+                )))
+}
+
+/// `i64::MIN / -1` overflows, and zero divides by zero.
+fn is_safe_int_divisor(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(ScalarValue::Int64(Some(v)), _) if *v != 0 && *v != -1)
+}
+
+fn is_wrapping_number(data_type: Option<&DataType>) -> bool {
+    matches!(data_type, Some(DataType::Int64 | DataType::Float64))
+}
+
+fn is_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+fn type_of(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
+    expr.get_type(schema).ok()
 }
 
 /// Below the aggregate every row reaches it unchanged: filters may drop

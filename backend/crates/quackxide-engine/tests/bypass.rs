@@ -78,8 +78,32 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("from_subquery_columns", "SELECT dept, COUNT(*) AS n FROM (SELECT dept, salary FROM people) t GROUP BY dept", Rows(2)),
     ("cte_aggregate", "WITH c AS (SELECT dept, COUNT(*) AS n FROM people GROUP BY dept) SELECT dept, n FROM c", Rows(2)),
     ("group_by_expression", "SELECT salary / 100 AS band, COUNT(*) AS n FROM people GROUP BY salary / 100", Rows(2)),
-    ("count_arithmetic", "SELECT dept, COUNT(*) AS n, SUM(salary) / COUNT(*) AS mean FROM people GROUP BY dept", Rows(2)),
     ("count_ratio", "SELECT dept, COUNT(*) AS n, COUNT(*) * 100 / 15 AS pct FROM people GROUP BY dept", Rows(2)),
+    // Expressions that cannot fail at runtime (ADR 0010).
+    ("float_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > 3.5 GROUP BY dept", Rows(2)),
+    ("string_literal_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > '3' GROUP BY dept", Rows(2)),
+    ("in_list", "SELECT dept, COUNT(*) AS n FROM people WHERE dept IN ('eng', 'ops') GROUP BY dept", Rows(2)),
+    ("not_in_list", "SELECT dept, COUNT(*) AS n FROM people WHERE dept NOT IN ('ceo') GROUP BY dept", Rows(2)),
+    ("between", "SELECT dept, COUNT(*) AS n FROM people WHERE salary BETWEEN 100 AND 205 GROUP BY dept", Rows(2)),
+    ("not_between", "SELECT dept, COUNT(*) AS n FROM people WHERE salary NOT BETWEEN 7000 AND 9999 GROUP BY dept", Rows(2)),
+    ("coalesce", "SELECT dept, COUNT(*) AS n FROM people WHERE COALESCE(salary, 0) > 0 GROUP BY dept", Rows(2)),
+    ("try_cast", "SELECT dept, COUNT(*) AS n FROM people WHERE TRY_CAST(id AS BIGINT) IS NULL GROUP BY dept", Rows(2)),
+    ("cast_to_double", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(salary AS DOUBLE) > 0 GROUP BY dept", Rows(2)),
+    ("add_one", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + 1 > 0 GROUP BY dept", Rows(2)),
+    ("add_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + NULL IS NULL GROUP BY dept", Rows(2)),
+    ("is_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary IS NOT NULL GROUP BY dept", Rows(2)),
+    ("not", "SELECT dept, COUNT(*) AS n FROM people WHERE NOT (dept = 'ceo') GROUP BY dept", Rows(2)),
+    ("order_by_ordinal_having_alias", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING n > 5 ORDER BY 2", Rows(2)),
+    ("lower_eq", "SELECT dept, COUNT(*) AS n FROM people WHERE lower(dept) = 'eng' GROUP BY dept", Rows(1)),
+    ("cast_dept_to_varchar", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(dept AS VARCHAR) = 'eng' GROUP BY dept", Rows(1)),
+    ("like", "SELECT dept, COUNT(*) AS n FROM people WHERE dept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("not_like", "SELECT dept, COUNT(*) AS n FROM people WHERE dept NOT LIKE 'e%' GROUP BY dept", Rows(1)),
+    // Expressions that can fail on some rows, refused whatever the data
+    // (ADR 0010). `SUM / COUNT` divides by zero when no row matches.
+    ("count_arithmetic", "SELECT dept, COUNT(*) AS n, SUM(salary) / COUNT(*) AS mean FROM people GROUP BY dept", Rejected),
+    ("literal_cast_fails", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST('x' AS BIGINT) > 0 GROUP BY dept", Rejected),
+    ("div_by_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / NULL IS NULL GROUP BY dept", Rejected),
+    ("div_by_column", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / salary > 0 GROUP BY dept", Rejected),
     // Row-level egress.
     ("select_star", "SELECT * FROM people", Rejected),
     ("bare_columns", "SELECT id, salary FROM people", Rejected),
@@ -106,7 +130,7 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("group_by_id", "SELECT id, COUNT(*) AS n, MAX(salary) AS s FROM people GROUP BY id", Rows(0)),
     ("group_by_unique_expr", "SELECT id || dept AS k, COUNT(*) AS n FROM people GROUP BY id || dept", Rows(0)),
     ("group_by_salary", "SELECT salary, COUNT(*) AS n FROM people GROUP BY salary", Rows(0)),
-    ("group_by_substr_id", "SELECT SUBSTR(id, 2, 2) AS k, COUNT(*) AS n FROM people GROUP BY SUBSTR(id, 2, 2)", Rows(0)),
+    ("group_by_substr_id", "SELECT SUBSTR(id, 2, 2) AS k, COUNT(*) AS n FROM people GROUP BY SUBSTR(id, 2, 2)", Rejected),
     ("group_by_case_isolates", "SELECT CASE WHEN dept = 'ceo' THEN salary ELSE 0 END AS s, COUNT(*) AS n FROM people GROUP BY 1", Rows(1)),
     // Grouping sets: subtotal rows beside group rows let one query subtract
     // published groups from a total and recover a suppressed cohort.
@@ -252,6 +276,61 @@ async fn zk_mode_without_a_cohort_threshold_refuses_every_query() {
     );
     let zero = scope(Some(0)).sql(group).await;
     assert!(matches!(zero, Err(QueryError::Disclosure(_))), "{zero:?}");
+}
+
+/// Queries whose expressions fail only on some rows: `{P}` holds only for
+/// the single `ceo` row when `{T}` is 9000, and for no row at 9500. Each
+/// must be refused at planning both times, so the outcome says nothing
+/// about the data (ADR 0010).
+#[rustfmt::skip]
+const ERROR_PROBES: &[(&str, &str)] = &[
+    ("where_div", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / (CASE WHEN {P} THEN 0 ELSE 1 END) > 0 GROUP BY dept"),
+    ("where_mod", "SELECT dept, COUNT(*) AS n FROM people WHERE salary % (CASE WHEN {P} THEN 0 ELSE 7 END) >= 0 GROUP BY dept"),
+    ("where_cast_str_to_int", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CASE WHEN {P} THEN 'x' ELSE '1' END AS BIGINT) > 0 GROUP BY dept"),
+    ("where_implicit_eq", "SELECT dept, COUNT(*) AS n FROM people WHERE (CASE WHEN {P} THEN id ELSE '1' END) = 5 GROUP BY dept"),
+    ("where_implicit_gt", "SELECT dept, COUNT(*) AS n FROM people WHERE (CASE WHEN {P} THEN id ELSE '7' END) > 3 GROUP BY dept"),
+    ("where_abs", "SELECT dept, COUNT(*) AS n FROM people WHERE abs(CASE WHEN {P} THEN salary - 9001 - 9223372036854775807 - 1 ELSE 0 END) >= 0 GROUP BY dept"),
+    ("where_to_timestamp", "SELECT dept, COUNT(*) AS n FROM people WHERE to_timestamp(CASE WHEN {P} THEN 'bad' ELSE '2020-01-01T00:00:00' END) IS NOT NULL GROUP BY dept"),
+    ("where_substr", "SELECT dept, COUNT(*) AS n FROM people WHERE substr(dept, 1, CASE WHEN {P} THEN -1 ELSE 1 END) IS NOT NULL GROUP BY dept"),
+    ("where_repeat", "SELECT dept, COUNT(*) AS n FROM people WHERE length(repeat(dept, CASE WHEN {P} THEN 2147483647 ELSE 1 END)) > 0 GROUP BY dept"),
+    ("where_lpad", "SELECT dept, COUNT(*) AS n FROM people WHERE length(lpad(dept, CASE WHEN {P} THEN 2147483647 ELSE 1 END)) > 0 GROUP BY dept"),
+    ("where_literal_div_zero", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND salary / 0 > 0 GROUP BY dept"),
+    ("where_float_to_int", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CAST(salary AS DOUBLE) / (CASE WHEN {P} THEN 0.0 ELSE 1.0 END) AS BIGINT) > 0 GROUP BY dept"),
+    ("where_to_decimal", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CASE WHEN {P} THEN salary ELSE 1 END AS DECIMAL(3,0)) > 0 GROUP BY dept"),
+    ("group_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept, salary / (CASE WHEN {P} THEN 0 ELSE 1 END)"),
+    ("having_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING 1 / (CASE WHEN MAX(salary) > {T} AND COUNT(*) = 1 THEN 0 ELSE 1 END) > 0"),
+    ("outer_div", "SELECT dept, COUNT(*) AS n, 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END) AS x FROM people GROUP BY dept"),
+    ("outer_cast", "SELECT dept, COUNT(*) AS n, CAST(CASE WHEN MAX(salary) > {T} THEN 'x' ELSE '1' END AS BIGINT) AS x FROM people GROUP BY dept"),
+    ("order_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END)"),
+    ("ratio_over_zero_rows", "SELECT COUNT(*) AS n, SUM(salary) / COUNT(*) AS m FROM people WHERE {P}"),
+];
+
+#[tokio::test]
+async fn error_probes_are_refused_whatever_the_data() {
+    let scope = scope(Some(K));
+    let mut failures = Vec::new();
+    for &(name, template) in ERROR_PROBES {
+        for threshold in ["9000", "9500"] {
+            let sql = template
+                .replace("{P}", &format!("id = 'p15' AND salary > {threshold}"))
+                .replace("{T}", threshold);
+            match scope.sql(&sql).await {
+                Err(QueryError::ZkPolicy) => {}
+                Err(err) => failures.push(format!("{name} at {threshold}: {err}")),
+                Ok(_) => failures.push(format!("{name} at {threshold}: accepted")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn ungated_queries_are_not_checked() {
+    let rows = ungated_scope()
+        .sql("SELECT salary / 2 AS h FROM people")
+        .await
+        .expect("ungated query runs");
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 15);
 }
 
 /// Statements other than a read-only query. `{dir}` is a scratch directory.
