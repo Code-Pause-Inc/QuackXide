@@ -111,8 +111,6 @@ pub struct ServerConfig {
 /// routes that need the vault refuse instead.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
-    /// `GCP_PROJECT_ID`.
-    pub gcp_project_id: Option<String>,
     /// `STORAGE_BUCKET` — bucket holding `tenants/{tenant_id}/…` paths.
     pub bucket: Option<String>,
     /// Timeouts and retries of the GCS client.
@@ -249,7 +247,6 @@ impl PlatformConfig {
             });
         }
         let storage = StorageConfig {
-            gcp_project_id: get_nonempty(&get, "GCP_PROJECT_ID"),
             bucket: get_nonempty(&get, "STORAGE_BUCKET"),
             client: StorageClientConfig {
                 request_timeout: Duration::from_secs(request_timeout),
