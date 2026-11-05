@@ -14,7 +14,7 @@ platform-auth = { path = "../crates/platform-auth" }
 platform-billing = { path = "../crates/platform-billing" }
 platform-connectors = { path = "../crates/platform-connectors" }
 platform-crypto = { path = "../crates/platform-crypto" }
-# `simulated` supplies the token signer the attestation_token target verifies against.
+# `simulated` supplies the token signer the attestation targets verify against.
 platform-enclave = { path = "../crates/platform-enclave", features = ["simulated"] }
 serde_json = "1"
 

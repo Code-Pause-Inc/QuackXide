@@ -7,9 +7,10 @@
 //! and the release policy. Where the key set comes from (pinned or fetched)
 //! is the caller's choice (ADR 0004 open question 3).
 //!
-//! The verifier emits no audit record. Its caller (P47, P48) must emit each
-//! attestation decision, accepted or refused, as a `SECURITY_AUDIT_EVENT`
-//! and cover it in `platform-api/tests/audit_coverage.rs`.
+//! The verifier emits no audit record. Every caller (today the attestation
+//! gate and the stand-in key release; P47 and P48 in production) must emit
+//! each decision, accepted or refused, as a `SECURITY_AUDIT_EVENT` and cover
+//! it in `platform-api/tests/audit_coverage.rs`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -129,7 +130,8 @@ enum Nonces {
 
 #[derive(Deserialize)]
 struct Claims {
-    // Required here: jsonwebtoken cannot require `iat` and only checks `exp`.
+    // jsonwebtoken ignores `iat` in `required_spec_claims`, so require it
+    // here; `exp` is read again for the lifetime cap.
     iat: u64,
     exp: u64,
     hwmodel: String,
@@ -248,8 +250,12 @@ impl TokenVerifier {
         if claims.iat > get_current_timestamp().saturating_add(CLOCK_SKEW_LEEWAY_SECS) {
             return Err(TokenError::NotYetValid);
         }
-        if claims.exp.saturating_sub(claims.iat) > MAX_TOKEN_LIFETIME_SECS {
-            return Err(TokenError::LifetimeTooLong);
+        match claims.exp.checked_sub(claims.iat) {
+            None => return Err(TokenError::Malformed),
+            Some(lifetime) if lifetime > MAX_TOKEN_LIFETIME_SECS => {
+                return Err(TokenError::LifetimeTooLong);
+            }
+            Some(_) => {}
         }
 
         let nonces = match claims.eat_nonce {
@@ -694,6 +700,23 @@ mod tests {
         let lifetime = Duration::from_secs(MAX_TOKEN_LIFETIME_SECS);
         let token = signer().sign(SIMULATED_AUDIENCE, &[nonce()], lifetime);
         assert!(verifier().verify(&token, &[nonce()]).is_ok());
+    }
+
+    #[test]
+    fn exp_before_iat_is_refused() {
+        let token = claims_with(|c| {
+            c.insert("iat".into(), (now() + 50).into());
+            c.insert("exp".into(), (now() + 10).into());
+        });
+        assert_eq!(err(&token), TokenError::Malformed);
+    }
+
+    #[test]
+    fn non_integer_exp_is_refused() {
+        let token = claims_with(|c| {
+            c.insert("exp".into(), (now() as f64 + 600.4).into());
+        });
+        assert_eq!(err(&token), TokenError::Malformed);
     }
 
     #[test]

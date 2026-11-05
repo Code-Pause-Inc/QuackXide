@@ -11,10 +11,10 @@ uses [Semantic Versioning](https://semver.org/).
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
-  `iat` no later than now plus the leeway, a lifetime (`exp - iat`) of at
-  most one hour, the expected nonces, and the release policy
-  (`GCP_INTEL_TDX`, `CONFIDENTIAL_SPACE`, `disabled-since-boot`, `STABLE`,
-  an allowed image digest). Tokens over 16 KiB are refused before parsing,
+  integer `iat` no later than now plus the leeway, an integer `exp` no
+  earlier than `iat` and at most one hour after it, the expected nonces,
+  and the release policy (`GCP_INTEL_TDX`, `CONFIDENTIAL_SPACE`,
+  `disabled-since-boot`, `STABLE`, an allowed image digest). Tokens over 16 KiB are refused before parsing,
   and errors name a class, never token contents. A dev-only signer
   (`simulated_token`, feature `simulated`) issues tokens for tests. The
   `attestation_token` fuzz target covers parsing and the signature check;
