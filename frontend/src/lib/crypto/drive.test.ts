@@ -65,8 +65,7 @@ async function deviceKeys(): Promise<DeviceKeys> {
   return {
     tenantId: crypto.randomUUID(),
     kek: await generateMasterKey(),
-    hpkePrivateKey: null,
-    hpkePublicKeyRaw: null,
+    hpke: null,
     createdAtIso: new Date().toISOString(),
   };
 }

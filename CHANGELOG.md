@@ -8,6 +8,19 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Browser envelope open (P34 checkpoint B): `envelope-wasm` exports
+  `openEnvelope` and `publicKeyFromPrivateKey`, over the new
+  `platform_crypto::hpke_open_with_private_key` and
+  `tenant_public_key_from_private`. The crypto worker holds the device's
+  HPKE private key as ADR 0007 describes: 32 random bytes, stored only
+  encrypted under a non-extractable AES-256-GCM seed key with AAD
+  `x25519-key-v1|{tenant}|{SHA-256 of the public key}`, decrypted just
+  before an open and zeroed after (`lib/crypto/devicekey.ts`). The Web
+  Crypto X25519 key, which could not open anything, is gone; device
+  records that hold one get a new key on the next init. `InitResult`'s
+  `x25519Supported` is now `hpkeKeyAvailable`. `fixtures/envelope/hpk1.json`
+  carries each recipient's test-only private key, and the browser tests
+  open every Rust-sealed vector.
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), the expected
