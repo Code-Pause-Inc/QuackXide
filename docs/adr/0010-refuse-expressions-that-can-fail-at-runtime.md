@@ -93,8 +93,12 @@ reaches it. "String type" means `Utf8`, `LargeUtf8` or `Utf8View`.
 
 Float arithmetic follows IEEE 754 and cannot fail: `x / 0.0` is
 infinity and `0.0 / 0.0` is NaN, and both are accepted. Comparisons
-order floats totally (Arrow's `total_cmp`), so NaN equals itself and
-sorts above every number, infinity included. Released results write NaN
+order floats totally (Arrow's `total_cmp`), so NaN equals itself and is
+unequal to every number. Its sign decides its order: positive NaN sorts
+above every number, infinity included, and negative NaN below. The sign
+of `0.0 / 0.0` depends on the CPU (positive on ARM, negative on x86), so a
+NaN comparison can select different rows across platforms but never
+fails. Released results write NaN
 and infinity as `null`. A predicate that makes a value infinite or NaN
 shows no more than `CASE WHEN … THEN 1 ELSE 0 END`, and its cohort is
 still suppressed below *k*. Float-to-integer casts, which fail on them,

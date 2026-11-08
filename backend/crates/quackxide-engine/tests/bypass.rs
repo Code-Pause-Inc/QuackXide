@@ -89,10 +89,11 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("coalesce", "SELECT dept, COUNT(*) AS n FROM people WHERE COALESCE(salary, 0) > 0 GROUP BY dept", Rows(2)),
     ("try_cast", "SELECT dept, COUNT(*) AS n FROM people WHERE TRY_CAST(id AS BIGINT) IS NULL GROUP BY dept", Rows(2)),
     ("cast_to_double", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(salary AS DOUBLE) > 0 GROUP BY dept", Rows(2)),
-    // Float division by zero gives infinity or NaN, never an error; NaN
-    // sorts above every number.
+    // Float division by zero gives infinity or NaN, never an error. NaN is
+    // unequal to every number; its order against them depends on its sign,
+    // which for `0.0 / 0.0` differs by CPU, so the NaN case uses `<>`.
     ("float_div_by_zero", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(salary AS DOUBLE) / 0.0 > 0 GROUP BY dept", Rows(2)),
-    ("float_nan_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE (CAST(salary AS DOUBLE) - CAST(salary AS DOUBLE)) / 0.0 > 0 GROUP BY dept", Rows(2)),
+    ("float_nan_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE (CAST(salary AS DOUBLE) - CAST(salary AS DOUBLE)) / 0.0 <> 0 GROUP BY dept", Rows(2)),
     ("add_one", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + 1 > 0 GROUP BY dept", Rows(2)),
     ("add_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + NULL IS NULL GROUP BY dept", Rows(2)),
     ("is_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary IS NOT NULL GROUP BY dept", Rows(2)),
