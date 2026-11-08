@@ -91,6 +91,15 @@ evaluates it once, as execution would (as a scalar), and refuses the
 query if that fails, so a constant cannot fail only when some row
 reaches it. "String type" means `Utf8`, `LargeUtf8` or `Utf8View`.
 
+Float arithmetic follows IEEE 754 and cannot fail: `x / 0.0` is
+infinity and `0.0 / 0.0` is NaN, and both are accepted. Comparisons
+order floats totally (Arrow's `total_cmp`), so NaN equals itself and
+sorts above every number, infinity included. Released results write NaN
+and infinity as `null`. A predicate that makes a value infinite or NaN
+shows no more than `CASE WHEN … THEN 1 ELSE 0 END`, and its cohort is
+still suppressed below *k*. Float-to-integer casts, which fail on them,
+stay refused.
+
 Everything else is refused: every other scalar function, arithmetic on
 any other type (decimals among them), division by a column or an
 aggregate, casts from `Utf8` to any other type, and casts of a column to
@@ -178,10 +187,10 @@ allowed types.
   condition true and false through the gate research and ZK mode share,
   each refused both times; cases showing that ordinary filters keep
   working (`salary > 3.5`, `salary > '3'`, `dept IN ('eng', 'ops')`,
-  `dept LIKE 'e%'`, `salary / 100`), on `Utf8`, `LargeUtf8` and
-  `Utf8View` columns; and a check that patterns at the length cap always
-  compile. `research_api.rs` sends one probe through the research
-  endpoint.
+  `dept LIKE 'e%'`, `salary / 100`, float division by zero), on `Utf8`,
+  `LargeUtf8` and `Utf8View` columns; and a check that patterns at the
+  length cap always compile. `research_api.rs` sends one probe through
+  the research endpoint.
 * `docs/THREAT_MODEL.md` A1 gains a row for the error oracle, the
   plan-level description in `docs/ARCHITECTURE.md` lists the expression
   allowlist, and `CHANGELOG.md` records the refused SQL under Security.
