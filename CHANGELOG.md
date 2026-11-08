@@ -205,6 +205,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* Research access runs in the `platform-api` binary without key release.
+  The catalog, access-request, grant and budget routes use a
+  `ResearchService` (`AppState::research`) instead of the confidential
+  query service, so they no longer answer 503 when `KEY_RELEASE_URL` is
+  unset. The binary always builds it from `RESEARCH_MIN_COHORT_SIZE` and
+  `RESEARCH_DEFAULT_QUERY_BUDGET` over in-memory stores, with a startup
+  warning that they are lost on restart. The query, research-query and
+  attestation routes still answer 503 without key release, and a research
+  query checks and charges grants through the same `ResearchService`.
+  Without one, the research routes answer 503 "research access not
+  configured". `platform_api::wiring::build_state` builds the binary's
+  state, so tests can run its exact wiring. `ConnectorQueryService::with_research`
+  takes an `Arc<ResearchService>`, and `DevResearchStack::query_service`
+  and `query_service_with_attestation` take one in place of the cohort
+  size and default budget.
 * The SEV-SNP simulation is retired: `SimulatedSnp`, the SEV-SNP report
   parser and P-384 chain verifier (`report`, `verifier`, `TrustRoot`), the
   `snp_report` fuzz target and the `SIMULATED_SNP_*` settings are removed,
