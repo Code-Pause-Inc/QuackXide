@@ -161,18 +161,25 @@ async function openPortal() {
   return user;
 }
 
-/** Approved requests for my listing: one left without a grant by a failed
- *  approval, one finished (active grant), one whose grant I revoked. */
+/** Approved requests: two on my datasets that did not finish (no grant; a
+ *  grant with no budget), one finished, one whose grant I revoked, and my
+ *  own request as a researcher, which is not mine to retry. Pending and
+ *  denied requests have no grant either, and are not approvals. */
 function seedApproved() {
   api.grants.mockResolvedValue([
     myGrant,
     issuedGrant,
+    unmeteredGrant,
     { ...grant("g-revoked", ME, REVOKED, "health"), revoked: true },
   ]);
   api.myRequests.mockResolvedValue([
     request("r-stuck", ownListing, STUCK, "approved"),
+    request("r-unfunded", listing("l-other", ME, "other", "Other"), RESEARCHER, "approved"),
     request("r-done", ownListing, RESEARCHER, "approved"),
     request("r-revoked", ownListing, REVOKED, "approved"),
+    request("r-mine", openListing, ME, "approved"),
+    request("r-waiting", listing("l-fresh", ME, "fresh", "Fresh"), RESEARCHER, "pending"),
+    request("r-refused", listing("l-gone", ME, "gone", "Gone"), RESEARCHER, "denied"),
   ]);
 }
 
@@ -313,18 +320,20 @@ describe("ResearchPortal", () => {
     expect(await screen.findByText("decline failed (409)")).toBeInTheDocument();
   });
 
-  it("lists only approvals that never issued a grant", async () => {
+  it("lists my approvals that left no grant or no budget", async () => {
     seedApproved();
     await openPortal();
     await screen.findByText("Data stewardship");
 
-    const section = unfinishedSection();
-    expect(section.getAllByRole("listitem")).toHaveLength(1);
-    expect(section.getByText(/researcher dddddddd/)).toBeInTheDocument();
-    expect(section.getByRole("button", { name: "Retry approval" })).toBeInTheDocument();
+    const rows = unfinishedSection().getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]!).getByText(/researcher dddddddd/)).toBeInTheDocument();
+    expect(within(rows[1]!).getByText("other")).toBeInTheDocument();
+    expect(within(rows[1]!).getByText(/researcher cccccccc/)).toBeInTheDocument();
   });
 
-  it("hides the section when every approval issued a grant", async () => {
+  it("hides the section when every approval finished", async () => {
+    api.myRequests.mockResolvedValue([request("r-done", ownListing, RESEARCHER, "approved")]);
     await openPortal();
     await screen.findByText("Data stewardship");
     expect(screen.queryByText("Unfinished approvals")).not.toBeInTheDocument();
@@ -336,7 +345,8 @@ describe("ResearchPortal", () => {
     const user = await openPortal();
     await screen.findByText("Data stewardship");
 
-    await user.click(unfinishedSection().getByRole("button", { name: "Retry approval" }));
+    const stuck = within(unfinishedSection().getByText(/researcher dddddddd/).closest("li")!);
+    await user.click(stuck.getByRole("button", { name: "Retry approval" }));
     expect(api.approveRequest).toHaveBeenCalledExactlyOnceWith("r-stuck");
     expect(api.catalog).toHaveBeenCalledTimes(2);
   });
@@ -347,9 +357,10 @@ describe("ResearchPortal", () => {
     const user = await openPortal();
     await screen.findByText("Data stewardship");
 
-    await user.click(unfinishedSection().getByRole("button", { name: "Retry approval" }));
+    const stuck = within(unfinishedSection().getByText(/researcher dddddddd/).closest("li")!);
+    await user.click(stuck.getByRole("button", { name: "Retry approval" }));
     expect(await screen.findByText("approve: not found")).toBeInTheDocument();
-    expect(unfinishedSection().getByRole("button", { name: "Retry approval" })).toBeEnabled();
+    expect(stuck.getByRole("button", { name: "Retry approval" })).toBeEnabled();
   });
 
   it("publishes a listing from the stewardship panel and closes the form", async () => {

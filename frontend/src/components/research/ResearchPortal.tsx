@@ -143,22 +143,21 @@ export default function ResearchPortal() {
     [data, me],
   );
 
-  /** My approvals that failed before any grant was minted (for example a 502
-   *  from the grant step). Approving again retries them. A revoked grant
-   *  counts as issued: the API refuses to retry past a revoke. */
+  /** My approvals that left no grant, or an active grant with no budget (a 502
+   *  from the grant or budget step); approving again finishes them. Revoked
+   *  grants are left out: the API refuses to retry past a revoke. */
   const unfinishedApprovals = useMemo(() => {
     if (!data || !me) return [];
-    return data.requests.filter(
-      (r) =>
-        r.steward_tenant === me &&
-        r.status === "approved" &&
-        !data.grants.some(
-          (g) =>
-            g.steward_tenant === me &&
-            g.researcher_tenant === r.researcher_tenant &&
-            g.connector === r.connector,
-        ),
-    );
+    return data.requests.filter((r) => {
+      if (r.steward_tenant !== me || r.status !== "approved") return false;
+      const grant = data.grants.find(
+        (g) =>
+          g.steward_tenant === me &&
+          g.researcher_tenant === r.researcher_tenant &&
+          g.connector === r.connector,
+      );
+      return !grant || (!grant.revoked && !data.budgets[grant.grant_id]);
+    });
   }, [data, me]);
 
   const myListings = useMemo(
@@ -427,7 +426,8 @@ export default function ResearchPortal() {
             >
               <SectionLabel>Unfinished approvals</SectionLabel>
               <p className="mt-1 text-xs text-slate-500">
-                These approvals failed before access was issued. Retry to finish them.
+                These approvals did not finish issuing access or its query allowance. Retry
+                to finish them.
               </p>
               <ul className="mt-3 divide-y divide-slate-100">
                 {unfinishedApprovals.map((request) => (
