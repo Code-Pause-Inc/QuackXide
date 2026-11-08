@@ -3,7 +3,8 @@
 //! disclosure-controlled queries (small cohorts suppressed); ungranted and
 //! revoked access is refused; row-level egress is blocked; an approval
 //! that fails part-way converges when the steward retries it; and a retry
-//! never re-activates a grant the steward has revoked.
+//! never re-activates a grant the steward has revoked, even when the revoke
+//! lands while the retry runs.
 mod common;
 
 use std::sync::Arc;
@@ -21,8 +22,8 @@ use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_tenancy::{
-    BudgetError, BudgetLedger, BudgetState, DatasetGrant, GrantRegistry, InMemoryBudgetLedger,
-    InMemoryGrantRegistry, TenancyError,
+    BudgetError, BudgetLedger, BudgetState, DatasetGrant, GrantOutcome, GrantRegistry,
+    InMemoryBudgetLedger, InMemoryGrantRegistry, TenancyError,
 };
 use quackxide_engine::EngineSettings;
 
@@ -482,6 +483,79 @@ impl GrantRegistry for FailFirstCreate {
         self.inner.create(steward, researcher, connector).await
     }
 
+    async fn create_unless_revoked(
+        &self,
+        steward: TenantId,
+        researcher: TenantId,
+        connector: &str,
+    ) -> Result<GrantOutcome, TenancyError> {
+        self.inner
+            .create_unless_revoked(steward, researcher, connector)
+            .await
+    }
+
+    async fn find_active(
+        &self,
+        researcher: TenantId,
+        steward: TenantId,
+        connector: &str,
+    ) -> Result<Option<DatasetGrant>, TenancyError> {
+        self.inner.find_active(researcher, steward, connector).await
+    }
+
+    async fn revoke(
+        &self,
+        steward: TenantId,
+        grant_id: &str,
+    ) -> Result<Option<DatasetGrant>, TenancyError> {
+        self.inner.revoke(steward, grant_id).await
+    }
+
+    async fn list_for(&self, tenant: TenantId) -> Result<Vec<DatasetGrant>, TenancyError> {
+        self.inner.list_for(tenant).await
+    }
+}
+
+/// The in-memory grant registry, except that `create_unless_revoked`, which
+/// only an approval retry calls, first revokes the grant it is about to
+/// check: a revoke that lands after the retry starts and before its grant
+/// step, made deterministic instead of racing two tasks.
+#[derive(Default)]
+struct RevokeDuringRetry {
+    inner: InMemoryGrantRegistry,
+}
+
+#[async_trait]
+impl GrantRegistry for RevokeDuringRetry {
+    async fn create(
+        &self,
+        steward: TenantId,
+        researcher: TenantId,
+        connector: &str,
+    ) -> Result<DatasetGrant, TenancyError> {
+        self.inner.create(steward, researcher, connector).await
+    }
+
+    async fn create_unless_revoked(
+        &self,
+        steward: TenantId,
+        researcher: TenantId,
+        connector: &str,
+    ) -> Result<GrantOutcome, TenancyError> {
+        // The steward's revoke lands here: the retry has started, and its
+        // grant step has not run yet.
+        let active = self
+            .inner
+            .find_active(researcher, steward, connector)
+            .await?;
+        if let Some(grant) = active {
+            self.inner.revoke(steward, &grant.grant_id).await?;
+        }
+        self.inner
+            .create_unless_revoked(steward, researcher, connector)
+            .await
+    }
+
     async fn find_active(
         &self,
         researcher: TenantId,
@@ -505,7 +579,8 @@ impl GrantRegistry for FailFirstCreate {
 }
 
 /// As [`research_app`], with `stores` in place of the in-memory research
-/// stores, so a test can make one registry call fail.
+/// stores, so a test can make one registry call fail or revoke a grant
+/// partway through a retry.
 async fn research_app_with_stores(
     steward: TenantId,
     steward_keypair: TenantKeypair,
@@ -746,6 +821,40 @@ async fn half_finished_approval_retry_after_a_revoke_is_refused() {
     // A late retry must not re-activate the revoked grant.
     let (status, body) = post(&app, &approve, &stoken, "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "late retry: {body}");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn approval_retry_racing_a_revoke_is_refused() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        grants: Arc::new(RevokeDuringRetry::default()),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // The first approval mints the grant through `create`, which the
+    // wrapper leaves alone, and the researcher has access.
+    let (status, resolved) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "approve: {resolved}");
+    let grant_id = resolved["grant"]["grant_id"].as_str().expect("grant id");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A retry starts, and the steward's revoke lands before its grant step.
+    // The retry is refused, and the revoke stands.
+    let (status, body) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "racing retry: {body}");
+    let (_, listed) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    let grants = listed["grants"].as_array().expect("grants");
+    assert_eq!(grants.len(), 1, "grants: {listed}");
+    assert_eq!(grants[0]["grant_id"], grant_id, "grants: {listed}");
+    assert_eq!(grants[0]["revoked"], true, "grants: {listed}");
     let (status, _) = research_query(&app, researcher, steward).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }

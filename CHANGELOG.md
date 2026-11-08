@@ -138,10 +138,14 @@ uses [Semantic Versioning](https://semver.org/).
   is refused, so no grant is ever minted for a pending or denied request.
   A retry never re-activates a revoked grant: it is refused with 404, so
   a re-sent approval (a frontend retry, a double-click or a stale tab)
-  cannot restore access after a revoke; an explicit re-grant or a new
-  request can. Audit records tell a retry from a first approval
-  (`retry=true` in the `research.catalog` detail), and a refused retry or
-  a refused deny of an approved request is recorded as `denied`.
+  cannot restore access after a revoke, even one that lands while the
+  retry is running; an explicit re-grant or a new request can. The retry
+  checks for a revoke and creates the grant in one atomic step, the new
+  `GrantRegistry::create_unless_revoked`, which a persistent backend must
+  implement as a conditional insert or a transaction. Audit records tell
+  a retry from a first approval (`retry=true` in the `research.catalog`
+  detail), and a refused retry or a refused deny of an approved request
+  is recorded as `denied`.
 
 ### Security
 
