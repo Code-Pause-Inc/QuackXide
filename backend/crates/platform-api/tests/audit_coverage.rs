@@ -605,6 +605,9 @@ async fn research_catalog_is_audited() {
     let (status, _) = post(&app, &deny, &stoken, "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // A retry that names a different budget is refused.
+    let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":7}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     // After a revoke, a retried approval is refused.
     let revoke = format!("/api/v1/grants/{grant_id}");
     let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
@@ -645,6 +648,13 @@ async fn research_catalog_is_audited() {
         "denied",
         &format!("deny refused request={request_id} researcher={researcher} status=approved"),
     );
+
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("approve refused request={request_id} retry=true reason=budget"),
+    );
+
     assert_catalog_event(
         &capture,
         "denied",

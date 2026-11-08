@@ -860,6 +860,60 @@ async fn approval_retry_racing_a_revoke_is_refused() {
 }
 
 #[tokio::test]
+async fn approval_retry_with_a_different_budget_is_refused() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // The steward approves with 10 query units instead of the listing's 25.
+    let (status, resolved) = post(&app, &approve, &stoken, r#"{"query_budget":10}"#).await;
+    assert_eq!(status, StatusCode::OK, "approve: {resolved}");
+    assert_eq!(resolved["request"]["approved_budget"], 10);
+    assert_eq!(resolved["grant"]["budget"]["limit"], 10);
+    let grant_id = resolved["grant"]["grant_id"].as_str().expect("grant id");
+
+    // A retry cannot change the approved budget, and the budget is unchanged.
+    let (status, body) = post(&app, &approve, &stoken, r#"{"query_budget":50}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "retry: {body}");
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+    let (_, budget) = call(&app, "GET", &budget_uri, &stoken, None).await;
+    assert_eq!(budget["limit"], 10, "budget: {budget}");
+
+    // A retry that repeats the approved budget, or leaves it out, converges.
+    for retry_body in [r#"{"query_budget":10}"#, "{}"] {
+        let (status, resolved) = post(&app, &approve, &stoken, retry_body).await;
+        assert_eq!(status, StatusCode::OK, "retry {retry_body}: {resolved}");
+        assert_eq!(resolved["grant"]["budget"]["limit"], 10);
+    }
+}
+
+#[tokio::test]
+async fn approval_retry_after_a_budget_failure_keeps_the_approved_budget() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(FailFirstOpen::default()),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // The approval asks for 10 query units and fails before the budget opens.
+    let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":10}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // A retry with no body opens the approved 10, not the listing's 25.
+    let (status, resolved) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "retry: {resolved}");
+    assert_eq!(resolved["grant"]["budget"]["limit"], 10);
+}
+
+#[tokio::test]
 async fn approving_a_denied_request_is_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();

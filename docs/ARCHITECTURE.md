@@ -287,10 +287,11 @@ publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. Researchers file access requests (idempotent while
 pending); approval mints the grant through the same code path as a direct
-grant. The approval is recorded first, so a failure partway leaves an
-approved request without a usable grant, never a grant behind a pending or
-denied one, and the steward's retry re-runs the idempotent grant and budget
-steps. A retry never undoes a revoke: while the steward's grant to that
+grant. The approval is recorded first, with its query budget, so a failure
+partway leaves an approved request without a usable grant, never a grant
+behind a pending or denied one, and the steward's retry re-runs the
+idempotent grant and budget steps with the approved budget; a retry cannot
+change it. A retry never undoes a revoke: while the steward's grant to that
 researcher for that connector is revoked, the retry is refused (404) with a
 `denied` event, and only an explicit re-grant or a new request restores
 access. Denied is terminal. `research.catalog` events carry identifiers

@@ -71,7 +71,8 @@ pub struct RequestAccessBody {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ApproveRequestBody {
-    /// Steward override of the listing's included query budget.
+    /// Steward override of the listing's included query budget. Recorded
+    /// with the approval; a retry may repeat it but not change it.
     #[serde(default)]
     pub query_budget: Option<u64>,
 }
@@ -184,13 +185,17 @@ impl ConnectorQueryService {
     /// Resolve an access request. Only its steward may; other tenants and
     /// unknown ids get the same "not found" (no existence oracle).
     ///
-    /// Approval marks the request Approved first, then mints the grant and
-    /// budget through the same path as a direct grant. If a later step
-    /// fails, the request stays Approved without a usable grant (fail
-    /// closed) and the steward retries: approving an already-Approved
-    /// request re-runs every step after `resolve` (slug, listing, grant and
-    /// budget), all idempotent, so the retry converges. A retry never
-    /// undoes a revoke: in place of `create`, it mints with
+    /// Approval marks the request Approved first, recording its query budget
+    /// (the steward's override, else the listing's included budget) in the
+    /// same step, then mints the grant and budget through the same path as a
+    /// direct grant. If a later step fails, the request stays Approved
+    /// without a usable grant (fail closed) and the steward retries:
+    /// approving an already-Approved request re-runs every step after
+    /// `resolve` (slug, grant and budget), all idempotent, so the retry
+    /// converges. A retry finishes the recorded decision: it opens the
+    /// approved budget, and a retry that names a different `query_budget`
+    /// is refused (400) and audited as `denied`. A retry never undoes a
+    /// revoke: in place of `create`, it mints with
     /// [`GrantRegistry::create_unless_revoked`], which checks for a revoked
     /// grant and creates in one atomic step, so a revoke that lands while
     /// the retry runs holds too. A retry that finds this researcher's grant
@@ -212,7 +217,7 @@ impl ConnectorQueryService {
     ) -> Result<Value, ApiError> {
         let catalog = self.catalog()?;
         let (request, retry) = match catalog
-            .resolve(steward, request_id, approve)
+            .resolve(steward, request_id, approve, budget_override)
             .await
             .map_err(|_| ApiError::Backend)?
         {
@@ -258,16 +263,24 @@ impl ConnectorQueryService {
             return Ok(json!({ "request": request }));
         }
 
+        // A retry finishes the recorded decision, budget included: it may
+        // repeat the approved budget or leave it out, but not change it.
+        if retry && budget_override.is_some() && budget_override != request.approved_budget {
+            security_audit_event(
+                AuditKind::ResearchCatalog,
+                Some(steward),
+                "denied",
+                &format!("approve refused request={request_id} retry=true reason=budget"),
+            );
+            return Err(ApiError::BadRequest(
+                "a retry cannot change the approved budget",
+            ));
+        }
         let connector = ConnectorSlug::new(&request.connector).map_err(|_| ApiError::Backend)?;
-        // Budget priority: steward override, then the listing's included
-        // budget, then the platform default applied by `fund_grant`.
-        let listed_budget = self
-            .catalog()?
-            .get_listing(&request.listing_id)
-            .await
-            .map_err(|_| ApiError::Backend)?
-            .map(|l| l.grant_budget);
-        let query_budget = budget_override.or(listed_budget);
+        // The approval recorded its budget: the steward's override, else the
+        // listing's included budget. `fund_grant` applies the platform
+        // default only if neither existed.
+        let query_budget = request.approved_budget;
         // A first approval is a new decision, so it may re-activate a revoked
         // grant. A retry may not.
         let grant = if retry {

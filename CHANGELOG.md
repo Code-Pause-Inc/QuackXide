@@ -136,6 +136,10 @@ uses [Semantic Versioning](https://semver.org/).
   the grant or budget step then failed (502) the retry got 404 and the
   request stayed approved with no grant. A deny after a failed approval
   is refused, so no grant is ever minted for a pending or denied request.
+  The approval records its query budget (the steward's `query_budget`,
+  else the listing's included budget) as the request's `approved_budget`,
+  and a retry opens that budget: a retry that names a different
+  `query_budget` is refused with 400.
   A retry never re-activates a revoked grant: it is refused with 404, so
   a re-sent approval (a frontend retry, a double-click or a stale tab)
   cannot restore access after a revoke, even one that lands while the
