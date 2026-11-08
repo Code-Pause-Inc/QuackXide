@@ -48,6 +48,8 @@ vi.mock("../../lib/research/client", async (importOriginal) => ({
 const ME = "aaaaaaaa-1111-4222-8333-444455556666";
 const STEWARD = "bbbbbbbb-1111-4222-8333-444455556666";
 const RESEARCHER = "cccccccc-1111-4222-8333-444455556666";
+const STUCK = "dddddddd-1111-4222-8333-444455556666";
+const REVOKED = "eeeeeeee-1111-4222-8333-444455556666";
 const TOKEN = `e30.${btoa(JSON.stringify({ tid: ME }))}.sig`;
 const RAW_ROW = "patient-7731,1962-04-18,E11.9";
 const STAMP = "2026-07-30T10:00:00.000Z";
@@ -157,6 +159,27 @@ async function openPortal() {
   await user.paste(TOKEN);
   await user.click(screen.getByRole("button", { name: "Open portal" }));
   return user;
+}
+
+/** Approved requests for my listing: one left without a grant by a failed
+ *  approval, one finished (active grant), one whose grant I revoked. */
+function seedApproved() {
+  api.grants.mockResolvedValue([
+    myGrant,
+    issuedGrant,
+    { ...grant("g-revoked", ME, REVOKED, "health"), revoked: true },
+  ]);
+  api.myRequests.mockResolvedValue([
+    request("r-stuck", ownListing, STUCK, "approved"),
+    request("r-done", ownListing, RESEARCHER, "approved"),
+    request("r-revoked", ownListing, REVOKED, "approved"),
+  ]);
+}
+
+function unfinishedSection() {
+  return within(
+    screen.getByRole("heading", { name: "Unfinished approvals" }).parentElement!,
+  );
 }
 
 function catalogItem(title: string) {
@@ -288,6 +311,45 @@ describe("ResearchPortal", () => {
     await user.click(incoming.getByRole("button", { name: "Decline" }));
     expect(api.denyRequest).toHaveBeenCalledWith("r-incoming");
     expect(await screen.findByText("decline failed (409)")).toBeInTheDocument();
+  });
+
+  it("lists only approvals that never issued a grant", async () => {
+    seedApproved();
+    await openPortal();
+    await screen.findByText("Data stewardship");
+
+    const section = unfinishedSection();
+    expect(section.getAllByRole("listitem")).toHaveLength(1);
+    expect(section.getByText(/researcher dddddddd/)).toBeInTheDocument();
+    expect(section.getByRole("button", { name: "Retry approval" })).toBeInTheDocument();
+  });
+
+  it("hides the section when every approval issued a grant", async () => {
+    await openPortal();
+    await screen.findByText("Data stewardship");
+    expect(screen.queryByText("Unfinished approvals")).not.toBeInTheDocument();
+  });
+
+  it("retries an unfinished approval and reloads", async () => {
+    seedApproved();
+    api.approveRequest.mockResolvedValue({});
+    const user = await openPortal();
+    await screen.findByText("Data stewardship");
+
+    await user.click(unfinishedSection().getByRole("button", { name: "Retry approval" }));
+    expect(api.approveRequest).toHaveBeenCalledExactlyOnceWith("r-stuck");
+    expect(api.catalog).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the error when a retry is refused", async () => {
+    seedApproved();
+    api.approveRequest.mockRejectedValue(new Error("approve: not found"));
+    const user = await openPortal();
+    await screen.findByText("Data stewardship");
+
+    await user.click(unfinishedSection().getByRole("button", { name: "Retry approval" }));
+    expect(await screen.findByText("approve: not found")).toBeInTheDocument();
+    expect(unfinishedSection().getByRole("button", { name: "Retry approval" })).toBeEnabled();
   });
 
   it("publishes a listing from the stewardship panel and closes the form", async () => {

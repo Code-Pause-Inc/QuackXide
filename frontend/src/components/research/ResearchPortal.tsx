@@ -143,6 +143,24 @@ export default function ResearchPortal() {
     [data, me],
   );
 
+  /** My approvals that failed before any grant was minted (for example a 502
+   *  from the grant step). Approving again retries them. A revoked grant
+   *  counts as issued: the API refuses to retry past a revoke. */
+  const unfinishedApprovals = useMemo(() => {
+    if (!data || !me) return [];
+    return data.requests.filter(
+      (r) =>
+        r.steward_tenant === me &&
+        r.status === "approved" &&
+        !data.grants.some(
+          (g) =>
+            g.steward_tenant === me &&
+            g.researcher_tenant === r.researcher_tenant &&
+            g.connector === r.connector,
+        ),
+    );
+  }, [data, me]);
+
   const myListings = useMemo(
     () => (!data || !me ? [] : data.catalog.listings.filter((l) => l.steward_tenant === me)),
     [data, me],
@@ -403,8 +421,46 @@ export default function ResearchPortal() {
             </div>
           )}
 
+          {unfinishedApprovals.length > 0 && (
+            <div
+              className={`px-6 py-5 ${incomingPending.length > 0 ? "border-t border-slate-100" : ""}`}
+            >
+              <SectionLabel>Unfinished approvals</SectionLabel>
+              <p className="mt-1 text-xs text-slate-500">
+                These approvals failed before access was issued. Retry to finish them.
+              </p>
+              <ul className="mt-3 divide-y divide-slate-100">
+                {unfinishedApprovals.map((request) => (
+                  <li key={request.request_id} className="flex items-center gap-4 py-4">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium">
+                        {listingTitleFor(request.steward_tenant, request.connector)}
+                      </p>
+                      <p className="mt-0.5 text-xs text-slate-500">
+                        researcher {shortId(request.researcher_tenant)} · approved{" "}
+                        {request.updated_at_iso.slice(0, 10)}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() =>
+                        act(`approve:${request.request_id}`, () =>
+                          client().approveRequest(request.request_id),
+                        )
+                      }
+                      className={primaryBtnCls}
+                    >
+                      {busy === `approve:${request.request_id}` ? "Retrying…" : "Retry approval"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div
-            className={`px-6 py-5 ${incomingPending.length > 0 ? "border-t border-slate-100" : ""}`}
+            className={`px-6 py-5 ${incomingPending.length > 0 || unfinishedApprovals.length > 0 ? "border-t border-slate-100" : ""}`}
           >
             <div className="flex items-center justify-between">
               <SectionLabel>Published listings</SectionLabel>
