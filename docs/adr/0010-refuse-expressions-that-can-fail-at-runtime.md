@@ -26,9 +26,11 @@ only when `id = 'p15' AND salary > 9000` (the single `ceo` row) holds:
 | `GROUP BY` | `salary / CASE WHEN … THEN 0 ELSE 1 END` |
 | `HAVING` | `1 / CASE WHEN MAX(salary) > 9000 AND COUNT(*) = 1 THEN 0 ELSE 1 END`, on a cohort of one |
 | Outer `SELECT` | `/` or `CAST` over `MAX(salary)` |
+| Outer `SELECT`, merged | `-m` over a subquery or CTE column `m = -9223372036854775807 - 1`: merging the two projections puts the literal under the minus, which then runs as a scalar, only for groups that exist |
+| Outer `SELECT`, statistics | `-(COUNT(salary) + 9223372036854775793)` with no `WHERE`: table statistics replace `COUNT` with a literal, so it fails only when exactly 15 salaries are non-null |
 
-The same probes do not fail on integer `+`, `-`, `*` or unary minus
-(they wrap), float division, `TRY_CAST`, `COALESCE`, `NULLIF`, `||`,
+The same probes do not fail on integer `+`, `-` or `*` (they wrap),
+float unary minus, float division, `TRY_CAST`, `COALESCE`, `NULLIF`, `||`,
 `lower`, `BETWEEN`, `IN`, `LIKE`, or integer-to-float comparison.
 `lpad(dept, 2147483647)` panics inside Arrow; DataFusion turns the panic
 into an error, so it is the same oracle, and also a way to exhaust
@@ -76,7 +78,8 @@ Allowed expressions, each with allowed operands:
 | Column, literal, alias | none |
 | `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM` | none |
 | `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `IS [NOT] TRUE`/`FALSE`/`UNKNOWN`, `BETWEEN` | none |
-| `+`, `-`, `*`, unary minus | every operand `Int64`, or every operand `Float64` |
+| `+`, `-`, `*` | every operand `Int64`, or every operand `Float64` |
+| Unary minus | the operand is `Float64` (for integers, `0 - x` wraps) |
 | `/`, `%` | both operands `Float64`; or both `Int64` with a literal divisor other than 0 and −1 (`i64::MIN / -1` overflows) |
 | `\|\|` | none |
 | `IN (…)` | every list element a literal, or an allowed `CAST` of one |
@@ -142,10 +145,13 @@ allowed types.
   are unchanged.
 * Refusing `repeat`, `lpad` and the other size-taking functions also
   closes the memory exhaustion they allowed.
-* The check assumes that execution evaluates what the analyzed plan
-  holds: the analyzer inserts every cast execution evaluates, and the
-  optimizer adds no expression that can fail on data. The bypass probes
-  pin known cases, not the assumption itself. A DataFusion upgrade
+* Every allowlisted operation must behave the same on a constant as on a
+  column. The optimizer turns one into the other: merging projections
+  substitutes a literal for a column, and aggregate statistics replace
+  `COUNT` with a literal, so an operation that wraps on a column but fails
+  on a constant (integer unary minus) is an oracle. The check also assumes
+  the analyzer inserts every cast execution evaluates. The bypass probes
+  pin known cases, not these assumptions. A DataFusion upgrade
   re-runs them, and its record lists any change to the allowlisted
   functions and to how they evaluate.
 * `SUM` over a decimal column could overflow on the data. Its result

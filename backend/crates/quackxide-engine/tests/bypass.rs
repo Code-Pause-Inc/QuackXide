@@ -96,6 +96,10 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("float_nan_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE (CAST(salary AS DOUBLE) - CAST(salary AS DOUBLE)) / 0.0 <> 0 GROUP BY dept", Rows(2)),
     ("add_one", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + 1 > 0 GROUP BY dept", Rows(2)),
     ("add_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + NULL IS NULL GROUP BY dept", Rows(2)),
+    // Unary minus only on floats; `0 - x` is the integer form, and wraps.
+    ("zero_minus_int", "SELECT dept, COUNT(*) AS n FROM people WHERE 0 - salary < 0 GROUP BY dept", Rows(2)),
+    ("negate_float", "SELECT dept, COUNT(*) AS n FROM people WHERE -CAST(salary AS DOUBLE) < 0 GROUP BY dept", Rows(2)),
+    ("negate_int", "SELECT dept, COUNT(*) AS n FROM people WHERE -salary < 0 GROUP BY dept", Rejected),
     ("is_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary IS NOT NULL GROUP BY dept", Rows(2)),
     ("not", "SELECT dept, COUNT(*) AS n FROM people WHERE NOT (dept = 'ceo') GROUP BY dept", Rows(2)),
     ("order_by_ordinal_having_alias", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING n > 5 ORDER BY 2", Rows(2)),
@@ -311,6 +315,13 @@ const ERROR_PROBES: &[(&str, &str)] = &[
     // A constant is evaluated as a scalar, where negating i64::MIN fails.
     ("where_negate_min_literal", "SELECT dept, COUNT(*) AS n FROM people WHERE CASE WHEN {P} THEN -(-9223372036854775807 - 1) ELSE 0 END > 0 GROUP BY dept"),
     ("outer_negate_min_literal", "SELECT dept, COUNT(*) AS n, CASE WHEN MAX(salary) > {T} THEN -(-9223372036854775807 - 1) ELSE 0 END AS x FROM people GROUP BY dept"),
+    // Merging projections puts the inner literal under the outer minus, so
+    // `-m` runs on i64::MIN as a scalar, and only for groups that exist.
+    ("subquery_negate_min", "SELECT dept, n, -m AS x FROM (SELECT dept, COUNT(*) AS n, -9223372036854775807 - 1 AS m FROM people WHERE {P} GROUP BY dept) t"),
+    ("cte_negate_min", "WITH t AS (SELECT dept, COUNT(*) AS n, -9223372036854775807 - 1 AS m FROM people WHERE {P} GROUP BY dept) SELECT dept, n, -m AS x FROM t"),
+    // Table statistics replace COUNT with a literal, so this negates
+    // i64::MIN only when exactly 15 salaries are non-null.
+    ("count_statistics_negate", "SELECT COUNT(*) AS n, -(COUNT(salary) + 9223372036854775793) AS x FROM people"),
     // A LIKE pattern compiles to a regex when some row reaches it; a long
     // one exceeds the regex size limit.
     ("where_like_long_pattern", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND dept LIKE '{LONG}' GROUP BY dept"),

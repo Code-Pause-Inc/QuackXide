@@ -134,7 +134,9 @@ fn node_cannot_fail(expr: &Expr, schema: &DFSchema) -> bool {
         // Its arguments are plain columns or literals (`is_permitted_aggregate`).
         | Expr::AggregateFunction(_) => true,
         Expr::BinaryExpr(binary) => binary_cannot_fail(binary, schema),
-        Expr::Negative(inner) => is_wrapping_number(type_of(inner, schema).as_ref()),
+        // Integer minus wraps on a column but fails on a constant `i64::MIN`,
+        // and projection merging can turn one into the other. `0 - x` wraps on both.
+        Expr::Negative(inner) => type_of(inner, schema) == Some(DataType::Float64),
         Expr::Like(like) => like_pattern_cannot_fail(&like.pattern),
         Expr::InList(in_list) => in_list.list.iter().all(|item| match item {
             Expr::Literal(..) => true,
