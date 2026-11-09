@@ -156,6 +156,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
+  own-data queries (`POST /api/v1/query`) stops single-query row export
+  only. That route has no query budget, so differencing across queries is
+  unbounded, including with a stolen access token; only research queries
+  are budget-bounded. This is recorded as a residual risk.
 * `tokio` 1.54.1 (RUSTSEC-2026-0384; 1.54.0 is yanked) and `zstd-sys`
   2.1.2 (RUSTSEC-2026-0410). `backend/deny.toml` records why
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5) and RUSTSEC-2026-0391, -0398 and

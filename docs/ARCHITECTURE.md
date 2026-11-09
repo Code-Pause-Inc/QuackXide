@@ -202,6 +202,13 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   "Research access" below). Refusals return HTTP 422; results report
   `suppressed_rows`. A ZK scope without a threshold, or with `k = 0`,
   refuses every query.
+* **What the ZK gate does not bound.** On own-data queries it stops a
+  single query from returning rows, and nothing more. `POST /api/v1/query`
+  has no query budget, so anyone holding the tenant's access token can run
+  overlapping aggregates without limit and rebuild suppressed cohorts by
+  differencing. Only research queries are budget-bounded (`BudgetLedger`,
+  below). A per-tenant, per-dataset budget for this route is planned, with
+  its own ADR.
 * **Key-release trust boundary.** The server cannot decrypt tenant data on
   its own (envelopes are sealed to a private key it does not hold at rest).
   In a `dev` build, when `KEY_RELEASE_URL` is configured,
