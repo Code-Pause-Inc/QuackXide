@@ -23,7 +23,9 @@ use platform_crypto::{SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
-use platform_tenancy::BudgetError;
+use platform_tenancy::{
+    BudgetError, BudgetLedger, BudgetState, CatalogRegistry, DatasetGrant, GrantRegistry,
+};
 use prometheus_client::metrics::histogram::Histogram;
 use quackxide_engine::{
     DisclosurePolicy, EngineSettings, MinCountThreshold, QueryError, QueryScope,
@@ -454,10 +456,154 @@ impl ConnectorQueryService {
         }))
     }
 
-    fn research(&self) -> Result<&ResearchService, ApiError> {
-        self.research
-            .as_deref()
-            .ok_or(ApiError::ResearchUnavailable)
+    pub(crate) fn grants(&self) -> Result<&Arc<dyn GrantRegistry>, ApiError> {
+        self.grants.as_ref().ok_or(ApiError::ResearchUnavailable)
+    }
+
+    fn budgets(&self) -> Result<&Arc<dyn BudgetLedger>, ApiError> {
+        self.budgets.as_ref().ok_or(ApiError::ResearchUnavailable)
+    }
+
+    pub(crate) fn catalog(&self) -> Result<&Arc<dyn CatalogRegistry>, ApiError> {
+        self.catalog.as_ref().ok_or(ApiError::ResearchUnavailable)
+    }
+
+    pub(crate) fn default_budget(&self) -> u64 {
+        self.default_budget
+    }
+
+    /// Steward grants a researcher aggregate access to one of its connectors,
+    /// allocating a query budget (default from config when unspecified).
+    /// `create` re-activates a revoked grant, so this is only for a new
+    /// decision by the steward: a direct grant or a first approval.
+    pub async fn grant(
+        &self,
+        steward: TenantId,
+        researcher: TenantId,
+        connector: &ConnectorSlug,
+        query_budget: Option<u64>,
+    ) -> Result<Value, ApiError> {
+        let grant = self
+            .grants()?
+            .create(steward, researcher, connector.as_str())
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        self.fund_grant(&grant, query_budget).await
+    }
+
+    /// Open the query budget of a grant that was just created or found
+    /// active, audit the grant, and return it with its budget as JSON. Both
+    /// [`grant`](Self::grant) and the approval retry in `research.rs` use it,
+    /// so the two paths cannot drift apart.
+    pub(crate) async fn fund_grant(
+        &self,
+        grant: &DatasetGrant,
+        query_budget: Option<u64>,
+    ) -> Result<Value, ApiError> {
+        // Insert-if-absent: re-granting reuses the grant id, so it can never
+        // reset spend — allocation only rises, via explicit top-ups.
+        let budget = self
+            .budgets()?
+            .open(&grant.grant_id, query_budget.unwrap_or(self.default_budget))
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        let researcher = grant.researcher_tenant;
+        let connector = &grant.connector;
+        security_audit_event(
+            AuditKind::TenantProvisioned,
+            Some(grant.steward_tenant),
+            "ok",
+            &format!(
+                "granted researcher={researcher} connector={connector} budget_limit={}",
+                budget.limit
+            ),
+        );
+        let mut value = serde_json::to_value(grant).map_err(|_| ApiError::Backend)?;
+        value["budget"] = budget_json(&budget)?;
+        Ok(value)
+    }
+
+    /// Steward-only budget top-up. Non-stewards — including the grant's own
+    /// researcher — get the same "not found" as an unknown id: allocation
+    /// control mirrors the revoke discipline (no existence oracle).
+    pub async fn top_up_budget(
+        &self,
+        steward: TenantId,
+        grant_id: &str,
+        additional: u64,
+    ) -> Result<Value, ApiError> {
+        let owns = self
+            .grants()?
+            .list_for(steward)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .into_iter()
+            .any(|g| g.grant_id == grant_id && g.steward_tenant == steward);
+        if !owns {
+            return Err(ApiError::NotFound);
+        }
+        let budget = self
+            .budgets()?
+            .top_up(grant_id, additional)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        security_audit_event(
+            AuditKind::ResearchBudget,
+            Some(steward),
+            "ok",
+            &format!(
+                "top_up grant={grant_id} added={additional} limit={}",
+                budget.limit
+            ),
+        );
+        budget_json(&budget)
+    }
+
+    /// Budget standing — visible only to the grant's parties (steward or
+    /// researcher); anyone else gets the same "not found" as an unknown id.
+    pub async fn budget_state(&self, caller: TenantId, grant_id: &str) -> Result<Value, ApiError> {
+        let is_party = self
+            .grants()?
+            .list_for(caller)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .into_iter()
+            .any(|g| g.grant_id == grant_id);
+        if !is_party {
+            return Err(ApiError::NotFound);
+        }
+        let budget = self
+            .budgets()?
+            .state(grant_id)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .ok_or(ApiError::NotFound)?;
+        budget_json(&budget)
+    }
+
+    pub async fn revoke_grant(&self, steward: TenantId, grant_id: &str) -> Result<Value, ApiError> {
+        let revoked = self
+            .grants()?
+            .revoke(steward, grant_id)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .ok_or(ApiError::NotFound)?;
+        security_audit_event(
+            AuditKind::TenantProvisioned,
+            Some(steward),
+            "ok",
+            &format!("revoked grant={grant_id}"),
+        );
+        serde_json::to_value(&revoked).map_err(|_| ApiError::Backend)
+    }
+
+    pub async fn list_grants(&self, tenant: TenantId) -> Result<Value, ApiError> {
+        let grants = self
+            .grants()?
+            .list_for(tenant)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        Ok(json!({ "grants": grants }))
     }
 
     /// Run a disclosure-controlled aggregate query by `researcher` over

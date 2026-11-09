@@ -22,8 +22,8 @@ use platform_config::ResearchConfig;
 use platform_core::{ConnectorSlug, TenantId};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
-    AccessRequest, BudgetError, BudgetLedger, BudgetState, CatalogError, CatalogRegistry,
-    DatasetGrant, GrantOutcome, GrantRegistry, ListingDetails, RequestStatus,
+    AccessRequest, BudgetLedger, CatalogError, CatalogRegistry, GrantOutcome, GrantRegistry,
+    ListingDetails, RequestStatus,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -430,8 +430,8 @@ impl ResearchService {
         approve: bool,
         budget_override: Option<u64>,
     ) -> Result<Value, ApiError> {
-        let (request, retry) = match self
-            .catalog
+        let catalog = self.catalog()?;
+        let (request, retry) = match catalog
             .resolve(steward, request_id, approve, budget_override)
             .await
             .map_err(|_| ApiError::Backend)?
@@ -527,7 +527,7 @@ impl ResearchService {
         request_id: &str,
     ) -> Result<Option<AccessRequest>, ApiError> {
         Ok(self
-            .catalog
+            .catalog()?
             .list_requests_for(steward)
             .await
             .map_err(|_| ApiError::Backend)?
@@ -552,7 +552,7 @@ impl ResearchService {
         query_budget: Option<u64>,
     ) -> Result<Value, ApiError> {
         let outcome = self
-            .grants
+            .grants()?
             .create_unless_revoked(steward, request.researcher_tenant, connector.as_str())
             .await
             .map_err(|_| ApiError::Backend)?;
@@ -574,13 +574,6 @@ impl ResearchService {
         };
         self.fund_grant(&grant, query_budget).await
     }
-}
-
-/// Serialize a budget with its derived `remaining`.
-fn budget_json(budget: &BudgetState) -> Result<Value, ApiError> {
-    let mut value = serde_json::to_value(budget).map_err(|_| ApiError::Backend)?;
-    value["remaining"] = json!(budget.remaining());
-    Ok(value)
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
