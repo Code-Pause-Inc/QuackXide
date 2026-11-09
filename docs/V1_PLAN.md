@@ -953,7 +953,6 @@ The first draft's single sign-in issue is split into backend verification, ident
 - Replacing a key is a separate, explicit rotation call that requires a fresh second factor (P30), is audited as a distinct outcome, and is never triggered by worker initialization. Until P30 lands, the rotation call refuses (fail closed). Negative tests in `platform-api/tests` and `audit_coverage.rs`.
 - The v1 multi-device and recovery policy from P14 is implemented (for example: a second device gets a clear refusal), and `KeySetupGate` explains the second-device and unsupported-browser cases.
 - A device without an HPKE key can generate and enroll one later without losing its master key.
-- After a refused re-enrollment, a research result is still sealed to the original key (P55), with a test.
 - Enrollment records are verifiable as P14 specifies: a Rust check (used by `connector-worker` before sealing, if P19 keeps connector ingestion) refuses a record that fails verification (fail closed), with negative tests. If P14 makes a browser sealer depend on a server-stored enrollment, this issue also exposes the same check in the crypto worker; P40 calls it before sealing. Today nothing reads the enrollment: `connector-worker` takes the sealing key from `DEMO_TENANT_PUBLIC_KEY_B64` (`backend/crates/platform-connectors/src/bin/connector-worker.rs:89-118`).
 
 **Where.** `frontend/src/lib/crypto/keystore.ts`, `worker.ts`, `core.ts`; `frontend/src/components/KeySetupGate.tsx`; `backend/crates/platform-api/src/lib.rs` (`put_enrollment`); `backend/crates/platform-storage/src/lib.rs`; `backend/crates/platform-api/tests/`.
@@ -1561,7 +1560,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - No component outside the attested Confidential VM (load balancer, TLS-terminating proxy, operational logs, audit stream, object store) ever holds the result's aggregate row values, with a test on the logs and audit stream. The `engine.query` audit record keeps its count metadata (`rows=`, `suppressed=`, `budget_remaining=`, `query.rs:602-615`), which billing reads.
 - Error responses (400, 401, 403, 404, 422, 429, 502, 503) stay unsealed and carry no result data or SQL echo, with a test.
 - The own-data query endpoint (`POST /api/v1/query`) either seals the same way or the ADR records why not.
-- Tests: a result opens only with the intended key; a different recipient key, a flipped byte, a result signed by any key other than the enclave's verified result-signing key, and a valid result replayed against another request nonce are refused; a recipient key substituted in the enrollment record yields nothing the substitute can open (or the query is refused, because the fingerprint no longer matches).
+- Tests: a result opens only with the intended key; a different recipient key, a flipped byte, a result signed by any key other than the enclave's verified result-signing key, and a valid result replayed against another request nonce are refused; a recipient key substituted in the enrollment record yields nothing the substitute can open (or the query is refused, because the fingerprint no longer matches); once P33 lands, a result after a refused re-enrollment is still sealed to the original key.
 - `docs/THREAT_MODEL.md` A2 rows "Read results at the API edge", key substitution and result forgery, and README "Status" ("Encrypted results") are updated.
 - The research diagram in `docs/ARCHITECTURE.md` (lines 177-190, which today ends in "aggregate rows + suppressed_rows + budget_remaining") ends in a result sealed to the researcher's key and states what stays cleartext metadata. The query diagram (lines 117-129, which ends in "JSON result rows") is updated too, or notes that it stays unsealed, as the ADR decides.
 
@@ -1569,7 +1568,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 
 **Depends on:** P14, P15, P85, P54 (result contract); P33 and P35 to close.
 
-**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run. Starts before P33: until P33 lands, the enrollment record that supplies the recipient key's fingerprint can still be overwritten, which is acceptable on the simulated TEE only. Seals with the suite named in the enrollment record, so P35 switches the suite without changing P55's code.
+**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run. Starts before P33: until P33 lands, the enrollment record that supplies the recipient key's fingerprint can still be overwritten, which is acceptable on the simulated TEE only. Seals with the recipient key's suite, which must equal the enrolled key's suite and is hybrid-only after P35, so P35 switches the suite without changing P55's code.
 
 **Security impact.** Closes "Read results at the API edge", recipient-key substitution and result forgery (A2).
 **ADR.** Required (wire format and trust boundary).
