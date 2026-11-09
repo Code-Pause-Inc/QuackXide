@@ -17,7 +17,7 @@ use platform_connectors::catalog;
 use platform_core::{ConnectorSlug, TenantId};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
-use platform_tenancy::{TenancyError, TenantRecord, TenantRegistry, TenantStatus};
+use platform_tenancy::{StatusOutcome, TenancyError, TenantRecord, TenantRegistry, TenantStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -115,6 +115,13 @@ impl ProvisioningService {
                 self.set_status(&subscription_id, TenantStatus::Suspended, occurred_at)
                     .await
             }
+            ProvisioningAction::Cancel {
+                subscription_id,
+                occurred_at,
+            } => {
+                self.set_status(&subscription_id, TenantStatus::Canceled, occurred_at)
+                    .await
+            }
             ProvisioningAction::Resume {
                 subscription_id,
                 occurred_at,
@@ -136,7 +143,7 @@ impl ProvisioningService {
         status: TenantStatus,
         occurred_at: DateTime<Utc>,
     ) -> Result<Value, ApiError> {
-        let updated = self
+        let outcome = self
             .registry
             .set_status(subscription_id, status, occurred_at)
             .await
@@ -144,22 +151,28 @@ impl ProvisioningService {
         let (verb, action) = match status {
             TenantStatus::Suspended => ("suspend", "suspended"),
             TenantStatus::Active => ("resume", "resumed"),
+            TenantStatus::Canceled => ("cancel", "canceled"),
         };
-        let outcome = match &updated {
-            None => "noop",
-            Some(record) if record.status != status => "stale",
-            Some(_) => "ok",
+        let detail = format!("{verb} subscription={subscription_id} occurred_at={occurred_at}");
+        let (tenant, result, detail) = match &outcome {
+            None => (None, "miss", detail),
+            Some(StatusOutcome::Applied(record)) => (Some(record.tenant_id), "ok", detail),
+            Some(StatusOutcome::Stale(record)) => (
+                Some(record.tenant_id),
+                "denied",
+                format!("{detail} reason=stale"),
+            ),
+            Some(StatusOutcome::Canceled(record)) => (
+                Some(record.tenant_id),
+                "denied",
+                format!("{detail} reason=canceled"),
+            ),
         };
-        security_audit_event(
-            AuditKind::TenantProvisioned,
-            updated.as_ref().map(|r| r.tenant_id),
-            outcome,
-            &format!("{verb} subscription={subscription_id} occurred_at={occurred_at}"),
-        );
+        security_audit_event(AuditKind::TenantProvisioned, tenant, result, &detail);
         Ok(json!({
             "received": true,
             "action": action,
-            "matched": updated.is_some(),
+            "matched": outcome.is_some(),
         }))
     }
 }

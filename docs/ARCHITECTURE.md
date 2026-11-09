@@ -312,7 +312,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
    │                        ▼
    │                identity service ── exchanges code, verifies Auth0 ID token (JWKS)
    │                        │            looks up (iss, sub) → tid, adm
-   │◀── preauth ────────────┤            refuses unknown or Suspended tenants
+   │◀── preauth ────────────┤            refuses unknown, Suspended or Canceled tenants
    │── TOTP code ──────────▶│
    │◀── access + refresh ───┘
    │
@@ -333,7 +333,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 * **Tenant identity.** Each signed-in person maps to exactly one tenant
   through the identity registry, keyed by the provider's `(iss, sub)`,
   never by email. `tid` remains the only source of tenant identity in the
-  API, and an unknown or Suspended tenant is refused.
+  API, and an unknown, Suspended or Canceled tenant is refused.
 * **Roles.** Steward and researcher stay grant relationships between
   tenants (see "Research access"); tokens carry no role claims. `adm`
   grants cross-tenant administrative powers and comes only from a

@@ -2,7 +2,7 @@
 
 export interface TenantView {
   tenant_id: string;
-  status: "active" | "suspended";
+  status: "active" | "suspended" | "canceled";
   subscription_id: string;
   customer_id: string;
   plan: string;

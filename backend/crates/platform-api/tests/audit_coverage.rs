@@ -385,14 +385,20 @@ async fn provisioning_webhook_is_audited() {
         capture.events()
     );
 
-    // Pause, a late resume (stale), then a newer resume.
-    for (event_type, occurred_at) in [
-        ("subscription.paused", "2026-08-02T00:00:00Z"),
-        ("subscription.resumed", "2026-08-01T00:00:00Z"),
-        ("subscription.resumed", "2026-08-03T00:00:00Z"),
+    // Every status event is audited with what it did, even when nothing
+    // changed: a skipped event is denied (stale or canceled), an unknown
+    // subscription is a miss.
+    for (subscription, event_type, occurred_at) in [
+        ("sub_a", "subscription.paused", "2026-08-02T00:00:00Z"),
+        ("sub_a", "subscription.paused", "2026-08-01T00:00:00Z"),
+        ("sub_a", "subscription.resumed", "2026-08-01T00:00:00Z"),
+        ("sub_a", "subscription.resumed", "2026-08-03T00:00:00Z"),
+        ("sub_a", "subscription.canceled", "2026-07-31T00:00:00Z"),
+        ("sub_a", "subscription.resumed", "2026-08-04T00:00:00Z"),
+        ("sub_zzz", "subscription.resumed", "2026-08-04T00:00:00Z"),
     ] {
         let body = format!(
-            r#"{{"event_type":"{event_type}","occurred_at":"{occurred_at}","data":{{"id":"sub_a"}}}}"#
+            r#"{{"event_type":"{event_type}","occurred_at":"{occurred_at}","data":{{"id":"{subscription}"}}}}"#
         )
         .into_bytes();
         let signature = common::paddle_signature(PADDLE_SECRET, &body);
@@ -421,12 +427,28 @@ async fn provisioning_webhook_is_audited() {
             "suspend subscription=sub_a occurred_at=2026-08-02 00:00:00 UTC",
         ),
         (
-            "stale",
-            "resume subscription=sub_a occurred_at=2026-08-01 00:00:00 UTC",
+            "denied",
+            "suspend subscription=sub_a occurred_at=2026-08-01 00:00:00 UTC reason=stale",
+        ),
+        (
+            "denied",
+            "resume subscription=sub_a occurred_at=2026-08-01 00:00:00 UTC reason=stale",
         ),
         (
             "ok",
             "resume subscription=sub_a occurred_at=2026-08-03 00:00:00 UTC",
+        ),
+        (
+            "ok",
+            "cancel subscription=sub_a occurred_at=2026-07-31 00:00:00 UTC",
+        ),
+        (
+            "denied",
+            "resume subscription=sub_a occurred_at=2026-08-04 00:00:00 UTC reason=canceled",
+        ),
+        (
+            "miss",
+            "resume subscription=sub_zzz occurred_at=2026-08-04 00:00:00 UTC",
         ),
     ]
     .map(|(o, d)| (o.to_owned(), d.to_owned()));

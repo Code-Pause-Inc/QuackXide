@@ -155,12 +155,16 @@ uses [Semantic Versioning](https://semver.org/).
   is recorded as `denied`.
 * A paused tenant comes back when its subscription resumes: the MoR
   webhook maps `subscription.resumed` to reactivation. Before, it was
-  ignored and the tenant stayed Suspended. Paddle does not deliver in
-  order, so status changes apply only when their `occurred_at` is newer
-  than the last one applied (a tie keeps Suspended), and a late or
-  retried event cannot undo a newer pause, cancel or resume. Provisioning
-  events never change an existing tenant's status. Events without a valid
-  RFC 3339 `occurred_at` are refused with 400.
+  ignored and the tenant stayed Suspended. A cancel is final (ADR 0006):
+  the tenant becomes Canceled whatever the cancel's `occurred_at`, and no
+  later pause or resume changes it. Paddle does not deliver in order, so
+  pauses and resumes apply only when their `occurred_at` is newer than the
+  last change applied (a tie keeps Suspended), and a late or retried event
+  cannot undo a newer one. Provisioning events never change an existing
+  tenant's status. Events without a valid RFC 3339 `occurred_at` are
+  refused with 400. Each status event is audited as `tenant.provisioned`:
+  `ok` when applied, `denied` with `reason=stale` or `reason=canceled`
+  when skipped, and `miss` for an unknown subscription.
 
 ### Security
 

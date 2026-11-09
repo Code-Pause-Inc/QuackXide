@@ -139,10 +139,13 @@ mean A4's "Forge signatures" row is closed by argument rather than code.
 * **`adm`** comes only from a server-side allowlist in the identity
   registry, keyed by `(iss, sub)`. Never from a provider attribute, group
   or claim the user or a provider tenant admin can edit.
-* **Suspended or unknown tenants are refused**, at the exchange and at
-  `require_tenant` / `require_admin` (403 with an `auth.decision` event,
-  fail closed if no registry is configured; built in P29). Reactivation is
-  an audited admin action.
+* **Suspended, canceled or unknown tenants are refused**, at the exchange
+  and at `require_tenant` / `require_admin` (403 with an `auth.decision`
+  event, fail closed if no registry is configured; built in P29). A signed
+  Paddle `subscription.resumed` newer than the last applied status change
+  reactivates a paused tenant automatically, with an audit event. A
+  canceled tenant stays refused until an administrator restores it, which
+  is an audited admin action.
 * Multi-member tenants and invitations are out of scope for v1.
 
 ### 4. Second factor

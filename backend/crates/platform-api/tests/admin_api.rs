@@ -153,7 +153,7 @@ async fn cancellation_webhook_suspends_the_tenant() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["action"], "suspended");
+    assert_eq!(json["action"], "canceled");
 
     let record = registry
         .get_by_subscription("sub_abc")
@@ -162,7 +162,7 @@ async fn cancellation_webhook_suspends_the_tenant() {
         .expect("rec");
     assert_eq!(
         serde_json::to_value(record.status).unwrap(),
-        serde_json::json!("suspended")
+        serde_json::json!("canceled")
     );
 }
 
@@ -237,8 +237,22 @@ async fn late_webhooks_cannot_undo_a_newer_status_change() {
 
     send_status_event(&app, "subscription.resumed", "2026-08-04T00:00:00Z").await;
     assert_eq!(status_of(&registry).await, "active");
+    // Cancel is final, so it applies even when it arrives late.
     send_status_event(&app, "subscription.canceled", "2026-08-03T00:00:00Z").await;
-    assert_eq!(status_of(&registry).await, "active");
+    assert_eq!(status_of(&registry).await, "canceled");
+}
+
+#[tokio::test]
+async fn newer_resume_or_pause_leaves_a_canceled_tenant_canceled() {
+    let (app, registry) = build(true);
+    assert_eq!(provision_via_webhook(&app).await, StatusCode::OK);
+    send_status_event(&app, "subscription.canceled", "2026-08-01T00:00:00Z").await;
+
+    for event_type in ["subscription.resumed", "subscription.paused"] {
+        let (status, json) = send_status_event(&app, event_type, "2026-08-02T00:00:00Z").await;
+        assert_eq!(status, StatusCode::OK, "json: {json}");
+        assert_eq!(status_of(&registry).await, "canceled", "{event_type}");
+    }
 }
 
 #[tokio::test]

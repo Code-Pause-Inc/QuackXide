@@ -159,6 +159,11 @@ pub enum ProvisioningAction {
         subscription_id: String,
         occurred_at: DateTime<Utc>,
     },
+    /// Final: a later resume does not undo it.
+    Cancel {
+        subscription_id: String,
+        occurred_at: DateTime<Utc>,
+    },
     Resume {
         subscription_id: String,
         occurred_at: DateTime<Utc>,
@@ -183,13 +188,22 @@ pub fn action_for(event: &PaddleEvent) -> ProvisioningAction {
                 },
             }
         }
-        "subscription.canceled" | "subscription.paused" => match &event.subscription_id {
-            Some(sub) => ProvisioningAction::Suspend {
+        "subscription.canceled" => match &event.subscription_id {
+            Some(sub) => ProvisioningAction::Cancel {
                 subscription_id: sub.clone(),
                 occurred_at: event.occurred_at,
             },
             None => ProvisioningAction::Ignore {
                 reason: "cancellation missing subscription id".to_owned(),
+            },
+        },
+        "subscription.paused" => match &event.subscription_id {
+            Some(sub) => ProvisioningAction::Suspend {
+                subscription_id: sub.clone(),
+                occurred_at: event.occurred_at,
+            },
+            None => ProvisioningAction::Ignore {
+                reason: "pause missing subscription id".to_owned(),
             },
         },
         "subscription.resumed" => match &event.subscription_id {
@@ -434,19 +448,24 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_and_pause_map_to_suspend_and_resume_to_resume() {
+    fn status_events_map_to_cancel_suspend_and_resume() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap()
             + chrono::Duration::milliseconds(500);
         let subscription_id = "sub_abc".to_owned();
-        for event_type in ["subscription.canceled", "subscription.paused"] {
-            assert_eq!(
-                action_for(&status_event(event_type)),
-                ProvisioningAction::Suspend {
-                    subscription_id: subscription_id.clone(),
-                    occurred_at,
-                }
-            );
-        }
+        assert_eq!(
+            action_for(&status_event("subscription.canceled")),
+            ProvisioningAction::Cancel {
+                subscription_id: subscription_id.clone(),
+                occurred_at,
+            }
+        );
+        assert_eq!(
+            action_for(&status_event("subscription.paused")),
+            ProvisioningAction::Suspend {
+                subscription_id: subscription_id.clone(),
+                occurred_at,
+            }
+        );
         assert_eq!(
             action_for(&status_event("subscription.resumed")),
             ProvisioningAction::Resume {
