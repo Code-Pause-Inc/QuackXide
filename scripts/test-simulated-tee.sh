@@ -149,6 +149,14 @@ if [[ "${OBJECT_COUNT}" -eq 0 ]]; then
   echo "ERROR: no tenant objects in the vault, so there is nothing to check" >&2
   exit 1
 fi
+# Every object must be an HPK1 envelope (platform-crypto's frame): the magic,
+# a 32-byte encapsulated key, then ciphertext ending in a 16-byte GCM tag.
+while IFS= read -r -d '' object; do
+  if ! cmp -s -n 4 <(printf 'HPK1') "${object}" || (( $(wc -c < "${object}") < 52 )); then
+    echo "ERROR: ${object#"${VAULT_COPY}/"} is not an HPK1 envelope" >&2
+    exit 1
+  fi
+done < <(find "${TENANT_DATA}" -type f -print0)
 # A fixture customer name, and the magic bytes of a plaintext Parquet file.
 for plaintext in "Sample Customer" "PAR1"; do
   if grep -rlF -- "${plaintext}" "${TENANT_DATA}" >&2; then
@@ -156,7 +164,7 @@ for plaintext in "Sample Customer" "PAR1"; do
     exit 1
   fi
 done
-echo "    ${OBJECT_COUNT} tenant objects stored, none with plaintext."
+echo "    ${OBJECT_COUNT} tenant objects stored, all HPK1 envelopes, none with plaintext."
 
 TOKEN=$(mint_jwt "${TENANT_ID}")
 
