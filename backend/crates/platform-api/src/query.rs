@@ -23,7 +23,9 @@ use platform_crypto::{SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
-use platform_tenancy::{BudgetError, BudgetLedger, BudgetState, CatalogRegistry, GrantRegistry};
+use platform_tenancy::{
+    BudgetError, BudgetLedger, BudgetState, CatalogRegistry, DatasetGrant, GrantRegistry,
+};
 use prometheus_client::metrics::histogram::Histogram;
 use quackxide_engine::{
     DisclosurePolicy, EngineSettings, MinCountThreshold, QueryError, QueryScope,
@@ -467,7 +469,7 @@ impl ConnectorQueryService {
         }))
     }
 
-    fn grants(&self) -> Result<&Arc<dyn GrantRegistry>, ApiError> {
+    pub(crate) fn grants(&self) -> Result<&Arc<dyn GrantRegistry>, ApiError> {
         self.grants.as_ref().ok_or(ApiError::ResearchUnavailable)
     }
 
@@ -485,6 +487,8 @@ impl ConnectorQueryService {
 
     /// Steward grants a researcher aggregate access to one of its connectors,
     /// allocating a query budget (default from config when unspecified).
+    /// `create` re-activates a revoked grant, so this is only for a new
+    /// decision by the steward: a direct grant or a first approval.
     pub async fn grant(
         &self,
         steward: TenantId,
@@ -497,6 +501,18 @@ impl ConnectorQueryService {
             .create(steward, researcher, connector.as_str())
             .await
             .map_err(|_| ApiError::Backend)?;
+        self.fund_grant(&grant, query_budget).await
+    }
+
+    /// Open the query budget of a grant that was just created or found
+    /// active, audit the grant, and return it with its budget as JSON. Both
+    /// [`grant`](Self::grant) and the approval retry in `research.rs` use it,
+    /// so the two paths cannot drift apart.
+    pub(crate) async fn fund_grant(
+        &self,
+        grant: &DatasetGrant,
+        query_budget: Option<u64>,
+    ) -> Result<Value, ApiError> {
         // Insert-if-absent: re-granting reuses the grant id, so it can never
         // reset spend — allocation only rises, via explicit top-ups.
         let budget = self
@@ -504,16 +520,18 @@ impl ConnectorQueryService {
             .open(&grant.grant_id, query_budget.unwrap_or(self.default_budget))
             .await
             .map_err(|_| ApiError::Backend)?;
+        let researcher = grant.researcher_tenant;
+        let connector = &grant.connector;
         security_audit_event(
             AuditKind::TenantProvisioned,
-            Some(steward),
+            Some(grant.steward_tenant),
             "ok",
             &format!(
                 "granted researcher={researcher} connector={connector} budget_limit={}",
                 budget.limit
             ),
         );
-        let mut value = serde_json::to_value(&grant).map_err(|_| ApiError::Backend)?;
+        let mut value = serde_json::to_value(grant).map_err(|_| ApiError::Backend)?;
         value["budget"] = budget_json(&budget)?;
         Ok(value)
     }

@@ -289,10 +289,15 @@ publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. Researchers file access requests (idempotent while
 pending); approval mints the grant through the same code path as a direct
-grant. The approval is recorded first, so a failure partway leaves an
-approved request without a usable grant, never a grant behind a pending or
-denied one, and the steward's retry re-runs the idempotent grant and budget
-steps. Denied is terminal. `research.catalog` events carry identifiers only.
+grant. The approval is recorded first, with its query budget, so a failure
+partway leaves an approved request without a usable grant, never a grant
+behind a pending or denied one, and the steward's retry re-runs the
+idempotent grant and budget steps with the approved budget; a retry cannot
+change it. A retry never undoes a revoke: while the steward's grant to that
+researcher for that connector is revoked, the retry is refused (404) with a
+`denied` event, and only an explicit re-grant or a new request restores
+access. Denied is terminal. `research.catalog` events carry identifiers
+only.
 
 **Residual risk:** overlapping-query differencing. See
 `docs/THREAT_MODEL.md`.
@@ -446,7 +451,8 @@ Rules, enforced by the capture tests:
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
-   and provisioning.
+   provisioning, and the research catalog (ok + denied): publish, request,
+   approval and its retry, deny, and the refused retry and deny.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on
