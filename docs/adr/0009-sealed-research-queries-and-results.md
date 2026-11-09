@@ -6,14 +6,17 @@
 ## Context
 
 A research query's SQL text arrives as plaintext JSON
-(`ResearchQueryRequest`, `backend/crates/platform-api/src/query.rs:829`)
-and its result leaves as plaintext JSON (`query.rs:733`). The browser has
+(`ResearchQueryRequest`, `backend/crates/platform-api/src/query.rs:847`)
+and its result leaves as plaintext JSON (`query.rs:751`). The browser has
 no evidence of what it is talking to. The plan requires queries and
 results to be plaintext only in the user's browser and inside the attested
-Confidential VM (P85, P55), which closes three threat-model A2 rows: reading
-results at the API edge, recipient-key substitution and result forgery.
+Confidential VM (P85, P55), which closes the threat model's A2 row "Read
+results at the API edge". Closing it also means checking the recipient
+key and authenticating the result, so the operator can substitute
+neither.
 
-Already decided, and not reopened here:
+Decided in the records below, and not reopened here. ADR 0005 and ADR 0007
+are Proposed, so they must be accepted together with this one:
 
 * ADR 0004: the browser supplies a nonce; the token carries it and a
   digest of the enclave's keys; the recipient key comes from the
@@ -82,7 +85,7 @@ sealing are zeroized after use, like the query-result buffer today.
 
 ### Binding v2
 
-The token's `eat_nonce` holds two base64url values, as
+The token's `eat_nonce` is exactly two base64url values, in this order, as
 `nonces_from_bytes` already produces: the browser's 32-byte challenge,
 then a 32-byte digest:
 
@@ -99,22 +102,38 @@ SHA-256( "attestation-binding-v2"
 | `signing-ml-dsa-65` | encoded public key |
 | `kms-public-key` | KMS public key; empty until P50 |
 | `tls-spki-sha256` | 32 bytes; empty until P67 |
-| `config-digest` | SHA-256 over the token's `submods.container.env` entries, sorted by name, each name and value length-prefixed |
+| `config-digest` | SHA-256 over the configuration names compiled into the image and the browser module (the names P50's release condition pins), in compiled order, each set name as `u16 len(name) ‖ name ‖ u32 len(value) ‖ value`; a name that is not set is left out |
+
+Every length prefix in this record is an unsigned integer, big-endian,
+counting bytes.
 
 The tag is neutral because the browser module computes it and the
-white-label guard forbids the engine name in the shipped bundle. The
-browser recomputes the config digest from the verified token rather than
-trusting a value in the bundle. It also refuses a configuration that
-loosens a control: `TEE_ATTESTATION_REQUIRED` and `FEATURE_ZK_ENABLED`
-must be absent or `true`, and `RESEARCH_MIN_COHORT_SIZE` absent or at
-least the compiled-in floor (P54). P14's policy may require more, never
-less.
+white-label guard forbids the engine name in the shipped bundle.
+
+The workload computes `config-digest` from its own environment, and the
+browser from the verified token's `submods.container.env`, so a match
+shows the workload read the configuration the token reports. The browser
+then checks that configuration by policy, as ADR 0005 decides: it reads
+the same compiled names from the token and refuses a value that loosens a
+control. `TEE_ATTESTATION_REQUIRED` and `FEATURE_ZK_ENABLED` must be
+absent or `true`, and `RESEARCH_MIN_COHORT_SIZE` absent or at least the
+compiled-in floor (P54). P14's policy may require more, never less. No
+expected digest is published or compared: one frontend image serves every
+deployment, so there is no trusted place to publish one.
 
 ### Evidence bundle
 
 `GET /api/v1/attestation?nonce=<base64url, 32 bytes>` is unauthenticated,
 rate-limited per client (P65), and refuses a missing or malformed nonce
-with 400. Each call requests one custom token with that nonce. The body:
+with 400. Each call requests one custom token with that nonce and the
+audience `urn:platform:browser-attestation`, a constant compiled into the
+image and the browser module; the caller chooses only the nonce. Anyone
+can fetch this token, so it must not open KMS. Production key release
+exchanges a token through workload identity federation, which checks no
+challenge of its own (ADR 0004), so P50's provider allows only the STS
+audience (`https://sts.googleapis.com`). This audience is neither that
+nor a provider's resource name, so federation refuses it. Development
+builds use the same audience. The body:
 
 ```json
 {
@@ -151,14 +170,16 @@ Byte fields are base64url without padding.
 The worker verifies the bundle with P47's `TokenVerifier`, built for
 wasm32 in the P34 browser module. In order, it checks:
 
-1. the signature against Google's key set, the issuer, audience and
-   validity window;
+1. the signature against Google's key set, the issuer, the audience
+   `urn:platform:browser-attestation` and the validity window;
 2. the hardware (TDX), software (Confidential Space), debug and support
    claims;
 3. the image digest against the compiled-in allowlist;
-4. that the first nonce equals its challenge;
+4. that `eat_nonce` is exactly two values, the first equal to its
+   challenge;
 5. that the digest it recomputes from the bundle's keys and the token's
-   configuration equals the second nonce.
+   configuration equals the second nonce, and that the configuration
+   passes the policy above.
 
 Any failure stops the query with an error naming the failed check, and
 nothing is sent. Browser JavaScript cannot see the TLS key, so
@@ -205,7 +226,7 @@ budget:
 | Frame does not open, or plaintext malformed | 400 |
 | `recipient_key` differs from the researcher's enrolled key | 403 |
 | Grant missing, revoked, or not `grant_id` | as today |
-| `request_nonce` already recorded with another envelope, or its query still running | 409 |
+| `request_nonce` already recorded with another envelope, its query still running, or its stored response expired | 409 |
 
 Replay protection and retries: each key set keeps its recorded nonces in
 memory. A nonce is inserted, atomically and only if absent, immediately
@@ -223,10 +244,12 @@ its signed response is stored with it.
   retries under a new nonce, and whether that is charged again follows
   P54's budget order.
 
-Only granted, authenticated requests reach that step, so the store grows
-by one aggregate response per such request, bounded by the rate limit;
-it empties when the key set changes, and a client then re-attests and
-re-sends under a new nonce.
+A stored response is dropped one token lifetime (an hour) after it is
+stored, since a client retries within its session, which lasts at most
+that long. Its nonce and envelope digest stay recorded for the key set's
+life, so a retry after that is refused with 409 and the client re-sends
+under a new nonce. The store empties when the key set changes, and a
+client then re-attests and re-sends under a new nonce.
 
 ### Recipient key
 
@@ -240,7 +263,7 @@ Anyone can seal a request to the enclave's public key, so what ties a
 result to the researcher is the bearer token and the enrolled key. An
 operator holding a researcher's token and able to overwrite that
 researcher's enrollment could send its own request with its own recipient
-key and read the result. Two things close this:
+key and read the result. Two things narrow this:
 
 * **Create-once enrollment (P33).** Until it lands, a release build
   refuses sealed research queries with 503; only `dev` builds, which run
@@ -248,6 +271,13 @@ key and read the result. Two things close this:
 * **TLS inside the VM (ADR 0005, P67).** Until then, bearer tokens are
   visible wherever TLS ends, and the threat model records that sealed
   results do not hold against that operator.
+
+Neither closes it. The API enforces create-once, but the identity
+registry and the enrollment record sit in stores the operator controls
+(ADR 0004). An operator who edits both directly can send queries as a
+researcher under its own recipient key and read the results. This is an
+A2 residual for v1, as ADR 0004 records for forged grants, budgets or
+identities.
 
 ### No downgrade
 
@@ -274,7 +304,9 @@ A successful response is:
   and `budget_remaining`, sealed to `recipient_key` under
   `research_result(tid, query)`, where `query` is the base64url of
   `SHA-256("research-query-binding-v1" ‖ grant_id ‖ request_nonce ‖
-  SHA-256(sql) ‖ schema_version)`, each field length-prefixed.
+  SHA-256(sql) ‖ schema_version)`, each field after the tag prefixed
+  with its `u32` length. An absent `schema_version` is the empty field
+  (length 0), so a present one must not be empty.
 * The signatures are over `"research-result-signature-v1" ‖ u32 len(info)
   ‖ info ‖ u32 len(frame) ‖ frame`, with ML-DSA-65's context string
   empty.
@@ -283,8 +315,11 @@ A successful response is:
   the frame. Any failure discards the response.
 
 Error responses carry a status and an error class, never result data or
-an SQL echo. The `engine.query` audit record keeps its counts on the
-server, which billing reads.
+an SQL echo. They are not signed, so the operator can forge or alter a
+refusal, as it can drop a request; the browser shows the class and trusts
+nothing else in an error. The `engine.query` audit record keeps the exact
+row, suppressed-row and budget counts on the server, where billing reads
+them and the operator can too.
 
 ### Out of scope
 
@@ -308,7 +343,14 @@ threat model records it as a residual.
 * `binding.rs` moves to the v2 layout and `EnclaveIdentity` holds real
   keys, with the request key's private half in production builds.
 * `ed25519-dalek` and `ml-dsa`, named in ADR 0007, are added and must pass
-  `cargo deny check`.
+  `cargo deny check`. They ship in the browser module, and so do
+  `jsonwebtoken` and its `rsa` backend through `TokenVerifier`; ADR 0007
+  lists only `hpke` for the browser.
+* `TokenVerifier::verify` requires `eat_nonce` to equal the expected
+  nonces exactly, in order, where today it requires only that each is
+  present. `VerifiedToken` exposes the compiled configuration names'
+  values from `submods.container.env`; today it exposes only the image
+  digest, hardware model and nonces.
 * `TokenVerifier` is built into the browser module, which grows by about
   1.1 MB before optimisation. The simulated TEE keeps issuing OIDC-shaped
   tokens and serves its key set to development builds, and P85's negative
@@ -327,12 +369,15 @@ threat model records it as a residual.
 * The attestation route requires its nonce, and the research route's
   request and response change shape. The worker gains attest, seal, verify
   and open, and P56 renders the opened result.
-* `docs/THREAT_MODEL.md` updates the A2 rows, including the dependence of
-  sealed results on create-once enrollment (P33) and TLS inside the VM
-  (P67), and adds the served-bundle residual (P85) and the unsealed
-  own-data endpoint. Its "Metadata" residual adds the `grant_id` sent in
-  the clear and the sealed result's length, which shows roughly how many
-  groups a result has.
+* `docs/THREAT_MODEL.md` updates the A2 row "Read results at the API
+  edge", including the dependence of sealed results on create-once
+  enrollment (P33) and TLS inside the VM (P67), and adds the residuals:
+  an operator who edits the identity registry and enrollment record, the
+  served bundle (P85), the unsealed own-data endpoint, and forged
+  refusals. Its "Metadata" residual adds the `grant_id` sent in the
+  clear, the sealed request's length, which bounds the SQL's, the sealed
+  result's length, each error class, and the exact row and suppressed-row
+  counts in the `engine.query` audit record.
   `docs/ARCHITECTURE.md`'s research flow shows the browser verifying the
   enclave first.
 * A restart invalidates every session's key set: one extra round trip per
