@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -140,8 +140,7 @@ function seed() {
   api.grants.mockResolvedValue([myGrant, issuedGrant, unmeteredGrant]);
   api.budget.mockImplementation(async (grantId: string) => {
     const budget = budgets[grantId];
-    if (!budget) throw new Error("budget standing: not found");
-    return { ...budget, rows: [RAW_ROW] };
+    return budget ? { ...budget, rows: [RAW_ROW] } : null;
   });
   api.myRequests.mockResolvedValue([
     request("r-pending", pendingListing, ME, "pending"),
@@ -339,16 +338,42 @@ describe("ResearchPortal", () => {
     expect(screen.queryByText("Unfinished approvals")).not.toBeInTheDocument();
   });
 
-  it("retries an unfinished approval and reloads", async () => {
+  it("does not list a finished approval whose budget failed to load", async () => {
+    api.myRequests.mockResolvedValue([request("r-done", ownListing, RESEARCHER, "approved")]);
+    api.budget.mockImplementation(async (grantId: string) => {
+      if (grantId === "g-issued") throw new Error("failed to load budget standing (502)");
+      return budgets[grantId] ?? null;
+    });
+    await openPortal();
+    await screen.findByText("Data stewardship");
+    expect(screen.queryByText("Unfinished approvals")).not.toBeInTheDocument();
+  });
+
+  it("retries an unfinished approval, and the finished one leaves the list", async () => {
     seedApproved();
     api.approveRequest.mockResolvedValue({});
     const user = await openPortal();
     await screen.findByText("Data stewardship");
 
+    // The retry issues the grant and its budget, so the reload finds both.
+    api.grants.mockResolvedValue([
+      myGrant,
+      issuedGrant,
+      unmeteredGrant,
+      { ...grant("g-revoked", ME, REVOKED, "health"), revoked: true },
+      grant("g-stuck", ME, STUCK, "health"),
+    ]);
+    api.budget.mockImplementation(async (grantId: string) =>
+      grantId === "g-stuck"
+        ? { grant_id: "g-stuck", limit: 10, spent: 0, remaining: 10 }
+        : (budgets[grantId] ?? null),
+    );
+
     const stuck = within(unfinishedSection().getByText(/researcher dddddddd/).closest("li")!);
     await user.click(stuck.getByRole("button", { name: "Retry approval" }));
     expect(api.approveRequest).toHaveBeenCalledExactlyOnceWith("r-stuck");
-    expect(api.catalog).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(unfinishedSection().getAllByRole("listitem")).toHaveLength(1));
+    expect(unfinishedSection().queryByText(/researcher dddddddd/)).not.toBeInTheDocument();
   });
 
   it("shows the error when a retry is refused", async () => {

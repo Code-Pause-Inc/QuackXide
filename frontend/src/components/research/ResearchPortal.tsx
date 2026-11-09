@@ -14,6 +14,7 @@ import {
   tenantFromJwt,
 } from "../../lib/research/client";
 import IssuedGrantRow from "./IssuedGrantRow";
+import RequestRow from "./RequestRow";
 import PublishForm from "./PublishForm";
 import { inputCls, primaryBtnCls, quietBtnCls } from "./styles";
 import { Meter, SectionLabel, StatusChip } from "./ui";
@@ -29,6 +30,9 @@ interface PortalData {
   catalog: CatalogView;
   grants: GrantView[];
   budgets: Record<string, BudgetView>;
+  /** Active grants the API says have no budget (404), as opposed to a budget
+   *  that failed to load. */
+  unfunded: Set<string>;
   requests: AccessRequestView[];
 }
 
@@ -61,18 +65,23 @@ export default function ResearchPortal() {
       c.myRequests(),
     ]);
     const active = grants.filter((g) => !g.revoked);
+    // `undefined` when the read failed: neither funded nor unfunded.
     const budgetList = await Promise.all(
       active.map(async (g) => {
         try {
-          return await c.budget(g.grant_id);
+          return [g.grant_id, await c.budget(g.grant_id)] as const;
         } catch {
-          return null;
+          return [g.grant_id, undefined] as const;
         }
       }),
     );
     const budgets: Record<string, BudgetView> = {};
-    for (const b of budgetList) if (b) budgets[b.grant_id] = b;
-    setData({ catalog, grants, budgets, requests });
+    const unfunded = new Set<string>();
+    for (const [grantId, budget] of budgetList) {
+      if (budget) budgets[grantId] = budget;
+      else if (budget === null) unfunded.add(grantId);
+    }
+    setData({ catalog, grants, budgets, unfunded, requests });
   };
 
   const connect = async () => {
@@ -143,9 +152,10 @@ export default function ResearchPortal() {
     [data, me],
   );
 
-  /** My approvals that left no grant, or an active grant with no budget (a 502
-   *  from the grant or budget step); approving again finishes them. Revoked
-   *  grants are left out: the API refuses to retry past a revoke. */
+  /** My approvals that left no grant, or an active grant the API says has no
+   *  budget (a 502 from the grant or budget step); approving again finishes
+   *  them. Revoked grants are left out: the API refuses to retry past a revoke.
+   *  A budget that failed to load counts as neither. */
   const unfinishedApprovals = useMemo(() => {
     if (!data || !me) return [];
     return data.requests.filter((r) => {
@@ -156,7 +166,7 @@ export default function ResearchPortal() {
           g.researcher_tenant === r.researcher_tenant &&
           g.connector === r.connector,
       );
-      return !grant || (!grant.revoked && !data.budgets[grant.grant_id]);
+      return !grant || data.unfunded.has(grant.grant_id);
     });
   }, [data, me]);
 
@@ -377,19 +387,13 @@ export default function ResearchPortal() {
               <SectionLabel>Access requests</SectionLabel>
               <ul className="mt-3 divide-y divide-slate-100">
                 {incomingPending.map((request) => (
-                  <li key={request.request_id} className="flex items-center gap-4 py-4">
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium">
-                        {listingTitleFor(request.steward_tenant, request.connector)}
-                      </p>
-                      <p className="mt-0.5 text-xs text-slate-500">
-                        researcher {shortId(request.researcher_tenant)} ·{" "}
-                        {request.created_at_iso.slice(0, 10)}
-                      </p>
-                      <p className="mt-1 text-xs italic text-slate-600">
-                        {request.note ? `“${request.note}”` : "No purpose stated."}
-                      </p>
-                    </div>
+                  <RequestRow
+                    key={request.request_id}
+                    title={listingTitleFor(request.steward_tenant, request.connector)}
+                    researcher={request.researcher_tenant}
+                    when={request.created_at_iso.slice(0, 10)}
+                    note={request.note ? `“${request.note}”` : "No purpose stated."}
+                  >
                     <button
                       type="button"
                       disabled={busy !== null}
@@ -414,7 +418,7 @@ export default function ResearchPortal() {
                     >
                       Decline
                     </button>
-                  </li>
+                  </RequestRow>
                 ))}
               </ul>
             </div>
@@ -431,16 +435,12 @@ export default function ResearchPortal() {
               </p>
               <ul className="mt-3 divide-y divide-slate-100">
                 {unfinishedApprovals.map((request) => (
-                  <li key={request.request_id} className="flex items-center gap-4 py-4">
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium">
-                        {listingTitleFor(request.steward_tenant, request.connector)}
-                      </p>
-                      <p className="mt-0.5 text-xs text-slate-500">
-                        researcher {shortId(request.researcher_tenant)} · approved{" "}
-                        {request.updated_at_iso.slice(0, 10)}
-                      </p>
-                    </div>
+                  <RequestRow
+                    key={request.request_id}
+                    title={listingTitleFor(request.steward_tenant, request.connector)}
+                    researcher={request.researcher_tenant}
+                    when={`approved ${request.updated_at_iso.slice(0, 10)}`}
+                  >
                     <button
                       type="button"
                       disabled={busy !== null}
@@ -453,7 +453,7 @@ export default function ResearchPortal() {
                     >
                       {busy === `approve:${request.request_id}` ? "Retrying…" : "Retry approval"}
                     </button>
-                  </li>
+                  </RequestRow>
                 ))}
               </ul>
             </div>
