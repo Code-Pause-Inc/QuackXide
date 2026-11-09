@@ -3,14 +3,16 @@
 //! A steward publishes a listing for one of its sealed connector datasets,
 //! opting it into discoverability. Researchers browse the catalog and file
 //! access requests; approval mints the grant and budget through the same path
-//! as a direct grant. Prices are integer cents in the configured currency.
+//! as a direct grant, except that a retried approval never re-activates a
+//! revoked grant. Prices are integer cents in the configured currency.
 
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use platform_core::{ConnectorSlug, TenantId};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
-    BudgetLedger, CatalogError, CatalogRegistry, GrantRegistry, ListingDetails, RequestStatus,
+    AccessRequest, BudgetLedger, CatalogError, CatalogRegistry, GrantOutcome, GrantRegistry,
+    ListingDetails, RequestStatus,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -69,7 +71,8 @@ pub struct RequestAccessBody {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ApproveRequestBody {
-    /// Steward override of the listing's included query budget.
+    /// Steward override of the listing's included query budget. Recorded
+    /// with the approval; a retry may repeat it but not change it.
     #[serde(default)]
     pub query_budget: Option<u64>,
 }
@@ -182,18 +185,29 @@ impl ConnectorQueryService {
     /// Resolve an access request. Only its steward may; other tenants and
     /// unknown ids get the same "not found" (no existence oracle).
     ///
-    /// Approval marks the request Approved first, then mints the grant and
-    /// budget through the same path as a direct grant. If a later step
-    /// fails, the request stays Approved without a usable grant (fail
-    /// closed) and the steward retries: approving an already-Approved
-    /// request re-runs every step after `resolve` (slug, listing, grant and
-    /// budget), all idempotent, so the retry converges. The re-run
-    /// re-activates the grant if the steward has revoked it since, as a
-    /// direct re-grant does.
+    /// Approval marks the request Approved first, recording its query budget
+    /// (the steward's override, else the listing's included budget) in the
+    /// same step, then mints the grant and budget through the same path as a
+    /// direct grant. If a later step fails, the request stays Approved
+    /// without a usable grant (fail closed) and the steward retries:
+    /// approving an already-Approved request re-runs every step after
+    /// `resolve` (slug, grant and budget), all idempotent, so the retry
+    /// converges. A retry finishes the recorded decision: it opens the
+    /// approved budget, and a retry that names a different `query_budget`
+    /// is refused (400) and audited as `denied`. A retry never undoes a
+    /// revoke: in place of `create`, it mints with
+    /// [`GrantRegistry::create_unless_revoked`], which checks for a revoked
+    /// grant and creates in one atomic step, so a revoke that lands while
+    /// the retry runs holds too. A retry that finds this researcher's grant
+    /// for the connector revoked is refused with the same "not found", even
+    /// when the revoke came before the approval (fail closed). Only an
+    /// explicit re-grant or a new request restores access. A retry is
+    /// audited with `retry=true`, and a refused retry as `denied`.
     ///
     /// Denial acts only on a Pending request and only records the outcome.
-    /// Denied is terminal and an Approved request cannot be denied, so no
-    /// grant is ever minted for a Pending or Denied request.
+    /// Denied is terminal and an Approved request cannot be denied (the
+    /// refusal is audited), so no grant is ever minted for a Pending or
+    /// Denied request.
     pub async fn resolve_access_request(
         &self,
         steward: TenantId,
@@ -202,28 +216,39 @@ impl ConnectorQueryService {
         budget_override: Option<u64>,
     ) -> Result<Value, ApiError> {
         let catalog = self.catalog()?;
-        let request = match catalog
-            .resolve(steward, request_id, approve)
+        let (request, retry) = match catalog
+            .resolve(steward, request_id, approve, budget_override)
             .await
             .map_err(|_| ApiError::Backend)?
         {
-            Some(request) => request,
-            // An earlier approval recorded Approved, then failed. Re-run the
-            // steps below for the request's own steward only:
-            // `list_requests_for` also returns requests where the caller is
-            // the researcher. Denied stays terminal.
-            None if approve => catalog
-                .list_requests_for(steward)
-                .await
-                .map_err(|_| ApiError::Backend)?
-                .into_iter()
-                .find(|r| {
-                    r.request_id == request_id
-                        && r.steward_tenant == steward
-                        && r.status == RequestStatus::Approved
-                })
-                .ok_or(ApiError::NotFound)?,
-            None => return Err(ApiError::NotFound),
+            // A Pending request, now resolved: a first decision.
+            Some(request) => (request, false),
+            // An earlier approval recorded Approved, then failed: a retry.
+            // Re-run the steps below for the request's own steward only.
+            // Denied stays terminal.
+            None if approve => {
+                let request = self
+                    .approved_request(steward, request_id)
+                    .await?
+                    .ok_or(ApiError::NotFound)?;
+                (request, true)
+            }
+            // Denying an Approved request is refused. Audit the refusal;
+            // the caller still gets the same "not found" as an unknown id.
+            None => {
+                if let Some(approved) = self.approved_request(steward, request_id).await? {
+                    security_audit_event(
+                        AuditKind::ResearchCatalog,
+                        Some(steward),
+                        "denied",
+                        &format!(
+                            "deny refused request={request_id} researcher={} status=approved",
+                            approved.researcher_tenant
+                        ),
+                    );
+                }
+                return Err(ApiError::NotFound);
+            }
         };
         if !approve {
             security_audit_event(
@@ -238,33 +263,101 @@ impl ConnectorQueryService {
             return Ok(json!({ "request": request }));
         }
 
+        // A retry finishes the recorded decision, budget included: it may
+        // repeat the approved budget or leave it out, but not change it.
+        if retry && budget_override.is_some() && budget_override != request.approved_budget {
+            security_audit_event(
+                AuditKind::ResearchCatalog,
+                Some(steward),
+                "denied",
+                &format!("approve refused request={request_id} retry=true reason=budget"),
+            );
+            return Err(ApiError::BadRequest(
+                "a retry cannot change the approved budget",
+            ));
+        }
         let connector = ConnectorSlug::new(&request.connector).map_err(|_| ApiError::Backend)?;
-        // Budget priority: steward override, then the listing's included
-        // budget, then the platform default applied by `grant`.
-        let listed_budget = self
-            .catalog()?
-            .get_listing(&request.listing_id)
-            .await
-            .map_err(|_| ApiError::Backend)?
-            .map(|l| l.grant_budget);
-        let grant = self
-            .grant(
-                steward,
-                request.researcher_tenant,
-                &connector,
-                budget_override.or(listed_budget),
-            )
-            .await?;
+        // The approval recorded its budget: the steward's override, else the
+        // listing's included budget. `fund_grant` applies the platform
+        // default only if neither existed.
+        let query_budget = request.approved_budget;
+        // A first approval is a new decision, so it may re-activate a revoked
+        // grant. A retry may not.
+        let grant = if retry {
+            self.grant_on_retry(steward, &request, &connector, query_budget)
+                .await?
+        } else {
+            self.grant(steward, request.researcher_tenant, &connector, query_budget)
+                .await?
+        };
+        let retry_note = if retry { " retry=true" } else { "" };
         security_audit_event(
             AuditKind::ResearchCatalog,
             Some(steward),
             "ok",
             &format!(
-                "approved request={request_id} researcher={}",
+                "approved request={request_id} researcher={}{retry_note}",
                 request.researcher_tenant
             ),
         );
         Ok(json!({ "request": request, "grant": grant }))
+    }
+
+    /// The caller's own request `request_id`, if it is Approved.
+    /// `list_requests_for` also returns requests where the caller is the
+    /// researcher, so the steward is checked as well.
+    async fn approved_request(
+        &self,
+        steward: TenantId,
+        request_id: &str,
+    ) -> Result<Option<AccessRequest>, ApiError> {
+        Ok(self
+            .catalog()?
+            .list_requests_for(steward)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .into_iter()
+            .find(|r| {
+                r.request_id == request_id
+                    && r.steward_tenant == steward
+                    && r.status == RequestStatus::Approved
+            }))
+    }
+
+    /// Mint the grant for an approval retry. The revoked check and the grant
+    /// are one registry step ([`GrantRegistry::create_unless_revoked`]), so a
+    /// retry never undoes a revoke, even one that lands while it runs. A
+    /// revoked grant stays revoked: the refusal is audited and the caller
+    /// gets the same "not found" as an unknown request.
+    async fn grant_on_retry(
+        &self,
+        steward: TenantId,
+        request: &AccessRequest,
+        connector: &ConnectorSlug,
+        query_budget: Option<u64>,
+    ) -> Result<Value, ApiError> {
+        let outcome = self
+            .grants()?
+            .create_unless_revoked(steward, request.researcher_tenant, connector.as_str())
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        let grant = match outcome {
+            GrantOutcome::Active(grant) => grant,
+            GrantOutcome::Revoked(revoked) => {
+                let request_id = &request.request_id;
+                security_audit_event(
+                    AuditKind::ResearchCatalog,
+                    Some(steward),
+                    "denied",
+                    &format!(
+                        "approve refused request={request_id} grant={} retry=true reason=revoked",
+                        revoked.grant_id
+                    ),
+                );
+                return Err(ApiError::NotFound);
+            }
+        };
+        self.fund_grant(&grant, query_budget).await
     }
 }
 

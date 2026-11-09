@@ -10,13 +10,16 @@ uses [Semantic Versioning](https://semver.org/).
 
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
-  with issuer, audience, validity (60 s clock-skew leeway), the expected
-  nonces, and the release policy (`GCP_INTEL_TDX`, `CONFIDENTIAL_SPACE`,
-  `disabled-since-boot`, `STABLE`, an allowed image digest). Tokens over
-  16 KiB are refused before parsing, and errors name a class, never token
-  contents. A dev-only signer (`simulated_token`, feature `simulated`)
-  issues tokens for tests, and the `attestation_token` fuzz target covers
-  the verifier.
+  with issuer, audience, validity (60 s clock-skew leeway), a required
+  integer `iat` no later than now plus the leeway, an integer `exp` no
+  earlier than `iat` and at most one hour after it, the expected nonces,
+  and the release policy (`GCP_INTEL_TDX`, `CONFIDENTIAL_SPACE`,
+  `disabled-since-boot`, `STABLE`, an allowed image digest). Tokens over 16 KiB are refused before parsing,
+  and errors name a class, never token contents. A dev-only signer
+  (`simulated_token`, feature `simulated`) issues tokens for tests. The
+  `attestation_token` fuzz target covers parsing and the signature check;
+  `attestation_claims` signs fuzzed claims to cover claim decoding and the
+  release policy.
 * Browser envelope sealing: `envelope-wasm` builds `platform-crypto`'s HPKE
   envelope seal for wasm32, and the crypto worker loads it through
   `frontend/src/lib/crypto/envelope.ts` to seal to a tenant's raw public
@@ -136,6 +139,20 @@ uses [Semantic Versioning](https://semver.org/).
   the grant or budget step then failed (502) the retry got 404 and the
   request stayed approved with no grant. A deny after a failed approval
   is refused, so no grant is ever minted for a pending or denied request.
+  The approval records its query budget (the steward's `query_budget`,
+  else the listing's included budget) as the request's `approved_budget`,
+  and a retry opens that budget: a retry that names a different
+  `query_budget` is refused with 400.
+  A retry never re-activates a revoked grant: it is refused with 404, so
+  a re-sent approval (a frontend retry, a double-click or a stale tab)
+  cannot restore access after a revoke, even one that lands while the
+  retry is running; an explicit re-grant or a new request can. The retry
+  checks for a revoke and creates the grant in one atomic step, the new
+  `GrantRegistry::create_unless_revoked`, which a persistent backend must
+  implement as a conditional insert or a transaction. Audit records tell
+  a retry from a first approval (`retry=true` in the `research.catalog`
+  detail), and a refused retry or a refused deny of an approved request
+  is recorded as `denied`.
 
 ### Security
 
