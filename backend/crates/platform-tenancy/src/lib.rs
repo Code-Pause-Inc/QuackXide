@@ -21,7 +21,7 @@ pub use catalog::{
     AccessRequest, CatalogError, CatalogRegistry, DatasetListing, InMemoryCatalogRegistry,
     ListingDetails, RequestStatus,
 };
-pub use grants::{DatasetGrant, GrantRegistry, InMemoryGrantRegistry};
+pub use grants::{DatasetGrant, GrantOutcome, GrantRegistry, InMemoryGrantRegistry};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TenancyError {
