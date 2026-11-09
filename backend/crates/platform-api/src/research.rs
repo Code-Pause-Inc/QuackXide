@@ -1,7 +1,7 @@
 //! Dataset catalog and access-request API.
 //!
-//! A steward publishes a listing for one of its sealed connector datasets,
-//! opting it into discoverability. Researchers browse the catalog and file
+//! A steward publishes a listing for a dataset it holds (a connector's or an
+//! upload's, with a committed snapshot), opting it into discoverability. Researchers browse the catalog and file
 //! access requests; approval mints the grant and budget through the same path
 //! as a direct grant, except that a retried approval never re-activates a
 //! revoked grant. Prices are integer cents in the configured currency.
@@ -48,6 +48,7 @@ pub const MAX_NOTE_CHARS: usize = 1000;
 
 #[derive(Debug, Deserialize)]
 pub struct PublishListingRequest {
+    /// The dataset's slug: a connector's, or an upload's (`upload_…`).
     pub connector: String,
     pub title: String,
     #[serde(default)]
@@ -81,13 +82,24 @@ pub struct ApproveRequestBody {
 
 impl ConnectorQueryService {
     /// Publish or re-publish a catalog listing for one of the steward's
-    /// connectors (upsert; the listing id is stable).
+    /// datasets (upsert; the listing id is stable). A dataset the steward
+    /// does not hold (no committed snapshot) is refused with 404 and a
+    /// `denied` event, so a listing never points at nothing.
     pub async fn publish_listing(
         &self,
         steward: TenantId,
         connector: &ConnectorSlug,
         req: &PublishListingRequest,
     ) -> Result<Value, ApiError> {
+        if !self.holds(steward, connector).await? {
+            security_audit_event(
+                AuditKind::ResearchCatalog,
+                Some(steward),
+                "denied",
+                &format!("publish refused connector={connector} reason=not_held"),
+            );
+            return Err(ApiError::NotFound);
+        }
         let details = ListingDetails {
             title: req.title.trim().to_owned(),
             description: req.description.trim().to_owned(),

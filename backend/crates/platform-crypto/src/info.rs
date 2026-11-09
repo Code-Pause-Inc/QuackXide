@@ -32,8 +32,11 @@ pub fn snapshot_manifest(
     format!("tenant-snapshot-manifest-v1|{tenant}|{connector}|{version}").into_bytes()
 }
 
-/// An object of a dataset a steward uploads from the browser. P38 fixes the
-/// identifiers that fill the fields.
+/// An object of a dataset a steward uploads from the browser (ADR 0011):
+/// `{tenant}` is the steward's tenant id, `{dataset}` the dataset's slug in
+/// the upload namespace (`upload_…`), and `{object}` the object id the
+/// browser chose before sealing. The snapshot's manifest uses
+/// [`snapshot_manifest`] with the same slug.
 pub fn steward_upload(
     tenant: impl Display,
     dataset: impl Display,

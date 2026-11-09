@@ -8,6 +8,25 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Steward dataset upload (ADR 0011, P38): `PUT /api/v1/datasets/{dataset}`
+  stores Parquet that the steward's browser sealed, with the snapshot
+  manifest the browser also sealed, as the dataset's new snapshot
+  (ADR 0003): the object, a plaintext record, then the manifest as the
+  commit, then pruning. Uploaded datasets are named in a reserved
+  `upload_` slug namespace that no connector may use, and keep using the
+  existing grant, listing and research query fields. The route takes the
+  tenant from the token only, needs no query service, and refuses with
+  401, 404 (outside the upload namespace), 409 (a version not newer than
+  the current one), 413 (over `DATASET_MAX_MIB`, default 64, 1 to 512,
+  refused at startup when out of range) and 422 (a malformed body or
+  envelope frame, a version more than five minutes ahead, or a declared
+  schema unlike the recorded one), each audited as `data.access`. The
+  body parser (`platform_connectors::upload`) has the `upload_body` fuzz
+  target. In the enclave, `QueryScope::register_parquet_declared` refuses
+  data unlike its declared schema or row cap
+  (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
+  `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
+  and `DevResearchStack` gains `register_key` and `with_vault`.
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
@@ -208,6 +227,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* Every dataset snapshot, a connector sync's included, writes a plaintext
+  record (`platform_storage::SnapshotRecord`: its suite, and for an upload
+  the declared row cap and schema) before its manifest, and pruning
+  deletes superseded records. A query refuses a snapshot without a valid
+  record, and a manifest that lists a missing object, with 502 (a missing
+  object was a 404). Publishing a catalog listing for a dataset the
+  steward does not hold, one without a committed snapshot, is refused with
+  404 and a `research.catalog` denial.
 * The SEV-SNP simulation is retired: `SimulatedSnp`, the SEV-SNP report
   parser and P-384 chain verifier (`report`, `verifier`, `TrustRoot`), the
   `snp_report` fuzz target and the `SIMULATED_SNP_*` settings are removed,

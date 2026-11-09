@@ -569,7 +569,29 @@ async fn superseded_snapshots_are_pruned() {
         .list(&TenantPaths::connector_snapshots_prefix(tenant, &connector))
         .await
         .expect("list");
-    assert_eq!((manifests.len(), objects.len()), (1, 1));
+    let records = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list");
+    assert_eq!((manifests.len(), objects.len(), records.len()), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn a_snapshot_without_its_record_fails_closed() {
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let record = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list")
+        .remove(0);
+    vault.delete(&record).await.expect("delete");
+
+    let service = service_over(tenant, keypair, vault, ZkMode::Disabled);
+    let result = service.query(tenant, &connector, COUNT_SQL).await;
+    assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

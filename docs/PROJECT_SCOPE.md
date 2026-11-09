@@ -35,7 +35,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Step | State | Notes |
 | --- | --- | --- |
 | Steward signs in | **Build** | Managed sign-in service. RS256/JWKS verification and a TOTP module exist; local development uses HS256 dev tokens. |
-| Upload | **Harden** | Browser-side drive encryption exists (Web Crypto, per-file keys, AAD-bound chunks). Research datasets currently enter through connector pipelines; a steward upload path for research datasets is needed. |
+| Upload | **Harden** | Browser-side drive encryption exists (Web Crypto, per-file keys, AAD-bound chunks). Research datasets enter through connector pipelines or the steward upload route (`PUT /api/v1/datasets/{dataset}`, ADR 0011), which stores Parquet sealed in the browser; browser sealing and the upload form are still needed. |
 | Hybrid post-quantum encryption | **Build** | X25519 + ML-KEM-768 key encapsulation; Ed25519 + ML-DSA-65 signatures. Current suite is X25519 only. No silent downgrade to classical-only. |
 | Encrypted storage | **Harden** | `VaultStore` with GCS and in-memory backends; typed tenant paths. |
 

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::{DataType, Schema};
 use bytes::Bytes;
 use datafusion::common::{DataFusionError, exec_err};
 use datafusion::datasource::MemTable;
@@ -28,7 +29,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use platform_core::ZkMode;
+use platform_core::{ColumnType, DeclaredSchema, ZkMode};
 use platform_crypto::{SecretBytes, ZeroizingWriter};
 use url::Url;
 
@@ -53,6 +54,27 @@ pub enum QueryError {
     Disclosure(String),
     #[error("query rejected: only read-only queries are permitted")]
     StatementNotAllowed,
+    /// The decrypted data does not match what the steward declared for it.
+    /// Names the check, never a column.
+    #[error("dataset does not match its declared {0}")]
+    DeclarationMismatch(Declaration),
+}
+
+/// Which part of a steward's declaration the data failed
+/// ([`QueryError::DeclarationMismatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Declaration {
+    Schema,
+    RowCap,
+}
+
+impl fmt::Display for Declaration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Declaration::Schema => "schema",
+            Declaration::RowCap => "row cap",
+        })
+    }
 }
 
 /// Where decoding a Parquet blob failed. Holds no upstream message, which
@@ -162,15 +184,53 @@ impl QueryScope {
         table: &str,
         blobs: &[&[u8]],
     ) -> Result<usize, QueryError> {
+        self.register(table, blobs, None)
+    }
+
+    /// As [`register_parquet_many`](Self::register_parquet_many), for a
+    /// dataset whose shape a steward declared (ADR 0011). Each blob's schema
+    /// must match `schema` (names in order, and [`ColumnType`] families),
+    /// and the rows its footer reports, summed, must not exceed `row_cap`,
+    /// both checked before any batch is decoded. Decoded rows are counted
+    /// against `row_cap` again. A failure is
+    /// [`QueryError::DeclarationMismatch`].
+    pub fn register_parquet_declared(
+        &mut self,
+        table: &str,
+        blobs: &[&[u8]],
+        schema: &DeclaredSchema,
+        row_cap: u64,
+    ) -> Result<usize, QueryError> {
+        self.register(table, blobs, Some((schema, row_cap)))
+    }
+
+    fn register(
+        &mut self,
+        table: &str,
+        blobs: &[&[u8]],
+        declared: Option<(&DeclaredSchema, u64)>,
+    ) -> Result<usize, QueryError> {
         if blobs.is_empty() {
             return Ok(0);
         }
         let mut schema = None;
         let mut partitions: Vec<Vec<RecordBatch>> = Vec::with_capacity(blobs.len());
         let mut rows = 0usize;
+        let mut footer_rows = 0u64;
         for blob in blobs {
             let reader = ParquetRecordBatchReaderBuilder::try_new(wiped_copy(blob))
                 .map_err(|_| QueryError::Parquet(ParquetStage::Metadata))?;
+            if let Some((declared_schema, row_cap)) = declared {
+                if !matches_declared(reader.schema(), declared_schema) {
+                    return Err(QueryError::DeclarationMismatch(Declaration::Schema));
+                }
+                let blob_rows = u64::try_from(reader.metadata().file_metadata().num_rows())
+                    .map_err(|_| QueryError::Parquet(ParquetStage::Metadata))?;
+                footer_rows = footer_rows.saturating_add(blob_rows);
+                if footer_rows > row_cap {
+                    return Err(QueryError::DeclarationMismatch(Declaration::RowCap));
+                }
+            }
             schema.get_or_insert_with(|| reader.schema().clone());
             let batches: Vec<RecordBatch> = reader
                 .build()
@@ -179,6 +239,11 @@ impl QueryScope {
                 .map_err(|_| QueryError::Parquet(ParquetStage::Batch))?;
             rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
             partitions.push(batches);
+        }
+        if let Some((_, row_cap)) = declared
+            && u64::try_from(rows).unwrap_or(u64::MAX) > row_cap
+        {
+            return Err(QueryError::DeclarationMismatch(Declaration::RowCap));
         }
 
         let schema = schema.expect("non-empty blobs yield a schema");
@@ -261,6 +326,44 @@ impl Drop for QueryScope {
             let _ = self.ctx.deregister_table(table.as_str());
         }
     }
+}
+
+/// Whether a decoded Arrow schema is the one a steward declared: the same
+/// column names in the same order, each of the declared type family. A
+/// column of a type no family covers never matches.
+fn matches_declared(actual: &Schema, declared: &DeclaredSchema) -> bool {
+    let columns = declared.columns();
+    actual.fields().len() == columns.len()
+        && actual.fields().iter().zip(columns).all(|(field, column)| {
+            field.name() == &column.name
+                && column_type_of(field.data_type()) == Some(column.column_type)
+        })
+}
+
+/// The declared type family an Arrow type belongs to, if any.
+pub fn column_type_of(data_type: &DataType) -> Option<ColumnType> {
+    Some(match data_type {
+        DataType::Boolean => ColumnType::Boolean,
+        DataType::Int8 => ColumnType::Int8,
+        DataType::Int16 => ColumnType::Int16,
+        DataType::Int32 => ColumnType::Int32,
+        DataType::Int64 => ColumnType::Int64,
+        DataType::UInt8 => ColumnType::Uint8,
+        DataType::UInt16 => ColumnType::Uint16,
+        DataType::UInt32 => ColumnType::Uint32,
+        DataType::UInt64 => ColumnType::Uint64,
+        DataType::Float32 => ColumnType::Float32,
+        DataType::Float64 => ColumnType::Float64,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => ColumnType::String,
+        DataType::Date32 | DataType::Date64 => ColumnType::Date,
+        DataType::Timestamp(_, _) => ColumnType::Timestamp,
+        DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => ColumnType::Decimal,
+        DataType::Dictionary(_, values) => return column_type_of(values),
+        _ => return None,
+    })
 }
 
 /// Decoder input owned by a zeroize-on-drop buffer, so the engine's copy of

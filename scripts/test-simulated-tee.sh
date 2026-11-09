@@ -9,8 +9,10 @@
 # Not covered yet:
 # - An approval retry after a revoke. On main it still restores access
 #   (#166, fixed by #168); add the check once that merges.
-# - Steward upload into a dataset: the API has none yet (P38). The steward's
-#   data arrives through the sync pipeline, seeded at startup.
+# - Steward upload (`PUT /api/v1/datasets/{dataset}`, ADR 0011): its body is
+#   sealed with the browser's envelope module, which this script does not
+#   run. The steward's data arrives through the sync pipeline, seeded at
+#   startup.
 # - Ciphertext at rest: the vault is in memory inside the container, so this
 #   script cannot read it from outside.
 set -euo pipefail

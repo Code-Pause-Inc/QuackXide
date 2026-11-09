@@ -168,3 +168,140 @@ async fn empty_result_serializes_to_empty_array() {
         .expect("query");
     assert_eq!(rows, serde_json::json!([]));
 }
+
+// ── Declared shapes (steward uploads, ADR 0011) ──
+
+fn invoice_columns(types: &[(&str, platform_core::ColumnType)]) -> platform_core::DeclaredSchema {
+    platform_core::DeclaredSchema::new(
+        types
+            .iter()
+            .map(|(name, column_type)| platform_core::DeclaredColumn {
+                name: (*name).to_owned(),
+                column_type: *column_type,
+            })
+            .collect(),
+    )
+    .expect("schema")
+}
+
+fn declared_invoices() -> platform_core::DeclaredSchema {
+    use platform_core::ColumnType::{Float64, String};
+    invoice_columns(&[
+        ("id", String),
+        ("currency", String),
+        ("total", Float64),
+        ("customer_bidx", String),
+    ])
+}
+
+fn register_declared(
+    schema: &platform_core::DeclaredSchema,
+    row_cap: u64,
+) -> Result<usize, QueryError> {
+    let mut scope = QueryScope::new(EngineSettings {
+        zk: ZkMode::Disabled,
+        max_concurrent_queries: 1,
+    });
+    let parquet = invoices_parquet();
+    scope.register_parquet_declared("invoices", &[&parquet], schema, row_cap)
+}
+
+#[tokio::test]
+async fn data_matching_its_declaration_registers() {
+    assert_eq!(register_declared(&declared_invoices(), 3).expect("rows"), 3);
+    assert_eq!(
+        register_declared(&declared_invoices(), 100).expect("rows"),
+        3
+    );
+}
+
+#[test]
+fn data_not_matching_its_declared_schema_is_refused() {
+    use platform_core::ColumnType::{Float64, Int64, String};
+    for schema in [
+        // A renamed column.
+        invoice_columns(&[
+            ("id", String),
+            ("ccy", String),
+            ("total", Float64),
+            ("customer_bidx", String),
+        ]),
+        // Another type family.
+        invoice_columns(&[
+            ("id", Int64),
+            ("currency", String),
+            ("total", Float64),
+            ("customer_bidx", String),
+        ]),
+        // A column missing, one extra, and the right columns out of order.
+        invoice_columns(&[("id", String), ("currency", String), ("total", Float64)]),
+        invoice_columns(&[
+            ("id", String),
+            ("currency", String),
+            ("total", Float64),
+            ("customer_bidx", String),
+            ("extra", Int64),
+        ]),
+        invoice_columns(&[
+            ("currency", String),
+            ("id", String),
+            ("total", Float64),
+            ("customer_bidx", String),
+        ]),
+    ] {
+        let err = register_declared(&schema, 3).expect_err("mismatch");
+        assert!(
+            matches!(
+                err,
+                QueryError::DeclarationMismatch(quackxide_engine::Declaration::Schema)
+            ),
+            "{err:?}"
+        );
+        // The error names the check, never a column.
+        let shown = err.to_string();
+        assert_eq!(shown, "dataset does not match its declared schema");
+    }
+}
+
+#[test]
+fn data_over_its_declared_row_cap_is_refused() {
+    let err = register_declared(&declared_invoices(), 2).expect_err("over the cap");
+    assert!(
+        matches!(
+            err,
+            QueryError::DeclarationMismatch(quackxide_engine::Declaration::RowCap)
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "dataset does not match its declared row cap"
+    );
+}
+
+#[test]
+fn string_encodings_share_the_declared_string_family() {
+    use arrow::datatypes::{DataType, TimeUnit};
+    use platform_core::ColumnType;
+    use quackxide_engine::column_type_of;
+    for data_type in [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+    ] {
+        assert_eq!(column_type_of(&data_type), Some(ColumnType::String));
+    }
+    assert_eq!(
+        column_type_of(&DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into())
+        )),
+        Some(ColumnType::Timestamp)
+    );
+    assert_eq!(
+        column_type_of(&DataType::Decimal128(10, 2)),
+        Some(ColumnType::Decimal)
+    );
+    assert_eq!(column_type_of(&DataType::Binary), None);
+}

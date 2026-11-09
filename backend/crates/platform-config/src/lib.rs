@@ -30,6 +30,14 @@ const DEFAULT_STORAGE_RETRY_TIMEOUT_SECS: u64 = 20;
 /// Longest wait between two retries; never longer than the retry window.
 pub const STORAGE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Default `DATASET_MAX_MIB`. A placeholder until the browser seal and the
+/// upload path are benchmarked (ADR 0011).
+pub const DEFAULT_DATASET_MAX_MIB: u64 = 64;
+/// Largest `DATASET_MAX_MIB` accepted. The API holds a whole upload in
+/// memory, and a query holds the decrypted dataset beside its ciphertext.
+pub const MAX_DATASET_MAX_MIB: u64 = 512;
+const MIB: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct PlatformConfig {
     pub brand: BrandConfig,
@@ -38,6 +46,7 @@ pub struct PlatformConfig {
     pub auth: AuthConfig,
     pub connectors: ConnectorConfig,
     pub research: ResearchConfig,
+    pub datasets: DatasetConfig,
     pub billing: BillingConfig,
     pub enclave: EnclaveConfig,
     pub features: FeatureFlags,
@@ -85,6 +94,15 @@ pub struct ResearchConfig {
     /// `RESEARCH_PRICING_CURRENCY` — ISO 4217 display currency for catalog
     /// prices (stored in integer cents).
     pub pricing_currency: String,
+}
+
+/// Steward dataset uploads (ADR 0011).
+#[derive(Debug, Clone)]
+pub struct DatasetConfig {
+    /// `DATASET_MAX_MIB` (1..=512, default 64), in bytes here: the largest
+    /// dataset a steward may upload, counted in sealed (ciphertext) bytes.
+    /// The upload route refuses anything larger with 413.
+    pub max_bytes: u64,
 }
 
 /// Customer-facing identity, sourced from env so branding needs no code change.
@@ -293,6 +311,15 @@ impl PlatformConfig {
             pricing_currency: get_or(&get, "RESEARCH_PRICING_CURRENCY", "USD"),
         };
 
+        let datasets = DatasetConfig {
+            max_bytes: parse_bounded(
+                &get,
+                "DATASET_MAX_MIB",
+                DEFAULT_DATASET_MAX_MIB,
+                1..=MAX_DATASET_MAX_MIB,
+            )? * MIB,
+        };
+
         let billing = BillingConfig {
             paddle_webhook_secret: get_secret(&get, "MOR_WEBHOOK_SECRET"),
             signature_tolerance_secs: parse_u64(
@@ -335,6 +362,7 @@ impl PlatformConfig {
             auth,
             connectors,
             research,
+            datasets,
             billing,
             enclave,
             features,
@@ -500,6 +528,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn dataset_size_limit_is_bounded_and_fails_closed() {
+        let cfg = PlatformConfig::from_source(source(&[])).expect("defaults");
+        assert_eq!(cfg.datasets.max_bytes, 64 * 1024 * 1024);
+        for (raw, mib) in [("1", 1), ("200", 200), ("512", 512)] {
+            let cfg =
+                PlatformConfig::from_source(source(&[("DATASET_MAX_MIB", raw)])).expect("in range");
+            assert_eq!(cfg.datasets.max_bytes, mib * 1024 * 1024, "{raw}");
+        }
+        for invalid in ["0", "513", "-1", "64MiB", "1e3"] {
+            assert!(
+                matches!(
+                    PlatformConfig::from_source(source(&[("DATASET_MAX_MIB", invalid)])),
+                    Err(ConfigError::Invalid {
+                        key: "DATASET_MAX_MIB",
+                        ..
+                    })
+                ),
+                "DATASET_MAX_MIB={invalid} must be refused"
+            );
+        }
     }
 
     #[test]

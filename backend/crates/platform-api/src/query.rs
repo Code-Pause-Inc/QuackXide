@@ -2,10 +2,12 @@
 //! endpoints.
 //!
 //! Inside the attested enclave, a query passes the attestation gate, decrypts
-//! each of the connector's sealed objects with the tenant key released into
-//! the enclave (`EnclaveKeyProvider`), runs the SQL in a [`QueryScope`], and
-//! zeroizes the decrypted blobs. Tenant identity comes only from the verified
-//! JWT; requests name a connector, never a tenant.
+//! each sealed object of the dataset's current snapshot with the tenant key
+//! released into the enclave (`EnclaveKeyProvider`), runs the SQL in a
+//! [`QueryScope`], and zeroizes the decrypted blobs. A dataset is a
+//! connector's or a steward upload's (ADR 0011); requests name it by its
+//! slug in their `connector` field. Tenant identity comes only from the
+//! verified JWT; requests name a dataset, never a tenant.
 //!
 //! Trust boundary: production releases tenant keys only into a
 //! hardware-attested enclave whose RAM the operator cannot read. The dev
@@ -16,12 +18,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use platform_connectors::pipeline::envelope_info;
-use platform_connectors::snapshot::{SnapshotManifest, manifest_info};
-use platform_core::{ConnectorSlug, TenantId};
+use bytes::Bytes;
+use platform_connectors::snapshot::{
+    SnapshotManifest, manifest_info, newest_manifest, object_info,
+};
+use platform_core::{ConnectorSlug, DatasetKind, DeclaredSchema, TenantId};
 use platform_crypto::{SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
-use platform_storage::{TenantPaths, VaultStore};
+use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
     BudgetError, BudgetLedger, BudgetState, CatalogRegistry, DatasetGrant, GrantRegistry,
@@ -361,33 +365,88 @@ impl ConnectorQueryService {
         self.plaintext_wait.clone()
     }
 
-    /// Decrypt `owner`'s current connector snapshot to plaintext Parquet:
-    /// the objects listed by the newest manifest, and nothing else, so
-    /// repeated or interrupted syncs never add rows. The blobs zeroize on
-    /// drop, so an error partway through wipes the objects already opened.
-    async fn decrypt_connector(
+    /// Whether `owner` holds `dataset`: it has a committed snapshot
+    /// (`platform_connectors::snapshot::holds`, the one definition).
+    pub(crate) async fn holds(
         &self,
         owner: TenantId,
-        connector: &ConnectorSlug,
-    ) -> Result<DecryptedObjects, ApiError> {
-        let manifests = self
+        dataset: &ConnectorSlug,
+    ) -> Result<bool, ApiError> {
+        Ok(platform_connectors::snapshot::holds(&*self.vault, owner, dataset).await?)
+    }
+
+    /// A stored part of the current snapshot. Its manifest or record listed
+    /// it, so a missing one is a broken or pruned snapshot (502), never a
+    /// 404 about the caller's request.
+    async fn snapshot_part(&self, owner: TenantId, path: &VaultPath) -> Result<Bytes, ApiError> {
+        match self.vault.get(path).await {
+            Ok(bytes) => Ok(bytes),
+            Err(StorageError::NotFound) => {
+                security_audit_event(
+                    AuditKind::DataAccess,
+                    Some(owner),
+                    "failed",
+                    "snapshot object listed by its manifest is missing",
+                );
+                Err(ApiError::Backend)
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Decrypt `owner`'s current snapshot of `dataset` to plaintext Parquet:
+    /// the objects listed by the newest manifest, and nothing else, so
+    /// repeated or interrupted writes never add rows. Objects open under the
+    /// `info` of the dataset's kind (ADR 0011). The snapshot's plaintext
+    /// record is read before any key is released, and an upload's declared
+    /// schema and row cap come back for the engine to check. The blobs
+    /// zeroize on drop, so an error partway through wipes the objects
+    /// already opened.
+    async fn decrypt_dataset(
+        &self,
+        owner: TenantId,
+        dataset: &ConnectorSlug,
+    ) -> Result<DecryptedDataset, ApiError> {
+        let Some((version, path)) = newest_manifest(&*self.vault, owner, dataset).await? else {
+            return Ok(DecryptedDataset::default());
+        };
+
+        let record = match self
             .vault
-            .list(&TenantPaths::connector_manifests_prefix(owner, connector))
-            .await?;
-        let Some((version, path)) = manifests
-            .iter()
-            .filter_map(|path| {
-                TenantPaths::connector_manifest_version(owner, connector, path)
-                    .map(|version| (version, path))
-            })
-            .max_by(|a, b| a.0.cmp(&b.0))
-        else {
-            return Ok(Vec::new());
+            .get(&TenantPaths::connector_record(owner, dataset, &version))
+            .await
+        {
+            Ok(bytes) => SnapshotRecord::parse(&bytes, &version).ok(),
+            Err(StorageError::NotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+        // Every committed snapshot has a record; an upload's must carry
+        // what its steward declared.
+        let declared = match (dataset.kind(), record) {
+            (DatasetKind::Connector, Some(_)) => Some(None),
+            (
+                DatasetKind::Upload,
+                Some(SnapshotRecord {
+                    schema: Some(schema),
+                    row_cap: Some(row_cap),
+                    ..
+                }),
+            ) => Some(Some((schema, row_cap))),
+            _ => None,
+        };
+        let Some(declared) = declared else {
+            security_audit_event(
+                AuditKind::DataAccess,
+                Some(owner),
+                "failed",
+                "snapshot record is missing, malformed or incomplete",
+            );
+            return Err(ApiError::Backend);
         };
 
         let key_session = self.keys.begin_query_session(owner).await?;
-        let envelope = self.vault.get(path).await?;
-        let info = manifest_info(&owner, connector, &version);
+        let envelope = self.snapshot_part(owner, &path).await?;
+        let info = manifest_info(&owner, dataset, &version);
         let plaintext = key_session.open_envelope(&info, &envelope).await?;
         let manifest = serde_json::from_slice::<SnapshotManifest>(plaintext.expose())
             .ok()
@@ -398,20 +457,20 @@ impl ConnectorQueryService {
                 AuditKind::DataAccess,
                 Some(owner),
                 "failed",
-                "connector snapshot manifest is malformed, mismatched or lists an object twice",
+                "snapshot manifest is malformed, mismatched or lists an object twice",
             );
             return Err(ApiError::Backend);
         };
 
         let mut blobs = Vec::with_capacity(manifest.objects.len());
         for object in &manifest.objects {
-            let path = TenantPaths::connector_snapshot_object(owner, connector, &version, *object);
-            let envelope = self.vault.get(&path).await?;
-            let info = envelope_info(&owner, connector, object);
+            let path = TenantPaths::connector_snapshot_object(owner, dataset, &version, *object);
+            let envelope = self.snapshot_part(owner, &path).await?;
+            let info = object_info(&owner, dataset, object);
             let plaintext = key_session.open_envelope(&info, &envelope).await?;
             blobs.push(plaintext);
         }
-        Ok(blobs)
+        Ok(DecryptedDataset { blobs, declared })
     }
 
     pub async fn query(
@@ -422,11 +481,11 @@ impl ConnectorQueryService {
     ) -> Result<Value, ApiError> {
         let tee_platform = platform_label(self.gate(tenant, "query").await?);
         let _slot = self.plaintext_slot().await?;
-        let blobs = self.decrypt_connector(tenant, connector).await?;
-        let object_count = blobs.len();
+        let dataset = self.decrypt_dataset(tenant, connector).await?;
+        let object_count = dataset.blobs.len();
         let zk_mode = self.settings.zk.is_enabled();
 
-        if blobs.is_empty() {
+        if dataset.blobs.is_empty() {
             security_audit_event(
                 AuditKind::QueryExecuted,
                 Some(tenant),
@@ -440,7 +499,7 @@ impl ConnectorQueryService {
         }
 
         let disclosure = zk_mode.then(|| self.threshold());
-        let result = run_scoped(self.settings.clone(), disclosure, connector, blobs, sql).await;
+        let result = run_scoped(self.settings.clone(), disclosure, connector, dataset, sql).await;
         let (rows, suppressed) = match result {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -678,12 +737,14 @@ impl ConnectorQueryService {
             }
         };
 
-        // The steward's key is released into the enclave to decrypt their data.
+        // The steward's key is released into the enclave to decrypt their
+        // data. A dataset that does not match its declaration is refused
+        // after this charge (ADR 0011; P54 decides whether that stays).
         let _slot = self.plaintext_slot().await?;
-        let blobs = self.decrypt_connector(steward, connector).await?;
-        let object_count = blobs.len();
+        let dataset = self.decrypt_dataset(steward, connector).await?;
+        let object_count = dataset.blobs.len();
 
-        if blobs.is_empty() {
+        if dataset.blobs.is_empty() {
             security_audit_event(
                 AuditKind::QueryExecuted,
                 Some(researcher),
@@ -708,7 +769,7 @@ impl ConnectorQueryService {
             research_settings,
             Some(self.threshold()),
             connector,
-            blobs,
+            dataset,
             sql,
         )
         .await;
@@ -777,28 +838,41 @@ fn budget_json(budget: &BudgetState) -> Result<Value, ApiError> {
     Ok(value)
 }
 
-/// Decrypted connector objects. Each element zeroizes on drop, so no exit
+/// Decrypted dataset objects. Each element zeroizes on drop, so no exit
 /// path (error, early return, or cancellation) leaves plaintext behind.
 type DecryptedObjects = Vec<SecretBytes>;
 
-/// Run `sql` over decrypted `blobs` in a fresh scope. Consumes the blobs, so
-/// they are zeroized when this returns on any path.
+/// A dataset's decrypted current snapshot and, for an upload, the schema
+/// and row cap its steward declared for it.
+#[derive(Default)]
+struct DecryptedDataset {
+    blobs: DecryptedObjects,
+    declared: Option<(DeclaredSchema, u64)>,
+}
+
+/// Run `sql` over a decrypted dataset in a fresh scope, registered as the
+/// table `dataset` and checked against its declaration, if any. Consumes
+/// the blobs, so they are zeroized when this returns on any path.
 /// Returns the rows and the number suppressed by disclosure control.
 async fn run_scoped(
     settings: EngineSettings,
     disclosure: Option<Arc<dyn DisclosurePolicy>>,
-    connector: &ConnectorSlug,
-    blobs: DecryptedObjects,
+    dataset: &ConnectorSlug,
+    decrypted: DecryptedDataset,
     sql: &str,
 ) -> Result<(Value, usize), ApiError> {
     let mut scope = QueryScope::new(settings);
     if let Some(policy) = disclosure {
         scope.set_disclosure(policy);
     }
-    let blob_refs: Vec<&[u8]> = blobs.iter().map(SecretBytes::expose).collect();
-    scope
-        .register_parquet_many(connector.as_str(), &blob_refs)
-        .map_err(map_query_error)?;
+    let blob_refs: Vec<&[u8]> = decrypted.blobs.iter().map(SecretBytes::expose).collect();
+    match &decrypted.declared {
+        Some((schema, row_cap)) => {
+            scope.register_parquet_declared(dataset.as_str(), &blob_refs, schema, *row_cap)
+        }
+        None => scope.register_parquet_many(dataset.as_str(), &blob_refs),
+    }
+    .map_err(map_query_error)?;
     let rows = scope.sql_json(sql).await.map_err(map_query_error)?;
     Ok((rows, scope.last_suppressed_rows()))
 }
@@ -817,11 +891,14 @@ fn map_query_error(err: QueryError) -> ApiError {
         // A planning/execution failure is almost always the caller's SQL.
         QueryError::Execution(_) => ApiError::BadRequest("query could not be executed"),
         QueryError::Parquet(_) | QueryError::Serialize(_) => ApiError::Backend,
+        // The stored data, not the caller's query, is at fault.
+        QueryError::DeclarationMismatch(_) => ApiError::DatasetMismatch,
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
+    /// The dataset's slug: a connector's, or an upload's (`upload_…`).
     pub connector: String,
     pub sql: String,
 }
@@ -830,6 +907,7 @@ pub struct QueryRequest {
 pub struct GrantRequest {
     /// Tenant id (UUID) to grant research access to.
     pub researcher_tenant: String,
+    /// The dataset's slug: a connector's, or an upload's (`upload_…`).
     pub connector: String,
     /// Query-budget allocation for this grant. Omitted ⇒ the platform
     /// default (`RESEARCH_DEFAULT_QUERY_BUDGET`).
@@ -847,6 +925,7 @@ pub struct TopUpRequest {
 pub struct ResearchQueryRequest {
     /// Steward tenant id (UUID) whose data is being queried.
     pub steward_tenant: String,
+    /// The dataset's slug: a connector's, or an upload's (`upload_…`).
     pub connector: String,
     pub sql: String,
 }

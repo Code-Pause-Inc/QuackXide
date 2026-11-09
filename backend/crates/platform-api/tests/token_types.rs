@@ -23,6 +23,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/grants"),
     ("POST", "/api/v1/research/query"),
     ("GET", "/api/v1/catalog"),
+    ("PUT", "/api/v1/datasets/upload_cohorts"),
     ("GET", "/admin/tenants"),
 ];
 

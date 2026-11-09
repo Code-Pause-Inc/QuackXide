@@ -3,8 +3,8 @@
 //! The **steward** owns (and seals) a dataset; a **researcher** is another
 //! tenant allowed to run aggregate queries over it, never to read rows. A
 //! [`DatasetGrant`] is the steward's revocable authorization of one
-//! researcher for one dataset (steward × connector). Research queries
-//! without an active grant are refused.
+//! researcher for one dataset (steward × dataset slug, a connector's or an
+//! upload's). Research queries without an active grant are refused.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -22,7 +22,8 @@ pub struct DatasetGrant {
     pub steward_tenant: TenantId,
     /// The tenant allowed to run disclosure-controlled aggregate queries.
     pub researcher_tenant: TenantId,
-    /// Dataset selector: the connector slug under the steward's prefix.
+    /// Dataset selector: the dataset's slug under the steward's prefix, a
+    /// connector's or an upload's (`upload_…`, ADR 0011).
     pub connector: String,
     pub revoked: bool,
     pub created_at_iso: String,

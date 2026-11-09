@@ -1934,6 +1934,8 @@ dependencies = [
  "object_store",
  "platform-config",
  "platform-core",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
