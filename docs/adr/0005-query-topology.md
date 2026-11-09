@@ -31,7 +31,9 @@ That digest does not show which settings the image was given.
 **One process.** `platform-api`, with the query engine in-process, runs
 as a Confidential Space workload on an Intel TDX Confidential VM
 (ADR 0004). The attested boundary is the VM; which binary runs in it is
-proven by the image digest in Google's attestation token.
+proven by the image digest in Google's attestation token. ADR 0006's
+identity service runs in its own Confidential VM under the same
+attestation policy; this record covers only `platform-api`.
 
 **A planned edge/worker split, not built in v1.** A split into an HTTP edge
 and a query worker isolates anything only if the worker itself verifies the
@@ -63,13 +65,14 @@ Confidential VM under the same attestation policy and passes the
 attestation gate before it seals anything. It holds no tenant private key
 and never reads object contents: its service account may only list,
 create and delete objects under `tenants/{t}/connectors/`, which is what
-ADR 0003's snapshots, manifests and pruning need. It seals to tenant
-public keys from a source the operator cannot substitute (the
-deployment configuration, or an enrollment record authenticated as ADR
-0004 decides), never from the environment, because a substituted key
-would let the operator open the data. Source credentials are secrets and
-reach it only by attested release, like every other secret. This record
-keeps only the chosen branch when it is accepted.
+ADR 0003's snapshots, manifests and pruning need. It seals to the KMS
+public key only, taken from the attested deployment configuration
+(ADR 0004), never to a tenant key or from the environment: a steward copy
+would need the steward's key from the operator-controlled enrollment
+record, and a substituted key would let the operator open the data. Source
+credentials are secrets and reach it only by attested release, like every
+other secret. This record keeps only the chosen branch when it is
+accepted.
 
 **The operator's settings are untrusted.** Everything the operator can set
 is untrusted input. Configuration may tighten a security control, never
@@ -95,6 +98,23 @@ address, the domain, the cloud project, the storage bucket, the registry
 store's address, the log filter, and the brand strings) and values bounded
 in code, which it can only tighten. A wrong value can cause an outage but
 cannot weaken a control.
+
+**The image fixes what the operator may override.** Its Confidential Space
+launch policy labels, covered by the image digest, are:
+
+* `tee.launch_policy.allow_env_override` lists exactly the names this
+  record lets the environment carry (the deployment configuration and the
+  values above that point at things the operator controls);
+* `tee.launch_policy.allow_cmd_override` is `false`, so the operator cannot
+  replace the command; and
+* `tee.launch_policy.log_redirect` and
+  `tee.launch_policy.monitoring_memory_allow` stay `debugonly`, so the
+  production image refuses log redirection and memory monitoring.
+  Capability, cgroup and mount overrides stay off.
+
+Without this policy, "a verifier sees exactly what the VM was given" would
+not hold: the operator could set names outside the list, or run another
+command in the same image.
 
 Secrets reach the VM only by release to the attested workload, through the
 same attested path that releases data keys. A secret store that the VM's
@@ -143,9 +163,13 @@ and `.env` is never loaded in production.
   to ADR 0004's condition and removes nothing from it. How the condition
   expresses the configuration (each value, or one canonical value) is
   settled in P50.
-* The browser checks the same configuration through the digest the
-  workload binds into its token (ADR 0004, "Freshness and binding"),
-  against the digest published for the deployment.
+* The browser checks the same configuration by policy. It reads the named
+  configuration keys from the token's `submods.container.env`, the same
+  names the KMS release condition pins (P50), and refuses a value outside
+  what the frontend accepts (for example, the attestation requirement or
+  the ZK gate turned off, or a minimum cohort size below its floor). There is
+  no per-deployment digest to compare against: one frontend image serves
+  every deployment, so there is no trusted place to publish one.
 * Configuration keys that today loosen a control from the environment
   (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
   `RESEARCH_DEFAULT_QUERY_BUDGET`, `JWT_ISSUER`, `JWT_AUDIENCE`) move into
