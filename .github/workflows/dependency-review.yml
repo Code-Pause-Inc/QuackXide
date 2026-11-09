@@ -2,6 +2,7 @@ name: dependency-review
 
 on:
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -9,6 +10,10 @@ permissions:
 
 jobs:
   review:
+    # The action only supports pull requests. On a merge-group run this job
+    # is skipped, which counts as passing; `dependency audit` in ci.yml still
+    # checks the merged lockfiles.
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
