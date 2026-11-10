@@ -181,9 +181,12 @@ async fn research_routes_refuse_without_a_research_layer() {
     let other = TenantId::generate();
     let grant_body = format!(r#"{{"researcher_tenant":"{other}","connector":"health"}}"#);
 
-    let cases: [(&str, String, Option<&str>); 6] = [
+    // Every route that needs the research service: the catalog, access
+    // requests, and grants with their budgets.
+    let cases: [(&str, String, Option<&str>); 12] = [
         ("GET", "/api/v1/catalog".to_owned(), None),
         ("POST", "/api/v1/catalog".to_owned(), Some(PUBLISH_BODY)),
+        ("DELETE", format!("/api/v1/catalog/{some_id}"), None),
         (
             "POST",
             format!("/api/v1/catalog/{some_id}/request"),
@@ -197,8 +200,21 @@ async fn research_routes_refuse_without_a_research_layer() {
         ),
         (
             "POST",
+            format!("/api/v1/research/requests/{some_id}/deny"),
+            None,
+        ),
+        ("GET", "/api/v1/grants".to_owned(), None),
+        (
+            "POST",
             "/api/v1/grants".to_owned(),
             Some(grant_body.as_str()),
+        ),
+        ("DELETE", format!("/api/v1/grants/{some_id}"), None),
+        ("GET", format!("/api/v1/grants/{some_id}/budget"), None),
+        (
+            "POST",
+            format!("/api/v1/grants/{some_id}/budget"),
+            Some(r#"{"additional":1}"#),
         ),
     ];
     for (method, uri, body) in cases {
