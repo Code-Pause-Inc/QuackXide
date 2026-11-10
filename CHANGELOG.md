@@ -8,6 +8,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
+  `development` selects development, and unset, blank or unknown values
+  are production. `APP_ENV` is read from the process environment before
+  `.env`, which is loaded only in development. At startup,
+  `PlatformConfig::check_production` refuses `JWT_HS256_SECRET`, an unset
+  `STORAGE_BUCKET`, `TEE_ATTESTATION_REQUIRED=false`,
+  `SIM_ATTESTATION_URL` and `KEY_RELEASE_URL`, and, in
+  `connector-worker`, the demo tenant and fixture sources. It lists every
+  reason by key name only and emits a `service.start` "denied" audit
+  event. Production mode cannot boot until the production key provider,
+  verification keys and durable stores land.
+* `npm run build:release` (`vite build --mode release`), run by
+  `release.yml`, fails unless `VITE_VAULT_MODE=http` and fails if
+  `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is set.
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
@@ -213,6 +227,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* Local runs of `platform-api` and `connector-worker` need
+  `APP_ENV=development`, and `devtoken` needs `--features dev`.
+  `scripts/check.sh` also lints the release binaries without the `dev`
+  feature.
 * Research access runs in the `platform-api` binary without key release.
   The catalog, access-request, grant and budget routes use a
   `ResearchService` (`AppState::research`) instead of the confidential
