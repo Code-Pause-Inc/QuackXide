@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
 use platform_api::dev::DevResearchStack;
-use platform_api::research::ResearchStores;
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 
@@ -598,11 +598,10 @@ async fn research_app_with_stores(
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
     };
-    // `with_research` replaces the in-memory stores `query_service` installed.
-    let service = stack
-        .query_service(settings, 5, 100)
-        .with_research(stores, 5, 100);
+    let research = Arc::new(ResearchService::new(stores, 5, 100));
+    let service = stack.query_service(settings, research.clone());
     build_app(AppState {
+        research: Some(research),
         query: Some(Arc::new(service)),
         ..common::app_state(SECRET, vault)
     })

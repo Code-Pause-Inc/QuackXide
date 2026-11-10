@@ -212,8 +212,9 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
   key into a zeroize-on-drop `TenantKeypair` for the duration of that
   query. The relying party checks the token with the production verifier
-  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query endpoint
-  fails closed with 503. That relying party is the development and
+  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query,
+  research-query and attestation endpoints fail closed with 503; research
+  access (below) does not need key release. That relying party is the development and
   simulation stand-in (ADR 0004): it and its clients compile only with the
   `dev` feature, and a build without it refuses to start when
   `KEY_RELEASE_URL` is set. In production each dataset has its own
@@ -279,6 +280,16 @@ by the granting steward only. Revoked, unknown, and foreign grants return the
 same response, so nothing leaks existence. Budget standing is visible to the
 grant's parties only; top-up is steward-only. Metering rides the
 `engine.query` event and doubles as the billing meter.
+
+Catalog, access requests, grants and budgets need no key material. They
+live in `research::ResearchService` (`AppState::research`), which
+`platform_api::wiring::build_state` always builds from
+`RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`, so their
+routes answer without key release; with no research service they refuse
+with 503. The query service holds the same `Arc`, so a research query
+checks and charges the grant those routes created. The stores are in
+memory: grants, budgets, listings and requests are lost on restart (P62
+makes them durable).
 
 
 
@@ -486,7 +497,9 @@ kinds only: no tenant ids, paths, messages, SQL text or engine name.
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public
   constructor; ids are UUID-validated at parse time.
 * Fail closed is the default everywhere: unset auth secret → 503; unwired
-  key release → 503; `KEY_RELEASE_URL` without the `dev` feature → refusal
+  key release → 503 on the query, research-query and attestation routes;
+  no research service → 503 on the catalog, access-request, grant and
+  budget routes; `KEY_RELEASE_URL` without the `dev` feature → refusal
   to start; unverifiable attestation → refusal; fabricated dev evidence
   requires an explicit, logged `allow_insecure_dev()`.
 * Workspace-wide `unsafe_code = "deny"`.
