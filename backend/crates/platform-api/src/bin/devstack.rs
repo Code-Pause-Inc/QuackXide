@@ -56,7 +56,7 @@ const TOKEN_TTL_SECS: i64 = 8 * 3600;
 async fn main() -> anyhow::Result<()> {
     // Before `from_env` loads `.env`, so a stray `.env` cannot opt in.
     let opted_in = dev::require_opt_in(|key| std::env::var(key).ok());
-    let config = PlatformConfig::from_env()?;
+    let config = PlatformConfig::from_env_dev_tool()?;
     platform_telemetry::init_from_env();
 
     let secret = match opted_in.and_then(|()| dev::require_dev_config(&config)) {

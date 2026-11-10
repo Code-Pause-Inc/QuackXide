@@ -35,11 +35,14 @@ fn token_for(tenant: TenantId) -> String {
     common::token_for(SECRET, tenant)
 }
 
-/// What the binary sees with only a token secret set: every other key at
-/// its default, so an in-memory vault, no `KEY_RELEASE_URL` and attestation
-/// required. Without the secret every authenticated route answers 503.
+/// What the binary sees in development mode with only a token secret set:
+/// every other key at its default, so an in-memory vault, no
+/// `KEY_RELEASE_URL` and attestation required. Without the secret every
+/// authenticated route answers 503. The HS256 secret and the in-memory vault
+/// are development paths, which production mode refuses (ADR 0009).
 fn binary_config() -> PlatformConfig {
     PlatformConfig::from_source(|key| match key {
+        "APP_ENV" => Some("development".to_owned()),
         "JWT_HS256_SECRET" => Some(SECRET.to_owned()),
         _ => None,
     })

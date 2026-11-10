@@ -26,6 +26,11 @@ required-features = ["dev"]
 name = "query-demo"
 required-features = ["dev"]
 
+# Dev-only: mints HS256 tokens, which production mode refuses (ADR 0009).
+[[bin]]
+name = "devtoken"
+required-features = ["dev"]
+
 [[bin]]
 name = "sim-attestation"
 required-features = ["dev"]

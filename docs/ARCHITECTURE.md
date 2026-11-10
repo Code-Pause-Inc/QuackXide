@@ -492,6 +492,42 @@ listener (`METRICS_BIND_ADDR`, default `127.0.0.1:9464`), never on the
 API's port. Labels are route patterns, methods, status codes and error
 kinds only: no tenant ids, paths, messages, SQL text or engine name.
 
+## Production mode
+
+Production mode is the deployment mode of `platform-api` and
+`connector-worker`, chosen by `APP_ENV` (ADR 0009). It is the default:
+unset, blank, or any value other than `development` is production. `APP_ENV`
+is read from the process environment before anything else, and `.env` is
+loaded only in development, so a stray `.env` can neither select
+development nor change a production setting.
+
+At startup each service calls `PlatformConfig::check_production` before it
+builds anything. In production it refuses to start, with every reason
+listed and a `service.start` "denied" audit event naming keys only, when:
+
+* `JWT_HS256_SECRET` is set (shared-secret tokens are development-only);
+* `STORAGE_BUCKET` is unset (the in-memory vault);
+* `TEE_ATTESTATION_REQUIRED=false` (development or simulated attestation);
+* `SIM_ATTESTATION_URL` is set (the simulated attestation provider);
+* `KEY_RELEASE_URL` is set (the key-release stand-in, which trusts only the
+  simulated root);
+* for `connector-worker`, the demo tenant is configured or the jobs are the
+  embedded fixtures (today, always).
+
+Later plan items add their refusals to the same function. Until the
+production key provider, verification keys, durable registries and
+identity stores land, production mode cannot boot, and local runs, CI and
+the simulated TEE set `APP_ENV=development`.
+
+The `dev` Cargo feature is separate: it decides which development code is
+compiled at all (`devstack`, `devtoken`, `key-release`, `query-demo`,
+`sim-attestation`, the simulated token provider). Release builds omit it;
+production mode refuses development configuration in any build.
+
+The frontend's release build (`npm run build:release`, `vite build --mode
+release`, run by `release.yml`) fails unless `VITE_VAULT_MODE` is `http` and
+`VITE_DEV_JWT` and `VITE_ADMIN_JWT` are empty.
+
 ## Structural enforcement
 
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public
@@ -500,7 +536,8 @@ kinds only: no tenant ids, paths, messages, SQL text or engine name.
   key release → 503 on the query, research-query and attestation routes;
   no research service → 503 on the catalog, access-request, grant and
   budget routes; `KEY_RELEASE_URL` without the `dev` feature → refusal
-  to start; unverifiable attestation → refusal; fabricated dev evidence
+  to start; any development-only path in production mode → refusal to
+  start; unverifiable attestation → refusal; fabricated dev evidence
   requires an explicit, logged `allow_insecure_dev()`.
 * Workspace-wide `unsafe_code = "deny"`.
 * `scripts/check.sh` fails the build if the engine name appears in the
