@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -48,6 +48,8 @@ vi.mock("../../lib/research/client", async (importOriginal) => ({
 const ME = "aaaaaaaa-1111-4222-8333-444455556666";
 const STEWARD = "bbbbbbbb-1111-4222-8333-444455556666";
 const RESEARCHER = "cccccccc-1111-4222-8333-444455556666";
+const STUCK = "dddddddd-1111-4222-8333-444455556666";
+const REVOKED = "eeeeeeee-1111-4222-8333-444455556666";
 const TOKEN = `e30.${btoa(JSON.stringify({ tid: ME }))}.sig`;
 const RAW_ROW = "patient-7731,1962-04-18,E11.9";
 const STAMP = "2026-07-30T10:00:00.000Z";
@@ -138,8 +140,7 @@ function seed() {
   api.grants.mockResolvedValue([myGrant, issuedGrant, unmeteredGrant]);
   api.budget.mockImplementation(async (grantId: string) => {
     const budget = budgets[grantId];
-    if (!budget) throw new Error("budget standing: not found");
-    return { ...budget, rows: [RAW_ROW] };
+    return budget ? { ...budget, rows: [RAW_ROW] } : null;
   });
   api.myRequests.mockResolvedValue([
     request("r-pending", pendingListing, ME, "pending"),
@@ -157,6 +158,34 @@ async function openPortal() {
   await user.paste(TOKEN);
   await user.click(screen.getByRole("button", { name: "Open portal" }));
   return user;
+}
+
+/** Approved requests: two on my datasets that did not finish (no grant; a
+ *  grant with no budget), one finished, one whose grant I revoked, and my
+ *  own request as a researcher, which is not mine to retry. Pending and
+ *  denied requests have no grant either, and are not approvals. */
+function seedApproved() {
+  api.grants.mockResolvedValue([
+    myGrant,
+    issuedGrant,
+    unmeteredGrant,
+    { ...grant("g-revoked", ME, REVOKED, "health"), revoked: true },
+  ]);
+  api.myRequests.mockResolvedValue([
+    request("r-stuck", ownListing, STUCK, "approved"),
+    request("r-unfunded", listing("l-other", ME, "other", "Other"), RESEARCHER, "approved"),
+    request("r-done", ownListing, RESEARCHER, "approved"),
+    request("r-revoked", ownListing, REVOKED, "approved"),
+    request("r-mine", openListing, ME, "approved"),
+    request("r-waiting", listing("l-fresh", ME, "fresh", "Fresh"), RESEARCHER, "pending"),
+    request("r-refused", listing("l-gone", ME, "gone", "Gone"), RESEARCHER, "denied"),
+  ]);
+}
+
+function unfinishedSection() {
+  return within(
+    screen.getByRole("heading", { name: "Unfinished approvals" }).parentElement!,
+  );
 }
 
 function catalogItem(title: string) {
@@ -288,6 +317,75 @@ describe("ResearchPortal", () => {
     await user.click(incoming.getByRole("button", { name: "Decline" }));
     expect(api.denyRequest).toHaveBeenCalledWith("r-incoming");
     expect(await screen.findByText("decline failed (409)")).toBeInTheDocument();
+  });
+
+  it("lists my approvals that left no grant or no budget", async () => {
+    seedApproved();
+    await openPortal();
+    await screen.findByText("Data stewardship");
+
+    const rows = unfinishedSection().getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]!).getByText(/researcher dddddddd/)).toBeInTheDocument();
+    expect(within(rows[1]!).getByText("other")).toBeInTheDocument();
+    expect(within(rows[1]!).getByText(/researcher cccccccc/)).toBeInTheDocument();
+  });
+
+  it("hides the section when every approval finished", async () => {
+    api.myRequests.mockResolvedValue([request("r-done", ownListing, RESEARCHER, "approved")]);
+    await openPortal();
+    await screen.findByText("Data stewardship");
+    expect(screen.queryByText("Unfinished approvals")).not.toBeInTheDocument();
+  });
+
+  it("does not list a finished approval whose budget failed to load", async () => {
+    api.myRequests.mockResolvedValue([request("r-done", ownListing, RESEARCHER, "approved")]);
+    api.budget.mockImplementation(async (grantId: string) => {
+      if (grantId === "g-issued") throw new Error("failed to load budget standing (502)");
+      return budgets[grantId] ?? null;
+    });
+    await openPortal();
+    await screen.findByText("Data stewardship");
+    expect(screen.queryByText("Unfinished approvals")).not.toBeInTheDocument();
+  });
+
+  it("retries an unfinished approval, and the finished one leaves the list", async () => {
+    seedApproved();
+    api.approveRequest.mockResolvedValue({});
+    const user = await openPortal();
+    await screen.findByText("Data stewardship");
+
+    // The retry issues the grant and its budget, so the reload finds both.
+    api.grants.mockResolvedValue([
+      myGrant,
+      issuedGrant,
+      unmeteredGrant,
+      { ...grant("g-revoked", ME, REVOKED, "health"), revoked: true },
+      grant("g-stuck", ME, STUCK, "health"),
+    ]);
+    api.budget.mockImplementation(async (grantId: string) =>
+      grantId === "g-stuck"
+        ? { grant_id: "g-stuck", limit: 10, spent: 0, remaining: 10 }
+        : (budgets[grantId] ?? null),
+    );
+
+    const stuck = within(unfinishedSection().getByText(/researcher dddddddd/).closest("li")!);
+    await user.click(stuck.getByRole("button", { name: "Retry approval" }));
+    expect(api.approveRequest).toHaveBeenCalledExactlyOnceWith("r-stuck");
+    await waitFor(() => expect(unfinishedSection().getAllByRole("listitem")).toHaveLength(1));
+    expect(unfinishedSection().queryByText(/researcher dddddddd/)).not.toBeInTheDocument();
+  });
+
+  it("shows the error when a retry is refused", async () => {
+    seedApproved();
+    api.approveRequest.mockRejectedValue(new Error("approve: not found"));
+    const user = await openPortal();
+    await screen.findByText("Data stewardship");
+
+    const stuck = within(unfinishedSection().getByText(/researcher dddddddd/).closest("li")!);
+    await user.click(stuck.getByRole("button", { name: "Retry approval" }));
+    expect(await screen.findByText("approve: not found")).toBeInTheDocument();
+    expect(stuck.getByRole("button", { name: "Retry approval" })).toBeEnabled();
   });
 
   it("publishes a listing from the stewardship panel and closes the form", async () => {
