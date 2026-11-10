@@ -140,6 +140,11 @@ uses [Semantic Versioning](https://semver.org/).
   binary. From `backend/`,
   `DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstack`
   starts it.
+* The steward portal lists approvals that did not finish, under
+  "Unfinished approvals": those with no grant, or with an active grant
+  but no query budget. A "Retry approval" action approves the request
+  again, and a refused retry shows its error. Approvals whose grant is
+  revoked are not listed, since the API refuses to retry them.
 
 ### Fixed
 
