@@ -75,6 +75,7 @@ services:
       - sim-attestation
       - key-release-service
     environment:
+      APP_ENV: "development"
       BIND_ADDR: "0.0.0.0:8080"
       METRICS_BIND_ADDR: "127.0.0.1:9464"
       KEY_RELEASE_URL: "http://key-release-service:8090"

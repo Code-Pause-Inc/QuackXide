@@ -61,6 +61,7 @@ async fn apps(tenant: TenantId) -> (Router, Router) {
         config: Arc::new(config),
         vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        research: None,
         query: Some(Arc::new(query)),
         provisioning: None,
     })

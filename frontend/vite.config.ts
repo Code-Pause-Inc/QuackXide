@@ -3,6 +3,8 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, loadEnv } from "vite";
 
+import { releaseEnvProblems } from "./src/config/release";
+
 // Branding and endpoints come from VITE_* env vars (see .env.example).
 export default defineConfig(({ mode }) => {
   // Dev server only: API_PROXY_TARGET has no VITE_ prefix, so it never
@@ -10,6 +12,14 @@ export default defineConfig(({ mode }) => {
   // the proxy forwards, so no CORS preflight crosses origins.
   const env = loadEnv(mode, ".", "");
   const target = env.API_PROXY_TARGET?.trim() || "http://127.0.0.1:8080";
+  // Release builds (`npm run build:release`, release.yml) refuse
+  // development paths (ADR 0009).
+  if (mode === "release") {
+    const problems = releaseEnvProblems(loadEnv(mode, ".", "VITE_"));
+    if (problems.length > 0) {
+      throw new Error(`release build refused:\n- ${problems.join("\n- ")}`);
+    }
+  }
   const proxy = Object.fromEntries(
     ["/api", "/admin", "/healthz"].map((prefix) => [prefix, { target, changeOrigin: true }]),
   );

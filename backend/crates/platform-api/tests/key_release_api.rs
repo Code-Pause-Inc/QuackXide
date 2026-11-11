@@ -28,7 +28,7 @@ use platform_api::key_release::{
     StaticKeySource, sim_attestation_router,
 };
 use platform_api::query::ConnectorQueryService;
-use platform_api::research::ResearchStores;
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
@@ -252,6 +252,7 @@ async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity
         config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
         vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        research: None,
         query: Some(Arc::new(query)),
         provisioning: None,
     });
@@ -338,6 +339,7 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         attestation.clone(),
         Arc::new(HttpKeyReleaseClient::new(format!("http://{addr}"))),
     ));
+    let research = Arc::new(ResearchService::new(ResearchStores::in_memory(), 11, 100));
     let query = ConnectorQueryService::new(
         vault.clone(),
         key_provider.clone(),
@@ -349,11 +351,12 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         false,
     )
     .with_enclave_identity(identity)
-    .with_research(ResearchStores::in_memory(), 11, 100);
+    .with_research(research.clone());
     let app = build_app(AppState {
         config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
         vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        research: Some(research),
         query: Some(Arc::new(query)),
         provisioning: Some(Arc::new(ProvisioningService::new(
             Arc::new(InMemoryTenantRegistry::new(default_connector_slugs())),
@@ -739,6 +742,7 @@ async fn query_still_answers_503_when_the_stand_in_refuses() {
         config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
         vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        research: None,
         query: Some(Arc::new(query)),
         provisioning: None,
     });

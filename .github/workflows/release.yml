@@ -29,6 +29,15 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: scripts/check.sh
+      # Replaces check.sh's development build of frontend/dist. Release mode
+      # refuses the local vault and any baked-in development token (ADR 0009).
+      - name: Build release frontend
+        working-directory: frontend
+        env:
+          VITE_VAULT_MODE: http
+          VITE_DEV_JWT: ""
+          VITE_ADMIN_JWT: ""
+        run: npm run build:release
       - name: Build release artifacts
         run: |
           cargo build --manifest-path backend/Cargo.toml --release --locked \

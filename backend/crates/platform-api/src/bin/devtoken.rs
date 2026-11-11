@@ -4,9 +4,9 @@
 //! never part of any deployed image.
 //!
 //! Usage:
-//!   cargo run -p platform-api --bin devtoken             # fresh tenant
-//!   cargo run -p platform-api --bin devtoken <tenant-uuid>
-//!   cargo run -p platform-api --bin devtoken --admin     # admin-claim token
+//!   cargo run -p platform-api --features dev --bin devtoken             # fresh tenant
+//!   cargo run -p platform-api --features dev --bin devtoken <tenant-uuid>
+//!   cargo run -p platform-api --features dev --bin devtoken --admin     # admin-claim token
 
 use platform_config::PlatformConfig;
 use platform_core::TenantId;
@@ -14,7 +14,7 @@ use platform_core::TenantId;
 const TOKEN_TTL_SECS: i64 = 8 * 3600;
 
 fn main() -> anyhow::Result<()> {
-    let config = PlatformConfig::from_env()?;
+    let config = PlatformConfig::from_env_dev_tool()?;
     let Some(secret) = config.auth.hs256_secret else {
         anyhow::bail!("JWT_HS256_SECRET is not set — refusing to mint a token");
     };
