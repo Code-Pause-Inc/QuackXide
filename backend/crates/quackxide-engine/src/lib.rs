@@ -223,7 +223,7 @@ impl QueryScope {
             }
             disclosure::verify_count_column(df.logical_plan())?;
             // Coercion inserts casts that can fail, so check the analyzed plan
-            // (ADR 0010).
+            // (ADR 0011).
             let state = self.ctx.state();
             let analyzed = state
                 .analyzer()

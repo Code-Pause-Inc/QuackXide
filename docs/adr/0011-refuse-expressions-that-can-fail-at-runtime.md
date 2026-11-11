@@ -1,4 +1,4 @@
-# 0010. Refuse expressions that can fail at runtime in the disclosure gate
+# 0011. Refuse expressions that can fail at runtime in the disclosure gate
 
 * Status: Proposed
 * Date: 2026-11-04

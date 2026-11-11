@@ -176,7 +176,7 @@ uses [Semantic Versioning](https://semver.org/).
 ### Security
 
 * Zero-knowledge and research queries whose expressions can fail at
-  runtime are refused at planning (ADR 0010). A conditional division by
+  runtime are refused at planning (ADR 0011). A conditional division by
   zero or a failing cast used to return 400 for some data and 200 for
   other data, answering a question about rows below the cohort threshold.
   Researchers lose division and modulo by a column or an aggregate,

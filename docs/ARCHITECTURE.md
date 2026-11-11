@@ -263,7 +263,7 @@ Three enforcement layers at one choke point, all in code:
   `FIRST_VALUE`) are refused — each can inflate a cohort count, single out
   an individual, or put a subtotal beside its parts in one result.
   After type coercion, every expression must also be one that cannot fail
-  at runtime (`policy::expressions_cannot_fail`, ADR 0010): comparisons,
+  at runtime (`policy::expressions_cannot_fail`, ADR 0011): comparisons,
   boolean logic, `IN`, `LIKE` with a pattern of at most 1,000 characters,
   `BETWEEN`, integer and float arithmetic, division by a literal other
   than 0 and −1, `CASE`, `COALESCE`, `NULLIF`, `lower`, `upper`,

@@ -2,7 +2,7 @@
 //! SQL carries a unique literal, over data holding a unique cell value that
 //! the query fails to cast, leaves neither value in any log line, audit
 //! record or HTTP response, with operational logging at `trace`. The research
-//! endpoint refuses the cast at planning (ADR 0010); the steward's own-data
+//! endpoint refuses the cast at planning (ADR 0011); the steward's own-data
 //! query, with zero-knowledge mode off, runs it and fails on the cell.
 //!
 //! This file is its own test binary because it installs the production

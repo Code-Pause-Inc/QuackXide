@@ -79,7 +79,7 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("cte_aggregate", "WITH c AS (SELECT dept, COUNT(*) AS n FROM people GROUP BY dept) SELECT dept, n FROM c", Rows(2)),
     ("group_by_expression", "SELECT salary / 100 AS band, COUNT(*) AS n FROM people GROUP BY salary / 100", Rows(2)),
     ("count_ratio", "SELECT dept, COUNT(*) AS n, COUNT(*) * 100 / 15 AS pct FROM people GROUP BY dept", Rows(2)),
-    // Expressions that cannot fail at runtime (ADR 0010).
+    // Expressions that cannot fail at runtime (ADR 0011).
     ("float_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > 3.5 GROUP BY dept", Rows(2)),
     ("string_literal_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > '3' GROUP BY dept", Rows(2)),
     ("in_list", "SELECT dept, COUNT(*) AS n FROM people WHERE dept IN ('eng', 'ops') GROUP BY dept", Rows(2)),
@@ -108,7 +108,7 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("like", "SELECT dept, COUNT(*) AS n FROM people WHERE dept LIKE 'e%' GROUP BY dept", Rows(1)),
     ("not_like", "SELECT dept, COUNT(*) AS n FROM people WHERE dept NOT LIKE 'e%' GROUP BY dept", Rows(1)),
     // Expressions that can fail on some rows, refused whatever the data
-    // (ADR 0010). `SUM / COUNT` divides by zero when no row matches.
+    // (ADR 0011). `SUM / COUNT` divides by zero when no row matches.
     ("count_arithmetic", "SELECT dept, COUNT(*) AS n, SUM(salary) / COUNT(*) AS mean FROM people GROUP BY dept", Rejected),
     ("literal_cast_fails", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST('x' AS BIGINT) > 0 GROUP BY dept", Rejected),
     ("div_by_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / NULL IS NULL GROUP BY dept", Rejected),
@@ -290,7 +290,7 @@ async fn zk_mode_without_a_cohort_threshold_refuses_every_query() {
 /// Queries whose expressions fail only on some rows: `{P}` holds only for
 /// the single `ceo` row when `{T}` is 9000, and for no row at 9500. Each
 /// must be refused at planning both times, so the outcome says nothing
-/// about the data (ADR 0010).
+/// about the data (ADR 0011).
 #[rustfmt::skip]
 const ERROR_PROBES: &[(&str, &str)] = &[
     ("where_div", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / (CASE WHEN {P} THEN 0 ELSE 1 END) > 0 GROUP BY dept"),

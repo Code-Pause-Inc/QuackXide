@@ -16,7 +16,7 @@
 //! [`expressions_cannot_fail`] adds a third check on the analyzed plan:
 //! every expression must be one that cannot fail at runtime, so a query's
 //! outcome (error or result) never depends on rows that suppression would
-//! hide (ADR 0010).
+//! hide (ADR 0011).
 //!
 //! It bounds what leaves the enclave; it complements, not replaces,
 //! attestation and envelope encryption.

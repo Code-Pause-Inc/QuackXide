@@ -412,7 +412,7 @@ async fn researcher_cannot_egress_raw_rows_or_skip_count() {
 }
 
 /// A query whose expression fails only on the rare cohort's row gets the
-/// same refusal whether or not that row matches (ADR 0010).
+/// same refusal whether or not that row matches (ADR 0011).
 #[tokio::test]
 async fn error_probe_gets_the_same_refusal_whatever_the_data() {
     let steward = TenantId::generate();
