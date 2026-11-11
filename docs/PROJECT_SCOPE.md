@@ -94,7 +94,7 @@ The first complete release is done when all of the following hold:
    receives the dataset key inside the enclave only, and returns a
    disclosure-controlled result sealed to the researcher's key.
 3. Every step of both lifecycles is **Built**; no step returns 503 for
-   missing wiring in a production build.
+   missing wiring in production mode (defined in `docs/ARCHITECTURE.md`).
 4. Registries are durable across restarts.
 5. The system deploys reproducibly from this repository's documentation.
 6. Benchmarks are committed with their method, results, and performance

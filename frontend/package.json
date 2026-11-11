@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "node node_modules/typescript7/bin/tsc --noEmit && vite build",
+    "build:release": "node node_modules/typescript7/bin/tsc --noEmit && vite build --mode release",
     "preview": "vite preview",
     "typecheck": "node node_modules/typescript7/bin/tsc --noEmit",
     "lint": "eslint . --max-warnings 0",

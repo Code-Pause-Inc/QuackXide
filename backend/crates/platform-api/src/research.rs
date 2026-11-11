@@ -1,4 +1,12 @@
-//! Dataset catalog and access-request API.
+//! Research access: the dataset catalog, access requests, grants and
+//! per-grant query budgets ([`ResearchService`]), and their HTTP handlers.
+//!
+//! None of it needs key material, so these routes are served without key
+//! release: the binary always builds the service (`crate::wiring`), and only
+//! `POST /api/v1/research/query` also needs the confidential query service.
+//! That query checks and charges grants through the same
+//! `Arc<ResearchService>`, so the grant a route here creates is the one the
+//! query checks and charges.
 //!
 //! A steward publishes a listing for one of its sealed connector datasets,
 //! opting it into discoverability. Researchers browse the catalog and file
@@ -6,20 +14,21 @@
 //! as a direct grant, except that a retried approval never re-activates a
 //! revoked grant. Prices are integer cents in the configured currency.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
+use platform_config::ResearchConfig;
 use platform_core::{ConnectorSlug, TenantId};
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
-    AccessRequest, BudgetLedger, CatalogError, CatalogRegistry, GrantOutcome, GrantRegistry,
-    ListingDetails, RequestStatus,
+    AccessRequest, BudgetError, BudgetLedger, BudgetState, CatalogError, CatalogRegistry,
+    DatasetGrant, GrantOutcome, GrantRegistry, ListingDetails, RequestStatus,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
 
-use crate::query::ConnectorQueryService;
-use crate::{ApiError, AppState, AuthedTenant, query_service};
+use crate::{ApiError, AppState, AuthedTenant, research_service};
 
 /// Stores backing the research-access layer.
 pub struct ResearchStores {
@@ -36,6 +45,24 @@ impl ResearchStores {
             catalog: Arc::new(platform_tenancy::InMemoryCatalogRegistry::default()),
         }
     }
+}
+
+/// Research access: catalog, access requests, grants and per-grant budgets,
+/// with the minimum cohort size research queries use. Built once and shared
+/// as one `Arc` by `AppState::research` and the query service.
+pub struct ResearchService {
+    grants: Arc<dyn GrantRegistry>,
+    /// Per-grant query budgets — bounds adaptive (differencing) querying and
+    /// meters billable access.
+    budgets: Arc<dyn BudgetLedger>,
+    /// Dataset catalog and access requests.
+    catalog: Arc<dyn CatalogRegistry>,
+    /// Minimum cohort size `k` for disclosure control
+    /// (`RESEARCH_MIN_COHORT_SIZE`). Zero refuses every research query.
+    min_cohort: u64,
+    /// Budget units allocated to a grant when the steward doesn't specify
+    /// (`RESEARCH_DEFAULT_QUERY_BUDGET`).
+    default_budget: u64,
 }
 
 /// Bounds on user-authored free text; oversize input is refused, not
@@ -79,7 +106,195 @@ pub struct ApproveRequestBody {
 
 // ── Service methods ──────────────────────────────────────────────────────────
 
-impl ConnectorQueryService {
+impl ResearchService {
+    pub fn new(stores: ResearchStores, min_cohort: u64, default_budget: u64) -> Self {
+        Self {
+            grants: stores.grants,
+            budgets: stores.budgets,
+            catalog: stores.catalog,
+            min_cohort,
+            default_budget,
+        }
+    }
+
+    /// From `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`.
+    /// `RESEARCH_PRICING_CURRENCY` stays on `PlatformConfig`, where
+    /// `catalog_index` reads it.
+    pub fn from_config(stores: ResearchStores, config: &ResearchConfig) -> Self {
+        Self::new(stores, config.min_cohort_size, config.default_query_budget)
+    }
+
+    /// The configured `k`. The query service applies it to research queries
+    /// and to own-data queries in zero-knowledge mode.
+    pub fn min_cohort(&self) -> u64 {
+        self.min_cohort
+    }
+
+    // ── Grants and budgets ──
+
+    /// Steward grants a researcher aggregate access to one of its connectors,
+    /// allocating a query budget (default from config when unspecified).
+    /// `create` re-activates a revoked grant, so this is only for a new
+    /// decision by the steward: a direct grant or a first approval.
+    pub async fn grant(
+        &self,
+        steward: TenantId,
+        researcher: TenantId,
+        connector: &ConnectorSlug,
+        query_budget: Option<u64>,
+    ) -> Result<Value, ApiError> {
+        let grant = self
+            .grants
+            .create(steward, researcher, connector.as_str())
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        self.fund_grant(&grant, query_budget).await
+    }
+
+    /// Open the query budget of a grant that was just created or found
+    /// active, audit the grant, and return it with its budget as JSON. Both
+    /// [`grant`](Self::grant) and the approval retry (`grant_on_retry`) use
+    /// it, so the two paths cannot drift apart.
+    async fn fund_grant(
+        &self,
+        grant: &DatasetGrant,
+        query_budget: Option<u64>,
+    ) -> Result<Value, ApiError> {
+        // Insert-if-absent: re-granting reuses the grant id, so it can never
+        // reset spend — allocation only rises, via explicit top-ups.
+        let budget = self
+            .budgets
+            .open(&grant.grant_id, query_budget.unwrap_or(self.default_budget))
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        let researcher = grant.researcher_tenant;
+        let connector = &grant.connector;
+        security_audit_event(
+            AuditKind::TenantProvisioned,
+            Some(grant.steward_tenant),
+            "ok",
+            &format!(
+                "granted researcher={researcher} connector={connector} budget_limit={}",
+                budget.limit
+            ),
+        );
+        let mut value = serde_json::to_value(grant).map_err(|_| ApiError::Backend)?;
+        value["budget"] = budget_json(&budget)?;
+        Ok(value)
+    }
+
+    /// Steward-only budget top-up. Non-stewards — including the grant's own
+    /// researcher — get the same "not found" as an unknown id: allocation
+    /// control mirrors the revoke discipline (no existence oracle).
+    pub async fn top_up_budget(
+        &self,
+        steward: TenantId,
+        grant_id: &str,
+        additional: u64,
+    ) -> Result<Value, ApiError> {
+        let owns = self
+            .grants
+            .list_for(steward)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .into_iter()
+            .any(|g| g.grant_id == grant_id && g.steward_tenant == steward);
+        if !owns {
+            return Err(ApiError::NotFound);
+        }
+        let budget = self
+            .budgets
+            .top_up(grant_id, additional)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        security_audit_event(
+            AuditKind::ResearchBudget,
+            Some(steward),
+            "ok",
+            &format!(
+                "top_up grant={grant_id} added={additional} limit={}",
+                budget.limit
+            ),
+        );
+        budget_json(&budget)
+    }
+
+    /// Budget standing — visible only to the grant's parties (steward or
+    /// researcher); anyone else gets the same "not found" as an unknown id.
+    pub async fn budget_state(&self, caller: TenantId, grant_id: &str) -> Result<Value, ApiError> {
+        let is_party = self
+            .grants
+            .list_for(caller)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .into_iter()
+            .any(|g| g.grant_id == grant_id);
+        if !is_party {
+            return Err(ApiError::NotFound);
+        }
+        let budget = self
+            .budgets
+            .state(grant_id)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .ok_or(ApiError::NotFound)?;
+        budget_json(&budget)
+    }
+
+    pub async fn revoke_grant(&self, steward: TenantId, grant_id: &str) -> Result<Value, ApiError> {
+        let revoked = self
+            .grants
+            .revoke(steward, grant_id)
+            .await
+            .map_err(|_| ApiError::Backend)?
+            .ok_or(ApiError::NotFound)?;
+        security_audit_event(
+            AuditKind::TenantProvisioned,
+            Some(steward),
+            "ok",
+            &format!("revoked grant={grant_id}"),
+        );
+        serde_json::to_value(&revoked).map_err(|_| ApiError::Backend)
+    }
+
+    pub async fn list_grants(&self, tenant: TenantId) -> Result<Value, ApiError> {
+        let grants = self
+            .grants
+            .list_for(tenant)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        Ok(json!({ "grants": grants }))
+    }
+
+    // ── For `ConnectorQueryService::research_query` ──
+
+    /// The researcher's active grant on `steward`'s `connector`, if any.
+    /// The research query checks this before touching any data and audits
+    /// the refusal itself.
+    pub(crate) async fn find_active_grant(
+        &self,
+        researcher: TenantId,
+        steward: TenantId,
+        connector: &ConnectorSlug,
+    ) -> Result<Option<DatasetGrant>, ApiError> {
+        self.grants
+            .find_active(researcher, steward, connector.as_str())
+            .await
+            .map_err(|_| ApiError::Backend)
+    }
+
+    /// Charge `cost` units to `grant_id`'s budget. The research query
+    /// charges after the attestation gate and audits a refusal itself.
+    pub(crate) async fn charge(
+        &self,
+        grant_id: &str,
+        cost: u64,
+    ) -> Result<BudgetState, BudgetError> {
+        self.budgets.charge(grant_id, cost).await
+    }
+
+    // ── Catalog and access requests ──
+
     /// Publish or re-publish a catalog listing for one of the steward's
     /// connectors (upsert; the listing id is stable).
     pub async fn publish_listing(
@@ -93,10 +308,10 @@ impl ConnectorQueryService {
             description: req.description.trim().to_owned(),
             license_fee_cents: req.license_fee_cents,
             compute_rate_cents: req.compute_rate_cents,
-            grant_budget: req.grant_budget.unwrap_or(self.default_budget()),
+            grant_budget: req.grant_budget.unwrap_or(self.default_budget),
         };
         let listing = self
-            .catalog()?
+            .catalog
             .publish(steward, connector.as_str(), details)
             .await
             .map_err(|_| ApiError::Backend)?;
@@ -119,7 +334,7 @@ impl ConnectorQueryService {
         listing_id: &str,
     ) -> Result<Value, ApiError> {
         let listing = self
-            .catalog()?
+            .catalog
             .unpublish(steward, listing_id)
             .await
             .map_err(|_| ApiError::Backend)?
@@ -136,7 +351,7 @@ impl ConnectorQueryService {
     /// Every published listing — the researcher-browsable catalog.
     pub async fn list_catalog(&self) -> Result<Value, ApiError> {
         let listings = self
-            .catalog()?
+            .catalog
             .list_published()
             .await
             .map_err(|_| ApiError::Backend)?;
@@ -151,7 +366,7 @@ impl ConnectorQueryService {
         note: &str,
     ) -> Result<Value, ApiError> {
         let request = self
-            .catalog()?
+            .catalog
             .request_access(listing_id, researcher, note)
             .await
             .map_err(|err| match err {
@@ -175,7 +390,7 @@ impl ConnectorQueryService {
     /// Requests where the caller is researcher or steward.
     pub async fn list_access_requests(&self, tenant: TenantId) -> Result<Value, ApiError> {
         let requests = self
-            .catalog()?
+            .catalog
             .list_requests_for(tenant)
             .await
             .map_err(|_| ApiError::Backend)?;
@@ -215,8 +430,8 @@ impl ConnectorQueryService {
         approve: bool,
         budget_override: Option<u64>,
     ) -> Result<Value, ApiError> {
-        let catalog = self.catalog()?;
-        let (request, retry) = match catalog
+        let (request, retry) = match self
+            .catalog
             .resolve(steward, request_id, approve, budget_override)
             .await
             .map_err(|_| ApiError::Backend)?
@@ -312,7 +527,7 @@ impl ConnectorQueryService {
         request_id: &str,
     ) -> Result<Option<AccessRequest>, ApiError> {
         Ok(self
-            .catalog()?
+            .catalog
             .list_requests_for(steward)
             .await
             .map_err(|_| ApiError::Backend)?
@@ -337,7 +552,7 @@ impl ConnectorQueryService {
         query_budget: Option<u64>,
     ) -> Result<Value, ApiError> {
         let outcome = self
-            .grants()?
+            .grants
             .create_unless_revoked(steward, request.researcher_tenant, connector.as_str())
             .await
             .map_err(|_| ApiError::Backend)?;
@@ -361,6 +576,13 @@ impl ConnectorQueryService {
     }
 }
 
+/// Serialize a budget with its derived `remaining`.
+fn budget_json(budget: &BudgetState) -> Result<Value, ApiError> {
+    let mut value = serde_json::to_value(budget).map_err(|_| ApiError::Backend)?;
+    value["remaining"] = json!(budget.remaining());
+    Ok(value)
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 fn require_text(value: &str, max: usize, what: &'static str) -> Result<(), ApiError> {
@@ -375,8 +597,8 @@ pub(crate) async fn catalog_index(
     State(state): State<AppState>,
     Extension(AuthedTenant(_tenant)): Extension<AuthedTenant>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
-    let listings = service.list_catalog().await?;
+    let research = research_service(&state)?;
+    let listings = research.list_catalog().await?;
     Ok(Json(json!({
         "listings": listings,
         "currency": state.config.research.pricing_currency,
@@ -389,7 +611,7 @@ pub(crate) async fn publish_listing(
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Json(req): Json<PublishListingRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     let connector = ConnectorSlug::new(&req.connector)
         .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
     require_text(
@@ -403,7 +625,7 @@ pub(crate) async fn publish_listing(
         ));
     }
     Ok(Json(
-        service.publish_listing(steward, &connector, &req).await?,
+        research.publish_listing(steward, &connector, &req).await?,
     ))
 }
 
@@ -413,8 +635,10 @@ pub(crate) async fn unpublish_listing(
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Path(listing_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.unpublish_listing(steward, &listing_id).await?))
+    let research = research_service(&state)?;
+    Ok(Json(
+        research.unpublish_listing(steward, &listing_id).await?,
+    ))
 }
 
 /// `POST /api/v1/catalog/{listing_id}/request` — researcher requests access.
@@ -424,12 +648,12 @@ pub(crate) async fn request_dataset_access(
     Path(listing_id): Path<String>,
     Json(body): Json<RequestAccessBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     if body.note.chars().count() > MAX_NOTE_CHARS {
         return Err(ApiError::BadRequest("note too long (max 1000 chars)"));
     }
     Ok(Json(
-        service
+        research
             .request_access(researcher, &listing_id, body.note.trim())
             .await?,
     ))
@@ -440,8 +664,8 @@ pub(crate) async fn list_access_requests(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.list_access_requests(tenant).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.list_access_requests(tenant).await?))
 }
 
 /// `POST /api/v1/research/requests/{id}/approve` — steward approves.
@@ -451,10 +675,10 @@ pub(crate) async fn approve_access_request(
     Path(request_id): Path<String>,
     body: Option<Json<ApproveRequestBody>>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     let override_budget = body.and_then(|Json(b)| b.query_budget);
     Ok(Json(
-        service
+        research
             .resolve_access_request(steward, &request_id, true, override_budget)
             .await?,
     ))
@@ -466,9 +690,9 @@ pub(crate) async fn deny_access_request(
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Path(request_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     Ok(Json(
-        service
+        research
             .resolve_access_request(steward, &request_id, false, None)
             .await?,
     ))

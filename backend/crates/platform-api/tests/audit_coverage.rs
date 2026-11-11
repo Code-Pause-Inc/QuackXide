@@ -735,3 +735,20 @@ async fn research_catalog_is_audited() {
         &format!("denied request={fresh_id} researcher={researcher}"),
     );
 }
+
+#[tokio::test]
+async fn production_mode_refusal_is_audited_without_values() {
+    let capture = AuditCapture::install();
+    let config = platform_config::PlatformConfig::from_source(|key| {
+        (key == "JWT_HS256_SECRET").then(|| "audit-refusal-secret".to_owned())
+    })
+    .expect("config loads");
+    assert!(platform_api::wiring::build_state(config).await.is_err());
+    let events = capture.events();
+    assert!(capture.contains("service.start", "denied"), "{events:?}");
+    assert!(!capture.contains("service.start", "ok"), "{events:?}");
+    assert!(
+        !format!("{events:?}").contains("audit-refusal-secret"),
+        "{events:?}"
+    );
+}
