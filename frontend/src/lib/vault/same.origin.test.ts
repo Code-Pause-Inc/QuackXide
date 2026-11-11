@@ -40,7 +40,7 @@ afterEach(() => {
 describe("same-origin API base", () => {
   it("HttpVault builds /api/v1/drive paths that resolve to the page origin in the worker", async () => {
     const urls = captureFetch([]);
-    const vault = new HttpVault({ baseUrl: "", token: "t", tenantId: "tid-1" });
+    const vault = new HttpVault({ baseUrl: "", getToken: () => "t", tenantId: "tid-1" });
 
     await vault.listManifests();
     await vault.deleteObject("a/b");
