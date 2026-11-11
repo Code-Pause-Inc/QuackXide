@@ -20,6 +20,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use parquet::arrow::ArrowWriter;
 use platform_api::dev::DevResearchStack;
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
@@ -125,8 +126,10 @@ async fn research_app(steward: TenantId) -> Router {
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
     };
-    let service = stack.query_service(settings, 5, 100);
+    let research = Arc::new(ResearchService::new(ResearchStores::in_memory(), 5, 100));
+    let service = stack.query_service(settings, research.clone());
     build_app(AppState {
+        research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(SECRET, vault)
     })
