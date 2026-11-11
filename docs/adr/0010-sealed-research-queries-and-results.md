@@ -1,4 +1,4 @@
-# 0009. Sealed research queries and results
+# 0010. Sealed research queries and results
 
 * Status: Proposed
 * Date: 2026-11-04
