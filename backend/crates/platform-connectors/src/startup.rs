@@ -22,15 +22,13 @@ pub struct WorkerStartup {
     pub interval: Duration,
 }
 
-/// Validate `config` with [`PlatformConfig::check_production`], then build
+/// Validate `config` with [`PlatformConfig::enforce_production`], then build
 /// the pipeline and jobs. A refusal emits a `service.start` "denied" audit
 /// event (reasons name keys, never values) and nothing is built.
 pub fn build(config: &PlatformConfig) -> anyhow::Result<WorkerStartup> {
-    if let Err(refusal) = config.check_production(Service::ConnectorWorker) {
-        let detail = refusal.to_string();
-        security_audit_event(AuditKind::ServiceStart, None, "denied", &detail);
-        anyhow::bail!("refusing to start: {detail}");
-    }
+    config
+        .enforce_production(Service::ConnectorWorker)
+        .map_err(|refusal| anyhow::anyhow!("refusing to start: {refusal}"))?;
     security_audit_event(
         AuditKind::ServiceStart,
         None,

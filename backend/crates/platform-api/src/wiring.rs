@@ -10,7 +10,8 @@
 //! `KEY_RELEASE_URL` names the simulated TEE's key-release stand-in, on the
 //! same research service the research routes use.
 //!
-//! Before any of that, [`check_production`] runs the production-mode gate
+//! Before any of that, [`PlatformConfig::enforce_production`] runs the
+//! production-mode gate
 //! (ADR 0009).
 
 use std::sync::Arc;
@@ -18,6 +19,9 @@ use std::sync::Arc;
 use platform_auth::JwtVerifier;
 use platform_config::{PlatformConfig, Service};
 use platform_storage::{ObjectStoreVault, VaultStore};
+// Only the non-`dev` refusal uses these. Clippy runs with `dev` on and
+// `-D warnings`, so an ungated import would fail it.
+#[cfg(not(feature = "dev"))]
 use platform_telemetry::{AuditKind, security_audit_event};
 
 use crate::AppState;
@@ -29,7 +33,9 @@ use crate::research::{ResearchService, ResearchStores};
 /// Refuses, with an audit event, a configuration this build or production
 /// mode must not run; nothing is built before the production-mode gate.
 pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
-    check_production(&config, Service::PlatformApi)?;
+    config
+        .enforce_production(Service::PlatformApi)
+        .map_err(|refusal| anyhow::anyhow!("refusing to start: {refusal}"))?;
 
     let vault: Arc<dyn VaultStore> = match config.storage.bucket.as_deref() {
         Some(bucket) => {
@@ -119,18 +125,6 @@ pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
         query,
         provisioning,
     })
-}
-
-/// Run [`PlatformConfig::check_production`] for `service`. A refusal emits a
-/// `service.start` "denied" audit event (reasons name keys, never values)
-/// and becomes the startup error.
-pub fn check_production(config: &PlatformConfig, service: Service) -> anyhow::Result<()> {
-    if let Err(refusal) = config.check_production(service) {
-        let detail = refusal.to_string();
-        security_audit_event(AuditKind::ServiceStart, None, "denied", &detail);
-        anyhow::bail!("refusing to start: {detail}");
-    }
-    Ok(())
 }
 
 /// DEV ONLY: the query service on the simulated TEE's key-release stand-in

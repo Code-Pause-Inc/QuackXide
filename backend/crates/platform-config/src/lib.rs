@@ -276,19 +276,52 @@ impl PlatformConfig {
     /// environment first; `.env` is loaded only in development, so a stray
     /// `.env` can neither select development nor change production settings.
     pub fn from_env() -> Result<Self, ConfigError> {
-        if AppEnv::parse(std::env::var("APP_ENV").ok().as_deref()) == AppEnv::Development {
-            let _ = dotenvy::dotenv(); // a missing .env is fine
-        }
-        Self::from_source(|key| std::env::var(key).ok())
+        Self::load(
+            |key| std::env::var(key).ok(),
+            || {
+                let _ = dotenvy::dotenv(); // a missing .env is fine
+            },
+        )
     }
 
-    /// For dev-only binaries (built only with the `dev` feature): loads
-    /// `.env` and reports development mode whatever `APP_ENV` says.
+    /// [`Self::from_env`] with the process environment and the `.env` loader
+    /// passed in, so the ordering is testable: `APP_ENV` is decided from
+    /// `process` before `load_dotenv` can run, `load_dotenv` runs only in
+    /// development, and the configuration is read after it.
+    fn load(
+        process: impl Fn(&str) -> Option<String>,
+        load_dotenv: impl FnOnce(),
+    ) -> Result<Self, ConfigError> {
+        if AppEnv::parse(process("APP_ENV").as_deref()) == AppEnv::Development {
+            load_dotenv();
+        }
+        Self::from_source(process)
+    }
+
+    /// DEV ONLY, for dev-only binaries: loads `.env` and reports development
+    /// mode whatever `APP_ENV` says. Compiled only with the `dev` feature, so
+    /// a release build cannot reach it.
+    #[cfg(feature = "dev")]
     pub fn from_env_dev_tool() -> Result<Self, ConfigError> {
         let _ = dotenvy::dotenv();
         let mut config = Self::from_source(|key| std::env::var(key).ok())?;
         config.env = AppEnv::Development;
         Ok(config)
+    }
+
+    /// Startup form of [`Self::check_production`], shared by every service so
+    /// the refusal is identical: on refusal it emits one `service.start`
+    /// "denied" audit event (reasons name keys, never values) and returns
+    /// the refusal.
+    pub fn enforce_production(&self, service: Service) -> Result<(), ProductionRefusal> {
+        self.check_production(service).inspect_err(|refusal| {
+            platform_telemetry::security_audit_event(
+                platform_telemetry::AuditKind::ServiceStart,
+                None,
+                "denied",
+                &refusal.to_string(),
+            );
+        })
     }
 
     /// The single production-mode gate, run by every service at startup
@@ -589,6 +622,64 @@ mod tests {
             .expect("loads")
             .check_production(service)
             .err()
+    }
+
+    /// `.env` stand-in: records that it ran and what it would have set.
+    fn load_with(process: &[(&str, &str)], dotenv: &[(&str, &str)]) -> (PlatformConfig, bool) {
+        use std::cell::{Cell, RefCell};
+        use std::collections::HashMap;
+        let env: RefCell<HashMap<String, String>> = RefCell::new(
+            process
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let loaded = Cell::new(false);
+        let config = PlatformConfig::load(
+            |key| env.borrow().get(key).cloned(),
+            || {
+                loaded.set(true);
+                let mut env = env.borrow_mut();
+                for (k, v) in dotenv {
+                    // dotenvy never overrides a set variable.
+                    env.entry(k.to_string()).or_insert_with(|| v.to_string());
+                }
+            },
+        )
+        .expect("loads");
+        (config, loaded.get())
+    }
+
+    #[test]
+    fn dotenv_is_not_loaded_in_production() {
+        let dotenv = [
+            ("APP_ENV", "development"),
+            ("JWT_HS256_SECRET", "from-dotenv"),
+        ];
+        for process in [
+            &[][..],
+            &[("APP_ENV", "production")][..],
+            &[("APP_ENV", "staging")][..],
+        ] {
+            let (config, loaded) = load_with(process, &dotenv);
+            assert!(!loaded, "{process:?}: .env must not be loaded");
+            assert_eq!(config.env, AppEnv::Production, "{process:?}");
+            assert!(config.auth.hs256_secret.is_none(), "{process:?}");
+        }
+    }
+
+    #[test]
+    fn dotenv_is_loaded_in_development_and_read_after() {
+        let (config, loaded) = load_with(
+            &[("APP_ENV", "development")],
+            &[("JWT_HS256_SECRET", "from-dotenv")],
+        );
+        assert!(loaded);
+        assert_eq!(config.env, AppEnv::Development);
+        assert_eq!(
+            config.auth.hs256_secret.as_ref().map(|s| s.expose()),
+            Some("from-dotenv")
+        );
     }
 
     #[test]

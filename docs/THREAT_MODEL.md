@@ -82,7 +82,7 @@ could then decrypt; policy changes and break-glass access are audited
 | Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
 | Run a query outside a genuine enclave, or a modified binary inside one | Attestation gate with `TEE_ATTESTATION_REQUIRED=true`; Google's attestation token must name TDX hardware, a production Confidential Space image, debug disabled and an allowed image digest | Seam and token verifier built (`platform_enclave::token`, tested on the simulated TEE); **token acquisition and verified gates on hardware to build** (P48) — fails closed until then |
-| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false`. Production mode, the default unless `APP_ENV=development` is set in the process environment, refuses to start when `TEE_ATTESTATION_REQUIRED=false`, `SIM_ATTESTATION_URL` or `KEY_RELEASE_URL` is set, so the gate does not rest on an operator-set flag (ADR 0009) | Built, tested (CI `release build has no dev binaries`; `platform-api/tests/startup.rs`) |
+| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false`. Production mode, the default unless `APP_ENV=development` is set in the process environment, refuses to start when `TEE_ATTESTATION_REQUIRED=false`, `SIM_ATTESTATION_URL` or `KEY_RELEASE_URL` is set, so production refuses these by default (ADR 0009); `APP_ENV=development` re-enables them (see residual risks) | Built, tested (CI `release build has no dev binaries`; `platform-api/tests/startup.rs`) |
 | Obtain a dataset's key for a query | Cloud KMS unwraps the dataset's data key only for the attested workload, per query, with nothing cached (ADR 0004); the steward's private key never leaves their browser | Seam built (`EnclaveKeyProvider`); **production key release to build** — returns 503 until then |
 | Authorize a modified image | The KMS key and its release policy live in a separate key project that no deployment identity administers (ADR 0004) | **Residual risk** for the key project's administrator — see below |
 | Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** — results currently leave as JSON over TLS |
@@ -165,6 +165,13 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   `SecretString`s, but the original values stay in the process
   environment for the life of the process, readable by anything that can
   read that process's memory or `/proc/<pid>/environ`.
+* **Development mode on a production host.** Production mode (ADR 0009)
+  refuses development-only paths by default, but `APP_ENV` is set by the
+  operator, and the in-memory vault, HS256 verifier and demo seed are
+  compiled into release binaries. `APP_ENV=development` on a production
+  host turns them all back on; the startup audit event records the mode.
+  The simulator and key-release stand-in are not affected: they compile
+  only with the `dev` feature.
 * **Extreme values.** `MIN` and `MAX` over a cohort of at least *k* still
   return one individual's actual value. This is standard for aggregate
   release; removing them from the allowlist, or applying a dominance rule,

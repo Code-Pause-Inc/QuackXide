@@ -7,7 +7,7 @@ default = []
 # `platform-enclave`'s simulated token provider. Never a default
 # feature; release builds (`.github/workflows/release.yml`) do not enable
 # it. The `Dockerfile` does: it builds the simulated TEE stack.
-dev = ["dep:synth-data", "platform-enclave/simulated"]
+dev = ["dep:synth-data", "platform-enclave/simulated", "platform-config/dev"]
 
 # Built only when `dev` is on (`--features dev`, or any build that includes
 # tests, through the dev-dependency below). A plain

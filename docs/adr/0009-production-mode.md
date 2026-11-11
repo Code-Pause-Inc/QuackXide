@@ -26,12 +26,17 @@ build contains, such as the in-memory vault or HS256.
 * One runtime switch, `APP_ENV`. Only `development` selects development;
   unset, blank and unknown values mean production.
 * `APP_ENV` is read from the process environment before `.env`, and `.env`
-  is loaded only in development. Dev-only binaries (built only with the
-  `dev` feature) load `.env` and run as development.
-* `PlatformConfig::check_production(service)` is the single gate. Each
-  service calls it at the start of its startup function
-  (`platform_api::startup::build`, `platform_connectors::startup::build`)
-  before building anything. It is not part of `from_source`, so tests can
+  is loaded only in development. The decision is a pure function of the
+  process environment (`PlatformConfig::load`, tested with a stand-in
+  loader). Dev-only binaries load `.env` and run as development through
+  `PlatformConfig::from_env_dev_tool`, which compiles only with
+  `platform-config`'s `dev` feature, so release builds cannot call it.
+* `PlatformConfig::check_production(service)` is the single gate.
+  `PlatformConfig::enforce_production(service)` wraps it with the audit
+  event, so every service refuses identically. Each service calls it
+  before building anything: `platform-api` at the start of
+  `platform_api::wiring::build_state`, `connector-worker` at the start of
+  `platform_connectors::startup::build`. It is not part of `from_source`, so tests can
   build any configuration. In production it refuses `JWT_HS256_SECRET`, an
   unset `STORAGE_BUCKET`, `TEE_ATTESTATION_REQUIRED=false`,
   `SIM_ATTESTATION_URL`, `KEY_RELEASE_URL`, and, for `connector-worker`,
@@ -57,3 +62,9 @@ build contains, such as the in-memory vault or HS256.
   the simulated TEE set `APP_ENV=development`.
 * `cargo run -p platform-api` and `connector-worker` need
   `APP_ENV=development` locally; `devtoken` needs `--features dev`.
+* `APP_ENV` is itself an operator-set variable, and the development paths
+  (in-memory vault, HS256 verifier, demo seed) are still compiled into
+  release binaries. Production mode makes them opt-in rather than
+  impossible: `APP_ENV=development` on a production host turns them all
+  back on. Gating them behind the `dev` feature as well would close this,
+  at the cost of feature-gating the integration tests that use them.
