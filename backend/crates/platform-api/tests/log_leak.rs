@@ -1,7 +1,9 @@
-//! Query content stays out of everything an operator can read. A research
-//! query whose SQL carries a unique literal, over data holding a unique cell
-//! value that the query fails to cast, leaves neither value in any log line,
-//! audit record or HTTP response, with operational logging at `trace`.
+//! Query content stays out of everything an operator can read. A query whose
+//! SQL carries a unique literal, over data holding a unique cell value that
+//! the query fails to cast, leaves neither value in any log line, audit
+//! record or HTTP response, with operational logging at `trace`. The research
+//! endpoint refuses the cast at planning (ADR 0011); the steward's own-data
+//! query, with zero-knowledge mode off, runs it and fails on the cell.
 //!
 //! This file is its own test binary because it installs the production
 //! subscriber process-wide, the way `platform_telemetry::init_from_env`
@@ -67,7 +69,7 @@ async fn query_literals_and_cell_values_never_reach_logs_or_responses() {
         "sql": sql,
     });
     let token = token_for(SECRET, researcher);
-    let (status, body) = send(
+    let (status, research_body) = send(
         &app,
         "POST",
         "/api/v1/research/query",
@@ -75,10 +77,23 @@ async fn query_literals_and_cell_values_never_reach_logs_or_responses() {
         request.to_string().into_bytes(),
     )
     .await;
-    let body = String::from_utf8_lossy(&body);
+    let research_body = String::from_utf8_lossy(&research_body).into_owned();
+    // A cast from text can fail, so the research gate refuses it.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{research_body}");
+
+    let request = serde_json::json!({ "connector": CONNECTOR, "sql": sql });
+    let (status, own_body) = send(
+        &app,
+        "POST",
+        "/api/v1/query",
+        &[bearer(&token_for(SECRET, steward)), json_header()],
+        request.to_string().into_bytes(),
+    )
+    .await;
+    let own_body = String::from_utf8_lossy(&own_body).into_owned();
     // The cast fails on the sentinel cell, so the engine refuses the query.
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("could not be executed"), "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{own_body}");
+    assert!(own_body.contains("could not be executed"), "{own_body}");
 
     let logs = output.contents();
     // Both prove the writer saw the run; without them, a dead capture
@@ -99,10 +114,12 @@ async fn query_literals_and_cell_values_never_reach_logs_or_responses() {
             !logs.contains(sentinel),
             "{sentinel} reached the logs:\n{logs}"
         );
-        assert!(
-            !body.contains(sentinel),
-            "{sentinel} reached the response: {body}"
-        );
+        for body in [&research_body, &own_body] {
+            assert!(
+                !body.contains(sentinel),
+                "{sentinel} reached the response: {body}"
+            );
+        }
     }
 }
 

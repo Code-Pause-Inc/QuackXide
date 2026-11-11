@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, make_array};
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int64Array, LargeStringArray, StringArray, StringViewArray};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -78,8 +78,41 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("from_subquery_columns", "SELECT dept, COUNT(*) AS n FROM (SELECT dept, salary FROM people) t GROUP BY dept", Rows(2)),
     ("cte_aggregate", "WITH c AS (SELECT dept, COUNT(*) AS n FROM people GROUP BY dept) SELECT dept, n FROM c", Rows(2)),
     ("group_by_expression", "SELECT salary / 100 AS band, COUNT(*) AS n FROM people GROUP BY salary / 100", Rows(2)),
-    ("count_arithmetic", "SELECT dept, COUNT(*) AS n, SUM(salary) / COUNT(*) AS mean FROM people GROUP BY dept", Rows(2)),
     ("count_ratio", "SELECT dept, COUNT(*) AS n, COUNT(*) * 100 / 15 AS pct FROM people GROUP BY dept", Rows(2)),
+    // Expressions that cannot fail at runtime (ADR 0011).
+    ("float_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > 3.5 GROUP BY dept", Rows(2)),
+    ("string_literal_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > '3' GROUP BY dept", Rows(2)),
+    ("in_list", "SELECT dept, COUNT(*) AS n FROM people WHERE dept IN ('eng', 'ops') GROUP BY dept", Rows(2)),
+    ("not_in_list", "SELECT dept, COUNT(*) AS n FROM people WHERE dept NOT IN ('ceo') GROUP BY dept", Rows(2)),
+    ("between", "SELECT dept, COUNT(*) AS n FROM people WHERE salary BETWEEN 100 AND 205 GROUP BY dept", Rows(2)),
+    ("not_between", "SELECT dept, COUNT(*) AS n FROM people WHERE salary NOT BETWEEN 7000 AND 9999 GROUP BY dept", Rows(2)),
+    ("coalesce", "SELECT dept, COUNT(*) AS n FROM people WHERE COALESCE(salary, 0) > 0 GROUP BY dept", Rows(2)),
+    ("try_cast", "SELECT dept, COUNT(*) AS n FROM people WHERE TRY_CAST(id AS BIGINT) IS NULL GROUP BY dept", Rows(2)),
+    ("cast_to_double", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(salary AS DOUBLE) > 0 GROUP BY dept", Rows(2)),
+    // Float division by zero gives infinity or NaN, never an error. NaN is
+    // unequal to every number; its order against them depends on its sign,
+    // which for `0.0 / 0.0` differs by CPU, so the NaN case uses `<>`.
+    ("float_div_by_zero", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(salary AS DOUBLE) / 0.0 > 0 GROUP BY dept", Rows(2)),
+    ("float_nan_compare", "SELECT dept, COUNT(*) AS n FROM people WHERE (CAST(salary AS DOUBLE) - CAST(salary AS DOUBLE)) / 0.0 <> 0 GROUP BY dept", Rows(2)),
+    ("add_one", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + 1 > 0 GROUP BY dept", Rows(2)),
+    ("add_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary + NULL IS NULL GROUP BY dept", Rows(2)),
+    // Unary minus only on floats; `0 - x` is the integer form, and wraps.
+    ("zero_minus_int", "SELECT dept, COUNT(*) AS n FROM people WHERE 0 - salary < 0 GROUP BY dept", Rows(2)),
+    ("negate_float", "SELECT dept, COUNT(*) AS n FROM people WHERE -CAST(salary AS DOUBLE) < 0 GROUP BY dept", Rows(2)),
+    ("negate_int", "SELECT dept, COUNT(*) AS n FROM people WHERE -salary < 0 GROUP BY dept", Rejected),
+    ("is_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary IS NOT NULL GROUP BY dept", Rows(2)),
+    ("not", "SELECT dept, COUNT(*) AS n FROM people WHERE NOT (dept = 'ceo') GROUP BY dept", Rows(2)),
+    ("order_by_ordinal_having_alias", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING n > 5 ORDER BY 2", Rows(2)),
+    ("lower_eq", "SELECT dept, COUNT(*) AS n FROM people WHERE lower(dept) = 'eng' GROUP BY dept", Rows(1)),
+    ("cast_dept_to_varchar", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(dept AS VARCHAR) = 'eng' GROUP BY dept", Rows(1)),
+    ("like", "SELECT dept, COUNT(*) AS n FROM people WHERE dept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("not_like", "SELECT dept, COUNT(*) AS n FROM people WHERE dept NOT LIKE 'e%' GROUP BY dept", Rows(1)),
+    // Expressions that can fail on some rows, refused whatever the data
+    // (ADR 0011). `SUM / COUNT` divides by zero when no row matches.
+    ("count_arithmetic", "SELECT dept, COUNT(*) AS n, SUM(salary) / COUNT(*) AS mean FROM people GROUP BY dept", Rejected),
+    ("literal_cast_fails", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST('x' AS BIGINT) > 0 GROUP BY dept", Rejected),
+    ("div_by_null", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / NULL IS NULL GROUP BY dept", Rejected),
+    ("div_by_column", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / salary > 0 GROUP BY dept", Rejected),
     // Row-level egress.
     ("select_star", "SELECT * FROM people", Rejected),
     ("bare_columns", "SELECT id, salary FROM people", Rejected),
@@ -106,7 +139,7 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("group_by_id", "SELECT id, COUNT(*) AS n, MAX(salary) AS s FROM people GROUP BY id", Rows(0)),
     ("group_by_unique_expr", "SELECT id || dept AS k, COUNT(*) AS n FROM people GROUP BY id || dept", Rows(0)),
     ("group_by_salary", "SELECT salary, COUNT(*) AS n FROM people GROUP BY salary", Rows(0)),
-    ("group_by_substr_id", "SELECT SUBSTR(id, 2, 2) AS k, COUNT(*) AS n FROM people GROUP BY SUBSTR(id, 2, 2)", Rows(0)),
+    ("group_by_substr_id", "SELECT SUBSTR(id, 2, 2) AS k, COUNT(*) AS n FROM people GROUP BY SUBSTR(id, 2, 2)", Rejected),
     ("group_by_case_isolates", "SELECT CASE WHEN dept = 'ceo' THEN salary ELSE 0 END AS s, COUNT(*) AS n FROM people GROUP BY 1", Rows(1)),
     // Grouping sets: subtotal rows beside group rows let one query subtract
     // published groups from a total and recover a suppressed cohort.
@@ -254,6 +287,138 @@ async fn zk_mode_without_a_cohort_threshold_refuses_every_query() {
     assert!(matches!(zero, Err(QueryError::Disclosure(_))), "{zero:?}");
 }
 
+/// Queries whose expressions fail only on some rows: `{P}` holds only for
+/// the single `ceo` row when `{T}` is 9000, and for no row at 9500. Each
+/// must be refused at planning both times, so the outcome says nothing
+/// about the data (ADR 0011).
+#[rustfmt::skip]
+const ERROR_PROBES: &[(&str, &str)] = &[
+    ("where_div", "SELECT dept, COUNT(*) AS n FROM people WHERE salary / (CASE WHEN {P} THEN 0 ELSE 1 END) > 0 GROUP BY dept"),
+    ("where_mod", "SELECT dept, COUNT(*) AS n FROM people WHERE salary % (CASE WHEN {P} THEN 0 ELSE 7 END) >= 0 GROUP BY dept"),
+    ("where_cast_str_to_int", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CASE WHEN {P} THEN 'x' ELSE '1' END AS BIGINT) > 0 GROUP BY dept"),
+    ("where_implicit_eq", "SELECT dept, COUNT(*) AS n FROM people WHERE (CASE WHEN {P} THEN id ELSE '1' END) = 5 GROUP BY dept"),
+    ("where_implicit_gt", "SELECT dept, COUNT(*) AS n FROM people WHERE (CASE WHEN {P} THEN id ELSE '7' END) > 3 GROUP BY dept"),
+    ("where_abs", "SELECT dept, COUNT(*) AS n FROM people WHERE abs(CASE WHEN {P} THEN salary - 9001 - 9223372036854775807 - 1 ELSE 0 END) >= 0 GROUP BY dept"),
+    ("where_to_timestamp", "SELECT dept, COUNT(*) AS n FROM people WHERE to_timestamp(CASE WHEN {P} THEN 'bad' ELSE '2020-01-01T00:00:00' END) IS NOT NULL GROUP BY dept"),
+    ("where_substr", "SELECT dept, COUNT(*) AS n FROM people WHERE substr(dept, 1, CASE WHEN {P} THEN -1 ELSE 1 END) IS NOT NULL GROUP BY dept"),
+    ("where_repeat", "SELECT dept, COUNT(*) AS n FROM people WHERE length(repeat(dept, CASE WHEN {P} THEN 2147483647 ELSE 1 END)) > 0 GROUP BY dept"),
+    ("where_lpad", "SELECT dept, COUNT(*) AS n FROM people WHERE length(lpad(dept, CASE WHEN {P} THEN 2147483647 ELSE 1 END)) > 0 GROUP BY dept"),
+    ("where_literal_div_zero", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND salary / 0 > 0 GROUP BY dept"),
+    ("where_float_to_int", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CAST(salary AS DOUBLE) / (CASE WHEN {P} THEN 0.0 ELSE 1.0 END) AS BIGINT) > 0 GROUP BY dept"),
+    ("where_to_decimal", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CASE WHEN {P} THEN salary ELSE 1 END AS DECIMAL(3,0)) > 0 GROUP BY dept"),
+    ("group_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept, salary / (CASE WHEN {P} THEN 0 ELSE 1 END)"),
+    ("having_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING 1 / (CASE WHEN MAX(salary) > {T} AND COUNT(*) = 1 THEN 0 ELSE 1 END) > 0"),
+    ("outer_div", "SELECT dept, COUNT(*) AS n, 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END) AS x FROM people GROUP BY dept"),
+    ("outer_cast", "SELECT dept, COUNT(*) AS n, CAST(CASE WHEN MAX(salary) > {T} THEN 'x' ELSE '1' END AS BIGINT) AS x FROM people GROUP BY dept"),
+    ("order_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END)"),
+    ("ratio_over_zero_rows", "SELECT COUNT(*) AS n, SUM(salary) / COUNT(*) AS m FROM people WHERE {P}"),
+    // A constant is evaluated as a scalar, where negating i64::MIN fails.
+    ("where_negate_min_literal", "SELECT dept, COUNT(*) AS n FROM people WHERE CASE WHEN {P} THEN -(-9223372036854775807 - 1) ELSE 0 END > 0 GROUP BY dept"),
+    ("outer_negate_min_literal", "SELECT dept, COUNT(*) AS n, CASE WHEN MAX(salary) > {T} THEN -(-9223372036854775807 - 1) ELSE 0 END AS x FROM people GROUP BY dept"),
+    // Merging projections puts the inner literal under the outer minus, so
+    // `-m` runs on i64::MIN as a scalar, and only for groups that exist.
+    ("subquery_negate_min", "SELECT dept, n, -m AS x FROM (SELECT dept, COUNT(*) AS n, -9223372036854775807 - 1 AS m FROM people WHERE {P} GROUP BY dept) t"),
+    ("cte_negate_min", "WITH t AS (SELECT dept, COUNT(*) AS n, -9223372036854775807 - 1 AS m FROM people WHERE {P} GROUP BY dept) SELECT dept, n, -m AS x FROM t"),
+    // Table statistics replace COUNT with a literal, so this negates
+    // i64::MIN only when exactly 15 salaries are non-null.
+    ("count_statistics_negate", "SELECT COUNT(*) AS n, -(COUNT(salary) + 9223372036854775793) AS x FROM people"),
+    // A LIKE pattern compiles to a regex when some row reaches it; a long
+    // one exceeds the regex size limit.
+    ("where_like_long_pattern", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND dept LIKE '{LONG}' GROUP BY dept"),
+    ("where_ilike_long_pattern", "SELECT dept, COUNT(*) AS n FROM people WHERE {P} AND dept ILIKE '{LONG}' GROUP BY dept"),
+];
+
+#[tokio::test]
+async fn error_probes_are_refused_whatever_the_data() {
+    let scope = scope(Some(K));
+    let mut failures = Vec::new();
+    for &(name, template) in ERROR_PROBES {
+        for threshold in ["9000", "9500"] {
+            let sql = template
+                .replace("{P}", &format!("id = 'p15' AND salary > {threshold}"))
+                .replace("{T}", threshold)
+                .replace("{LONG}", &"_".repeat(50_000));
+            match scope.sql(&sql).await {
+                Err(QueryError::ZkPolicy) => {}
+                Err(err) => failures.push(format!("{name} at {threshold}: {err}")),
+                Ok(_) => failures.push(format!("{name} at {threshold}: accepted")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Every string type accepts the same text expressions. `texts` holds the
+/// `people` departments as `Utf8` (`dept`), `LargeUtf8` (`ldept`) and
+/// `Utf8View` (`vdept`).
+#[rustfmt::skip]
+const TEXT_CASES: &[(&str, &str, Expect)] = &[
+    ("like_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE dept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("like_large_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE ldept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("like_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE vdept LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("not_like_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE vdept NOT LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("ilike_large_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE ldept ILIKE 'E%' GROUP BY dept", Rows(1)),
+    ("like_cast_to_varchar", "SELECT dept, COUNT(*) AS n FROM texts WHERE CAST(dept AS VARCHAR) LIKE 'e%' GROUP BY dept", Rows(1)),
+    ("concat_large_utf8", "SELECT dept, COUNT(*) AS n FROM texts WHERE ldept || '' = 'eng' GROUP BY dept", Rows(1)),
+    ("cast_large_utf8_to_varchar", "SELECT dept, COUNT(*) AS n FROM texts WHERE CAST(ldept AS VARCHAR) = 'eng' GROUP BY dept", Rows(1)),
+    ("lower_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE lower(vdept) = 'eng' GROUP BY dept", Rows(1)),
+    ("in_list_utf8_view", "SELECT dept, COUNT(*) AS n FROM texts WHERE vdept IN ('eng', 'ops') GROUP BY dept", Rows(2)),
+];
+
+#[tokio::test]
+async fn text_expressions_work_on_every_string_type() {
+    run(&text_scope(), TEXT_CASES).await;
+}
+
+#[tokio::test]
+async fn like_patterns_up_to_the_cap_run_and_longer_ones_are_refused() {
+    let cap = quackxide_engine::policy::MAX_LIKE_PATTERN_CHARS;
+    let scope = text_scope();
+    for column in ["dept", "ldept", "vdept"] {
+        for op in ["LIKE", "ILIKE"] {
+            let at_cap = format!("e{}", "%".repeat(cap - 1));
+            let sql = format!(
+                "SELECT dept, COUNT(*) AS n FROM texts WHERE {column} {op} '{at_cap}' GROUP BY dept"
+            );
+            check(&scope, &sql, Rows(1))
+                .await
+                .unwrap_or_else(|why| panic!("{column} {op} at cap: {why}"));
+            let over = "_".repeat(cap + 1);
+            let sql = format!(
+                "SELECT dept, COUNT(*) AS n FROM texts WHERE {column} {op} '{over}' GROUP BY dept"
+            );
+            check(&scope, &sql, Rejected)
+                .await
+                .unwrap_or_else(|why| panic!("{column} {op} over cap: {why}"));
+        }
+    }
+}
+
+/// The cap leaves room under the regex size limit even for the costliest
+/// pattern characters, and on non-ASCII data, which takes the regex path.
+#[test]
+fn like_patterns_at_the_cap_always_compile() {
+    use arrow::array::Scalar;
+    use arrow::compute::kernels::comparison::{ilike, like};
+    let cap = quackxide_engine::policy::MAX_LIKE_PATTERN_CHARS;
+    let data = StringArray::from(vec!["é", "ǅ", "k"]);
+    for unit in ["_", "%_", "ǅ", "k", "é_"] {
+        let pattern: String = unit.chars().cycle().take(cap).collect();
+        let pattern = Scalar::new(StringArray::from(vec![pattern]));
+        assert!(like(&data, &pattern).is_ok(), "LIKE {unit:?}");
+        assert!(ilike(&data, &pattern).is_ok(), "ILIKE {unit:?}");
+    }
+}
+
+#[tokio::test]
+async fn ungated_queries_are_not_checked() {
+    let rows = ungated_scope()
+        .sql("SELECT salary / 2 AS h FROM people")
+        .await
+        .expect("ungated query runs");
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 15);
+}
+
 /// Statements other than a read-only query. `{dir}` is a scratch directory.
 #[rustfmt::skip]
 const STATEMENTS: &[(&str, &str)] = &[
@@ -379,6 +544,27 @@ fn ungated_scope() -> QueryScope {
             &parquet(&[("id", &ids), ("dept", &depts), ("salary", &salaries)]),
         )
         .expect("register people");
+    scope
+}
+
+/// A zero-knowledge scope (k = `K`) whose `texts` table holds each `people`
+/// department as `Utf8`, `LargeUtf8` and `Utf8View`.
+fn text_scope() -> QueryScope {
+    let mut scope = QueryScope::new(EngineSettings {
+        zk: ZkMode::Enabled,
+        max_concurrent_queries: 1,
+    });
+    let depts = || ROWS.iter().map(|r| r.1);
+    let utf8 = StringArray::from_iter_values(depts());
+    let large = LargeStringArray::from_iter_values(depts());
+    let view = StringViewArray::from_iter_values(depts());
+    scope
+        .register_parquet(
+            "texts",
+            &parquet(&[("dept", &utf8), ("ldept", &large), ("vdept", &view)]),
+        )
+        .expect("register texts");
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: K }));
     scope
 }
 
