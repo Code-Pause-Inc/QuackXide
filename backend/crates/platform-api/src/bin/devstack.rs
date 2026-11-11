@@ -34,8 +34,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use platform_api::dev::{self, DevResearchStack};
-use platform_api::query::ConnectorQueryService;
-use platform_api::research::PublishListingRequest;
+use platform_api::research::{PublishListingRequest, ResearchService, ResearchStores};
 use platform_api::{AppState, build_apps};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
@@ -57,7 +56,7 @@ const TOKEN_TTL_SECS: i64 = 8 * 3600;
 async fn main() -> anyhow::Result<()> {
     // Before `from_env` loads `.env`, so a stray `.env` cannot opt in.
     let opted_in = dev::require_opt_in(|key| std::env::var(key).ok());
-    let config = PlatformConfig::from_env()?;
+    let config = PlatformConfig::from_env_dev_tool()?;
     platform_telemetry::init_from_env();
 
     let secret = match opted_in.and_then(|()| dev::require_dev_config(&config)) {
@@ -88,12 +87,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("committing the synthetic cohort")?;
     let vault = stack.vault();
-    let service = stack.query_service(
-        engine_settings(&config),
-        min_cohort,
-        config.research.default_query_budget,
-    );
-    let listing_id = publish_listing_for(&service, steward, &connector).await?;
+    let research = Arc::new(ResearchService::from_config(
+        ResearchStores::in_memory(),
+        &config.research,
+    ));
+    let service = stack.query_service(engine_settings(&config), research.clone());
+    let listing_id = publish_listing_for(&research, steward, &connector).await?;
 
     let steward_token = dev_token(secret, &config, steward, "dev-steward")?;
     let researcher_token = dev_token(secret, &config, researcher, "dev-researcher")?;
@@ -108,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config),
         vault,
         jwt: Some(jwt),
+        research: Some(research),
         query: Some(Arc::new(service)),
         provisioning: None,
     });
@@ -182,7 +182,7 @@ fn synthetic_cohort(min_cohort: u64) -> anyhow::Result<(Zeroizing<Vec<u8>>, usiz
 
 /// Publishes the steward's catalog listing for the cohort and returns its id.
 async fn publish_listing_for(
-    service: &ConnectorQueryService,
+    research: &ResearchService,
     steward: TenantId,
     connector: &ConnectorSlug,
 ) -> anyhow::Result<String> {
@@ -194,7 +194,7 @@ async fn publish_listing_for(
         compute_rate_cents: 0,
         grant_budget: None,
     };
-    let listing = service
+    let listing = research
         .publish_listing(steward, connector, &request)
         .await
         .map_err(|_| anyhow!("publishing the catalog listing failed"))?;
@@ -249,13 +249,13 @@ mod tests {
             .commit_snapshot(steward, keypair, &connector, "cohort", &parquet)
             .await
             .expect("commit");
-        let service = stack.query_service(
-            engine_settings(&config),
-            min_cohort,
-            config.research.default_query_budget,
-        );
+        let research = Arc::new(ResearchService::from_config(
+            ResearchStores::in_memory(),
+            &config.research,
+        ));
+        let service = stack.query_service(engine_settings(&config), research.clone());
 
-        let granted = service.grant(steward, researcher, &connector, None).await;
+        let granted = research.grant(steward, researcher, &connector, None).await;
         assert!(granted.is_ok(), "grant refused");
         let sql = example_sql();
         let Ok(result) = service
