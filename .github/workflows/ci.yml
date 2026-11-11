@@ -174,12 +174,15 @@ jobs:
               exit 1
             fi
           done
+      # The two steps below check the build-time layer, past the production-mode
+      # gate (ADR 0009): APP_ENV=development, which production mode would
+      # refuse with these settings anyway.
       - name: The release connector-worker refuses unattested syncs
         run: |
           cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-connectors --bin connector-worker
           cd "$RUNNER_TEMP"
           set +e
-          TEE_ATTESTATION_REQUIRED=false timeout 20 "$GITHUB_WORKSPACE/backend/target/release/connector-worker" > worker.log 2>&1
+          APP_ENV=development TEE_ATTESTATION_REQUIRED=false timeout 20 "$GITHUB_WORKSPACE/backend/target/release/connector-worker" > worker.log 2>&1
           set -e
           if ! grep '"audit_kind":"tee.attestation"' worker.log | grep -q '"outcome":"denied"'; then
             cat worker.log
@@ -197,7 +200,7 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set +e
-          KEY_RELEASE_URL=http://127.0.0.1:9 BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+          APP_ENV=development KEY_RELEASE_URL=http://127.0.0.1:9 BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
             timeout 30 "$GITHUB_WORKSPACE/backend/target/release/platform-api" > platform-api.log 2>&1
           status=$?
           set -e
@@ -212,7 +215,8 @@ jobs:
             exit 1
           fi
       # The local-directory vault exists for the simulated TEE stack only, and
-      # no build accepts it together with a bucket.
+      # no build accepts it together with a bucket. APP_ENV=development gets
+      # past the production-mode gate (ADR 0009) to the build-level refusal.
       - name: The release platform-api refuses STORAGE_LOCAL_DIR
         working-directory: ${{ runner.temp }}
         run: |
@@ -223,7 +227,7 @@ jobs:
             local reason="$1"
             shift
             set +e
-            env "$@" STORAGE_LOCAL_DIR="$PWD/vault" BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+            env "$@" APP_ENV=development STORAGE_LOCAL_DIR="$PWD/vault" BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
               timeout 30 "$GITHUB_WORKSPACE/backend/target/release/platform-api" > platform-api.log 2>&1
             status=$?
             set -e
@@ -241,6 +245,33 @@ jobs:
           }
           refuses 'STORAGE_LOCAL_DIR is dev-only'
           refuses 'not both' STORAGE_BUCKET=example-bucket
+      # Production is the default (ADR 0009): with no APP_ENV, both release
+      # binaries refuse their development-only defaults and audit the refusal.
+      - name: The release binaries refuse to start in production mode
+        working-directory: ${{ runner.temp }}
+        run: |
+          for bin in platform-api connector-worker; do
+            set +e
+            BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+              timeout 30 "$GITHUB_WORKSPACE/backend/target/release/$bin" > "$bin.log" 2>&1
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+              cat "$bin.log"
+              echo "::error::the release $bin started in production mode without production configuration"
+              exit 1
+            fi
+            if ! grep -q "production mode refuses to start $bin" "$bin.log"; then
+              cat "$bin.log"
+              echo "::error::the release $bin exited, but not because of production mode"
+              exit 1
+            fi
+            if ! grep '"audit_kind":"service.start"' "$bin.log" | grep -q '"outcome":"denied"'; then
+              cat "$bin.log"
+              echo "::error::the release $bin refused production mode without a service.start audit event"
+              exit 1
+            fi
+          done
 
 
   fuzz-build:

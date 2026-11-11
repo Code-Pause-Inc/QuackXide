@@ -34,10 +34,12 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+pub mod wiring;
 use admin::ProvisioningService;
 use query::{
     ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
 };
+use research::ResearchService;
 
 /// 4 MiB plaintext chunk + GCM tag + IV prefix, with headroom.
 pub const MAX_CHUNK_BODY_BYTES: usize = 5 * 1024 * 1024;
@@ -54,7 +56,12 @@ pub struct AppState {
     pub vault: Arc<dyn VaultStore>,
     /// None ⇒ auth not configured ⇒ drive routes refuse (fail closed).
     pub jwt: Option<Arc<JwtVerifier>>,
-    /// None ⇒ query, grant, catalog, and research routes refuse with 503.
+    /// Research access, which needs no key material. None ⇒ catalog,
+    /// access-request, grant and budget routes refuse with 503. A query
+    /// service that runs research queries holds the same `Arc`.
+    pub research: Option<Arc<ResearchService>>,
+    /// None ⇒ the query, research-query and attestation routes refuse with
+    /// 503.
     pub query: Option<Arc<ConnectorQueryService>>,
     /// None ⇒ admin and webhook routes refuse with 503.
     pub provisioning: Option<Arc<ProvisioningService>>,
@@ -555,13 +562,20 @@ pub(crate) fn query_service(state: &AppState) -> Result<&Arc<ConnectorQueryServi
     state.query.as_ref().ok_or(ApiError::QueryUnavailable)
 }
 
+pub(crate) fn research_service(state: &AppState) -> Result<&ResearchService, ApiError> {
+    state
+        .research
+        .as_deref()
+        .ok_or(ApiError::ResearchUnavailable)
+}
+
 /// Steward grants a researcher aggregate access to one of its connectors.
 async fn create_grant(
     State(state): State<AppState>,
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Json(req): Json<GrantRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     let researcher: TenantId = req
         .researcher_tenant
         .parse()
@@ -572,7 +586,7 @@ async fn create_grant(
     let connector = ConnectorSlug::new(&req.connector)
         .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
     Ok(Json(
-        service
+        research
             .grant(steward, researcher, &connector, req.query_budget)
             .await?,
     ))
@@ -585,12 +599,12 @@ async fn top_up_budget(
     Path(grant_id): Path<String>,
     Json(req): Json<TopUpRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     if req.additional == 0 {
         return Err(ApiError::BadRequest("top-up amount must be positive"));
     }
     Ok(Json(
-        service
+        research
             .top_up_budget(steward, &grant_id, req.additional)
             .await?,
     ))
@@ -602,8 +616,8 @@ async fn get_budget(
     Extension(AuthedTenant(caller)): Extension<AuthedTenant>,
     Path(grant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.budget_state(caller, &grant_id).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.budget_state(caller, &grant_id).await?))
 }
 
 async fn revoke_grant(
@@ -611,16 +625,16 @@ async fn revoke_grant(
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Path(grant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.revoke_grant(steward, &grant_id).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.revoke_grant(steward, &grant_id).await?))
 }
 
 async fn list_grants(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.list_grants(tenant).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.list_grants(tenant).await?))
 }
 
 async fn run_research_query(

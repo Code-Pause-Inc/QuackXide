@@ -8,7 +8,7 @@ default = []
 # local-directory vault (`STORAGE_LOCAL_DIR`). Never a default
 # feature; release builds (`.github/workflows/release.yml`) do not enable
 # it. The `Dockerfile` does: it builds the simulated TEE stack.
-dev = ["dep:synth-data", "platform-enclave/simulated", "platform-storage/dev"]
+dev = ["dep:synth-data", "platform-enclave/simulated", "platform-config/dev", "platform-storage/dev"]
 
 # Built only when `dev` is on (`--features dev`, or any build that includes
 # tests, through the dev-dependency below). A plain
@@ -25,6 +25,11 @@ required-features = ["dev"]
 
 [[bin]]
 name = "query-demo"
+required-features = ["dev"]
+
+# Dev-only: mints HS256 tokens, which production mode refuses (ADR 0009).
+[[bin]]
+name = "devtoken"
 required-features = ["dev"]
 
 [[bin]]
