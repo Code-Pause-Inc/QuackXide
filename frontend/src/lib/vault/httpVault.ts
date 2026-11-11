@@ -13,8 +13,10 @@ import {
 
 export interface HttpVaultConfig {
   baseUrl: string;
-  /** Without a token, requests go out unauthenticated and are rejected. */
-  token: string | null;
+  /** Read on every request, so a refreshed token applies without rebuilding
+   *  the vault. Without a token, requests go out unauthenticated and are
+   *  rejected. */
+  getToken: () => string | null;
   /** Local tenant id, used to rebuild records for client-side AAD checks. */
   tenantId: string;
 }
@@ -37,7 +39,8 @@ export class HttpVault implements VaultClient {
 
   private headers(contentType?: string): HeadersInit {
     const headers: Record<string, string> = {};
-    if (this.config.token) headers.Authorization = `Bearer ${this.config.token}`;
+    const token = this.config.getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
     if (contentType) headers["Content-Type"] = contentType;
     return headers;
   }
