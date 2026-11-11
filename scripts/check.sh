@@ -17,6 +17,11 @@ cargo check --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-targets
 echo "== backend: clippy (warnings are errors) =="
 cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" --workspace --all-targets --locked -- -D warnings
 
+echo "== backend: clippy, production feature set (no dev feature) =="
+# --all-targets above unifies in the test-only `dev` feature; the release
+# binaries are built without it, so lint them as shipped.
+cargo clippy --manifest-path "$ROOT/backend/Cargo.toml" -p platform-api -p platform-connectors --bins --locked -- -D warnings
+
 echo "== backend: cargo test =="
 cargo test --manifest-path "$ROOT/backend/Cargo.toml" --workspace --locked
 

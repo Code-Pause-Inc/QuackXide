@@ -9,11 +9,15 @@
 //! `GET /api/v1/attestation` answer 503. A `dev` build builds it when
 //! `KEY_RELEASE_URL` names the simulated TEE's key-release stand-in, on the
 //! same research service the research routes use.
+//!
+//! Before any of that, [`PlatformConfig::enforce_production`] runs the
+//! production-mode gate
+//! (ADR 0009).
 
 use std::sync::Arc;
 
 use platform_auth::JwtVerifier;
-use platform_config::PlatformConfig;
+use platform_config::{PlatformConfig, Service};
 use platform_storage::{ObjectStoreVault, VaultStore};
 // Only the non-`dev` refusal uses these. Clippy runs with `dev` on and
 // `-D warnings`, so an ungated import would fail it.
@@ -26,8 +30,13 @@ use crate::research::{ResearchService, ResearchStores};
 
 /// Builds the API state from `config`: vault, token verifier, attestation,
 /// research access, the confidential query service and provisioning.
-/// Refuses, with an audit event, a configuration this build must not run.
+/// Refuses, with an audit event, a configuration this build or production
+/// mode must not run; nothing is built before the production-mode gate.
 pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
+    config
+        .enforce_production(Service::PlatformApi)
+        .map_err(|refusal| anyhow::anyhow!("refusing to start: {refusal}"))?;
+
     let vault: Arc<dyn VaultStore> = match config.storage.bucket.as_deref() {
         Some(bucket) => {
             tracing::info!(vault = "gcs", "storage vault: Google Cloud Storage");
@@ -55,7 +64,7 @@ pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
 
     let attestation = platform_enclave::provider_for(config.features.tee_attestation_required);
     if !config.features.tee_attestation_required {
-        maybe_seed_demo_fixture(&vault, &attestation).await?;
+        maybe_seed_demo_fixture(&config, &vault, &attestation).await?;
     }
 
     // One `Arc` for the research routes and the query service, so the grant
@@ -170,23 +179,19 @@ fn key_release_query_service(
 /// seal the synthetic QuickBooks fixture into the vault for `DEMO_TENANT_ID`
 /// using `DEMO_TENANT_PUBLIC_KEY_B64`.
 async fn maybe_seed_demo_fixture(
+    config: &PlatformConfig,
     vault: &Arc<dyn VaultStore>,
     attestation: &Arc<dyn platform_enclave::AttestationProvider>,
 ) -> anyhow::Result<()> {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
 
-    let (Ok(raw_tenant), Ok(raw_pk_b64)) = (
-        std::env::var("DEMO_TENANT_ID"),
-        std::env::var("DEMO_TENANT_PUBLIC_KEY_B64"),
-    ) else {
+    let demo = &config.connectors.demo_tenant;
+    let (Some(raw_tenant), Some(raw_pk_b64)) =
+        (demo.tenant_id.as_deref(), demo.public_key_b64.as_deref())
+    else {
         return Ok(());
     };
-    let raw_tenant = raw_tenant.trim();
-    let raw_pk_b64 = raw_pk_b64.trim();
-    if raw_tenant.is_empty() || raw_pk_b64.is_empty() {
-        return Ok(());
-    }
 
     let tenant: platform_core::TenantId = raw_tenant.parse()?;
     let pk_bytes = B64.decode(raw_pk_b64)?;

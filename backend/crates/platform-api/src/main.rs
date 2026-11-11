@@ -1,4 +1,5 @@
-//! platform-api binary: config → telemetry → state (`platform_api::wiring`) → serve.
+//! platform-api binary: config → telemetry → state (`platform_api::wiring`: production-mode
+//! gate, then wiring) → serve.
 
 use platform_api::build_apps;
 use platform_config::PlatformConfig;
@@ -13,7 +14,12 @@ async fn main() -> anyhow::Result<()> {
 
     let state = platform_api::wiring::build_state(config).await?;
 
-    security_audit_event(AuditKind::ServiceStart, None, "ok", "platform-api booting");
+    security_audit_event(
+        AuditKind::ServiceStart,
+        None,
+        "ok",
+        &format!("platform-api booting ({})", state.config.env.as_str()),
+    );
 
     let bind_addr = state.config.server.bind_addr;
     let metrics_addr = state.config.server.metrics_bind_addr;
