@@ -3163,6 +3163,7 @@ dependencies = [
  "object_store",
  "platform-config",
  "platform-core",
+ "platform-storage",
  "thiserror",
  "tokio",
 ]

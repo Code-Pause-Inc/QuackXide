@@ -79,7 +79,9 @@ Client key architecture:
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
-  `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  `ObjectStoreVault` covers GCS (production), in-memory (dev/tests) and,
+  in `dev` builds only, a local directory (`STORAGE_LOCAL_DIR`, used by
+  the simulated TEE stack). A release build refuses `STORAGE_LOCAL_DIR`.
   Storage errors are classified: missing objects are 404, lost
   create-only writes 409, transient failures (after the storage client's
   own retries) 503 with `Retry-After`, and permanent ones (credentials,
