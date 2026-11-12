@@ -18,7 +18,9 @@ use platform_config::PlatformConfig;
 use platform_core::{TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
+use platform_storage::{
+    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+};
 use platform_telemetry::capture::AuditCapture;
 use quackxide_engine::EngineSettings;
 use serde_json::json;
@@ -59,6 +61,9 @@ impl VaultStore for TestVault {
             Listing::Fails => Err(StorageError::Unavailable("down".into())),
             Listing::Hangs => std::future::pending().await,
         }
+    }
+    async fn list_entries(&self, _: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        unreachable!("readiness lists paths only")
     }
     async fn usage(&self, _: &VaultPath) -> Result<StorageUsage, StorageError> {
         unreachable!("readiness never measures usage")

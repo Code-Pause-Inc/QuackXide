@@ -105,6 +105,42 @@ delete that fails partway leaves the object listed and a retry finishes it.
 Until then the object's download fails, since some chunks are gone. An
 object whose manifest is gone is a 404.
 
+An upload sends its chunks first and its manifest last. The manifest PUT
+is refused with 409 unless every chunk `0..chunk_count` is stored, so a
+listed object always had all its chunks when it was committed.
+
+An upload that stops before its manifest leaves chunks nothing points to.
+`platform-api` sweeps every hour (`platform_api::sweep`): it deletes an
+object's chunks when the object has no manifest and no chunk of it has been
+written for 24 hours (`ORPHAN_MIN_AGE`). An upload that pauses longer than
+that between chunks loses the chunks it had sent, and its manifest is then
+refused.
+
+The sweep and a manifest PUT for the same object cannot both succeed.
+Before deleting, the sweep claims the object by creating a marker
+(`tenants/{tenant}/drive/sweeping/{object}`, create-only), then checks for
+a manifest and re-lists the chunks, so a manifest or chunk written since
+its first listing saves the object. It removes the marker only after its
+last delete. The manifest PUT checks the marker and the chunks, writes the
+manifest, then checks both again and deletes the manifest it wrote if
+either check fails. Each side writes before it reads what the other wrote,
+so either the sweep finds the manifest and deletes nothing, or the upload
+finds the marker or a missing chunk and gets 409. An object another run has
+claimed is skipped. A marker left by a run that stopped partway keeps its
+object refused until a later run finds the marker older than
+`ORPHAN_MIN_AGE` and removes it. Replacing an existing manifest skips the
+second check: the sweep never deletes the chunks of an object that has a
+manifest.
+
+Each deletion is audited; a run that deletes nothing audits nothing. One
+object's storage error does not stop the run. The sweep's cross-tenant
+listing stays inside `platform-storage` (`list_drive_entries_all_tenants`),
+which returns only single-tenant drive paths. Ages are the store's
+last-modified times, so the API host's clock must be within hours of the
+store's. The claim depends on the store's create-only write; the local GCS
+emulator does not enforce it, so two sweeps there can both claim an object,
+which deletes the same orphan twice and nothing else.
+
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
 

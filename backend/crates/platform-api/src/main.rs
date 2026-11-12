@@ -14,6 +14,9 @@ async fn main() -> anyhow::Result<()> {
 
     let state = platform_api::wiring::build_state(config).await?;
 
+    // Deletes chunks of drive uploads that never wrote a manifest.
+    platform_api::sweep::spawn_sweeper(state.vault.clone());
+
     security_audit_event(
         AuditKind::ServiceStart,
         None,

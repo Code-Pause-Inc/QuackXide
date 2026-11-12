@@ -28,7 +28,9 @@ use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
+use platform_storage::{
+    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+};
 use quackxide_engine::EngineSettings;
 use sha2::Sha256;
 use tower::ServiceExt;
@@ -349,6 +351,17 @@ impl FlakyVault {
     fn check(&self, fails: bool) -> Result<(), StorageError> {
         if fails { Err((self.error)()) } else { Ok(()) }
     }
+
+    /// Store an object whatever the faults, as data written before the
+    /// outage began.
+    pub async fn seed(&self, path: &VaultPath, ciphertext: Bytes) {
+        self.inner.put(path, ciphertext).await.expect("seed");
+    }
+
+    /// Whether an object is stored, whatever the faults.
+    pub async fn holds(&self, path: &VaultPath) -> bool {
+        self.inner.get(path).await.is_ok()
+    }
 }
 
 /// A [`FlakyVault`] failing `faults` with [`outage`].
@@ -377,6 +390,10 @@ impl VaultStore for FlakyVault {
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.check(self.faults.list)?;
         self.inner.list(prefix).await
+    }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.check(self.faults.list)?;
+        self.inner.list_entries(prefix).await
     }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.check(self.faults.usage)?;
