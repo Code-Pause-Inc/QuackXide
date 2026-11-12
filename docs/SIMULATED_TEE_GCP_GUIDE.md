@@ -8,9 +8,9 @@ This document maps each component of the local simulated TEE to its production c
 
 | QuackXide Component | What It Does in Local Simulation (`TeePlatform::Simulated`) | Production Counterpart (ADR 0004) |
 | --- | --- | --- |
-| **`sim-attestation` (`TokenSigner`, `bin/sim-attestation.rs`)** | Signs RS256 tokens with a throwaway RSA-2048 key generated at start, with Google's claim layout: `iss`, `aud`, `exp`, `nbf`, `eat_nonce`, `hwmodel`, `swname`, `dbgstat`, `submods.confidential_space.support_attributes`, `submods.container.image_digest`. `GET /jwks` publishes the key set. | Google's attestation service, which verifies the TDX quote and signs the token ([token claims](https://docs.cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims)). |
+| **`sim-attestation` (`TokenSigner`, `bin/sim-attestation.rs`)** | Signs RS256 tokens with a throwaway RSA-2048 key generated at start, with Google's claim layout: `iss`, `aud`, `iat`, `exp`, `nbf`, `eat_nonce`, `hwmodel`, `swname`, `dbgstat`, `submods.confidential_space.support_attributes`, `submods.container.image_digest`. `GET /jwks` publishes the key set. | Google's attestation service, which verifies the TDX quote and signs the token ([token claims](https://docs.cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims)). |
 | **`SimulatedTokenProvider` (`AttestationProvider`)** | Requests a token from `sim-attestation` with `POST /v1/token {audience, nonces, token_type: "OIDC"}`, and verifies its own tokens with `TokenVerifier` (dev gates). | A Confidential Space provider (P48) requesting the token from the launcher (`/run/container_launcher/teeserver.sock`) with the same request shape. |
-| **`TokenVerifier` (`platform_enclave::token`)** | The production verifier: RS256 only; issuer, audience, `exp`/`nbf` (60 s leeway), nonces; `hwmodel == GCP_INTEL_TDX`, `swname == CONFIDENTIAL_SPACE`, `dbgstat == disabled-since-boot`, `STABLE`, allowed image digest. | The same code, given Google's key set (ADR 0004 open question 3) and the image digests P49 publishes. |
+| **`TokenVerifier` (`platform_enclave::token`)** | The production verifier: RS256 only; issuer, audience, `exp`/`nbf` (60 s leeway), a required `iat` no later than now plus the leeway, an `exp` no earlier than `iat` and at most one hour after it, nonces; `hwmodel == GCP_INTEL_TDX`, `swname == CONFIDENTIAL_SPACE`, `dbgstat == disabled-since-boot`, `STABLE`, allowed image digest. | The same code, given Google's key set (ADR 0004 open question 3) and the image digests P49 publishes. |
 | **Nonces (`ReportDataBinding`)** | Two 32-byte nonces, base64url: the freshness nonce, and `SHA-256(tag ‖ enclave_hpke_pk ‖ result_signing_pk ‖ tls_cert_sha256 ‖ config_digest)`. | The same binding (ADR 0004, "Freshness and binding"). |
 | **`SIM_TOKEN_DBGSTAT`, `SIM_TOKEN_IMAGE_DIGEST`, `SIM_TOKEN_HWMODEL`** | Change the claims `sim-attestation` signs, to prove refusals. | A debug Confidential Space image, a different image, or other hardware. |
 | **`EnclaveIdentity` (`platform-api::key_release`)** | Ephemeral in-RAM HPKE keypair generated at process start; the private key never leaves process memory. | The same key generation inside the TDX guest, whose memory TDX encrypts. |
@@ -87,7 +87,7 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 └──────────────────┘ └──────────────────┘
 ```
 
-`enclave-api` keeps sealed snapshots in the in-memory vault. `fake-gcs-server` 1.49.3 routes `object_store` 0.13's simple uploads (`PUT /{bucket}/{object}`) to its JSON upload handler and refuses them, so the stack has no storage emulator; the GCS client is covered by `platform-storage`'s tests against local fake servers.
+`enclave-api` keeps sealed snapshots in a directory on the `enclave_vault` volume (`STORAGE_LOCAL_DIR`, which only `dev` builds accept). `fake-gcs-server` routes `object_store` 0.13's simple uploads (`PUT /{bucket}/{object}`) to its JSON upload handler and refuses them (still so in 1.56.1; #153), so the stack has no storage emulator; the GCS client is covered by `platform-storage`'s tests against local fake servers.
 
 `setup_net` (not internal) connects `key-release-service` and `sim-attestation` to `127.0.0.1` ports, only so the test script can enroll a tenant key and wait for the simulator: Docker publishes no ports for containers that are only on an internal network.
 
@@ -104,12 +104,14 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 ./scripts/test-simulated-tee.sh
 ```
 
-It runs five stages:
+It runs seven stages:
 1. Builds every image and starts `sim-attestation` and `key-release-service`.
 2. Enrolls a tenant key (`PUT /v1/keys`, which returns the public key).
-3. Starts `enclave-api`, which seals the synthetic QuickBooks fixture into its in-memory vault under the tenant's public key.
-4. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
-5. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
+3. Starts `enclave-api`, which seals the synthetic QuickBooks fixture into its vault under the tenant's public key.
+4. Copies the vault out of the container and requires tenant objects with no plaintext: no fixture customer name and no Parquet magic bytes.
+5. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
+6. Runs the research lifecycle: publish, request, approve, a query under disclosure control and a budget, revoke.
+7. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
 
 ---
 

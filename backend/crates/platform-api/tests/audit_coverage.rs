@@ -1,6 +1,6 @@
 //! Audit-coverage contract: every security-relevant flow (key enrollment,
-//! TEE attestation, provisioning, data access including misses and denials)
-//! emits its SECURITY_AUDIT_EVENT record.
+//! TEE attestation, provisioning, data access including misses and denials,
+//! the research catalog) emits its SECURITY_AUDIT_EVENT record.
 
 mod common;
 
@@ -25,7 +25,7 @@ use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
 
-use common::{app_state, bearer, dev_attestation, json_header, send, synced_vault};
+use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
 
 const SECRET: &str = "audit-itest-secret";
 const PADDLE_SECRET: &str = "pdl_ntfset_audit_secret";
@@ -362,7 +362,7 @@ async fn provisioning_webhook_is_audited() {
     let app = full_app(TenantId::generate(), ZkMode::Disabled).await;
 
     let body =
-        br#"{"event_type":"subscription.created","data":{"id":"sub_a","customer_id":"cus_a","items":[{"price":{"id":"pri_x"}}]}}"#
+        br#"{"event_type":"subscription.created","occurred_at":"2026-07-30T12:00:00Z","data":{"id":"sub_a","customer_id":"cus_a","items":[{"price":{"id":"pri_x"}}]}}"#
             .to_vec();
     let (status, _) = send(
         &app,
@@ -384,6 +384,75 @@ async fn provisioning_webhook_is_audited() {
         "{:?}",
         capture.events()
     );
+
+    // Every status event is audited with what it did, even when nothing
+    // changed: a skipped event is denied (stale or canceled), an unknown
+    // subscription is a miss.
+    for (subscription, event_type, occurred_at) in [
+        ("sub_a", "subscription.paused", "2026-08-02T00:00:00Z"),
+        ("sub_a", "subscription.paused", "2026-08-01T00:00:00Z"),
+        ("sub_a", "subscription.resumed", "2026-08-01T00:00:00Z"),
+        ("sub_a", "subscription.resumed", "2026-08-03T00:00:00Z"),
+        ("sub_a", "subscription.canceled", "2026-07-31T00:00:00Z"),
+        ("sub_a", "subscription.resumed", "2026-08-04T00:00:00Z"),
+        ("sub_zzz", "subscription.resumed", "2026-08-04T00:00:00Z"),
+    ] {
+        let body = format!(
+            r#"{{"event_type":"{event_type}","occurred_at":"{occurred_at}","data":{{"id":"{subscription}"}}}}"#
+        )
+        .into_bytes();
+        let signature = common::paddle_signature(PADDLE_SECRET, &body);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/admin/webhooks/mor",
+            &[("Paddle-Signature", signature), json_header()],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let status_changes: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.audit_kind == "tenant.provisioned"
+                && e.detail != "provisioned subscription=sub_a plan=pri_x"
+        })
+        .map(|e| (e.outcome, e.detail))
+        .collect();
+    let expected = [
+        (
+            "ok",
+            "suspend subscription=sub_a occurred_at=2026-08-02 00:00:00 UTC",
+        ),
+        (
+            "denied",
+            "suspend subscription=sub_a occurred_at=2026-08-01 00:00:00 UTC reason=stale",
+        ),
+        (
+            "denied",
+            "resume subscription=sub_a occurred_at=2026-08-01 00:00:00 UTC reason=stale",
+        ),
+        (
+            "ok",
+            "resume subscription=sub_a occurred_at=2026-08-03 00:00:00 UTC",
+        ),
+        (
+            "ok",
+            "cancel subscription=sub_a occurred_at=2026-07-31 00:00:00 UTC",
+        ),
+        (
+            "denied",
+            "resume subscription=sub_a occurred_at=2026-08-04 00:00:00 UTC reason=canceled",
+        ),
+        (
+            "miss",
+            "resume subscription=sub_zzz occurred_at=2026-08-04 00:00:00 UTC",
+        ),
+    ]
+    .map(|(o, d)| (o.to_owned(), d.to_owned()));
+    assert_eq!(status_changes, expected);
 
     // Bad signature → AuthDecision denied in the audit stream.
     let (status, _) = send(
@@ -546,5 +615,140 @@ async fn drive_listing_past_the_cap_is_audited() {
         capture.contains("data.access", "denied"),
         "{:?}",
         capture.events()
+    );
+}
+
+/// Asserts a `research.catalog` event with this outcome and exactly this
+/// detail was captured. `contains()` compares only kind and outcome.
+fn assert_catalog_event(capture: &AuditCapture, outcome: &str, detail: &str) {
+    let events = capture.events();
+    assert!(
+        events.iter().any(|e| {
+            e.audit_kind == "research.catalog" && e.outcome == outcome && e.detail == detail
+        }),
+        "no research.catalog {outcome} event {detail:?} in {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn research_catalog_is_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = common::research_app(
+        SECRET,
+        steward,
+        TenantKeypair::generate(),
+        dev_attestation(),
+        false,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let rtoken = token_for(researcher);
+
+    // Publish a listing, then request access to it.
+    let (status, listing) = post(
+        &app,
+        "/api/v1/catalog",
+        &stoken,
+        r#"{"connector":"health","title":"Cohorts","license_fee_cents":0,"compute_rate_cents":0}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "publish: {listing}");
+    let listing_id = listing["listing_id"].as_str().expect("listing id");
+    let request_uri = format!("/api/v1/catalog/{listing_id}/request");
+    let (status, request) = post(&app, &request_uri, &rtoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "request: {request}");
+    let request_id = request["request_id"].as_str().expect("request id");
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let deny = format!("/api/v1/research/requests/{request_id}/deny");
+
+    // A first approval, then a retry of it.
+    let (status, resolved) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "approve: {resolved}");
+    let grant_id = resolved["grant"]["grant_id"].as_str().expect("grant id");
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Denying the Approved request is refused.
+    let (status, _) = post(&app, &deny, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A retry that names a different budget is refused.
+    let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":7}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // After a revoke, a retried approval is refused.
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A fresh request, denied normally.
+    let (status, fresh) = post(&app, &request_uri, &rtoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "request: {fresh}");
+    let fresh_id = fresh["request_id"].as_str().expect("request id");
+    let fresh_deny = format!("/api/v1/research/requests/{fresh_id}/deny");
+    let (status, _) = post(&app, &fresh_deny, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("published listing={listing_id} connector=health"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("requested request={request_id} listing={listing_id} steward={steward}"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("approved request={request_id} researcher={researcher}"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("approved request={request_id} researcher={researcher} retry=true"),
+    );
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("deny refused request={request_id} researcher={researcher} status=approved"),
+    );
+
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("approve refused request={request_id} retry=true reason=budget"),
+    );
+
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("approve refused request={request_id} grant={grant_id} retry=true reason=revoked"),
+    );
+    assert_catalog_event(
+        &capture,
+        "ok",
+        &format!("denied request={fresh_id} researcher={researcher}"),
+    );
+}
+
+#[tokio::test]
+async fn production_mode_refusal_is_audited_without_values() {
+    let capture = AuditCapture::install();
+    let config = platform_config::PlatformConfig::from_source(|key| {
+        (key == "JWT_HS256_SECRET").then(|| "audit-refusal-secret".to_owned())
+    })
+    .expect("config loads");
+    assert!(platform_api::wiring::build_state(config).await.is_err());
+    let events = capture.events();
+    assert!(capture.contains("service.start", "denied"), "{events:?}");
+    assert!(!capture.contains("service.start", "ok"), "{events:?}");
+    assert!(
+        !format!("{events:?}").contains("audit-refusal-secret"),
+        "{events:?}"
     );
 }

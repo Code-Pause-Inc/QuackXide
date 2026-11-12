@@ -3,11 +3,12 @@ default = []
 # DEV ONLY. Builds the `devstack` local research server and the research
 # wiring it shares with the integration tests: tenant keys held in process
 # memory and fabricated, unattested TEE evidence. Also builds the simulated
-# TEE: the key-release stand-in (`key_release::stand_in`) and
-# `platform-enclave`'s simulated token provider. Never a default
+# TEE: the key-release stand-in (`key_release::stand_in`),
+# `platform-enclave`'s simulated token provider and `platform-storage`'s
+# local-directory vault (`STORAGE_LOCAL_DIR`). Never a default
 # feature; release builds (`.github/workflows/release.yml`) do not enable
 # it. The `Dockerfile` does: it builds the simulated TEE stack.
-dev = ["dep:synth-data", "platform-enclave/simulated"]
+dev = ["dep:synth-data", "platform-enclave/simulated", "platform-config/dev", "platform-storage/dev"]
 
 # Built only when `dev` is on (`--features dev`, or any build that includes
 # tests, through the dev-dependency below). A plain
@@ -24,6 +25,11 @@ required-features = ["dev"]
 
 [[bin]]
 name = "query-demo"
+required-features = ["dev"]
+
+# Dev-only: mints HS256 tokens, which production mode refuses (ADR 0009).
+[[bin]]
+name = "devtoken"
 required-features = ["dev"]
 
 [[bin]]
@@ -63,6 +69,7 @@ futures.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

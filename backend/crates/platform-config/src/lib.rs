@@ -30,8 +30,66 @@ const DEFAULT_STORAGE_RETRY_TIMEOUT_SECS: u64 = 20;
 /// Longest wait between two retries; never longer than the retry window.
 pub const STORAGE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Deployment mode, from `APP_ENV` (ADR 0009). Unset or any value other
+/// than `development` means production: development paths must be asked
+/// for, never reached by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppEnv {
+    Production,
+    Development,
+}
+
+impl AppEnv {
+    /// Parse an `APP_ENV` value. Only `development` (any case, trimmed)
+    /// selects development; unset, blank and unknown values are production.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("development") => Self::Development,
+            _ => Self::Production,
+        }
+    }
+
+    pub fn is_production(self) -> bool {
+        self == Self::Production
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Development => "development",
+        }
+    }
+}
+
+/// The long-running services that check production mode at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    PlatformApi,
+    ConnectorWorker,
+}
+
+impl Service {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlatformApi => "platform-api",
+            Self::ConnectorWorker => "connector-worker",
+        }
+    }
+}
+
+/// Production mode refused this configuration. `reasons` name environment
+/// keys and paths only, never their values.
+#[derive(Debug, thiserror::Error)]
+#[error("production mode refuses to start {}: {}", service.as_str(), reasons.join("; "))]
+pub struct ProductionRefusal {
+    pub service: Service,
+    pub reasons: Vec<&'static str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PlatformConfig {
+    /// `APP_ENV` — production unless explicitly `development`.
+    pub env: AppEnv,
     pub brand: BrandConfig,
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -52,6 +110,9 @@ pub struct EnclaveConfig {
     /// `QUERY_MAX_CONCURRENT` — maximum concurrent queries holding decrypted
     /// plaintext in enclave RAM (`1..=64`, default `4`).
     pub query_max_concurrent: usize,
+    /// `SIM_ATTESTATION_URL` — the simulated attestation service. Dev only;
+    /// `platform_enclave::provider_for` reads the same key.
+    pub sim_attestation_url: Option<String>,
 }
 
 /// Merchant-of-Record (Paddle) webhook settings. The secret is zeroized on
@@ -70,6 +131,22 @@ pub struct BillingConfig {
 pub struct ConnectorConfig {
     /// `CONNECTOR_SYNC_INTERVAL_SECS` — background sync cadence.
     pub sync_interval_secs: u64,
+    /// `DEMO_TENANT_ID` and `DEMO_TENANT_PUBLIC_KEY_B64` — the development
+    /// demo tenant that fixture syncs (and the API's demo seed) seal to.
+    pub demo_tenant: DemoTenantConfig,
+}
+
+/// Raw demo-tenant settings; each binary parses them where it uses them.
+#[derive(Debug, Clone, Default)]
+pub struct DemoTenantConfig {
+    pub tenant_id: Option<String>,
+    pub public_key_b64: Option<String>,
+}
+
+impl DemoTenantConfig {
+    pub fn is_set(&self) -> bool {
+        self.tenant_id.is_some() || self.public_key_b64.is_some()
+    }
 }
 
 /// Research-access disclosure-control settings.
@@ -193,15 +270,108 @@ pub enum ConfigError {
 }
 
 impl PlatformConfig {
-    /// Load from the process environment (plus `.env` if present, for dev).
+    /// Load from the process environment. `APP_ENV` is read from the process
+    /// environment first; `.env` is loaded only in development, so a stray
+    /// `.env` can neither select development nor change production settings.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let _ = dotenvy::dotenv(); // a missing .env is fine
-        Self::from_source(|key| std::env::var(key).ok())
+        Self::load(
+            |key| std::env::var(key).ok(),
+            || {
+                let _ = dotenvy::dotenv(); // a missing .env is fine
+            },
+        )
+    }
+
+    /// [`Self::from_env`] with the process environment and the `.env` loader
+    /// passed in, so the ordering is testable: `APP_ENV` is decided from
+    /// `process` before `load_dotenv` can run, `load_dotenv` runs only in
+    /// development, and the configuration is read after it.
+    fn load(
+        process: impl Fn(&str) -> Option<String>,
+        load_dotenv: impl FnOnce(),
+    ) -> Result<Self, ConfigError> {
+        if AppEnv::parse(process("APP_ENV").as_deref()) == AppEnv::Development {
+            load_dotenv();
+        }
+        Self::from_source(process)
+    }
+
+    /// DEV ONLY, for dev-only binaries: loads `.env` and reports development
+    /// mode whatever `APP_ENV` says. Compiled only with the `dev` feature, so
+    /// a release build cannot reach it.
+    #[cfg(feature = "dev")]
+    pub fn from_env_dev_tool() -> Result<Self, ConfigError> {
+        let _ = dotenvy::dotenv();
+        let mut config = Self::from_source(|key| std::env::var(key).ok())?;
+        config.env = AppEnv::Development;
+        Ok(config)
+    }
+
+    /// Startup form of [`Self::check_production`], shared by every service so
+    /// the refusal is identical: on refusal it emits one `service.start`
+    /// "denied" audit event (reasons name keys, never values) and returns
+    /// the refusal.
+    pub fn enforce_production(&self, service: Service) -> Result<(), ProductionRefusal> {
+        self.check_production(service).inspect_err(|refusal| {
+            platform_telemetry::security_audit_event(
+                platform_telemetry::AuditKind::ServiceStart,
+                None,
+                "denied",
+                &refusal.to_string(),
+            );
+        })
+    }
+
+    /// The single production-mode gate, run by every service at startup
+    /// before it builds anything. Development passes; production refuses
+    /// every development-only path at once, listing each reason. Kept out of
+    /// [`Self::from_source`] so tests can build any configuration.
+    pub fn check_production(&self, service: Service) -> Result<(), ProductionRefusal> {
+        if !self.env.is_production() {
+            return Ok(());
+        }
+        let mut reasons = Vec::new();
+        if self.auth.hs256_secret.is_some() {
+            reasons
+                .push("JWT_HS256_SECRET is set: shared-secret HS256 tokens are development-only");
+        }
+        if self.storage.bucket.is_none() {
+            reasons.push("STORAGE_BUCKET is unset: the in-memory vault is development-only");
+        }
+        if !self.features.tee_attestation_required {
+            reasons.push(
+                "TEE_ATTESTATION_REQUIRED=false: the development and simulated attestation providers are development-only",
+            );
+        }
+        if self.enclave.sim_attestation_url.is_some() {
+            reasons.push("SIM_ATTESTATION_URL is set: the simulated attestation provider is development-only");
+        }
+        if self.enclave.key_release_url.is_some() {
+            reasons.push(
+                "KEY_RELEASE_URL is set: the key-release stand-in trusts only the simulated attestation root",
+            );
+        }
+        if service == Service::ConnectorWorker {
+            if self.connectors.demo_tenant.is_set() {
+                reasons.push("DEMO_TENANT_* is set: the demo tenant is development-only");
+            }
+            // connector-worker has no production source yet; every job it
+            // can schedule is an embedded fixture.
+            reasons.push(
+                "connector-worker syncs only embedded fixture sources, which are development-only",
+            );
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(ProductionRefusal { service, reasons })
+        }
     }
 
     /// Load from any key→value source. Lets tests avoid mutating process env,
     /// which is `unsafe` in edition 2024 and racy under parallel tests.
     pub fn from_source(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let env = AppEnv::parse(get("APP_ENV").as_deref());
         let brand = BrandConfig {
             public_name: get_or(&get, "APP_PUBLIC_NAME", DEFAULT_PUBLIC_NAME),
             domain_name: get_or(&get, "APP_DOMAIN_NAME", "localhost"),
@@ -278,6 +448,10 @@ impl PlatformConfig {
                 "CONNECTOR_SYNC_INTERVAL_SECS",
                 DEFAULT_SYNC_INTERVAL_SECS,
             )?,
+            demo_tenant: DemoTenantConfig {
+                tenant_id: get_nonempty(&get, "DEMO_TENANT_ID"),
+                public_key_b64: get_nonempty(&get, "DEMO_TENANT_PUBLIC_KEY_B64"),
+            },
         };
 
         let research = ResearchConfig {
@@ -315,6 +489,7 @@ impl PlatformConfig {
         let enclave = EnclaveConfig {
             key_release_url: get_nonempty(&get, "KEY_RELEASE_URL"),
             query_max_concurrent: raw_max_concurrent as usize,
+            sim_attestation_url: get_nonempty(&get, "SIM_ATTESTATION_URL"),
         };
 
         let features = FeatureFlags {
@@ -323,6 +498,7 @@ impl PlatformConfig {
         };
 
         Ok(Self {
+            env,
             brand,
             server: ServerConfig {
                 bind_addr,
@@ -423,6 +599,193 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key: &str| map.get(key).cloned()
+    }
+
+    /// Everything production mode accepts today, so each test below can
+    /// flip exactly one setting.
+    const PRODUCTION_OK: &[(&str, &str)] = &[("STORAGE_BUCKET", "vault-bucket")];
+
+    fn with(
+        base: &[(&'static str, &'static str)],
+        extra: &[(&'static str, &'static str)],
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut pairs = base.to_vec();
+        pairs.extend_from_slice(extra);
+        pairs
+    }
+
+    fn refusal(pairs: &[(&str, &str)], service: Service) -> Option<ProductionRefusal> {
+        PlatformConfig::from_source(source(pairs))
+            .expect("loads")
+            .check_production(service)
+            .err()
+    }
+
+    /// `.env` stand-in: records that it ran and what it would have set.
+    fn load_with(process: &[(&str, &str)], dotenv: &[(&str, &str)]) -> (PlatformConfig, bool) {
+        use std::cell::{Cell, RefCell};
+        use std::collections::HashMap;
+        let env: RefCell<HashMap<String, String>> = RefCell::new(
+            process
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let loaded = Cell::new(false);
+        let config = PlatformConfig::load(
+            |key| env.borrow().get(key).cloned(),
+            || {
+                loaded.set(true);
+                let mut env = env.borrow_mut();
+                for (k, v) in dotenv {
+                    // dotenvy never overrides a set variable.
+                    env.entry(k.to_string()).or_insert_with(|| v.to_string());
+                }
+            },
+        )
+        .expect("loads");
+        (config, loaded.get())
+    }
+
+    #[test]
+    fn dotenv_is_not_loaded_in_production() {
+        let dotenv = [
+            ("APP_ENV", "development"),
+            ("JWT_HS256_SECRET", "from-dotenv"),
+        ];
+        for process in [
+            &[][..],
+            &[("APP_ENV", "production")][..],
+            &[("APP_ENV", "staging")][..],
+        ] {
+            let (config, loaded) = load_with(process, &dotenv);
+            assert!(!loaded, "{process:?}: .env must not be loaded");
+            assert_eq!(config.env, AppEnv::Production, "{process:?}");
+            assert!(config.auth.hs256_secret.is_none(), "{process:?}");
+        }
+    }
+
+    #[test]
+    fn dotenv_is_loaded_in_development_and_read_after() {
+        let (config, loaded) = load_with(
+            &[("APP_ENV", "development")],
+            &[("JWT_HS256_SECRET", "from-dotenv")],
+        );
+        assert!(loaded);
+        assert_eq!(config.env, AppEnv::Development);
+        assert_eq!(
+            config.auth.hs256_secret.as_ref().map(|s| s.expose()),
+            Some("from-dotenv")
+        );
+    }
+
+    #[test]
+    fn app_env_is_production_unless_development_is_explicit() {
+        for raw in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("production"),
+            Some("prod"),
+            Some("dev"),
+            Some("staging"),
+        ] {
+            assert_eq!(AppEnv::parse(raw), AppEnv::Production, "{raw:?}");
+        }
+        for raw in ["development", " Development ", "DEVELOPMENT"] {
+            assert_eq!(AppEnv::parse(Some(raw)), AppEnv::Development, "{raw:?}");
+        }
+        let cfg = PlatformConfig::from_source(source(&[])).expect("defaults");
+        assert_eq!(cfg.env, AppEnv::Production);
+    }
+
+    #[test]
+    fn production_accepts_a_configuration_without_dev_paths() {
+        let cfg = PlatformConfig::from_source(source(PRODUCTION_OK)).expect("loads");
+        cfg.check_production(Service::PlatformApi)
+            .expect("accepted");
+    }
+
+    #[test]
+    fn production_refuses_each_dev_only_setting() {
+        for (extra, needle) in [
+            (("JWT_HS256_SECRET", "s3cret-value"), "JWT_HS256_SECRET"),
+            (
+                ("TEE_ATTESTATION_REQUIRED", "false"),
+                "TEE_ATTESTATION_REQUIRED",
+            ),
+            (
+                ("SIM_ATTESTATION_URL", "http://127.0.0.1:8070"),
+                "SIM_ATTESTATION_URL",
+            ),
+            (
+                ("KEY_RELEASE_URL", "http://127.0.0.1:8090"),
+                "KEY_RELEASE_URL",
+            ),
+        ] {
+            for service in [Service::PlatformApi, Service::ConnectorWorker] {
+                let err = refusal(&with(PRODUCTION_OK, &[extra]), service)
+                    .unwrap_or_else(|| panic!("{extra:?} must be refused for {service:?}"));
+                let message = err.to_string();
+                assert!(message.contains(needle), "{message}");
+                assert!(
+                    !message.contains("s3cret-value"),
+                    "values never appear: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_refuses_the_in_memory_vault() {
+        let err = refusal(&[], Service::PlatformApi).expect("refused");
+        assert_eq!(err.reasons.len(), 1, "{err}");
+        assert!(err.to_string().contains("STORAGE_BUCKET"), "{err}");
+    }
+
+    #[test]
+    fn production_refuses_the_demo_tenant_and_fixture_sources_in_connector_worker() {
+        let err = refusal(PRODUCTION_OK, Service::ConnectorWorker).expect("fixtures refused");
+        assert!(err.to_string().contains("fixture"), "{err}");
+        let err = refusal(
+            &with(
+                PRODUCTION_OK,
+                &[("DEMO_TENANT_ID", "t"), ("DEMO_TENANT_PUBLIC_KEY_B64", "k")],
+            ),
+            Service::ConnectorWorker,
+        )
+        .expect("demo tenant refused");
+        assert!(err.to_string().contains("DEMO_TENANT_"), "{err}");
+    }
+
+    #[test]
+    fn production_reports_every_reason_at_once() {
+        let err = refusal(
+            &[
+                ("JWT_HS256_SECRET", "x"),
+                ("TEE_ATTESTATION_REQUIRED", "false"),
+            ],
+            Service::PlatformApi,
+        )
+        .expect("refused");
+        assert_eq!(err.reasons.len(), 3, "{err}");
+    }
+
+    #[test]
+    fn development_mode_allows_dev_paths() {
+        let cfg = PlatformConfig::from_source(source(&[
+            ("APP_ENV", "development"),
+            ("JWT_HS256_SECRET", "x"),
+            ("TEE_ATTESTATION_REQUIRED", "false"),
+            ("SIM_ATTESTATION_URL", "http://127.0.0.1:8070"),
+            ("DEMO_TENANT_ID", "t"),
+        ]))
+        .expect("loads");
+        assert_eq!(cfg.env, AppEnv::Development);
+        cfg.check_production(Service::PlatformApi)
+            .expect("dev accepted");
+        cfg.check_production(Service::ConnectorWorker)
+            .expect("dev accepted");
     }
 
     #[test]
