@@ -260,6 +260,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* ADR 0007's "Browser private-key storage" section is accepted, and ADR
+  0004 now says the researcher's result key is held as that section
+  describes instead of "non-extractable": a private key that HPKE opens
+  with is stored encrypted under a non-extractable AES-256-GCM key.
 * `GCP_PROJECT_ID` is removed: nothing read it. The GCS client takes its
   bucket from `STORAGE_BUCKET` and its credentials from `object_store`'s
   `GOOGLE_*` environment variables or the metadata server.
