@@ -222,6 +222,16 @@ impl QueryScope {
                 return Err(QueryError::ZkPolicy);
             }
             disclosure::verify_count_column(df.logical_plan())?;
+            // Coercion inserts casts that can fail, so check the analyzed plan
+            // (ADR 0011).
+            let state = self.ctx.state();
+            let analyzed = state
+                .analyzer()
+                .execute_and_check(df.logical_plan().clone(), state.config_options(), |_, _| {})
+                .map_err(|_| QueryError::Execution(ExecutionStage::Plan))?;
+            if !policy::expressions_cannot_fail(&analyzed) {
+                return Err(QueryError::ZkPolicy);
+            }
         }
         let disclosure = match (&self.disclosure, gated) {
             (Some(policy), _) => Some(policy),

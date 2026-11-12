@@ -180,6 +180,16 @@ uses [Semantic Versioning](https://semver.org/).
   only. That route has no query budget, so differencing across queries is
   unbounded, including with a stolen access token; only research queries
   are budget-bounded. This is recorded as a residual risk.
+* Zero-knowledge and research queries whose expressions can fail at
+  runtime are refused at planning (ADR 0011). A conditional division by
+  zero or a failing cast used to return 400 for some data and 200 for
+  other data, answering a question about rows below the cohort threshold.
+  Researchers lose division and modulo by a column or an aggregate,
+  string-to-number casts, `LIKE` patterns over 1,000 characters, and
+  functions other than `COALESCE`, `NULLIF`, `lower` and `upper`;
+  `SUM(x) / COUNT(*)` and `SUBSTR(...)` are now refused. `AVG` and integer
+  division by a constant other than 0 and −1 still work. Unary minus works
+  on floats only; write `0 - x` for integers.
 * `tokio` 1.54.1 (RUSTSEC-2026-0384; 1.54.0 is yanked) and `zstd-sys`
   2.1.2 (RUSTSEC-2026-0410). `backend/deny.toml` records why
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5) and RUSTSEC-2026-0391, -0398 and
