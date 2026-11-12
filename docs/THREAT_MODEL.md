@@ -107,6 +107,7 @@ Goal: gain access through the API.
 | Self-assigned administrator access | `adm` set only from a server-side allowlist keyed by the provider's `(iss, sub)`, never from a provider attribute (ADR 0006) | **To build** (P29) |
 | Access by a suspended or unknown tenant | The exchange and `require_tenant` / `require_admin` refuse unknown, Suspended or Canceled tenants with 403 (ADR 0006) | **To build** (P29) — today any validly signed `tid` passes |
 | Login CSRF or a replayed sign-in response | Authorization code with PKCE (S256), single-use `state` and OIDC `nonce` checked by the identity service, exact-match redirect URIs; no token in a URL (ADR 0006) | **To build** (P13, P29, P32) |
+| Rebuilding records through own-data queries with a stolen access token | ZK gate stops single-query row export; `POST /api/v1/query` has no query budget, so differencing is unbounded | **Residual risk** — see below |
 | Stolen or replayed refresh token | Rotation on every use; reuse revokes the token family; sign-out and administrator disable revoke immediately (ADR 0006) | **To build** (P30) |
 | Token theft from browser storage | Access token held in memory only, never `localStorage`, `sessionStorage` or IndexedDB; provider tokens never reach the browser (ADR 0006) | **To build** (P31, P32) |
 
@@ -148,11 +149,20 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
 ## Residual risks
 
 * **Overlapping-query differencing.** Two aggregate queries whose cohorts
-  differ by one record can reveal that record. The budget makes this finite
-  and priced; it does not prevent it within an allocation. The closure is a
-  perturbation `DisclosurePolicy` composed at the existing choke point,
-  followed by a formal privacy-loss accountant in place of the constant
-  per-query cost.
+  differ by one record can reveal that record. For research queries the
+  budget makes this finite and priced; it does not prevent it within an
+  allocation. The closure is a perturbation `DisclosurePolicy` composed at
+  the existing choke point, followed by a formal privacy-loss accountant in
+  place of the constant per-query cost.
+* **Differencing on own-data queries.** `ZkMode::Enabled` on
+  `POST /api/v1/query` stops a single query from exporting rows. It does
+  not bound differencing across queries: the route has no budget, so the
+  tenant's own users, or anyone who steals one of their access tokens, can
+  run overlapping aggregates without limit and rebuild suppressed cohorts
+  one record at a time. Only research queries are budget-bounded. A stolen
+  access token can't be revoked; it works until it expires (10 minutes
+  under ADR 0006). A per-tenant, per-dataset budget on this route is
+  planned, with its own ADR for who sets and tops up the limit.
 * **Unzeroized working memory.** Decrypted Parquet bytes, OAuth secrets,
   connector response bodies, `Dataset` cells, the Parquet output buffer
   and the query-result JSON buffer are zeroized. Decoded Arrow arrays, the
@@ -191,7 +201,8 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   not prevented. Google is trusted for hardware verification, workload
   identity and key custody, and the platform is tied to GCP.
 * **Differencing across snapshots.** Querying before and after a dataset
-  update can reveal the rows that changed, bounded by the budget like any
-  other overlapping-query differencing.
+  update can reveal the rows that changed. On research queries the budget
+  bounds it like any other overlapping-query differencing; on own-data
+  queries nothing does.
 * **Unfinished controls.** Every item marked "to build" above is a gap, and
   the corresponding path fails closed until it is built.

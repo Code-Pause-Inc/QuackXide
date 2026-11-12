@@ -193,6 +193,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
+  own-data queries (`POST /api/v1/query`) stops single-query row export
+  only. That route has no query budget, so differencing across queries is
+  unbounded, including with a stolen access token; only research queries
+  are budget-bounded. This is recorded as a residual risk.
 * Zero-knowledge and research queries whose expressions can fail at
   runtime are refused at planning (ADR 0011). A conditional division by
   zero or a failing cast used to return 400 for some data and 200 for
