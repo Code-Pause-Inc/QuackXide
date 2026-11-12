@@ -5,6 +5,7 @@
 //! ```text
 //! tenants/{tenant_id}/drive/manifests/{object_id}.json
 //! tenants/{tenant_id}/drive/objects/{object_id}/{chunk_index:08}
+//! tenants/{tenant_id}/drive/sweeping/{object_id}
 //! tenants/{tenant_id}/connectors/{connector_slug}/{object_id}.parquet
 //! ```
 //!
@@ -107,6 +108,23 @@ impl TenantPaths {
     /// Prefix of all chunks of one drive object (deletion).
     pub fn drive_object_prefix(tenant: TenantId, object: ObjectId) -> VaultPath {
         VaultPath(format!("tenants/{tenant}/drive/objects/{object}"))
+    }
+
+    /// Marker the orphan sweep holds while it deletes one object's chunks.
+    /// It sits outside [`drive_object_prefix`](Self::drive_object_prefix)
+    /// and [`drive_manifest_prefix`](Self::drive_manifest_prefix), so chunk
+    /// and manifest listings never return it.
+    pub fn drive_sweep_marker(tenant: TenantId, object: ObjectId) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/drive/sweeping/{object}"))
+    }
+
+    /// The tenant and object of a
+    /// [`drive_sweep_marker`](Self::drive_sweep_marker) path.
+    pub fn drive_sweep_marker_parts(path: &VaultPath) -> Option<(TenantId, ObjectId)> {
+        let rest = path.as_str().strip_prefix("tenants/")?;
+        let (tenant, rest) = rest.split_once('/')?;
+        let object = rest.strip_prefix("drive/sweeping/")?;
+        Some((tenant.parse().ok()?, object.parse().ok()?))
     }
 
     /// An enclave-encrypted Parquet object produced by a connector sync.
@@ -244,6 +262,8 @@ pub struct VaultEntry {
 pub enum DriveEntryKind {
     Manifest,
     Chunk,
+    /// A [`TenantPaths::drive_sweep_marker`].
+    SweepMarker,
 }
 
 /// One drive manifest or chunk found by [`list_drive_entries_all_tenants`].
@@ -271,6 +291,8 @@ pub async fn list_drive_entries_all_tenants(
             let (kind, (tenant, object)) =
                 if let Some(parts) = TenantPaths::drive_manifest_parts(&entry.path) {
                     (DriveEntryKind::Manifest, parts)
+                } else if let Some(parts) = TenantPaths::drive_sweep_marker_parts(&entry.path) {
+                    (DriveEntryKind::SweepMarker, parts)
                 } else {
                     (
                         DriveEntryKind::Chunk,
@@ -602,9 +624,23 @@ mod tests {
             TenantPaths::drive_manifest_parts(&manifest),
             Some((tenant_a(), object_1()))
         );
+        let marker = TenantPaths::drive_sweep_marker(tenant_a(), object_1());
+        assert_eq!(
+            TenantPaths::drive_sweep_marker_parts(&marker),
+            Some((tenant_a(), object_1()))
+        );
         // Each parser accepts only its own kind of path.
         assert_eq!(TenantPaths::drive_chunk_parts(&manifest), None);
         assert_eq!(TenantPaths::drive_manifest_parts(&chunk), None);
+        assert_eq!(TenantPaths::drive_chunk_parts(&marker), None);
+        assert_eq!(TenantPaths::drive_manifest_parts(&marker), None);
+        assert_eq!(TenantPaths::drive_sweep_marker_parts(&chunk), None);
+        assert_eq!(TenantPaths::drive_sweep_marker_parts(&manifest), None);
+        // A marker is outside the prefixes that chunk and manifest listings use.
+        let chunks = TenantPaths::drive_object_prefix(tenant_a(), object_1());
+        let manifests = TenantPaths::drive_manifest_prefix(tenant_a());
+        assert!(!marker.as_str().starts_with(chunks.as_str()));
+        assert!(!marker.as_str().starts_with(manifests.as_str()));
         let t = tenant_a();
         let o = object_1();
         for raw in [
@@ -623,6 +659,11 @@ mod tests {
             );
             assert_eq!(
                 TenantPaths::drive_manifest_parts(&VaultPath(raw.clone())),
+                None,
+                "{raw}"
+            );
+            assert_eq!(
+                TenantPaths::drive_sweep_marker_parts(&VaultPath(raw.clone())),
                 None,
                 "{raw}"
             );

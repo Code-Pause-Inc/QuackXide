@@ -1,10 +1,14 @@
 //! Drive orphan sweep: chunks without a manifest are deleted once they are
-//! older than `ORPHAN_MIN_AGE`, and nothing else is touched.
+//! older than `ORPHAN_MIN_AGE`, and nothing else is touched. A manifest is
+//! never committed over chunks the sweep deleted, whichever of the two runs
+//! first.
 
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,7 +23,9 @@ use platform_storage::{
 /// hide manifests from listings (as a listing taken just before a manifest
 /// was written would), list chunks that are already gone (as another
 /// replica's sweep leaves them), mark a chunk freshly written right after
-/// the first listing, and fail every delete of one object.
+/// the first listing, and fail every delete of one object. A [`Hook`] runs
+/// other work at a chosen point inside one call, to interleave an upload
+/// with a sweep.
 struct AgedVault {
     inner: ObjectStoreVault,
     ages: Mutex<HashMap<VaultPath, DateTime<Utc>>>,
@@ -27,6 +33,25 @@ struct AgedVault {
     phantoms: Vec<VaultEntry>,
     rewrite_after_first_listing: Mutex<Option<VaultPath>>,
     failing_object: Option<ObjectId>,
+    /// Runs once, before the first chunk delete.
+    before_chunk_delete: Hook,
+    /// Runs once, before the first create-only manifest write.
+    before_manifest_write: Hook,
+    /// Runs once, after the first create-only manifest write.
+    after_manifest_write: Hook,
+}
+
+type Hook = Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>;
+
+fn set(hook: &Hook, work: impl Future<Output = ()> + Send + 'static) {
+    *hook.lock().expect("lock") = Some(Box::pin(work));
+}
+
+async fn run(hook: &Hook) {
+    let work = hook.lock().expect("lock").take();
+    if let Some(work) = work {
+        work.await;
+    }
 }
 
 impl AgedVault {
@@ -38,7 +63,24 @@ impl AgedVault {
             phantoms: Vec::new(),
             rewrite_after_first_listing: Mutex::new(None),
             failing_object: None,
+            before_chunk_delete: Mutex::new(None),
+            before_manifest_write: Mutex::new(None),
+            after_manifest_write: Mutex::new(None),
         }
+    }
+
+    async fn marker_held(&self, tenant: TenantId, object: ObjectId) -> bool {
+        self.inner
+            .get(&TenantPaths::drive_sweep_marker(tenant, object))
+            .await
+            .is_ok()
+    }
+
+    async fn has_manifest(&self, tenant: TenantId, object: ObjectId) -> bool {
+        self.inner
+            .get(&TenantPaths::drive_manifest(tenant, object))
+            .await
+            .is_ok()
     }
 
     /// Store `path`, reported as last modified `age` ago.
@@ -83,12 +125,21 @@ impl VaultStore for AgedVault {
         self.inner.put(path, ciphertext).await
     }
     async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
-        self.inner.put_if_absent(path, ciphertext).await
+        if TenantPaths::drive_manifest_parts(path).is_none() {
+            return self.inner.put_if_absent(path, ciphertext).await;
+        }
+        run(&self.before_manifest_write).await;
+        let written = self.inner.put_if_absent(path, ciphertext).await;
+        run(&self.after_manifest_write).await;
+        written
     }
     async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
         self.inner.get(path).await
     }
     async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        if TenantPaths::drive_chunk_parts(path).is_some() {
+            run(&self.before_chunk_delete).await;
+        }
         if self
             .failing_object
             .is_some_and(|o| TenantPaths::drive_chunk_parts(path).is_some_and(|(_, p)| p == o))
@@ -173,6 +224,7 @@ async fn aborted_upload_is_swept() {
         }
     );
     assert_eq!(vault.left(tenant, object).await, 0);
+    assert!(!vault.marker_held(tenant, object).await);
 }
 
 #[tokio::test]
@@ -257,6 +309,7 @@ async fn a_manifest_written_after_the_listing_saves_the_object() {
 
     assert_eq!(sweep(&vault).await.objects, 0);
     assert_eq!(vault.left(tenant, object).await, 1);
+    assert!(!vault.marker_held(tenant, object).await);
 }
 
 #[tokio::test]
@@ -304,6 +357,7 @@ async fn a_chunk_rewritten_after_the_listing_saves_the_object() {
     let report = sweep(&vault).await;
     assert_eq!((report.objects, report.recent), (0, 1));
     assert_eq!(vault.left(tenant, object).await, 2);
+    assert!(!vault.marker_held(tenant, object).await);
 }
 
 #[tokio::test]
@@ -339,6 +393,55 @@ async fn one_failing_object_does_not_stop_the_others() {
     assert!(err.is_retryable());
     assert_eq!(vault.left(tenant, other).await, 0);
     assert_eq!(vault.left(tenant, stuck).await, 1);
+    // A failed object is released, so the next run can try it again.
+    assert!(!vault.marker_held(tenant, stuck).await);
+}
+
+const SECRET: &str = "sweep-test-secret";
+
+fn app(vault: &Arc<AgedVault>) -> axum::Router {
+    platform_api::build_app(common::app_state(SECRET, vault.clone()))
+}
+
+/// Commit a manifest for `chunk_count` chunks through the API.
+async fn put_manifest(
+    app: &axum::Router,
+    tenant: TenantId,
+    object: ObjectId,
+    chunk_count: u32,
+) -> axum::http::StatusCode {
+    let manifest = serde_json::json!({
+        "wrapped_key": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "d3JhcHBlZC1rZXk=" },
+        "manifest":    { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "bWFuaWZlc3QtY3Q=" },
+        "chunk_count": chunk_count,
+        "encrypted_size_bytes": 28 * u64::from(chunk_count),
+        "created_at_iso": "2026-07-30T12:00:00.000Z"
+    });
+    let (status, _) = common::send(
+        app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{object}/manifest"),
+        &[
+            common::bearer(&common::token_for(SECRET, tenant)),
+            common::json_header(),
+        ],
+        manifest.to_string().into_bytes(),
+    )
+    .await;
+    status
+}
+
+async fn listing(app: &axum::Router, tenant: TenantId) -> Vec<u8> {
+    let (status, body) = common::send(
+        app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[common::bearer(&common::token_for(SECRET, tenant))],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    body
 }
 
 /// An upload that paused past `ORPHAN_MIN_AGE` had its first chunks swept.
@@ -347,56 +450,208 @@ async fn one_failing_object_does_not_stop_the_others() {
 #[tokio::test]
 async fn a_swept_upload_cannot_commit_its_manifest() {
     use axum::http::StatusCode;
-    const SECRET: &str = "sweep-test-secret";
 
-    let vault = std::sync::Arc::new(AgedVault::new());
-    let app = platform_api::build_app(common::app_state(SECRET, vault.clone()));
+    let vault = Arc::new(AgedVault::new());
+    let app = app(&vault);
     let tenant = TenantId::generate();
     let object = ObjectId::generate();
-    let token = common::token_for(SECRET, tenant);
 
     vault.chunks(tenant, object, &[0, 1], old()).await;
     assert_eq!(sweep(vault.as_ref()).await.chunks, 2);
 
     // The tab wakes, sends the last chunk, then the manifest.
-    let chunk = vec![0u8; 28];
     let (status, _) = common::send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{object}/chunks/2"),
         &[
-            common::bearer(&token),
+            common::bearer(&common::token_for(SECRET, tenant)),
             common::content_type("application/octet-stream"),
         ],
-        chunk,
+        vec![0u8; 28],
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let manifest = serde_json::json!({
-        "wrapped_key": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "d3JhcHBlZC1rZXk=" },
-        "manifest":    { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "bWFuaWZlc3QtY3Q=" },
-        "chunk_count": 3,
-        "encrypted_size_bytes": 84,
-        "created_at_iso": "2026-07-30T12:00:00.000Z"
-    });
-    let (status, _) = common::send(
-        &app,
-        "PUT",
-        &format!("/api/v1/drive/objects/{object}/manifest"),
-        &[common::bearer(&token), common::json_header()],
-        manifest.to_string().into_bytes(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        put_manifest(&app, tenant, object, 3).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        listing(&app, tenant).await,
+        b"[]".to_vec(),
+        "a refused manifest is not listed"
+    );
+}
 
-    let (status, body) = common::send(
-        &app,
-        "GET",
-        "/api/v1/drive/objects",
-        &[common::bearer(&token)],
-        Vec::new(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"[]".to_vec(), "a refused manifest is not listed");
+/// The manifest arrives while the sweep is deleting the object's chunks:
+/// after the sweep's manifest check, before its first delete. The sweep
+/// holds the object, so the manifest is refused.
+#[tokio::test]
+async fn a_manifest_sent_while_the_sweep_deletes_is_refused() {
+    use axum::http::StatusCode;
+
+    let vault = Arc::new(AgedVault::new());
+    let app = app(&vault);
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault.chunks(tenant, object, &[0, 1], old()).await;
+
+    let status = Arc::new(Mutex::new(None));
+    let seen = status.clone();
+    let upload = app.clone();
+    set(&vault.before_chunk_delete, async move {
+        let status = put_manifest(&upload, tenant, object, 2).await;
+        *seen.lock().expect("lock") = Some(status);
+    });
+
+    let report = sweep(vault.as_ref()).await;
+    assert_eq!((report.objects, report.chunks), (1, 2));
+    assert_eq!(*status.lock().expect("lock"), Some(StatusCode::CONFLICT));
+    assert!(!vault.has_manifest(tenant, object).await);
+    assert!(!vault.marker_held(tenant, object).await);
+    assert_eq!(listing(&app, tenant).await, b"[]".to_vec());
+}
+
+/// A whole sweep runs between the manifest handler's first check and its
+/// write. The handler's second check finds the chunks gone and takes the
+/// manifest back.
+#[tokio::test]
+async fn a_manifest_written_over_swept_chunks_is_taken_back() {
+    use axum::http::StatusCode;
+
+    let vault = Arc::new(AgedVault::new());
+    let app = app(&vault);
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault.chunks(tenant, object, &[0, 1], old()).await;
+
+    let swept = Arc::new(Mutex::new(None));
+    let seen = swept.clone();
+    let sweeper = vault.clone();
+    set(&vault.before_manifest_write, async move {
+        let report = sweep(sweeper.as_ref()).await;
+        *seen.lock().expect("lock") = Some(report.chunks);
+    });
+
+    assert_eq!(
+        put_manifest(&app, tenant, object, 2).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(*swept.lock().expect("lock"), Some(2));
+    assert!(!vault.has_manifest(tenant, object).await);
+    assert_eq!(listing(&app, tenant).await, b"[]".to_vec());
+}
+
+/// The sweep has claimed the object and found no manifest, and is still
+/// deleting when the manifest is written. The handler's second check finds
+/// the claim and takes the manifest back, although every chunk it names is
+/// still stored at that moment.
+#[tokio::test]
+async fn a_manifest_written_under_a_claim_is_taken_back() {
+    use axum::http::StatusCode;
+
+    let vault = Arc::new(AgedVault::new());
+    let app = app(&vault);
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault.chunks(tenant, object, &[0, 1], old()).await;
+
+    let claimer = vault.clone();
+    set(&vault.before_manifest_write, async move {
+        claimer
+            .put_if_absent(
+                &TenantPaths::drive_sweep_marker(tenant, object),
+                Bytes::from_static(b"sweeping"),
+            )
+            .await
+            .expect("claim");
+    });
+
+    assert_eq!(
+        put_manifest(&app, tenant, object, 2).await,
+        StatusCode::CONFLICT
+    );
+    assert!(!vault.has_manifest(tenant, object).await);
+    assert_eq!(vault.left(tenant, object).await, 2);
+}
+
+/// The sweep starts just after the manifest is written. It claims the
+/// object, finds the manifest and deletes nothing, so the upload commits.
+#[tokio::test]
+async fn a_sweep_that_starts_after_the_manifest_is_written_deletes_nothing() {
+    use axum::http::StatusCode;
+
+    // The sweep's listing predates the manifest.
+    let mut vault = AgedVault::new();
+    vault.hide_manifests = true;
+    let vault = Arc::new(vault);
+    let app = app(&vault);
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault.chunks(tenant, object, &[0, 1], old()).await;
+
+    let swept = Arc::new(Mutex::new(None));
+    let seen = swept.clone();
+    let sweeper = vault.clone();
+    set(&vault.after_manifest_write, async move {
+        *seen.lock().expect("lock") = Some(sweep(sweeper.as_ref()).await);
+    });
+
+    assert_eq!(
+        put_manifest(&app, tenant, object, 2).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(*swept.lock().expect("lock"), Some(SweepReport::default()));
+    assert_eq!(vault.left(tenant, object).await, 2);
+    assert!(vault.has_manifest(tenant, object).await);
+    assert!(!vault.marker_held(tenant, object).await);
+}
+
+#[tokio::test]
+async fn a_claimed_object_is_left_to_the_run_that_holds_it() {
+    use axum::http::StatusCode;
+
+    let vault = Arc::new(AgedVault::new());
+    let app = app(&vault);
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault.chunks(tenant, object, &[0, 1], old()).await;
+    vault
+        .put_aged(TenantPaths::drive_sweep_marker(tenant, object), recent())
+        .await;
+
+    assert_eq!(sweep(vault.as_ref()).await, SweepReport::default());
+    assert_eq!(vault.left(tenant, object).await, 2);
+    assert!(vault.marker_held(tenant, object).await);
+    assert_eq!(
+        put_manifest(&app, tenant, object, 2).await,
+        StatusCode::CONFLICT
+    );
+    assert!(!vault.has_manifest(tenant, object).await);
+}
+
+/// A run that stopped partway left its marker. Once the marker is older
+/// than `ORPHAN_MIN_AGE` the next run removes it and sweeps the object.
+#[tokio::test]
+async fn a_stale_marker_is_removed_and_its_object_swept() {
+    let vault = AgedVault::new();
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault.chunks(tenant, object, &[0, 1], old()).await;
+    vault
+        .put_aged(TenantPaths::drive_sweep_marker(tenant, object), old())
+        .await;
+
+    let report = sweep(&vault).await;
+    assert_eq!((report.objects, report.chunks), (1, 2));
+    assert_eq!(vault.left(tenant, object).await, 0);
+    assert!(!vault.marker_held(tenant, object).await);
+}
+
+/// A stale marker whose object has nothing left to sweep is still removed,
+/// so a new upload of that object is not refused for ever.
+#[tokio::test]
+async fn a_stale_marker_without_chunks_is_removed() {
+    let vault = AgedVault::new();
+    let (tenant, object) = (TenantId::generate(), ObjectId::generate());
+    vault
+        .put_aged(TenantPaths::drive_sweep_marker(tenant, object), old())
+        .await;
+
+    assert_eq!(sweep(&vault).await, SweepReport::default());
+    assert!(!vault.marker_held(tenant, object).await);
 }

@@ -351,6 +351,17 @@ impl FlakyVault {
     fn check(&self, fails: bool) -> Result<(), StorageError> {
         if fails { Err((self.error)()) } else { Ok(()) }
     }
+
+    /// Store an object whatever the faults, as data written before the
+    /// outage began.
+    pub async fn seed(&self, path: &VaultPath, ciphertext: Bytes) {
+        self.inner.put(path, ciphertext).await.expect("seed");
+    }
+
+    /// Whether an object is stored, whatever the faults.
+    pub async fn holds(&self, path: &VaultPath) -> bool {
+        self.inner.get(path).await.is_ok()
+    }
 }
 
 /// A [`FlakyVault`] failing `faults` with [`outage`].

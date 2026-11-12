@@ -549,6 +549,25 @@ fn faulty_drive(faults: common::Faults, error: fn() -> StorageError) -> (Router,
     (app, token_for(TenantId::generate()))
 }
 
+/// [`faulty_drive`] with `OBJ`'s manifest already stored, as if written
+/// before the outage. A manifest cannot be committed through the API while
+/// reads fail: `put_manifest` must read the orphan sweep's marker.
+async fn faulty_drive_with_manifest(
+    faults: common::Faults,
+    error: fn() -> StorageError,
+) -> (Router, String) {
+    let vault = Arc::new(common::FlakyVault::new(faults, error));
+    let tenant = TenantId::generate();
+    vault
+        .seed(
+            &platform_storage::TenantPaths::drive_manifest(tenant, OBJ.parse().expect("object id")),
+            manifest_json().into_bytes().into(),
+        )
+        .await;
+    let app = build_app(common::app_state(SECRET, vault));
+    (app, token_for(tenant))
+}
+
 async fn put_manifest(app: &Router, token: &str) -> StatusCode {
     put_chunks(app, token, 1).await;
     send(
@@ -602,16 +621,47 @@ async fn put_outage_is_retryable() {
 
 #[tokio::test]
 async fn get_outage_is_retryable_not_not_found() {
-    let (app, token) = faulty_drive(
+    let (app, token) = faulty_drive_with_manifest(
         common::Faults {
             get: true,
             ..Default::default()
         },
         common::outage,
-    );
-    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    )
+    .await;
     let uri = format!("/api/v1/drive/objects/{OBJ}/manifest");
     assert_retryable_outage(&app, &token, "GET", &uri).await;
+}
+
+/// While reads fail, `put_manifest` cannot tell whether the orphan sweep
+/// holds the object, so it commits nothing.
+#[tokio::test]
+async fn manifest_is_refused_while_reads_fail() {
+    let vault = Arc::new(common::FlakyVault::new(
+        common::Faults {
+            get: true,
+            ..Default::default()
+        },
+        common::outage,
+    ));
+    let app = build_app(common::app_state(SECRET, vault.clone()));
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    put_chunks(&app, &token, 1).await;
+
+    let (status, headers, _) = common::send_with_headers(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+    let manifest =
+        platform_storage::TenantPaths::drive_manifest(tenant, OBJ.parse().expect("object id"));
+    assert!(!vault.holds(&manifest).await, "nothing was committed");
 }
 
 #[tokio::test]
@@ -938,13 +988,13 @@ async fn manifest_reads_run_concurrently_but_bounded() {
 
 #[tokio::test]
 async fn a_failed_manifest_read_fails_the_whole_listing() {
-    let (app, token) = faulty_drive(
+    let (app, token) = faulty_drive_with_manifest(
         common::Faults {
             get: true,
             ..Default::default()
         },
         common::outage,
-    );
-    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    )
+    .await;
     assert_retryable_outage(&app, &token, "GET", "/api/v1/drive/objects").await;
 }

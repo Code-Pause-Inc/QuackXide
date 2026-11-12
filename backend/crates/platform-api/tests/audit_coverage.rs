@@ -654,6 +654,129 @@ async fn orphan_sweep_deletions_are_audited() {
     );
 }
 
+fn sweep_events(capture: &AuditCapture) -> Vec<(String, String)> {
+    capture
+        .events()
+        .iter()
+        .filter(|e| e.audit_kind == "data.access" && e.detail.starts_with("orphan_sweep"))
+        .map(|e| (e.outcome.clone(), e.detail.clone()))
+        .collect()
+}
+
+fn after_the_orphan_age() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + platform_api::sweep::ORPHAN_MIN_AGE + chrono::TimeDelta::minutes(1)
+}
+
+#[tokio::test]
+async fn a_sweep_that_deletes_nothing_audits_nothing() {
+    let capture = AuditCapture::install();
+    let vault = ObjectStoreVault::new_in_memory();
+    let (tenant, object) = (TenantId::generate(), platform_core::ObjectId::generate());
+    // A complete object, and an upload still in progress.
+    for path in [
+        platform_storage::TenantPaths::drive_chunk(tenant, object, 0),
+        platform_storage::TenantPaths::drive_manifest(tenant, object),
+    ] {
+        vault
+            .put(&path, bytes::Bytes::from_static(b"ciphertext"))
+            .await
+            .expect("put");
+    }
+    platform_api::sweep::sweep_orphaned_chunks(&vault, after_the_orphan_age())
+        .await
+        .expect("sweep");
+    vault
+        .put(
+            &platform_storage::TenantPaths::drive_chunk(
+                tenant,
+                platform_core::ObjectId::generate(),
+                0,
+            ),
+            bytes::Bytes::from_static(b"ciphertext"),
+        )
+        .await
+        .expect("put");
+    let report = platform_api::sweep::sweep_orphaned_chunks(&vault, chrono::Utc::now())
+        .await
+        .expect("sweep");
+    assert_eq!(report.recent, 1);
+
+    assert_eq!(sweep_events(&capture), Vec::new());
+}
+
+#[tokio::test]
+async fn a_failed_orphan_sweep_delete_is_audited() {
+    let capture = AuditCapture::install();
+    let vault = common::FlakyVault::new(
+        common::Faults {
+            delete: true,
+            ..Default::default()
+        },
+        common::outage,
+    );
+    let (tenant, object) = (TenantId::generate(), platform_core::ObjectId::generate());
+    vault
+        .seed(
+            &platform_storage::TenantPaths::drive_chunk(tenant, object, 0),
+            bytes::Bytes::from_static(b"ciphertext"),
+        )
+        .await;
+
+    platform_api::sweep::sweep_orphaned_chunks(&vault, after_the_orphan_age())
+        .await
+        .expect_err("the delete fails");
+    assert_eq!(
+        sweep_events(&capture),
+        vec![(
+            "failed".to_owned(),
+            format!("orphan_sweep object={object} chunks=0")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_manifest_refused_during_a_sweep_is_audited_as_denied() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let object = platform_core::ObjectId::generate();
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    for path in [
+        platform_storage::TenantPaths::drive_chunk(tenant, object, 0),
+        platform_storage::TenantPaths::drive_sweep_marker(tenant, object),
+    ] {
+        vault
+            .put(&path, bytes::Bytes::from_static(b"ciphertext"))
+            .await
+            .expect("put");
+    }
+    let app = build_app(app_state(SECRET, vault));
+    let manifest = serde_json::json!({
+        "wrapped_key": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "d3JhcHBlZC1rZXk=" },
+        "manifest": { "iv_b64": "AAAAAAAAAAAAAAAA", "data_b64": "bWFuaWZlc3Q=" },
+        "chunk_count": 1,
+        "encrypted_size_bytes": 28,
+        "created_at_iso": "2026-07-30T12:00:00.000Z"
+    });
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{object}/manifest"),
+        &[bearer(&token_for(tenant)), json_header()],
+        manifest.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let detail = format!("put_manifest object={object} chunk_count=1 reason=sweeping");
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "data.access" && e.outcome == "denied" && e.detail == detail),
+        "{:?}",
+        capture.events()
+    );
+}
+
 #[tokio::test]
 async fn a_manifest_missing_chunks_is_audited_as_denied() {
     let capture = AuditCapture::install();

@@ -676,6 +676,32 @@ fn validate_payload(payload: &EncPayloadB64) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Why a manifest for `chunk_count` chunks cannot be committed now: the
+/// orphan sweep holds the object's marker, or a chunk is not stored.
+async fn manifest_blocker(
+    vault: &dyn VaultStore,
+    tenant: TenantId,
+    object_id: ObjectId,
+    chunk_count: u32,
+) -> Result<Option<String>, StorageError> {
+    match vault
+        .get(&TenantPaths::drive_sweep_marker(tenant, object_id))
+        .await
+    {
+        Ok(_) => return Ok(Some("reason=sweeping".to_owned())),
+        Err(StorageError::NotFound) => {}
+        Err(err) => return Err(err),
+    }
+    let stored: HashSet<platform_storage::VaultPath> = vault
+        .list(&TenantPaths::drive_object_prefix(tenant, object_id))
+        .await?
+        .into_iter()
+        .collect();
+    Ok((0..chunk_count)
+        .find(|&i| !stored.contains(&TenantPaths::drive_chunk(tenant, object_id, i)))
+        .map(|missing| format!("missing_chunk={missing}")))
+}
+
 async fn put_manifest(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
@@ -689,38 +715,72 @@ async fn put_manifest(
     validate_payload(&body.wrapped_key)?;
     validate_payload(&body.manifest)?;
 
-    // Every chunk the manifest names must be stored. An upload that paused
-    // long enough for the orphan sweep to delete its first chunks would
-    // otherwise commit a file that cannot be downloaded.
-    let stored_chunks: HashSet<platform_storage::VaultPath> = state
-        .vault
-        .list(&TenantPaths::drive_object_prefix(tenant, object_id))
-        .await?
-        .into_iter()
-        .collect();
-    if let Some(missing) = (0..body.chunk_count)
-        .find(|&i| !stored_chunks.contains(&TenantPaths::drive_chunk(tenant, object_id, i)))
-    {
+    let vault = state.vault.as_ref();
+    let refused = |reason: &str| {
         security_audit_event(
             AuditKind::DataAccess,
             Some(tenant),
             "denied",
             &format!(
-                "put_manifest object={object_id} chunk_count={} missing_chunk={missing}",
+                "put_manifest object={object_id} chunk_count={} {reason}",
                 body.chunk_count
             ),
         );
-        return Err(ApiError::Conflict);
+        ApiError::Conflict
+    };
+
+    // Every chunk the manifest names must be stored, and the orphan sweep
+    // must not be deleting them. An upload that paused long enough to be
+    // swept would otherwise commit a file that cannot be downloaded.
+    if let Some(reason) = manifest_blocker(vault, tenant, object_id, body.chunk_count).await? {
+        return Err(refused(&reason));
     }
 
     let stored = serde_json::to_vec(&body).map_err(|_| ApiError::Backend)?;
-    state
-        .vault
-        .put(
-            &TenantPaths::drive_manifest(tenant, object_id),
-            stored.into(),
-        )
-        .await?;
+    let manifest_path = TenantPaths::drive_manifest(tenant, object_id);
+    let created = match vault
+        .put_if_absent(&manifest_path, stored.clone().into())
+        .await
+    {
+        Ok(()) => true,
+        // Replacing a manifest: the object was already complete, and the
+        // sweep never deletes the chunks of an object that has a manifest.
+        Err(StorageError::AlreadyExists) => {
+            vault.put(&manifest_path, stored.into()).await?;
+            false
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if created {
+        // The sweep claims an object and then looks for its manifest; this
+        // handler has written the manifest and now looks for the claim, so
+        // one of the two sees the other (`sweep` module docs). The sweep
+        // releases its claim only after its last delete, so if the claim is
+        // gone, the chunk check shows what it deleted.
+        match manifest_blocker(vault, tenant, object_id, body.chunk_count).await {
+            Ok(None) => {}
+            blocked => {
+                // Take the manifest back, so the upload is missing, not
+                // broken.
+                match vault.delete(&manifest_path).await {
+                    Ok(()) | Err(StorageError::NotFound) => {}
+                    Err(err) => {
+                        security_audit_event(
+                            AuditKind::DataAccess,
+                            Some(tenant),
+                            "failed",
+                            &format!("put_manifest object={object_id} rollback"),
+                        );
+                        return Err(err.into());
+                    }
+                }
+                return Err(match blocked {
+                    Ok(reason) => refused(&format!("{} rolled_back", reason.unwrap_or_default())),
+                    Err(err) => err.into(),
+                });
+            }
+        }
+    }
     security_audit_event(
         AuditKind::DataAccess,
         Some(tenant),
