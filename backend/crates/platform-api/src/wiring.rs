@@ -19,9 +19,6 @@ use std::sync::Arc;
 use platform_auth::JwtVerifier;
 use platform_config::{PlatformConfig, Service};
 use platform_storage::{ObjectStoreVault, VaultStore};
-// Only the non-`dev` refusal uses these. Clippy runs with `dev` on and
-// `-D warnings`, so an ungated import would fail it.
-#[cfg(not(feature = "dev"))]
 use platform_telemetry::{AuditKind, security_audit_event};
 
 use crate::AppState;
@@ -37,12 +34,34 @@ pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
         .enforce_production(Service::PlatformApi)
         .map_err(|refusal| anyhow::anyhow!("refusing to start: {refusal}"))?;
 
-    let vault: Arc<dyn VaultStore> = match config.storage.bucket.as_deref() {
-        Some(bucket) => {
+    let local_dir = std::env::var("STORAGE_LOCAL_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty());
+    let vault: Arc<dyn VaultStore> = match (config.storage.bucket.as_deref(), local_dir) {
+        (Some(_), Some(_)) => {
+            let reason = "set STORAGE_BUCKET or STORAGE_LOCAL_DIR, not both";
+            security_audit_event(AuditKind::ServiceStart, None, "denied", reason);
+            anyhow::bail!("refusing to start: {reason}");
+        }
+        #[cfg(feature = "dev")]
+        (None, Some(dir)) => {
+            tracing::warn!(vault = "local", %dir, "STORAGE_LOCAL_DIR set — local-directory vault (dev only)");
+            Arc::new(ObjectStoreVault::new_local_dir(std::path::Path::new(
+                dir.trim(),
+            ))?)
+        }
+        // A release build never stores tenant data outside the bucket.
+        #[cfg(not(feature = "dev"))]
+        (None, Some(_)) => {
+            let reason = "STORAGE_LOCAL_DIR is dev-only: the local-directory vault exists only with the dev feature";
+            security_audit_event(AuditKind::ServiceStart, None, "denied", reason);
+            anyhow::bail!("refusing to start: {reason}");
+        }
+        (Some(bucket), None) => {
             tracing::info!(vault = "gcs", "storage vault: Google Cloud Storage");
             Arc::new(ObjectStoreVault::new_gcs(bucket, &config.storage.client)?)
         }
-        None => {
+        (None, None) => {
             tracing::warn!(
                 vault = "memory",
                 "STORAGE_BUCKET unset — in-memory vault (dev only; data is lost on restart)"

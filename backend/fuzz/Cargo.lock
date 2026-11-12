@@ -1825,6 +1825,7 @@ dependencies = [
 name = "platform-billing"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hmac",
  "serde",
  "serde_json",

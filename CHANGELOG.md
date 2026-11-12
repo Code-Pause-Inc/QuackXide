@@ -22,6 +22,12 @@ uses [Semantic Versioning](https://semver.org/).
 * `npm run build:release` (`vite build --mode release`), run by
   `release.yml`, fails unless `VITE_VAULT_MODE=http` and fails if
   `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is set.
+* The simulated TEE stack keeps `enclave-api`'s vault in a directory on a
+  Docker volume (`ObjectStoreVault::new_local_dir`, `STORAGE_LOCAL_DIR`),
+  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext.
+  Only `dev` builds have this backend: a release `platform-api` refuses to
+  start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
+  accepts `object_store` 0.13's uploads (#153).
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
@@ -172,6 +178,18 @@ uses [Semantic Versioning](https://semver.org/).
   a retry from a first approval (`retry=true` in the `research.catalog`
   detail), and a refused retry or a refused deny of an approved request
   is recorded as `denied`.
+* A paused tenant comes back when its subscription resumes: the MoR
+  webhook maps `subscription.resumed` to reactivation. Before, it was
+  ignored and the tenant stayed Suspended. A cancel is final (ADR 0006):
+  the tenant becomes Canceled whatever the cancel's `occurred_at`, and no
+  later pause or resume changes it. Paddle does not deliver in order, so
+  pauses and resumes apply only when their `occurred_at` is newer than the
+  last change applied (a tie keeps Suspended), and a late or retried event
+  cannot undo a newer one. Provisioning events never change an existing
+  tenant's status. Events without a valid RFC 3339 `occurred_at` are
+  refused with 400. Each status event is audited as `tenant.provisioned`:
+  `ok` when applied, `denied` with `reason=stale` or `reason=canceled`
+  when skipped, and `miss` for an unknown subscription.
 
 ### Security
 

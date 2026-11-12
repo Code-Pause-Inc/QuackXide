@@ -79,7 +79,9 @@ Client key architecture:
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
-  `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  `ObjectStoreVault` covers GCS (production), in-memory (dev/tests) and,
+  in `dev` builds only, a local directory (`STORAGE_LOCAL_DIR`, used by
+  the simulated TEE stack). A release build refuses `STORAGE_LOCAL_DIR`.
   Storage errors are classified: missing objects are 404, lost
   create-only writes 409, transient failures (after the storage client's
   own retries) 503 with `Retry-After`, and permanent ones (credentials,
@@ -330,7 +332,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
    │                        ▼
    │                identity service ── exchanges code, verifies Auth0 ID token (JWKS)
    │                        │            looks up (iss, sub) → tid, adm
-   │◀── preauth ────────────┤            refuses unknown or Suspended tenants
+   │◀── preauth ────────────┤            refuses unknown, Suspended or Canceled tenants
    │── TOTP code ──────────▶│
    │◀── access + refresh ───┘
    │
@@ -351,7 +353,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 * **Tenant identity.** Each signed-in person maps to exactly one tenant
   through the identity registry, keyed by the provider's `(iss, sub)`,
   never by email. `tid` remains the only source of tenant identity in the
-  API, and an unknown or Suspended tenant is refused.
+  API, and an unknown, Suspended or Canceled tenant is refused.
 * **Roles.** Steward and researcher stay grant relationships between
   tenants (see "Research access"); tokens carry no role claims. `adm`
   grants cross-tenant administrative powers and comes only from a
@@ -378,7 +380,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
 | platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out | Plaintext persistence |
 | platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
-| platform-billing | MoR (Paddle) webhook signature verification, replay guard | Webhook secrets in Debug output |
+| platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |
 | quackxide-engine | `QueryScope` RAII, plan gate, disclosure policies | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
 | synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |
