@@ -96,7 +96,7 @@ P12 phase A → P14 (includes the workload-identity decision) → P47 (starts of
 Chains that feed it:
 - Simulated TEE: P8 → P84 stage 1; P47 → P84 stage 2. Every later enclave, sealing and browser item is developed and tested against P84 before it runs on hardware.
 - Browser-verified enclave and sealed queries: P14, P15, P47, P34 checkpoint B and P84 → P85 (the attestation endpoint and the browser verifier), with P49's published values and P67's TLS-key binding for the production run → P55 → P56.
-- Sealed results: P14 → P33 → P55 → P56. P33 needs P31 (the session token and `tid` in the crypto worker) and P41's conditional-write PR, not the identity service, so this chain runs in parallel with P29.
+- Sealed results: P14 → P55 → P56, with P33 before P55 closes. P55 is built against the current enrollment record; P33 makes that record create-once. P33 needs P31 (the session token and `tid` in the crypto worker) and P41's conditional-write PR, not the identity service, so this chain runs in parallel with P29.
 - Hybrid suite for DoD item 1: P17 → P34 (seal first) and P35 (after P73's `HPK1` baseline) → P36 → P40 closes. P36 also needs P33, so it too waits on P14, P31 and P41's conditional-write PR, not on the identity service. P35 also feeds the main path at P50, which must wrap released keys with the hybrid suite before it closes.
 - Steward upload for DoD item 1: P38 → P39 → P40. P38 reuses the versioned-snapshot layout already merged on `main` (ADR 0003); its remaining hard dependencies are P14 and P69.
 - Sign-in, which DoD items 1 and 2 both begin with: P16 and P13 (provider development tenant) → P29 → P30 → P32, which P40 needs to close and P82 runs end to end; P29 and P30 → P63 → P68. A checkpoint in P5 follows P29's first attempt at the token exchange against the provider's development tenant.
@@ -1560,15 +1560,15 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - No component outside the attested Confidential VM (load balancer, TLS-terminating proxy, operational logs, audit stream, object store) ever holds the result's aggregate row values, with a test on the logs and audit stream. The `engine.query` audit record keeps its count metadata (`rows=`, `suppressed=`, `budget_remaining=`, `query.rs:602-615`), which billing reads.
 - Error responses (400, 401, 403, 404, 422, 429, 502, 503) stay unsealed and carry no result data or SQL echo, with a test.
 - The own-data query endpoint (`POST /api/v1/query`) either seals the same way or the ADR records why not.
-- Tests: a result opens only with the intended key; a different recipient key, a flipped byte, a result signed by any key other than the enclave's verified result-signing key, and a valid result replayed against another request nonce are refused; a recipient key substituted in the enrollment record yields nothing the substitute can open (or the query is refused, because the fingerprint no longer matches).
+- Tests: a result opens only with the intended key; a different recipient key, a flipped byte, a result signed by any key other than the enclave's verified result-signing key, and a valid result replayed against another request nonce are refused; a recipient key substituted in the enrollment record yields nothing the substitute can open (or the query is refused, because the fingerprint no longer matches); once P33 lands, a result after a refused re-enrollment is still sealed to the original key.
 - `docs/THREAT_MODEL.md` A2 rows "Read results at the API edge", key substitution and result forgery, and README "Status" ("Encrypted results") are updated.
 - The research diagram in `docs/ARCHITECTURE.md` (lines 177-190, which today ends in "aggregate rows + suppressed_rows + budget_remaining") ends in a result sealed to the researcher's key and states what stays cleartext metadata. The query diagram (lines 117-129, which ends in "JSON result rows") is updated too, or notes that it stays unsealed, as the ADR decides.
 
 **Where.** `backend/crates/platform-api/src/query.rs`, `backend/crates/platform-api/src/lib.rs` (enrollment), `backend/crates/platform-crypto/src/lib.rs`, `docs/adr/`, `docs/THREAT_MODEL.md`, `docs/ARCHITECTURE.md`, `README.md`.
 
-**Depends on:** P14, P15, P85, P54 (result contract), P33, and P35 to close.
+**Depends on:** P14, P15, P85, P54 (result contract); P33 and P35 to close.
 
-**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run.
+**Sequencing.** Developed and tested against the simulated TEE (P84); P50 is needed only for the final on-hardware run. Starts before P33: until P33 lands, the enrollment record that supplies the recipient key's fingerprint can still be overwritten, which is acceptable on the simulated TEE only. Seals with the recipient key's suite, which must equal the enrolled key's suite and is hybrid-only after P35, so P35 switches the suite without changing P55's code.
 
 **Security impact.** Closes "Read results at the API edge", recipient-key substitution and result forgery (A2).
 **ADR.** Required (wire format and trust boundary).
