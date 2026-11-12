@@ -260,6 +260,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `docs/PROJECT_SCOPE.md` lists what is not in v1.0: live connector sync,
+  the admin connector toggles, charging catalog prices, blind-index search
+  and closing differencing. The merchant-of-record webhook and its tenant
+  status handling stay. Releases no longer ship `connector-worker`; it is a
+  development tool.
 * Local runs of `platform-api` and `connector-worker` need
   `APP_ENV=development`, and `devtoken` needs `--features dev`.
   `scripts/check.sh` also lints the release binaries without the `dev`
