@@ -5,6 +5,7 @@
 //! hashed byte-for-byte; re-serialized JSON will not match. `ts` outside the
 //! tolerance window is rejected as a replay.
 
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -100,7 +101,9 @@ pub fn verify_paddle_signature(
 pub struct PaddleEvent {
     pub event_id: String,
     pub event_type: String,
-    pub occurred_at: String,
+    /// When the change happened. Paddle does not deliver in order, so this,
+    /// not arrival, orders status changes.
+    pub occurred_at: DateTime<Utc>,
     pub subscription_id: Option<String>,
     pub customer_id: Option<String>,
     pub status: Option<String>,
@@ -118,11 +121,15 @@ struct RawEvent {
     data: serde_json::Value,
 }
 
-/// Parse a Paddle event body. `event_type` is required; the rest are
-/// best-effort so schema additions don't break parsing.
+/// Parse a Paddle event body. `event_type` and an RFC 3339 `occurred_at`
+/// are required; the rest are best-effort so schema additions don't break
+/// parsing.
 pub fn parse_event(raw_body: &[u8]) -> Result<PaddleEvent, BillingError> {
     let raw: RawEvent =
         serde_json::from_slice(raw_body).map_err(|_| BillingError::MalformedPayload)?;
+    let occurred_at = DateTime::parse_from_rfc3339(&raw.occurred_at)
+        .map_err(|_| BillingError::MalformedPayload)?
+        .with_timezone(&Utc);
     let data = &raw.data;
     let string_at = |ptr: &str| {
         data.pointer(ptr)
@@ -132,7 +139,7 @@ pub fn parse_event(raw_body: &[u8]) -> Result<PaddleEvent, BillingError> {
     Ok(PaddleEvent {
         event_id: raw.event_id,
         event_type: raw.event_type,
-        occurred_at: raw.occurred_at,
+        occurred_at,
         subscription_id: string_at("/id"),
         customer_id: string_at("/customer_id"),
         status: string_at("/status"),
@@ -150,6 +157,16 @@ pub enum ProvisioningAction {
     },
     Suspend {
         subscription_id: String,
+        occurred_at: DateTime<Utc>,
+    },
+    /// Final: a later resume does not undo it.
+    Cancel {
+        subscription_id: String,
+        occurred_at: DateTime<Utc>,
+    },
+    Resume {
+        subscription_id: String,
+        occurred_at: DateTime<Utc>,
     },
     Ignore {
         reason: String,
@@ -171,12 +188,31 @@ pub fn action_for(event: &PaddleEvent) -> ProvisioningAction {
                 },
             }
         }
-        "subscription.canceled" | "subscription.paused" => match &event.subscription_id {
-            Some(sub) => ProvisioningAction::Suspend {
+        "subscription.canceled" => match &event.subscription_id {
+            Some(sub) => ProvisioningAction::Cancel {
                 subscription_id: sub.clone(),
+                occurred_at: event.occurred_at,
             },
             None => ProvisioningAction::Ignore {
                 reason: "cancellation missing subscription id".to_owned(),
+            },
+        },
+        "subscription.paused" => match &event.subscription_id {
+            Some(sub) => ProvisioningAction::Suspend {
+                subscription_id: sub.clone(),
+                occurred_at: event.occurred_at,
+            },
+            None => ProvisioningAction::Ignore {
+                reason: "pause missing subscription id".to_owned(),
+            },
+        },
+        "subscription.resumed" => match &event.subscription_id {
+            Some(sub) => ProvisioningAction::Resume {
+                subscription_id: sub.clone(),
+                occurred_at: event.occurred_at,
+            },
+            None => ProvisioningAction::Ignore {
+                reason: "resume missing subscription id".to_owned(),
             },
         },
         other => ProvisioningAction::Ignore {
@@ -188,6 +224,7 @@ pub fn action_for(event: &PaddleEvent) -> ProvisioningAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     const SECRET: &str = "pdl_ntfset_test_secret";
 
@@ -403,21 +440,60 @@ mod tests {
         }
     }
 
+    fn status_event(event_type: &str) -> PaddleEvent {
+        let body = format!(
+            r#"{{"event_type":"{event_type}","occurred_at":"2026-08-01T12:00:00.5+02:00","data":{{"id":"sub_abc"}}}}"#
+        );
+        parse_event(body.as_bytes()).expect("parse")
+    }
+
     #[test]
-    fn cancellation_maps_to_suspend() {
-        let body = br#"{"event_type":"subscription.canceled","data":{"id":"sub_abc"}}"#;
-        let event = parse_event(body).expect("parse");
+    fn status_events_map_to_cancel_suspend_and_resume() {
+        let occurred_at = Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(500);
+        let subscription_id = "sub_abc".to_owned();
         assert_eq!(
-            action_for(&event),
+            action_for(&status_event("subscription.canceled")),
+            ProvisioningAction::Cancel {
+                subscription_id: subscription_id.clone(),
+                occurred_at,
+            }
+        );
+        assert_eq!(
+            action_for(&status_event("subscription.paused")),
             ProvisioningAction::Suspend {
-                subscription_id: "sub_abc".into()
+                subscription_id: subscription_id.clone(),
+                occurred_at,
+            }
+        );
+        assert_eq!(
+            action_for(&status_event("subscription.resumed")),
+            ProvisioningAction::Resume {
+                subscription_id,
+                occurred_at,
             }
         );
     }
 
     #[test]
+    fn missing_or_invalid_occurred_at_is_malformed() {
+        for occurred_at in [None, Some(""), Some("yesterday"), Some("2026-08-01")] {
+            let mut body =
+                serde_json::json!({"event_type": "subscription.paused", "data": {"id": "sub_abc"}});
+            if let Some(value) = occurred_at {
+                body["occurred_at"] = value.into();
+            }
+            assert_eq!(
+                parse_event(body.to_string().as_bytes()),
+                Err(BillingError::MalformedPayload),
+                "{occurred_at:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unrelated_event_is_ignored() {
-        let body = br#"{"event_type":"transaction.completed","data":{"id":"txn_1"}}"#;
+        let body = br#"{"event_type":"transaction.completed","occurred_at":"2026-08-01T00:00:00Z","data":{"id":"txn_1"}}"#;
         let event = parse_event(body).expect("parse");
         assert!(matches!(
             action_for(&event),
