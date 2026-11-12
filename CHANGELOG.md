@@ -260,6 +260,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* ADR 0007's "Browser private-key storage" section is accepted, and ADR
+  0004 now says the researcher's result key is held as that section
+  describes instead of "non-extractable": a private key that HPKE opens
+  with is stored encrypted under a non-extractable AES-256-GCM key.
 * `docs/PROJECT_SCOPE.md` lists what is not in v1.0: live connector sync,
   the admin connector toggles, charging catalog prices, blind-index search
   and closing differencing. The merchant-of-record webhook and its tenant

@@ -1,6 +1,7 @@
 # 0007. Hybrid suite construction, libraries, browser key storage and migration
 
-* Status: Proposed
+* Status: Proposed. The "Browser private-key storage" section is accepted
+  (2026-11-12); the rest waits on the open questions.
 * Date: 2026-10-19
 
 ## Context
@@ -33,7 +34,7 @@ keys live, or how existing ciphertext migrates.
   `@noble/post-quantum`'s README says it has not been independently
   audited (it records a self-audit at 0.6.1). ADR 0001's "established
   libraries only" therefore needs a definition that can be met.
-* ADR 0004 (Proposed) keeps a copy of each steward upload wrapped to the
+* ADR 0004 keeps a copy of each steward upload wrapped to the
   steward's browser key, generates the researcher's result key in the
   researcher's browser, and wraps data keys to a Cloud KMS X-Wing key.
   Cloud KMS documents `KEM_XWING` (public key 1216, ciphertext 1120,
@@ -128,9 +129,10 @@ An X-Wing private key is a 32-byte seed. The browser holds it as follows:
   zeroize on drop) and drops it when the open ends.
 
 This applies to the steward's upload key (ADR 0004) and the researcher's
-result key (P55). Under the hybrid suite a result key cannot be
-non-extractable as ADR 0004 currently says; ADR 0004 is amended to "held
-as ADR 0007 describes" before it is accepted.
+result key (P55). A key that HPKE opens with cannot stay in Web Crypto's
+non-extractable store, so ADR 0004 says the result key is held as this
+section describes. The current `HPK1` X25519 private key is held the same
+way, with AAD `x25519-key-v1|{tenant}|{fingerprint of the public key}`.
 
 Residual risk, as ADR 0001 requires: a copy of the IndexedDB records is
 useless off the device, but code running in the worker during an open
@@ -217,8 +219,8 @@ the hybrid suite ships, a new record reinstates it.
 * `docs/PROJECT_SCOPE.md`'s "Established libraries only" and
   `docs/ARCHITECTURE.md`'s migration rules point to this record's
   definition.
-* On acceptance: P35 and P36 may merge; ADR 0004 replaces "non-extractable"
-  for the result key; P34's vector file gains the hybrid vectors.
+* On acceptance: P35 and P36 may merge; P34's vector file gains the hybrid
+  vectors.
 
 ## Open questions
 
@@ -226,5 +228,5 @@ the hybrid suite ships, a new record reinstates it.
    tracks it and the later revisions did not change the bytes?
 2. Should the second implementation for committed vectors be `hpke-js`
    (the only other HPKE X-Wing implementation found), or should vectors
-   also come from Cloud KMS once ADR 0004 is decided?
+   also come from Cloud KMS (ADR 0004)?
 3. Accept "established" as defined above, in place of "audited"?
