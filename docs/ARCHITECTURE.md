@@ -166,8 +166,9 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
   aborts siblings. On SIGTERM or Ctrl-C it lets the sync in flight commit
   and starts no more. The `connector-worker` binary runs fixture jobs
-  end-to-end without live credentials; `HttpJsonSource` (OAuth refresh →
-  GET → mapper) is the production fetch path.
+  end-to-end without live credentials. It is a development tool, not a
+  release artifact: live sync through `HttpJsonSource` (OAuth refresh →
+  GET → mapper) is not in v1.0 (`docs/PROJECT_SCOPE.md`).
 
 ### 3. Query (zero-trust analytics)
 

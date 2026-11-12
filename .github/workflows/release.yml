@@ -41,11 +41,10 @@ jobs:
       - name: Build release artifacts
         run: |
           cargo build --manifest-path backend/Cargo.toml --release --locked \
-            -p platform-api -p platform-connectors
+            -p platform-api
           mkdir -p dist
-          for bin in platform-api connector-worker; do
-            cp "backend/target/release/$bin" dist/
-          done
+          # connector-worker is not a v1.0 artifact (docs/PROJECT_SCOPE.md).
+          cp backend/target/release/platform-api dist/
           tar -C frontend/dist -czf dist/frontend.tar.gz .
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
