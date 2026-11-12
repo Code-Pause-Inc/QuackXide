@@ -94,7 +94,7 @@ The first complete release is done when all of the following hold:
    receives the dataset key inside the enclave only, and returns a
    disclosure-controlled result sealed to the researcher's key.
 3. Every step of both lifecycles is **Built**; no step returns 503 for
-   missing wiring in a production build.
+   missing wiring in production mode (defined in `docs/ARCHITECTURE.md`).
 4. Registries are durable across restarts.
 5. The system deploys reproducibly from this repository's documentation.
 6. Benchmarks are committed with their method, results, and performance
@@ -108,6 +108,32 @@ The first complete release is done when all of the following hold:
    describe the system as built, with no "to build" items left in the
    release scope.
 10. `scripts/check.sh` passes on `main`.
+
+## Not in v1.0
+
+These exist in the repository or the documentation but are not part of the
+first release. Each stays off or unshipped in production until a later
+release takes it on.
+
+* **Live connector sync for real tenants.** `HttpJsonSource`, persistence of
+  OAuth credentials, and a sync-job registry driven by the admin connector
+  toggles are deferred. `connector-worker` runs fixture jobs for
+  development and the simulated TEE only: it is not a release artifact and
+  is not deployed. The storage and grant model keyed by connector slug
+  stays, because research datasets, listings and grants are built on it;
+  the steward upload uses the same layout, as its ADR records.
+* **Admin connector toggles.** They are recorded on the tenant but nothing
+  reads them in v1.
+* **Billing beyond tenant status.** The merchant-of-record webhook stays:
+  it provisions tenants and applies pause, resume and cancel (ADR 0006).
+  Enforcing tenant status is part of sign-in. Charging researchers the
+  catalog prices is deferred; prices are recorded only.
+* **Blind-index search.** The engine library stays, but no route produces
+  the indexed column and there is no key management for it.
+* **Closing differencing.** Query budgets bound differencing on research
+  queries, and own-data queries are not bounded. A perturbation policy and
+  a privacy-loss accountant are deferred; `docs/THREAT_MODEL.md` records
+  the residual risk.
 
 ## Team
 

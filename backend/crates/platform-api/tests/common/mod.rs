@@ -19,6 +19,7 @@ use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
 use platform_api::dev::DevResearchStack;
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
@@ -211,13 +212,14 @@ pub fn config_with_mor_secret(secret: &str) -> PlatformConfig {
     .expect("config")
 }
 
-/// Default config, an HS256 verifier for `secret`, and no query or
-/// provisioning service. Override fields with struct update syntax.
+/// Default config, an HS256 verifier for `secret`, and no research, query
+/// or provisioning service. Override fields with struct update syntax.
 pub fn app_state(secret: &str, vault: Arc<dyn VaultStore>) -> AppState {
     AppState {
         config: Arc::new(default_config()),
         vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(secret, ISS, AUD))),
+        research: None,
         query: None,
         provisioning: None,
     }
@@ -284,18 +286,19 @@ pub async fn research_app(
         .await
         .expect("commit");
     let vault = stack.vault();
+    let research = Arc::new(ResearchService::new(ResearchStores::in_memory(), 5, 100));
     let service = stack.query_service_with_attestation(
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
             max_concurrent_queries: 4,
         },
-        5,
-        100,
+        research.clone(),
         attestation,
         require_attestation,
     );
 
     build_app(AppState {
+        research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)
     })

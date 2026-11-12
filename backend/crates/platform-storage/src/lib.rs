@@ -331,6 +331,16 @@ impl ObjectStoreVault {
         Self::new(Arc::new(InMemory::new()))
     }
 
+    /// DEV ONLY: each object is a file under `dir`, at its vault path. The
+    /// simulated TEE stack uses it because no GCS emulator accepts
+    /// `object_store`'s uploads (#153). `dir` must already exist.
+    #[cfg(feature = "dev")]
+    pub fn new_local_dir(dir: &std::path::Path) -> Result<Self, StorageError> {
+        let store = object_store::local::LocalFileSystem::new_with_prefix(dir)
+            .map_err(|e| StorageError::Fatal(e.to_string()))?;
+        Ok(Self::new(Arc::new(store)))
+    }
+
     /// Google Cloud Storage backend. Credentials resolve from the environment
     /// or the GCE metadata server unless `STORAGE_EMULATOR_HOST` points at a
     /// local GCS emulator (`fsouza/fake-gcs-server`). Timeouts and retries
@@ -740,6 +750,66 @@ mod tests {
             .expect("list b");
         assert_eq!(b_list.len(), 1);
         assert_eq!(b_list[0], b_path);
+    }
+
+    /// A fresh directory for one test; the caller removes it.
+    #[cfg(feature = "dev")]
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vault-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[cfg(feature = "dev")]
+    #[tokio::test]
+    async fn local_dir_vault_stores_each_object_as_a_file_at_its_path() {
+        let dir = scratch_dir("local-layout");
+        let vault = ObjectStoreVault::new_local_dir(&dir).expect("vault");
+        let path = TenantPaths::drive_manifest(tenant_a(), object_1());
+
+        vault
+            .put(&path, Bytes::from_static(b"sealed"))
+            .await
+            .expect("put");
+        assert_eq!(
+            vault.get(&path).await.expect("get"),
+            Bytes::from_static(b"sealed")
+        );
+        assert_eq!(
+            vault
+                .list(&TenantPaths::drive_manifest_prefix(tenant_a()))
+                .await
+                .expect("list"),
+            vec![path.clone()]
+        );
+        // The simulated TEE's e2e script reads these files to check them.
+        assert_eq!(
+            std::fs::read(dir.join(path.as_str())).expect("file at the vault path"),
+            b"sealed"
+        );
+        assert!(matches!(
+            vault
+                .put_if_absent(&path, Bytes::from_static(b"other"))
+                .await,
+            Err(StorageError::AlreadyExists)
+        ));
+        vault.delete(&path).await.expect("delete");
+        assert!(matches!(
+            vault.get(&path).await,
+            Err(StorageError::NotFound)
+        ));
+
+        std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn local_dir_vault_refuses_a_missing_directory() {
+        let dir = std::env::temp_dir().join(format!("vault-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ObjectStoreVault::new_local_dir(&dir).is_err());
+        assert!(!dir.exists(), "the vault must not create its own directory");
     }
 
     #[tokio::test]

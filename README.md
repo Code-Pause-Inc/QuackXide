@@ -93,7 +93,7 @@ backend/crates/
   platform-telemetry/     JSON tracing + SECURITY_AUDIT_EVENT stream
   platform-crypto/        AEAD, HPKE envelopes, blind indexes, TOTP
   platform-auth/          JWT verification (dev HS256, RS256/JWKS) + keygen
-  platform-storage/       Tenant-isolated ciphertext vault (GCS / emulator / in-memory)
+  platform-storage/       Tenant-isolated ciphertext vault (GCS / emulator / in-memory / dev-only local directory)
   platform-enclave/       Attestation gates, Confidential Space token verifier; dev-only token simulator (feature "simulated")
   platform-connectors/    Connector catalog, OAuth2, NDJSON, Parquet-out
   platform-tenancy/       Tenants, grants, budgets, dataset catalog
@@ -146,8 +146,9 @@ End-to-end locally, from `backend/`. The secret goes in `backend/.env`
 
 ```sh
 sed -i.bak "s/^JWT_HS256_SECRET=.*/JWT_HS256_SECRET=\"$(openssl rand -hex 32)\"/" .env && rm .env.bak
+export APP_ENV=development                   # both terminals; unset means production (ADR 0009)
 cargo run -p platform-api                    # terminal 1
-cargo run -p platform-api --bin devtoken     # terminal 2: prints a token
+cargo run -p platform-api --features dev --bin devtoken   # terminal 2: prints a token
 # frontend/.env: VITE_VAULT_MODE="http", VITE_DEV_JWT="<token>"
 cargo run -p platform-api --features dev --bin query-demo   # sealed-query round trip over simulated tokens + KeyReleaseRelyingParty
 ```
@@ -217,9 +218,11 @@ locally across isolated networks (`public_net` and `internal: true`
   debug disabled, `STABLE`, allowed image digest) before wrapping a tenant's
   private key via HPKE (`key-release-v1`) for a single query.
 
-`enclave-api` keeps its sealed snapshots in the in-memory vault:
-`fake-gcs-server` 1.49.3 does not accept the uploads `object_store` 0.13
-sends, so no storage emulator is part of the stack.
+`enclave-api` keeps its sealed snapshots in a directory on the
+`enclave_vault` volume (`STORAGE_LOCAL_DIR`, dev builds only), and the test
+script checks that it holds only ciphertext. No GCS emulator is part of the
+stack: `fake-gcs-server` does not accept the uploads `object_store` 0.13
+sends (#153).
 
 The simulation runs production's evidence path (the token verifier, its
 release policy, key release through the stand-in, sealed queries) on any
@@ -230,7 +233,9 @@ development and CI only. The images are built with the `dev` feature;
 `key-release`, `sim-attestation` and `query-demo`, and the simulated token
 provider, exist only in such builds. A build without `dev` refuses to start
 when `KEY_RELEASE_URL` is set, and refuses every attestation when
-`TEE_ATTESTATION_REQUIRED=false`. `TEE_ATTESTATION_REQUIRED=true` refuses
+`TEE_ATTESTATION_REQUIRED=false`. Production mode (`docs/ARCHITECTURE.md`)
+refuses to start on any of these paths in every build, so the stack sets
+`APP_ENV=development`. `TEE_ATTESTATION_REQUIRED=true` refuses
 simulated evidence, and query and research responses report
 `"tee_platform": "simulated"`.
 
@@ -239,7 +244,7 @@ simulated evidence, and query and research responses report
 
 ```sh
 cargo run -p platform-api --features dev --bin sim-attestation   # terminal 1
-SIM_ATTESTATION_URL=http://127.0.0.1:8070 \
+APP_ENV=development SIM_ATTESTATION_URL=http://127.0.0.1:8070 \
   cargo run -p platform-connectors --features simulated --bin connector-worker   # terminal 2
 ```
 

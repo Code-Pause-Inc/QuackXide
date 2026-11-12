@@ -16,12 +16,16 @@ import {
   unwrapFileKey,
 } from "./core";
 import type { DeviceKeys } from "./keystore";
-import type { DownloadResult, DriveFileSummary } from "./protocol";
+import type { DownloadResult, DriveFileSummary, SessionClaims } from "./protocol";
 import type { ChunkRecord, FileManifest, ManifestRecord } from "./types";
 
 export interface DriveContext {
   keys: DeviceKeys;
   vault: VaultClient;
+  /** Claims of the session token, snapshotted when the operation starts so
+   *  one operation never mixes identities. Unverified in the browser; null
+   *  without a session. Not yet used: #175 binds keys and AAD to `tid`. */
+  session?: SessionClaims | null;
   onProgress?: (done: number, total: number) => void;
 }
 

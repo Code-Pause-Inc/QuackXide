@@ -4,8 +4,9 @@
 #   1. enclave-api         -> Confidential Space workload (simulated token provider)
 #   2. sim-attestation     -> Google's attestation service (signs tokens, serves keys)
 #   3. key-release-service -> Cloud KMS stand-in, verifying tokens before release
-# enclave-api uses the in-memory vault: fake-gcs-server does not accept the
-# uploads object_store 0.13 sends.
+# enclave-api keeps its vault in the `enclave_vault` volume, so
+# scripts/test-simulated-tee.sh can check that only ciphertext is stored. No
+# GCS emulator accepts the uploads object_store 0.13 sends (#153).
 #
 # `setup_net` exists only so scripts/test-simulated-tee.sh can enroll a tenant
 # key and wait for sim-attestation from the host: Docker publishes no ports
@@ -75,6 +76,7 @@ services:
       - sim-attestation
       - key-release-service
     environment:
+      APP_ENV: "development"
       BIND_ADDR: "0.0.0.0:8080"
       METRICS_BIND_ADDR: "127.0.0.1:9464"
       KEY_RELEASE_URL: "http://key-release-service:8090"
@@ -88,7 +90,11 @@ services:
       JWT_AUDIENCE: "${JWT_AUDIENCE:-quackxide-api}"
       DEMO_TENANT_ID: "${DEMO_TENANT_ID:-}"
       DEMO_TENANT_PUBLIC_KEY_B64: "${DEMO_TENANT_PUBLIC_KEY_B64:-}"
+      RESEARCH_MIN_COHORT_SIZE: "${RESEARCH_MIN_COHORT_SIZE:-}"
+      STORAGE_LOCAL_DIR: /var/lib/quackxide/vault
       RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - enclave_vault:/var/lib/quackxide/vault
     ports:
       - "127.0.0.1:8080:8080"
     networks:
@@ -101,6 +107,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  enclave_vault:
 
 networks:
   public_net:

@@ -143,7 +143,10 @@ export class ResearchClient {
   }
 
   private async get<T>(path: string, what: string): Promise<T> {
-    const response = await fetch(this.url(path), { headers: this.headers() });
+    return this.read<T>(await fetch(this.url(path), { headers: this.headers() }), what);
+  }
+
+  private async read<T>(response: Response, what: string): Promise<T> {
     if (response.status === 401) throw new Error("not authenticated");
     if (response.status === 503) throw new Error("research access is not enabled on this deployment");
     if (!response.ok) throw new Error(`failed to load ${what} (${response.status})`);
@@ -159,8 +162,11 @@ export class ResearchClient {
     return body.grants;
   }
 
-  async budget(grantId: string): Promise<BudgetView> {
-    return this.get<BudgetView>(budgetPath(grantId), "budget standing");
+  /** `null` when the grant has no budget (404); any other failure throws. */
+  async budget(grantId: string): Promise<BudgetView | null> {
+    const response = await fetch(this.url(budgetPath(grantId)), { headers: this.headers() });
+    if (response.status === 404) return null;
+    return this.read<BudgetView>(response, "budget standing");
   }
 
   async myRequests(): Promise<AccessRequestView[]> {

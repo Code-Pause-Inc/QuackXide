@@ -21,5 +21,13 @@ futures.workspace = true
 object_store.workspace = true
 thiserror.workspace = true
 
+[features]
+default = []
+# DEV ONLY. A vault on a local directory, for the simulated TEE stack
+# (`docker-compose.simulated-tee.yml`). Never a default feature;
+# `platform-api`'s `dev` feature and test builds enable it.
+dev = []
+
 [dev-dependencies]
+platform-storage = { path = ".", features = ["dev"] }
 tokio.workspace = true

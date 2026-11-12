@@ -117,6 +117,7 @@ fn app(setup: Setup) -> (Router, Arc<TestVault>) {
         config: Arc::new(config),
         vault: vault.clone(),
         jwt,
+        research: None,
         query,
         provisioning: None,
     });

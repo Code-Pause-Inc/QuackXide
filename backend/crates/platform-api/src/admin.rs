@@ -11,12 +11,13 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use platform_billing::{ProvisioningAction, action_for, parse_event, verify_paddle_signature};
 use platform_connectors::catalog;
 use platform_core::{ConnectorSlug, TenantId};
 use platform_storage::{TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
-use platform_tenancy::{TenancyError, TenantRecord, TenantRegistry, TenantStatus};
+use platform_tenancy::{StatusOutcome, TenancyError, TenantRecord, TenantRegistry, TenantStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -107,24 +108,26 @@ impl ProvisioningService {
                     "tenant_id": record.tenant_id,
                 }))
             }
-            ProvisioningAction::Suspend { subscription_id } => {
-                let updated = self
-                    .registry
-                    .set_status(&subscription_id, TenantStatus::Suspended)
+            ProvisioningAction::Suspend {
+                subscription_id,
+                occurred_at,
+            } => {
+                self.set_status(&subscription_id, TenantStatus::Suspended, occurred_at)
                     .await
-                    .map_err(|_| ApiError::Backend)?;
-                let tenant = updated.as_ref().map(|r| r.tenant_id);
-                security_audit_event(
-                    AuditKind::TenantProvisioned,
-                    tenant,
-                    if updated.is_some() { "ok" } else { "noop" },
-                    &format!("suspend subscription={subscription_id}"),
-                );
-                Ok(json!({
-                    "received": true,
-                    "action": "suspended",
-                    "matched": updated.is_some(),
-                }))
+            }
+            ProvisioningAction::Cancel {
+                subscription_id,
+                occurred_at,
+            } => {
+                self.set_status(&subscription_id, TenantStatus::Canceled, occurred_at)
+                    .await
+            }
+            ProvisioningAction::Resume {
+                subscription_id,
+                occurred_at,
+            } => {
+                self.set_status(&subscription_id, TenantStatus::Active, occurred_at)
+                    .await
             }
             ProvisioningAction::Ignore { reason } => Ok(json!({
                 "received": true,
@@ -132,6 +135,45 @@ impl ProvisioningService {
                 "reason": reason,
             })),
         }
+    }
+
+    async fn set_status(
+        &self,
+        subscription_id: &str,
+        status: TenantStatus,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Value, ApiError> {
+        let outcome = self
+            .registry
+            .set_status(subscription_id, status, occurred_at)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        let (verb, action) = match status {
+            TenantStatus::Suspended => ("suspend", "suspended"),
+            TenantStatus::Active => ("resume", "resumed"),
+            TenantStatus::Canceled => ("cancel", "canceled"),
+        };
+        let detail = format!("{verb} subscription={subscription_id} occurred_at={occurred_at}");
+        let (tenant, result, detail) = match &outcome {
+            None => (None, "miss", detail),
+            Some(StatusOutcome::Applied(record)) => (Some(record.tenant_id), "ok", detail),
+            Some(StatusOutcome::Stale(record)) => (
+                Some(record.tenant_id),
+                "denied",
+                format!("{detail} reason=stale"),
+            ),
+            Some(StatusOutcome::Canceled(record)) => (
+                Some(record.tenant_id),
+                "denied",
+                format!("{detail} reason=canceled"),
+            ),
+        };
+        security_audit_event(AuditKind::TenantProvisioned, tenant, result, &detail);
+        Ok(json!({
+            "received": true,
+            "action": action,
+            "matched": outcome.is_some(),
+        }))
     }
 }
 
