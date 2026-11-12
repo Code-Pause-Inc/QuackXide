@@ -1,6 +1,7 @@
 // Main-thread promise API over the crypto worker; correlates requests with
 // responses so UI code never touches postMessage.
 
+import { resolveVaultConfig } from "../../config/vault";
 import type {
   DownloadResult,
   DriveFileSummary,
@@ -28,6 +29,11 @@ export class DriveWorkerClient {
   constructor() {
     this.worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     this.worker.onmessage = (ev: MessageEvent) => this.onMessage(ev.data as WorkerResponse);
+    // Development: the UI thread supplies the build-time dev token. Posted
+    // first, so the worker has it before any other request. A malformed token
+    // leaves the worker without a session, and vault calls report that.
+    const devJwt = resolveVaultConfig(import.meta.env).devJwt;
+    if (devJwt) this.setSession(devJwt).catch(() => undefined);
   }
 
   terminate(): void {
@@ -63,6 +69,12 @@ export class DriveWorkerClient {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onProgress });
       this.worker.postMessage({ ...req, id } as WorkerRequest);
     });
+  }
+
+  /** Deliver or replace the session bearer token. A refreshed token takes
+   *  effect for the next vault request without restarting the worker. */
+  setSession(token: string): Promise<null> {
+    return this.call<null>({ op: "session", token });
   }
 
   init(): Promise<InitResult> {
