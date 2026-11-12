@@ -87,19 +87,27 @@ async fn confidential_query_returns_aggregate_over_sealed_connector_data() {
     assert_eq!(rows[1]["revenue"], 1730.25);
 }
 
+fn simulated_token_provider() -> Arc<platform_enclave::simulated_token::SimulatedTokenProvider> {
+    use platform_enclave::simulated_token::{
+        SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
+    };
+    let signer = TokenSigner::generate("urn:query:sim", SimulatedClaims::default());
+    Arc::new(SimulatedTokenProvider::in_process(
+        Arc::new(signer),
+        platform_enclave::token::ReleasePolicy {
+            allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+        },
+    ))
+}
+
 #[tokio::test]
 async fn query_response_names_the_tee_platform() {
     let tenant = TenantId::generate();
     let token = token_for(tenant);
     let sql = r#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#;
 
-    let simulated = app_with_attestation(
-        tenant,
-        ZkMode::Disabled,
-        Arc::new(platform_enclave::SimulatedSnp::new()),
-        false,
-    )
-    .await;
+    let simulated =
+        app_with_attestation(tenant, ZkMode::Disabled, simulated_token_provider(), false).await;
     let (status, body) = post_query(&simulated, Some(&token), sql).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["tee_platform"], "simulated");
@@ -128,6 +136,45 @@ async fn query_is_refused_when_attestation_is_required_and_fails() {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
         assert_eq!(body["error"], "enclave attestation unavailable");
+    }
+}
+
+#[tokio::test]
+async fn query_refuses_every_tampered_simulated_token() {
+    use platform_enclave::simulated_token::{
+        SIMULATED_IMAGE_DIGEST, SimulatedClaims, Tamper, TamperedTokenProvider, TokenSigner,
+    };
+    use platform_enclave::token::ReleasePolicy;
+
+    let signer = Arc::new(TokenSigner::generate(
+        "urn:query:sim",
+        SimulatedClaims::default(),
+    ));
+    for tamper in Tamper::ALL {
+        let provider = TamperedTokenProvider::new(
+            signer.clone(),
+            ReleasePolicy {
+                allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
+            },
+            tamper,
+        );
+        let tenant = TenantId::generate();
+        let app = app_with_attestation(tenant, ZkMode::Disabled, Arc::new(provider), false).await;
+        let (status, body) = post_query(
+            &app,
+            Some(&token_for(tenant)),
+            r#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{tamper:?}: {body}"
+        );
+        assert_eq!(
+            body["error"], "enclave attestation unavailable",
+            "{tamper:?}"
+        );
     }
 }
 

@@ -3,23 +3,34 @@
 //! Google's attestation service signs an RS256 token whose claims name the
 //! hardware, the software, the debug state and the container image digest.
 //! [`TokenVerifier`] checks the signature against a key set passed in, the
-//! issuer, audience and validity window, the expected nonces, and the
-//! release policy. Where the key set comes from (pinned or fetched) is the
-//! caller's choice (ADR 0004 open question 3).
+//! issuer, audience, validity window and token age, the expected nonces,
+//! and the release policy. Where the key set comes from (pinned or fetched)
+//! is the caller's choice (ADR 0004 open question 3).
+//!
+//! The verifier emits no audit record. Every caller (today the attestation
+//! gate and the stand-in key release; P47 and P48 in production) must emit
+//! each decision, accepted or refused, as a `SECURITY_AUDIT_EVENT` and cover
+//! it in `platform-api/tests/audit_coverage.rs`.
 
 use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::jwk::AlgorithmParameters;
+pub use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header, get_current_timestamp,
+};
 use serde::Deserialize;
 
 /// Tokens larger than this are refused before any parsing.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
-/// Allowed clock skew for `exp` and `nbf`, in seconds.
+/// Allowed clock skew for `exp`, `nbf` and `iat`, in seconds.
 pub const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
+/// Longest accepted `exp - iat`, in seconds. Google's attestation tokens
+/// last one hour, as do the simulator's.
+pub const MAX_TOKEN_LIFETIME_SECS: u64 = 3600;
 /// Audience of the simulated TEE's tokens.
 pub const SIMULATED_AUDIENCE: &str = "quackxide-enclave";
 
@@ -50,6 +61,8 @@ pub enum TokenError {
     Expired,
     #[error("attestation token not yet valid")]
     NotYetValid,
+    #[error("attestation token lifetime too long")]
+    LifetimeTooLong,
     #[error("attestation token nonce missing or wrong")]
     Nonce,
     #[error("attestation token hardware not allowed")]
@@ -117,6 +130,10 @@ enum Nonces {
 
 #[derive(Deserialize)]
 struct Claims {
+    // jsonwebtoken ignores `iat` in `required_spec_claims`, so require it
+    // here; `exp` is read again for the lifetime cap.
+    iat: u64,
+    exp: u64,
     hwmodel: String,
     swname: String,
     dbgstat: String,
@@ -227,6 +244,19 @@ impl TokenVerifier {
                 _ => TokenError::Malformed,
             })?
             .claims;
+
+        // Bound token age: a far-future `exp` would otherwise keep a token
+        // valid, with only the single-use nonce against replay.
+        if claims.iat > get_current_timestamp().saturating_add(CLOCK_SKEW_LEEWAY_SECS) {
+            return Err(TokenError::NotYetValid);
+        }
+        match claims.exp.checked_sub(claims.iat) {
+            None => return Err(TokenError::Malformed),
+            Some(lifetime) if lifetime > MAX_TOKEN_LIFETIME_SECS => {
+                return Err(TokenError::LifetimeTooLong);
+            }
+            Some(_) => {}
+        }
 
         let nonces = match claims.eat_nonce {
             Nonces::One(n) => vec![n],
@@ -623,6 +653,132 @@ mod tests {
     #[test]
     fn missing_aud_is_refused() {
         assert_eq!(err(&claims_without("aud")), TokenError::Malformed);
+    }
+
+    /// A valid token whose claims `edit` changes before signing.
+    fn claims_with(edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> String {
+        let mut claims = signer().claims_json(
+            SIMULATED_AUDIENCE,
+            &[nonce()],
+            now(),
+            Duration::from_secs(600),
+        );
+        edit(claims.as_object_mut().unwrap());
+        signer().sign_claims(&claims)
+    }
+
+    #[test]
+    fn missing_iat_is_refused() {
+        assert_eq!(err(&claims_without("iat")), TokenError::Malformed);
+    }
+
+    #[test]
+    fn iat_in_the_future_beyond_leeway_is_refused() {
+        let token = claims_with(|c| {
+            c.insert("iat".into(), (now() + CLOCK_SKEW_LEEWAY_SECS + 5).into());
+        });
+        assert_eq!(err(&token), TokenError::NotYetValid);
+    }
+
+    #[test]
+    fn iat_within_leeway_is_accepted() {
+        let token = claims_with(|c| {
+            c.insert("iat".into(), (now() + 30).into());
+        });
+        assert!(verifier().verify(&token, &[nonce()]).is_ok());
+    }
+
+    #[test]
+    fn lifetime_over_the_cap_is_refused() {
+        let lifetime = Duration::from_secs(MAX_TOKEN_LIFETIME_SECS + 1);
+        let token = signer().sign(SIMULATED_AUDIENCE, &[nonce()], lifetime);
+        assert_eq!(err(&token), TokenError::LifetimeTooLong);
+    }
+
+    #[test]
+    fn lifetime_at_the_cap_is_accepted() {
+        let lifetime = Duration::from_secs(MAX_TOKEN_LIFETIME_SECS);
+        let token = signer().sign(SIMULATED_AUDIENCE, &[nonce()], lifetime);
+        assert!(verifier().verify(&token, &[nonce()]).is_ok());
+    }
+
+    #[test]
+    fn exp_before_iat_is_refused() {
+        let token = claims_with(|c| {
+            c.insert("iat".into(), (now() + 50).into());
+            c.insert("exp".into(), (now() + 10).into());
+        });
+        assert_eq!(err(&token), TokenError::Malformed);
+    }
+
+    #[test]
+    fn non_integer_exp_is_refused() {
+        let token = claims_with(|c| {
+            c.insert("exp".into(), (now() as f64 + 600.4).into());
+        });
+        assert_eq!(err(&token), TokenError::Malformed);
+    }
+
+    #[test]
+    fn empty_expected_nonces_are_refused() {
+        let result = verifier().verify(&valid_token(), &[]);
+        assert_eq!(result.unwrap_err(), TokenError::Nonce);
+    }
+
+    #[test]
+    fn malformed_rsa_key_is_refused() {
+        let mut jwk = rsa_jwk_json();
+        jwk["n"] = "not base64url!".into();
+        let keys = serde_json::json!({"keys": [jwk]});
+        assert_eq!(verifier_from(keys).err(), Some(TokenError::BadKeySet));
+    }
+
+    /// `valid_token()`'s payload and signature under a forged header.
+    fn with_header(header: &str) -> String {
+        let token = valid_token();
+        let parts: Vec<&str> = token.split('.').collect();
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            parts[1],
+            parts[2]
+        )
+    }
+
+    #[test]
+    fn alg_none_header_is_refused() {
+        assert_eq!(
+            err(&with_header(r#"{"alg":"none"}"#)),
+            TokenError::Malformed
+        );
+    }
+
+    #[test]
+    fn same_family_algorithms_are_refused() {
+        let kid = signer().jwks().keys[0].common.key_id.clone().unwrap();
+        for alg in ["RS512", "PS256"] {
+            let token = with_header(&format!(r#"{{"alg":"{alg}","kid":"{kid}"}}"#));
+            assert_eq!(err(&token), TokenError::WrongAlgorithm, "{alg}");
+        }
+    }
+
+    #[test]
+    fn missing_policy_claims_are_refused() {
+        for claim in ["hwmodel", "submods", "eat_nonce"] {
+            assert_eq!(
+                err(&claims_without(claim)),
+                TokenError::Malformed,
+                "{claim}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrongly_typed_nonce_is_refused() {
+        let token = claims_with(|c| {
+            c.insert("eat_nonce".into(), 7.into());
+        });
+        assert_eq!(err(&token), TokenError::Malformed);
     }
 
     #[test]

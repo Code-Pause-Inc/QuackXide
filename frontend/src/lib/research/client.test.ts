@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  ResearchClient,
   budgetPath,
   dollarsToCents,
   formatMoney,
@@ -80,5 +81,24 @@ describe("dollarsToCents", () => {
     expect(dollarsToCents("-5")).toBeNull();
     expect(dollarsToCents("1.234")).toBeNull();
     expect(dollarsToCents("1.")).toBeNull();
+  });
+});
+
+describe("ResearchClient.budget", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const respond = (status: number) =>
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
+
+  it("returns null when the grant has no budget", async () => {
+    respond(404);
+    await expect(new ResearchClient("", "t").budget("g1")).resolves.toBeNull();
+  });
+
+  it("throws on any other failure, so it is not read as no budget", async () => {
+    respond(502);
+    await expect(new ResearchClient("", "t").budget("g1")).rejects.toThrow(
+      "failed to load budget standing (502)",
+    );
   });
 });

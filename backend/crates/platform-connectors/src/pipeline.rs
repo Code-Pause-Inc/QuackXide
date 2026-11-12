@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 use platform_crypto::TenantPublicKey;
-use platform_enclave::{AttestationProvider, TeePlatform, fresh_nonce};
+use platform_enclave::{AttestationProvider, EnclaveError, TeePlatform, fresh_nonce};
 use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
 
@@ -109,10 +109,10 @@ impl EnclavePipeline {
                         AuditKind::TeeAttestation,
                         Some(tenant),
                         "denied",
-                        "simulated SEV-SNP evidence cannot satisfy required hardware attestation",
+                        "simulated evidence cannot satisfy required hardware attestation",
                     );
                     return Err(PipelineError::AttestationRefused(
-                        "evidence platform is simulated, not hardware SEV-SNP".into(),
+                        "evidence platform is simulated, not hardware".into(),
                     ));
                 }
                 if let Err(err) = self.attestation.verify_evidence(&evidence, &nonce) {
@@ -120,7 +120,7 @@ impl EnclavePipeline {
                         AuditKind::TeeAttestation,
                         Some(tenant),
                         "denied",
-                        "simulated SEV-SNP evidence failed verification",
+                        "simulated evidence failed verification",
                     );
                     return Err(PipelineError::AttestationRefused(err.to_string()));
                 }
@@ -128,7 +128,7 @@ impl EnclavePipeline {
                     AuditKind::TeeAttestation,
                     Some(tenant),
                     "simulated",
-                    "simulated SEV-SNP evidence verified for sync (dev only)",
+                    "simulated evidence verified for sync (dev only)",
                 );
                 Ok(())
             }
@@ -152,7 +152,9 @@ impl EnclavePipeline {
                     "evidence platform is not SEV-SNP".into(),
                 ))
             }
-            Err(err) if !self.require_attestation => {
+            // Only a missing TEE may run unattested in dev, as in `gate_execution`;
+            // a provider that rejects (including a build without the simulator) refuses.
+            Err(err @ EnclaveError::Unavailable(_)) if !self.require_attestation => {
                 security_audit_event(
                     AuditKind::TeeAttestation,
                     Some(tenant),

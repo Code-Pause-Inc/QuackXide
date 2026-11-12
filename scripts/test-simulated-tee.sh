@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
-# End-to-end smoke and tamper-refusal verification for the local Docker
-# Simulated AMD SEV-SNP TEE topology (docker-compose.simulated-tee.yml).
+# End-to-end verification on the local Docker simulated TEE
+# (docker-compose.simulated-tee.yml): simulated Confidential Space tokens,
+# checked by the token verifier before key release (ADR 0004), the research
+# lifecycle (publish, request, approve, query under disclosure control and a
+# budget, revoke), refusal of tampered tokens, and a vault that holds only
+# ciphertext. Needs Docker, curl, openssl and jq.
+#
+# Not covered yet:
+# - An approval retry after a revoke. On main it still restores access
+#   (#166, fixed by #168); add the check once that merges.
+# - Steward upload into a dataset: the API has none yet (P38). The steward's
+#   data arrives through the sync pipeline, seeded at startup.
 set -euo pipefail
 
 COMPOSE_FILE="docker-compose.simulated-tee.yml"
+# The demo tenant owns the sealed fixture, so it is also the steward.
 TENANT_ID="6f2c8a2e-1111-4222-8333-444455556666"
+RESEARCHER_ID="0b7d3c1e-2222-4333-8444-555566667777"
 JWT_SECRET="simulated-tee-local-jwt-secret-32b!!"
+# The fixture has two USD invoices and one EUR invoice, so with k = 2 a
+# GROUP BY currency keeps one row and suppresses one.
+MIN_COHORT=2
 
 cleanup() {
+  local status=$?
+  if [[ ${status} -ne 0 ]]; then
+    docker compose -f "${COMPOSE_FILE}" logs --tail 20 >&2 || true
+  fi
   docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "${VAULT_COPY:-}"
 }
 trap cleanup EXIT
 
@@ -42,79 +62,184 @@ wait_for_http() {
   return 1
 }
 
-echo "==> [1/5] Building and starting fake-gcs and key-release-service..."
-docker compose -f "${COMPOSE_FILE}" up -d --build fake-gcs key-release-service
+QUERY='{"connector":"quickbooks","sql":"SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency ORDER BY currency"}'
 
-echo "==> [2/5] Creating 'quackxide-vault' bucket in fake-gcs and enrolling demo tenant..."
-curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=quackxide-sim" \
+query_status() {
+  curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8080/api/v1/query" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "${QUERY}"
+}
+
+# api METHOD PATH TOKEN [BODY]: sets RESP_STATUS and RESP_BODY.
+api() {
+  local method="$1" path="$2" token="$3" body="${4:-}"
+  local args=(-s -X "${method}" "http://127.0.0.1:8080${path}"
+    -H "Authorization: Bearer ${token}" -w $'\n%{http_code}')
+  if [[ -n "${body}" ]]; then
+    args+=(-H "Content-Type: application/json" -d "${body}")
+  fi
+  local out
+  out=$(curl "${args[@]}")
+  RESP_STATUS="${out##*$'\n'}"
+  RESP_BODY="${out%$'\n'*}"
+}
+
+# expect_response STEP STATUS [JQ_FILTER]: checks the last api call.
+expect_response() {
+  local step="$1" status="$2" filter="${3:-}"
+  if [[ "${RESP_STATUS}" != "${status}" ]]; then
+    echo "ERROR: ${step}: expected HTTP ${status}, got ${RESP_STATUS}: ${RESP_BODY}" >&2
+    exit 1
+  fi
+  if [[ -n "${filter}" ]] && ! printf '%s' "${RESP_BODY}" | jq -e "${filter}" >/dev/null; then
+    echo "ERROR: ${step}: response does not match ${filter}: ${RESP_BODY}" >&2
+    exit 1
+  fi
+  echo "    ${step}: HTTP ${status}."
+}
+
+# Restart sim-attestation with one claim changed and expect queries to fail closed.
+expect_tamper_refused() {
+  local name="$1" var="$2" value="$3"
+  env "${var}=${value}" docker compose -f "${COMPOSE_FILE}" up -d --force-recreate sim-attestation >/dev/null
+  # Without this, a 503 could mean the service is not up yet rather than a refusal.
+  wait_for_http "http://127.0.0.1:8070/healthz"
+  local code
+  code=$(query_status)
+  if [[ "${code}" != "503" ]]; then
+    echo "ERROR: expected HTTP 503 with ${name}, got ${code}" >&2
+    exit 1
+  fi
+  echo "    ${name} refused with HTTP 503."
+}
+
+echo "==> [1/7] Building all images; starting sim-attestation and key-release-service..."
+# Build every image now, so later stages never start one built from older code.
+docker compose -f "${COMPOSE_FILE}" build
+docker compose -f "${COMPOSE_FILE}" up -d sim-attestation key-release-service
+wait_for_http "http://127.0.0.1:8070/healthz"
+wait_for_http "http://127.0.0.1:8090/healthz"
+
+echo "==> [2/7] Enrolling the demo tenant's key with key-release-service..."
+PRIVATE_KEY_B64=$(openssl rand -base64 32)
+ENROLL_JSON=$(curl -fsS -X PUT "http://127.0.0.1:8090/v1/keys" \
   -H "Content-Type: application/json" \
-  -d '{"name":"quackxide-vault"}' >/dev/null
-
-ENROLL_JSON=$(curl -fsS -X POST "http://127.0.0.1:8090/v1/key-release/tenants" \
-  -H "Content-Type: application/json" \
-  -d "{\"tenant_id\":\"${TENANT_ID}\"}")
-
+  -d "{\"tenant_id\":\"${TENANT_ID}\",\"private_key_b64\":\"${PRIVATE_KEY_B64}\"}")
 TENANT_PUBKEY_B64=$(printf '%s' "${ENROLL_JSON}" | sed -n 's/.*"public_key_b64":"\([^"]*\)".*/\1/p')
 if [[ -z "${TENANT_PUBKEY_B64}" ]]; then
   echo "ERROR: failed to extract public_key_b64 from key-release-service response: ${ENROLL_JSON}" >&2
   exit 1
 fi
 
-echo "==> [3/5] Starting enclave-api and sealing synthetic QuickBooks fixture into fake-gcs..."
+echo "==> [3/7] Starting enclave-api and sealing the synthetic QuickBooks fixture into its vault..."
 DEMO_TENANT_ID="${TENANT_ID}" \
 DEMO_TENANT_PUBLIC_KEY_B64="${TENANT_PUBKEY_B64}" \
+RESEARCH_MIN_COHORT_SIZE="${MIN_COHORT}" \
   docker compose -f "${COMPOSE_FILE}" up -d enclave-api
-
 wait_for_http "http://127.0.0.1:8080/healthz"
+
+echo "==> [4/7] Checking that the vault holds only ciphertext..."
+# enclave-api's vault is a directory in the enclave_vault volume (#153).
+VAULT_COPY=$(mktemp -d)
+docker compose -f "${COMPOSE_FILE}" cp enclave-api:/var/lib/quackxide/vault/. "${VAULT_COPY}"
+TENANT_DATA="${VAULT_COPY}/tenants/${TENANT_ID}"
+OBJECT_COUNT=$(find "${TENANT_DATA}" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [[ "${OBJECT_COUNT}" -eq 0 ]]; then
+  echo "ERROR: no tenant objects in the vault, so there is nothing to check" >&2
+  exit 1
+fi
+# Every object must be an HPK1 envelope (platform-crypto's frame): the magic,
+# a 32-byte encapsulated key, then ciphertext ending in a 16-byte GCM tag.
+while IFS= read -r -d '' object; do
+  if ! cmp -s -n 4 <(printf 'HPK1') "${object}" || (( $(wc -c < "${object}") < 52 )); then
+    echo "ERROR: ${object#"${VAULT_COPY}/"} is not an HPK1 envelope" >&2
+    exit 1
+  fi
+done < <(find "${TENANT_DATA}" -type f -print0)
+# A fixture customer name, and the magic bytes of a plaintext Parquet file.
+for plaintext in "Sample Customer" "PAR1"; do
+  if grep -rlF -- "${plaintext}" "${TENANT_DATA}" >&2; then
+    echo "ERROR: plaintext \"${plaintext}\" stored in the vault (files above)" >&2
+    exit 1
+  fi
+done
+echo "    ${OBJECT_COUNT} tenant objects stored, all HPK1 envelopes, none with plaintext."
 
 TOKEN=$(mint_jwt "${TENANT_ID}")
 
-echo "==> [4/5] Verifying public attestation quote and confidential query happy path..."
-ATTEST_RESP=$(curl -fsS "http://127.0.0.1:8080/api/v1/attestation?nonce=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-if ! printf '%s' "${ATTEST_RESP}" | grep -q '"report_b64"'; then
-  echo "ERROR: expected report_b64 in /api/v1/attestation response: ${ATTEST_RESP}" >&2
+echo "==> [5/7] Verifying the attestation token and the confidential query happy path..."
+NONCE_B64=$(openssl rand -base64 32)
+ATTEST_RESP=$(curl -fsS -G "http://127.0.0.1:8080/api/v1/attestation" --data-urlencode "nonce_b64=${NONCE_B64}")
+if ! printf '%s' "${ATTEST_RESP}" | grep -q '"token":"ey'; then
+  echo "ERROR: expected a token in /api/v1/attestation response: ${ATTEST_RESP}" >&2
   exit 1
 fi
 
 QUERY_RESP=$(curl -fsS -X POST "http://127.0.0.1:8080/api/v1/query" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"connector":"quickbooks","sql":"SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency ORDER BY currency"}')
-
-if ! printf '%s' "${QUERY_RESP}" | grep -q '"enclave_signature"'; then
-  echo "ERROR: expected enclave_signature in query response: ${QUERY_RESP}" >&2
+  -d "${QUERY}")
+if ! printf '%s' "${QUERY_RESP}" | grep -q '"rows"'; then
+  echo "ERROR: expected result rows in query response: ${QUERY_RESP}" >&2
   exit 1
 fi
-echo "    Happy path verified (signed enclave response received)."
+echo "    Happy path verified (token-gated key release and query)."
 
-echo "==> [5/5] Verifying fail-closed tamper refusal (MEASUREMENT mismatch & DEBUG=1)..."
-TAMPERED_MEAS=$(printf 'ff%.0s' {1..96})
-SIMULATED_SNP_MEASUREMENT_HEX="${TAMPERED_MEAS}" \
-  docker compose -f "${COMPOSE_FILE}" up -d --force-recreate enclave-api
-wait_for_http "http://127.0.0.1:8080/healthz"
+echo "==> [6/7] Verifying the research lifecycle: publish, request, approve, query, revoke..."
+RESEARCHER_TOKEN=$(mint_jwt "${RESEARCHER_ID}")
+RESEARCH_QUERY="{\"steward_tenant\":\"${TENANT_ID}\",\"connector\":\"quickbooks\",\"sql\":\"SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency ORDER BY currency\"}"
 
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8080/api/v1/query" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"connector":"quickbooks","sql":"SELECT COUNT(*) FROM quickbooks"}')
-if [[ "${HTTP_CODE}" != "503" ]]; then
-  echo "ERROR: expected HTTP 503 on tampered MEASUREMENT, got ${HTTP_CODE}" >&2
+api POST /api/v1/research/query "${RESEARCHER_TOKEN}" "${RESEARCH_QUERY}"
+expect_response "query without a grant is refused" 403
+
+api POST /api/v1/catalog "${TOKEN}" \
+  '{"connector":"quickbooks","title":"Invoices","license_fee_cents":0,"compute_rate_cents":0}'
+expect_response "steward publishes a listing" 200 '.listing_id | type == "string"'
+LISTING_ID=$(printf '%s' "${RESP_BODY}" | jq -r .listing_id)
+
+api POST "/api/v1/catalog/${LISTING_ID}/request" "${RESEARCHER_TOKEN}" '{}'
+expect_response "researcher requests access" 200 '.status == "pending"'
+REQUEST_ID=$(printf '%s' "${RESP_BODY}" | jq -r .request_id)
+
+# A budget of 3 units: two queries and one refused probe use it up.
+api POST "/api/v1/research/requests/${REQUEST_ID}/approve" "${TOKEN}" '{"query_budget":3}'
+expect_response "steward approves with a 3-unit budget" 200 '.grant.revoked == false'
+GRANT_ID=$(printf '%s' "${RESP_BODY}" | jq -r .grant.grant_id)
+
+api POST /api/v1/research/query "${RESEARCHER_TOKEN}" "${RESEARCH_QUERY}"
+expect_response "aggregate query keeps the USD cohort and suppresses EUR" 200 \
+  '.rows == [{"currency":"USD","n":2}] and .suppressed_rows == 1
+   and .budget_remaining == 2 and .tee_platform == "simulated"'
+
+api POST /api/v1/research/query "${RESEARCHER_TOKEN}" \
+  "{\"steward_tenant\":\"${TENANT_ID}\",\"connector\":\"quickbooks\",\"sql\":\"SELECT customer, total FROM quickbooks\"}"
+expect_response "row-level query is refused" 422
+
+api POST /api/v1/research/query "${RESEARCHER_TOKEN}" "${RESEARCH_QUERY}"
+expect_response "the refused probe still cost a unit" 200 '.budget_remaining == 0'
+
+api POST /api/v1/research/query "${RESEARCHER_TOKEN}" "${RESEARCH_QUERY}"
+expect_response "query on a spent budget is refused" 429
+
+api DELETE "/api/v1/grants/${GRANT_ID}" "${TOKEN}"
+expect_response "steward revokes the grant" 200
+
+api POST /api/v1/research/query "${RESEARCHER_TOKEN}" "${RESEARCH_QUERY}"
+expect_response "query after the revoke is refused" 403
+
+echo "==> [7/7] Verifying fail-closed refusal of tampered tokens..."
+expect_tamper_refused "a debug image" SIM_TOKEN_DBGSTAT enabled
+expect_tamper_refused "an unlisted image digest" SIM_TOKEN_IMAGE_DIGEST "sha256:$(printf '0%.0s' {1..64})"
+expect_tamper_refused "non-TDX hardware" SIM_TOKEN_HWMODEL GCP_AMD_SEV
+
+docker compose -f "${COMPOSE_FILE}" up -d --force-recreate sim-attestation >/dev/null
+wait_for_http "http://127.0.0.1:8070/healthz"
+CODE=$(query_status)
+if [[ "${CODE}" != "200" ]]; then
+  echo "ERROR: expected HTTP 200 after restoring default claims, got ${CODE}" >&2
   exit 1
 fi
-echo "    MEASUREMENT mismatch refused with HTTP 503."
+echo "    Default claims accepted again after the simulator restarted with a new key."
 
-SIMULATED_SNP_DEBUG="true" \
-  docker compose -f "${COMPOSE_FILE}" up -d --force-recreate enclave-api
-wait_for_http "http://127.0.0.1:8080/healthz"
-
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:8080/api/v1/query" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"connector":"quickbooks","sql":"SELECT COUNT(*) FROM quickbooks"}')
-if [[ "${HTTP_CODE}" != "503" ]]; then
-  echo "ERROR: expected HTTP 503 on GuestPolicy::DEBUG=1, got ${HTTP_CODE}" >&2
-  exit 1
-fi
-echo "    GuestPolicy::DEBUG=1 refused with HTTP 503."
-
-echo "==> All Simulated TEE Docker verification checks passed."
+echo "==> All simulated TEE Docker verification checks passed."

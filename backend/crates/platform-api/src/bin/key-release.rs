@@ -1,127 +1,81 @@
-//! Standalone attestation-verifying key-release relying-party service (`P50`).
+//! DEV ONLY: the simulated TEE's key-release stand-in for Cloud KMS (ADR 0004).
 //!
-//! Verifies 1184-byte binary SEV-SNP attestation reports (`ARK -> ASK -> VCEK`
-//! chain, `MEASUREMENT`, `GuestPolicy`, `TcbVersion`, and 64-byte
-//! `REPORT_DATA`) before wrapping tenant keys under HPKE to the enclave's
-//! ephemeral public key.
+//! Verifies simulated Confidential Space tokens with the production
+//! `TokenVerifier` before wrapping tenant keys under HPKE to the enclave's
+//! ephemeral public key. Built only with the `dev` feature.
 //!
 //! Environment:
 //! - `KEY_RELEASE_BIND_ADDR`: bind address (default `127.0.0.1:8090`).
-//! - `KEY_RELEASE_ARK_PUBKEY_B64`: base64 SEC1 P-384 public key of the trusted
-//!   ARK root.
-//! - `SIMULATED_SNP_SEED`: when `TEE_ATTESTATION_REQUIRED=false` and
-//!   `KEY_RELEASE_ARK_PUBKEY_B64` is unset, deterministically derives the
-//!   simulated ARK public key so `enclave-api` and `key-release-service` share
-//!   the same synthetic root of trust in local Docker.
-//! - `KEY_RELEASE_EXPECTED_MEASUREMENT_HEX`: optional 96-char hex (48-byte)
-//!   expected `MEASUREMENT` allowlist override.
+//! - `SIM_ATTESTATION_URL`: base URL of the `sim-attestation` service, whose
+//!   `GET /jwks` supplies the token-signing keys (required).
+//! - `SIM_ATTESTATION_ISSUER`: expected token issuer (default
+//!   `http://sim-attestation:8070`).
+//! - `KEY_RELEASE_ALLOWED_IMAGE_DIGEST`: image digest the release policy
+//!   allows (default: the simulator's built-in digest).
 //! - `KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX`: optional 64-char hex (32-byte)
-//!   expected `config_digest` in `REPORT_DATA`.
-//! - `TEE_ATTESTATION_REQUIRED`: when `true` (default), pins the root as
-//!   `TrustRoot::ProductionAmd` and requires hardware `TeePlatform::SevSnp`.
-//!   When `false`, pins `TrustRoot::Simulated` for the local simulated TEE.
+//!   expected deployment configuration digest.
+//! - `TEE_ATTESTATION_REQUIRED`: must be `false`; the stand-in verifies
+//!   simulated tokens only.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
-use platform_api::key_release::KeyReleaseRelyingParty;
-use platform_enclave::{
-    AttestationVerifier, MEASUREMENT_BYTES, SimulatedSnp, SimulatedSnpConfig, TrustRoot,
-    decode_hex_array,
-};
+use platform_api::key_release::{HttpKeySource, KeyReleaseRelyingParty};
+use platform_enclave::decode_hex_array;
+use platform_enclave::simulated_token::{DEFAULT_SIM_ISSUER, SIMULATED_IMAGE_DIGEST};
+use platform_enclave::token::ReleasePolicy;
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     platform_telemetry::init_from_env();
 
-    let bind_addr: SocketAddr = std::env::var("KEY_RELEASE_BIND_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8090".to_owned())
-        .parse()?;
-
-    let require_hardware = match std::env::var("TEE_ATTESTATION_REQUIRED") {
-        Ok(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    };
-
-    let ark_sec1 = match std::env::var("KEY_RELEASE_ARK_PUBKEY_B64") {
-        Ok(ark_b64) if !ark_b64.trim().is_empty() => B64.decode(ark_b64.trim())?,
-        _ if !require_hardware => {
-            let seed = std::env::var("SIMULATED_SNP_SEED").map_err(|_| {
-                anyhow::anyhow!(
-                    "either KEY_RELEASE_ARK_PUBKEY_B64 or SIMULATED_SNP_SEED must be set (fail closed)"
-                )
-            })?;
-            let trimmed = seed.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!("SIMULATED_SNP_SEED must not be empty (fail closed)");
-            }
-            let sim = SimulatedSnp::with_seed_and_config(
-                trimmed.as_bytes(),
-                SimulatedSnpConfig::default(),
-            );
-            sim.cert_chain().ark.public_key_sec1.clone()
-        }
-        _ => {
-            anyhow::bail!(
-                "KEY_RELEASE_ARK_PUBKEY_B64 must be set when TEE_ATTESTATION_REQUIRED=true (fail closed)"
-            );
-        }
-    };
-
-    let trust_root = if require_hardware {
-        TrustRoot::ProductionAmd {
-            ark_public_keys_sec1: vec![ark_sec1],
-        }
-    } else {
-        TrustRoot::Simulated {
-            ark_public_key_sec1: ark_sec1,
-        }
-    };
-
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut policy = SimulatedSnp::default_policy(now_unix);
-    if let Ok(raw_meas) = std::env::var("KEY_RELEASE_EXPECTED_MEASUREMENT_HEX") {
-        let trimmed = raw_meas.trim();
-        if !trimmed.is_empty() {
-            let m = decode_hex_array::<MEASUREMENT_BYTES>(trimmed).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "KEY_RELEASE_EXPECTED_MEASUREMENT_HEX must be exactly 96 hex chars (48 bytes)"
-                )
-            })?;
-            policy.expected_measurements = vec![m];
-        }
+    let required = env_or("TEE_ATTESTATION_REQUIRED", "true");
+    if !matches!(
+        required.to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    ) {
+        anyhow::bail!(
+            "the key-release stand-in verifies simulated tokens only (ADR 0004); \
+             set TEE_ATTESTATION_REQUIRED=false"
+        );
     }
 
-    let verifier = AttestationVerifier::new(trust_root, policy);
-    let mut relying_party = KeyReleaseRelyingParty::new(verifier, require_hardware);
-    if let Ok(raw_cfg) = std::env::var("KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX") {
-        let trimmed = raw_cfg.trim();
-        if !trimmed.is_empty() {
-            let cfg_digest = decode_hex_array::<32>(trimmed).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX must be exactly 64 hex chars (32 bytes)"
-                )
-            })?;
-            relying_party = relying_party.with_expected_config_digest(cfg_digest);
-        }
+    let bind_addr: SocketAddr = env_or("KEY_RELEASE_BIND_ADDR", "127.0.0.1:8090").parse()?;
+    let sim_url = env_or("SIM_ATTESTATION_URL", "");
+    if sim_url.is_empty() {
+        anyhow::bail!("SIM_ATTESTATION_URL must be set (fail closed)");
     }
-    let relying_party = Arc::new(relying_party);
+    let policy = ReleasePolicy {
+        allowed_image_digests: vec![env_or(
+            "KEY_RELEASE_ALLOWED_IMAGE_DIGEST",
+            SIMULATED_IMAGE_DIGEST,
+        )],
+    };
+    let mut relying_party = KeyReleaseRelyingParty::new(
+        Arc::new(HttpKeySource::new(&sim_url)),
+        env_or("SIM_ATTESTATION_ISSUER", DEFAULT_SIM_ISSUER),
+        policy,
+    );
+    let cfg = env_or("KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX", "");
+    if !cfg.is_empty() {
+        let digest = decode_hex_array::<32>(&cfg).ok_or_else(|| {
+            anyhow::anyhow!(
+                "KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX must be exactly 64 hex chars (32 bytes)"
+            )
+        })?;
+        relying_party = relying_party.with_expected_config_digest(digest);
+    }
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(
-        %bind_addr,
-        require_hardware,
-        "key-release relying party listening"
-    );
-    axum::serve(listener, relying_party.router()).await?;
+    tracing::info!(%bind_addr, "key-release stand-in listening");
+    axum::serve(listener, Arc::new(relying_party).router()).await?;
     Ok(())
 }

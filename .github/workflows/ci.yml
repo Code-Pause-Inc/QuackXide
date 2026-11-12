@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -25,7 +26,7 @@ jobs:
           workspaces: backend
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: wasm-bindgen@0.2.126
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -52,7 +53,7 @@ jobs:
       - run: cargo test --manifest-path backend/Cargo.toml --workspace --locked
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: wasm-bindgen@0.2.126
       - run: scripts/build-wasm.sh
@@ -91,7 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-llvm-cov
       - name: Backend coverage
@@ -106,7 +107,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: wasm-bindgen@0.2.126
       - run: scripts/build-wasm.sh
@@ -143,7 +144,7 @@ jobs:
             echo "::error::platform-api is missing from the build report; the check cannot run"
             exit 1
           fi
-          for bin in devstack key-release query-demo; do
+          for bin in devstack key-release query-demo sim-attestation; do
             if grep -qx "$bin" <<<"$built"; then
               echo "::error::the default-feature release build produced the dev-only binary $bin"
               exit 1
@@ -151,7 +152,7 @@ jobs:
           done
       - name: Dev-only binaries cannot be built without the dev feature
         run: |
-          for bin in devstack key-release query-demo; do
+          for bin in devstack key-release query-demo sim-attestation; do
             if cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api --bin "$bin" 2> "$bin.err"; then
               echo "::error::$bin built without --features dev"
               exit 1
@@ -162,13 +163,45 @@ jobs:
               exit 1
             fi
           done
+      # Feature edges a release build uses. Dev edges are left out: test builds
+      # turn `dev`, and with it the simulator, on.
+      - name: The release build has no attestation simulator
+        run: |
+          for crate in platform-api platform-connectors; do
+            # Captured first, so a failing cargo tree fails the step instead of passing it.
+            tree=$(cargo tree --manifest-path backend/Cargo.toml --locked -p "$crate" -e normal,features -i platform-enclave)
+            if grep -q 'feature "simulated"' <<<"$tree"; then
+              echo "::error::the release build of $crate enables platform-enclave's simulated feature"
+              exit 1
+            fi
+          done
+      # The two steps below check the build-time layer, past the production-mode
+      # gate (ADR 0009): APP_ENV=development, which production mode would
+      # refuse with these settings anyway.
+      - name: The release connector-worker refuses unattested syncs
+        run: |
+          cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-connectors --bin connector-worker
+          cd "$RUNNER_TEMP"
+          set +e
+          APP_ENV=development TEE_ATTESTATION_REQUIRED=false timeout 20 "$GITHUB_WORKSPACE/backend/target/release/connector-worker" > worker.log 2>&1
+          set -e
+          if ! grep '"audit_kind":"tee.attestation"' worker.log | grep -q '"outcome":"denied"'; then
+            cat worker.log
+            echo "::error::the release connector-worker did not refuse attestation"
+            exit 1
+          fi
+          if grep '"audit_kind":"connector.sync"' worker.log | grep -q '"outcome":"ok"'; then
+            cat worker.log
+            echo "::error::the release connector-worker synced without attestation"
+            exit 1
+          fi
       # The key-release service is the simulated TEE's stand-in for Cloud KMS
       # (ADR 0004). A release platform-api must refuse to start when pointed at it.
       - name: The release platform-api refuses the dev-only KEY_RELEASE_URL
         working-directory: ${{ runner.temp }}
         run: |
           set +e
-          KEY_RELEASE_URL=http://127.0.0.1:9 BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+          APP_ENV=development KEY_RELEASE_URL=http://127.0.0.1:9 BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
             timeout 30 "$GITHUB_WORKSPACE/backend/target/release/platform-api" > platform-api.log 2>&1
           status=$?
           set -e
@@ -182,6 +215,64 @@ jobs:
             echo "::error::the release platform-api exited, but not because KEY_RELEASE_URL is dev-only"
             exit 1
           fi
+      # The local-directory vault exists for the simulated TEE stack only, and
+      # no build accepts it together with a bucket. APP_ENV=development gets
+      # past the production-mode gate (ADR 0009) to the build-level refusal.
+      - name: The release platform-api refuses STORAGE_LOCAL_DIR
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p vault
+          # refuses REASON [VAR=VALUE...]: platform-api must exit, naming REASON,
+          # with a denied service.start audit event.
+          refuses() {
+            local reason="$1"
+            shift
+            set +e
+            env "$@" APP_ENV=development STORAGE_LOCAL_DIR="$PWD/vault" BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+              timeout 30 "$GITHUB_WORKSPACE/backend/target/release/platform-api" > platform-api.log 2>&1
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+              cat platform-api.log
+              echo "::error::the release platform-api started with STORAGE_LOCAL_DIR set ($*)"
+              exit 1
+            fi
+            if ! grep -q "$reason" platform-api.log \
+              || ! grep '"audit_kind":"service.start"' platform-api.log | grep -q '"outcome":"denied"'; then
+              cat platform-api.log
+              echo "::error::the release platform-api exited, but not with a denied audit event for: $reason"
+              exit 1
+            fi
+          }
+          refuses 'STORAGE_LOCAL_DIR is dev-only'
+          refuses 'not both' STORAGE_BUCKET=example-bucket
+      # Production is the default (ADR 0009): with no APP_ENV, both release
+      # binaries refuse their development-only defaults and audit the refusal.
+      - name: The release binaries refuse to start in production mode
+        working-directory: ${{ runner.temp }}
+        run: |
+          for bin in platform-api connector-worker; do
+            set +e
+            BIND_ADDR=127.0.0.1:0 METRICS_BIND_ADDR=127.0.0.1:0 \
+              timeout 30 "$GITHUB_WORKSPACE/backend/target/release/$bin" > "$bin.log" 2>&1
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+              cat "$bin.log"
+              echo "::error::the release $bin started in production mode without production configuration"
+              exit 1
+            fi
+            if ! grep -q "production mode refuses to start $bin" "$bin.log"; then
+              cat "$bin.log"
+              echo "::error::the release $bin exited, but not because of production mode"
+              exit 1
+            fi
+            if ! grep '"audit_kind":"service.start"' "$bin.log" | grep -q '"outcome":"denied"'; then
+              cat "$bin.log"
+              echo "::error::the release $bin refused production mode without a service.start audit event"
+              exit 1
+            fi
+          done
 
 
   fuzz-build:
@@ -199,6 +290,24 @@ jobs:
       # backend/fuzz/Cargo.lock that a workspace change left stale.
       - name: Check every fuzz target
         run: cargo check --manifest-path backend/fuzz/Cargo.toml --locked --bins
+
+  simulated-tee:
+    name: simulated TEE end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Warms the builder from the Actions cache, so the script's own
+      # `docker compose build` reuses unchanged layers, above all the
+      # cargo-chef dependency layer.
+      - uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: docker-compose.simulated-tee.yml
+          set: |
+            *.cache-from=type=gha,scope=simulated-tee
+            *.cache-to=type=gha,scope=simulated-tee,mode=max
+      - run: scripts/test-simulated-tee.sh
 
   secret-scan:
     name: secret scan

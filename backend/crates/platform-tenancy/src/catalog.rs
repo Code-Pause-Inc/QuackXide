@@ -66,6 +66,11 @@ pub struct AccessRequest {
     /// Researcher-stated purpose (bounded at the API edge; may be empty).
     pub note: String,
     pub status: RequestStatus,
+    /// The query budget the approval granted: the steward's override, else
+    /// the listing's included budget. Recorded in the same step as the
+    /// approval, so a retry finishes the same decision. `None` unless
+    /// approved.
+    pub approved_budget: Option<u64>,
     pub created_at_iso: String,
     pub updated_at_iso: String,
 }
@@ -121,12 +126,19 @@ pub trait CatalogRegistry: Send + Sync {
 
     /// Resolve a Pending request (approve or deny). Only the listing's
     /// steward may; unknown ids, other stewards' requests, and
-    /// already-resolved requests are indistinguishable (`None`).
+    /// already-resolved requests are indistinguishable (`None`). Approved
+    /// and Denied requests are never re-resolved: Denied is terminal, and a
+    /// caller retrying an approval's grant and budget steps finds the
+    /// Approved request with `list_requests_for`. An approval records its
+    /// query budget in the same step (`approved_budget`): `budget_override`,
+    /// else the listing's included budget. A denial ignores
+    /// `budget_override`.
     async fn resolve(
         &self,
         steward: TenantId,
         request_id: &str,
         approve: bool,
+        budget_override: Option<u64>,
     ) -> Result<Option<AccessRequest>, TenancyError>;
 }
 
@@ -253,6 +265,7 @@ impl CatalogRegistry for InMemoryCatalogRegistry {
             connector,
             note: note.to_owned(),
             status: RequestStatus::Pending,
+            approved_budget: None,
             created_at_iso: now.clone(),
             updated_at_iso: now,
         };
@@ -282,17 +295,22 @@ impl CatalogRegistry for InMemoryCatalogRegistry {
         steward: TenantId,
         request_id: &str,
         approve: bool,
+        budget_override: Option<u64>,
     ) -> Result<Option<AccessRequest>, TenancyError> {
-        match self.lock().requests.get_mut(request_id) {
+        let mut inner = self.lock();
+        let Inner { listings, requests } = &mut *inner;
+        match requests.get_mut(request_id) {
             Some(request)
                 if request.steward_tenant == steward
                     && request.status == RequestStatus::Pending =>
             {
-                request.status = if approve {
-                    RequestStatus::Approved
+                if approve {
+                    let listed = listings.get(&request.listing_id).map(|l| l.grant_budget);
+                    request.status = RequestStatus::Approved;
+                    request.approved_budget = budget_override.or(listed);
                 } else {
-                    RequestStatus::Denied
-                };
+                    request.status = RequestStatus::Denied;
+                }
                 request.updated_at_iso = now_iso();
                 Ok(Some(request.clone()))
             }
@@ -400,13 +418,13 @@ mod tests {
         // Only the steward can resolve; researcher learns nothing.
         assert!(
             registry
-                .resolve(researcher, &request.request_id, true)
+                .resolve(researcher, &request.request_id, true, None)
                 .await
                 .expect("ok")
                 .is_none()
         );
         let approved = registry
-            .resolve(steward, &request.request_id, true)
+            .resolve(steward, &request.request_id, true, None)
             .await
             .expect("ok")
             .expect("mine");
@@ -415,11 +433,22 @@ mod tests {
         // Already resolved → not actionable again.
         assert!(
             registry
-                .resolve(steward, &request.request_id, false)
+                .resolve(steward, &request.request_id, false, None)
                 .await
                 .expect("ok")
                 .is_none()
         );
+        // Re-approving isn't actionable either. The request stays Approved
+        // and listed for its steward, which is how an approval retry finds it.
+        assert!(
+            registry
+                .resolve(steward, &request.request_id, true, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
+        let listed = registry.list_requests_for(steward).await.expect("list");
+        assert_eq!(listed[0].status, RequestStatus::Approved);
 
         // Resolved history doesn't block a fresh request.
         let fresh = registry
@@ -428,6 +457,53 @@ mod tests {
             .expect("re-request");
         assert_ne!(fresh.request_id, request.request_id);
         assert_eq!(fresh.status, RequestStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn approval_records_its_budget() {
+        let registry = InMemoryCatalogRegistry::default();
+        let steward = TenantId::generate();
+        let listing = registry
+            .publish(steward, "health", details("Cohorts"))
+            .await
+            .expect("publish");
+
+        // The steward's override wins over the listing's 25.
+        let first = registry
+            .request_access(&listing.listing_id, TenantId::generate(), "")
+            .await
+            .expect("request");
+        assert_eq!(first.approved_budget, None);
+        let approved = registry
+            .resolve(steward, &first.request_id, true, Some(10))
+            .await
+            .expect("ok")
+            .expect("mine");
+        assert_eq!(approved.approved_budget, Some(10));
+
+        // Without an override, the listing's included budget is recorded.
+        let second = registry
+            .request_access(&listing.listing_id, TenantId::generate(), "")
+            .await
+            .expect("request");
+        let approved = registry
+            .resolve(steward, &second.request_id, true, None)
+            .await
+            .expect("ok")
+            .expect("mine");
+        assert_eq!(approved.approved_budget, Some(25));
+
+        // A denial records no budget.
+        let third = registry
+            .request_access(&listing.listing_id, TenantId::generate(), "")
+            .await
+            .expect("request");
+        let denied = registry
+            .resolve(steward, &third.request_id, false, Some(10))
+            .await
+            .expect("ok")
+            .expect("mine");
+        assert_eq!(denied.approved_budget, None);
     }
 
     #[tokio::test]

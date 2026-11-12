@@ -117,8 +117,7 @@ impl Default for EnclaveIdentity {
 pub struct AttestationBundle {
     pub platform: String,
     pub nonce_b64: String,
-    pub report_b64: String,
-    pub cert_chain_b64: String,
+    pub token: String,
     pub enclave_hpke_public_key_b64: String,
     pub result_signing_public_key_b64: String,
     pub tls_cert_sha256_b64: String,

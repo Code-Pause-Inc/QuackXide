@@ -1,11 +1,14 @@
 //! DEV ONLY — local research stack: the API with the research routes wired
 //! (catalog, access requests, grants, budgets, research queries) and seeded,
-//! so the steward and researcher lifecycle runs on one machine without
-//! SEV-SNP hardware.
+//! so the steward and researcher lifecycle runs on one machine without TEE
+//! hardware.
 //!
-//! Nothing here is confidential. Tenant keys are held in process memory, TEE
-//! evidence is fabricated (`DevAttestation::allow_insecure_dev`), and the
-//! vault and registries are in memory, so everything is lost on exit. The
+//! Nothing here is confidential. Queries run on the simulated TEE: an
+//! in-process signer issues Confidential Space-shaped tokens, the production
+//! verifier checks them, and the key-release stand-in releases tenant keys
+//! held in process memory only after a token passes. That exercises the
+//! evidence path, not the protection. The vault and registries are in
+//! memory, so everything is lost on exit. The
 //! binary is built only with the `dev` feature and refuses to start unless:
 //!
 //! * `DEVSTACK_ALLOW_INSECURE=1` is set in the command's environment (a value
@@ -31,8 +34,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use platform_api::dev::{self, DevResearchStack};
-use platform_api::query::ConnectorQueryService;
-use platform_api::research::PublishListingRequest;
+use platform_api::research::{PublishListingRequest, ResearchService, ResearchStores};
 use platform_api::{AppState, build_apps};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
@@ -54,7 +56,7 @@ const TOKEN_TTL_SECS: i64 = 8 * 3600;
 async fn main() -> anyhow::Result<()> {
     // Before `from_env` loads `.env`, so a stray `.env` cannot opt in.
     let opted_in = dev::require_opt_in(|key| std::env::var(key).ok());
-    let config = PlatformConfig::from_env()?;
+    let config = PlatformConfig::from_env_dev_tool()?;
     platform_telemetry::init_from_env();
 
     let secret = match opted_in.and_then(|()| dev::require_dev_config(&config)) {
@@ -85,12 +87,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("committing the synthetic cohort")?;
     let vault = stack.vault();
-    let service = stack.query_service(
-        engine_settings(&config),
-        min_cohort,
-        config.research.default_query_budget,
-    );
-    let listing_id = publish_listing_for(&service, steward, &connector).await?;
+    let research = Arc::new(ResearchService::from_config(
+        ResearchStores::in_memory(),
+        &config.research,
+    ));
+    let service = stack.query_service(engine_settings(&config), research.clone());
+    let listing_id = publish_listing_for(&research, steward, &connector).await?;
 
     let steward_token = dev_token(secret, &config, steward, "dev-steward")?;
     let researcher_token = dev_token(secret, &config, researcher, "dev-researcher")?;
@@ -105,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config),
         vault,
         jwt: Some(jwt),
+        research: Some(research),
         query: Some(Arc::new(service)),
         provisioning: None,
     });
@@ -145,8 +148,8 @@ async fn main() -> anyhow::Result<()> {
 /// log and a `service.start` audit record.
 fn warn_insecure() {
     const WARNING: &str = "devstack is INSECURE and for DEVELOPMENT ONLY: tenant keys are held \
-                           in process memory and TEE evidence is fabricated. Never load real \
-                           data into it or expose it beyond this machine.";
+                           in process memory and the TEE is simulated. Never load real data \
+                           into it or expose it beyond this machine.";
     eprintln!("\n*** {WARNING} ***\n");
     tracing::warn!("{WARNING}");
     security_audit_event(
@@ -179,7 +182,7 @@ fn synthetic_cohort(min_cohort: u64) -> anyhow::Result<(Zeroizing<Vec<u8>>, usiz
 
 /// Publishes the steward's catalog listing for the cohort and returns its id.
 async fn publish_listing_for(
-    service: &ConnectorQueryService,
+    research: &ResearchService,
     steward: TenantId,
     connector: &ConnectorSlug,
 ) -> anyhow::Result<String> {
@@ -191,7 +194,7 @@ async fn publish_listing_for(
         compute_rate_cents: 0,
         grant_budget: None,
     };
-    let listing = service
+    let listing = research
         .publish_listing(steward, connector, &request)
         .await
         .map_err(|_| anyhow!("publishing the catalog listing failed"))?;
@@ -246,13 +249,13 @@ mod tests {
             .commit_snapshot(steward, keypair, &connector, "cohort", &parquet)
             .await
             .expect("commit");
-        let service = stack.query_service(
-            engine_settings(&config),
-            min_cohort,
-            config.research.default_query_budget,
-        );
+        let research = Arc::new(ResearchService::from_config(
+            ResearchStores::in_memory(),
+            &config.research,
+        ));
+        let service = stack.query_service(engine_settings(&config), research.clone());
 
-        let granted = service.grant(steward, researcher, &connector, None).await;
+        let granted = research.grant(steward, researcher, &connector, None).await;
         assert!(granted.is_ok(), "grant refused");
         let sql = example_sql();
         let Ok(result) = service
@@ -265,5 +268,6 @@ mod tests {
         let released = result["rows"].as_array().map(Vec::len).unwrap_or(0);
         assert!(suppressed >= 1, "nothing suppressed: {result}");
         assert!(released >= 1, "nothing released: {result}");
+        assert_eq!(result["tee_platform"], "simulated", "{result}");
     }
 }
