@@ -260,6 +260,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `GCP_PROJECT_ID` is removed: nothing read it. The GCS client takes its
+  bucket from `STORAGE_BUCKET` and its credentials from `object_store`'s
+  `GOOGLE_*` environment variables or the metadata server.
 * `docs/PROJECT_SCOPE.md` lists what is not in v1.0: live connector sync,
   the admin connector toggles, charging catalog prices, blind-index search
   and closing differencing. The merchant-of-record webhook and its tenant
