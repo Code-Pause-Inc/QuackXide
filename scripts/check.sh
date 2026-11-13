@@ -82,7 +82,8 @@ fi
 echo "== secret scan: no credentials in history (docs/DATA_POLICY.md) =="
 # CI always runs it; locally it runs only when gitleaks is installed.
 if command -v gitleaks >/dev/null 2>&1; then
-    gitleaks git --no-banner --redact --config "$ROOT/.gitleaks.toml" "$ROOT"
+    # HEAD only, as in CI: other local branches carry their own allowlists.
+    gitleaks git --no-banner --redact --config "$ROOT/.gitleaks.toml" --log-opts=HEAD "$ROOT"
 else
     echo "skipped: gitleaks is not installed (CI runs it on every pull request)"
 fi
