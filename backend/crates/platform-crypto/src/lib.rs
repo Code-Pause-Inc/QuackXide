@@ -554,6 +554,17 @@ mod tests {
     }
 
     #[test]
+    fn hpk1_envelope_overhead_is_52_bytes() {
+        // Magic (4) + encapsulated X25519 key (32) + AES-GCM tag (16).
+        // docs/BENCHMARKS.md records this size.
+        let recipient = TenantKeypair::generate().public_key();
+        for len in [0usize, 32, 4096] {
+            let envelope = hpke_seal_to_tenant(&recipient, b"size", &vec![0u8; len]).expect("seal");
+            assert_eq!(envelope.len(), len + 52);
+        }
+    }
+
+    #[test]
     fn envelope_suite_comes_from_the_frame_magic() {
         let keypair = TenantKeypair::generate();
         let envelope = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"x").expect("seal");
