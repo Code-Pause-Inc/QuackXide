@@ -61,3 +61,10 @@ jobs:
         env:
           BROWSERS: ${{ matrix.browser }}
         run: npm run test:browser
+      - name: Keep failure screenshots and traces
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-${{ matrix.browser }}
+          path: frontend/.vitest/
+          if-no-files-found: ignore

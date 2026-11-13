@@ -1,10 +1,12 @@
 // The crypto worker, Web Crypto keys and IndexedDB persistence in real
 // browsers (vitest `browser` project, `npm run test:browser`). Nothing is
-// mocked: the module worker, the wasm envelope module and the local vault
-// run as they do in the app. No backend is involved.
+// mocked: the module worker and the local vault run as they do in the app,
+// and the worker loads the wasm envelope module (nothing here seals with
+// it). No backend is involved.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { LocalVault } from "../vault/localVault";
 import { loadDeviceKeys } from "./keystore";
 import { DriveWorkerClient } from "./workerClient";
 
@@ -20,8 +22,9 @@ function deleteDatabase(name: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.deleteDatabase(name);
     req.onsuccess = () => resolve();
+    // A still-open connection only delays the delete (`blocked`); the hook
+    // timeout bounds the wait.
     req.onerror = () => reject(req.error ?? new Error(`could not delete ${name}`));
-    req.onblocked = () => reject(new Error(`${name} is still open`));
   });
 }
 
@@ -49,6 +52,8 @@ describe("crypto worker in a real browser", () => {
     const init = await client().init();
     expect(init.created).toBe(true);
     expect(init.tenantId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    // A device HPKE key exists exactly where the browser can make one.
+    expect(init.hpkePublicKeyB64 !== null).toBe(await canGenerateX25519());
   });
 
   it("keeps the drive KEK non-extractable", async () => {
@@ -81,6 +86,10 @@ describe("crypto worker in a real browser", () => {
     crypto.getRandomValues(bytes);
 
     const uploaded = await drive.upload(new File([bytes], "a.bin"));
+    // The vault holds ciphertext: the stored chunk is not the plaintext.
+    const stored = await new LocalVault().getChunk(uploaded.objectId, 0);
+    expect(stored).not.toBeNull();
+    expect(new Uint8Array(stored!.data)).not.toEqual(bytes);
     const listed = await drive.list();
     expect(listed.map((f) => f.objectId)).toContain(uploaded.objectId);
 

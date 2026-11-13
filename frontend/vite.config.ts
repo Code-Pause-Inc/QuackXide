@@ -78,7 +78,14 @@ export default defineConfig(({ mode }) => {
           test: {
             name: "browser",
             include: ["src/**/*.browser.test.ts"],
-            browser: { enabled: true, provider: playwright(), headless: true, instances: browsers },
+            browser: {
+              enabled: true,
+              provider: playwright(),
+              headless: true,
+              instances: browsers,
+              // Failure screenshots and traces land in .vitest/ (CI keeps them).
+              trace: { mode: "retain-on-failure", tracesDir: ".vitest/traces" },
+            },
           },
         },
       ],

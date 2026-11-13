@@ -116,8 +116,10 @@ jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 
 The `browser` project runs `*.browser.test.ts` in real headless browsers
 through Playwright, with nothing mocked: the module crypto worker, Web
-Crypto keys, IndexedDB and the wasm envelope module (build it first with
-`scripts/build-wasm.sh`). It needs no backend. `npm test` does not run it;
+Crypto keys and IndexedDB. The worker loads the wasm envelope module (build
+it first with `scripts/build-wasm.sh`), but no browser test seals with it
+yet. It needs no backend. Failure screenshots and Playwright traces go to
+`frontend/.vitest/`, which the `browser` workflow keeps when a job fails. `npm test` does not run it;
 from `frontend/`:
 
 ```sh
