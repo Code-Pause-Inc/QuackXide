@@ -30,6 +30,14 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser tests (#223 stage A). A vitest `browser` project runs the module
+  crypto worker, Web Crypto keys, IndexedDB persistence across a worker
+  restart, a drive round trip and the X25519 probe in real browsers
+  (`npm run test:browser`, Playwright); `npm test` is unchanged. The
+  `browser` workflow runs Chromium on every pull request and Chromium,
+  Firefox and WebKit on `main` and nightly. WebKit fails today: it cannot
+  store an X25519 `CryptoKey` in IndexedDB, which the device key store
+  does.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before

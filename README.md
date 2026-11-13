@@ -134,6 +134,12 @@ committed). It needs the `wasm32-unknown-unknown` target, which
 `rust-toolchain.toml` lists, and the `wasm-bindgen` CLI at the version
 `backend/Cargo.lock` pins. Rerun it after changing the envelope code.
 
+The drive works in current Chromium and Firefox, which CI tests along with
+WebKit (`npm run test:browser`); X25519 support is checked at runtime.
+Safari (WebKit) does not work yet: it cannot store the X25519 device key in
+IndexedDB, so the crypto worker fails to start until that key is stored
+sealed, as ADR 0007 describes (#200).
+
 ```sh
 cargo install --locked wasm-bindgen-cli --version 0.2.126   # once
 ../scripts/build-wasm.sh
