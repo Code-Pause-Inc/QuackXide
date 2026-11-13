@@ -36,7 +36,7 @@ uses [Semantic Versioning](https://semver.org/).
   benchmarks the base commit and the head in one job, and
   `scripts/bench-compare.sh` fails it when a benchmark's whole 95 %
   interval is more than 10 % slower. `docs/BENCHMARKS.md` records the
-  hybrid suite's targets.
+  targets for the hybrid suite and the engine.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
   4 MiB, and a unit test pins the 52-byte envelope overhead. The `bench`

@@ -109,14 +109,17 @@ changes; later runs of the same code differ only by runner noise.
 
 ## Engine query times
 
-From this PR's CI run: TBD.
+Criterion's estimate from
+[run 43414070024](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43414070024)
+of #233, on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC 7763, 4 CPUs,
+`rustc 1.94.1`.
 
 | Benchmark | Rows | Objects | `count` | `filter` |
 | --- | --- | --- | --- | --- |
-| `engine/<query>/10000` | 10 000 | 1 | TBD | TBD |
-| `engine/<query>/100000` | 100 000 | 1 | TBD | TBD |
-| `engine/<query>/1000000` | 1 000 000 | 1 | TBD | TBD |
-| `engine/<query>/1000000x8` | 1 000 000 | 8 | TBD | TBD |
+| `engine/<query>/10000` | 10 000 | 1 | 2.21 ms | 2.29 ms |
+| `engine/<query>/100000` | 100 000 | 1 | 16.6 ms | 16.5 ms |
+| `engine/<query>/1000000` | 1 000 000 | 1 | 204 ms | 198 ms |
+| `engine/<query>/1000000x8` | 1 000 000 | 8 | 215 ms | 171 ms |
 
 ## Targets and regression threshold
 
@@ -135,8 +138,9 @@ recorded tables:
 * The hybrid suite's cost: `hpk2` at most 4× `hpk1` for key generation and
   for seal and open from 32 B to 4 KiB, and at most 1.25× at 4 MiB, in the
   same run.
-* Engine queries: TBD, set from the first recorded run at about 1.5× its
-  times.
+* Engine queries, `count` and `filter` alike: at most 4 ms at 10 000 rows,
+  25 ms at 100 000 rows, and 350 ms at 1 000 000 rows in one or eight
+  objects (about 1.5× the recorded times, rounded up).
 
 ## Still to come (#185)
 
