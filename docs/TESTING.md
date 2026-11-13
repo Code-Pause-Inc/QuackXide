@@ -131,6 +131,31 @@ BROWSERS=chromium,firefox,webkit npm run test:browser
 The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
 
+### Browser timings
+
+`npm run bench:browser` (from `frontend/`) times chunk encryption
+(`encryptPayload` at 4 KiB and 4 MiB) and the first, cold load of the wasm
+envelope module in real browsers (`src/lib/crypto/timings.browser.timing.ts`,
+which `npm run test:browser` leaves out). Vitest cannot run `bench` in
+browser mode, so each timing is the median and p95 per operation over 20
+samples, each a batch of calls, since browsers coarsen `performance.now()`.
+The wasm load is one sample per run: repeated loads hit the module cache.
+These numbers are report only: the `browser` workflow writes them, and the
+module's raw and gzipped size, to each run's job summary, and nothing fails
+on them. Pull requests run Chromium; `main` and the nightly run add Firefox
+and WebKit. They move to `docs/BENCHMARKS.md` with the other
+benchmarks.
+
+Recorded from CI: Chromium from this PR's run, Firefox and WebKit from the
+first nightly run after it merges; runs TBD.
+
+| Timing | Chromium | Firefox | WebKit |
+| --- | --- | --- | --- |
+| `encryptPayload/4KiB` | TBD | TBD | TBD |
+| `encryptPayload/4MiB` | TBD | TBD | TBD |
+| `wasm/first-load` | TBD | TBD | TBD |
+| wasm module size | TBD | | |
+
 ### Envelope vectors
 
 `fixtures/envelope/` holds the vectors that keep the browser and the backend
