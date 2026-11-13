@@ -9,9 +9,9 @@ import { errorMessage } from "../format";
 import { HttpVault } from "../vault/httpVault";
 import { LocalVault } from "../vault/localVault";
 import type { VaultClient } from "../vault/types";
-import { generateHpkeKeypair, generateMasterKey, isX25519Supported, keyFingerprint } from "./core";
+import { generateMasterKey, keyFingerprint } from "./core";
+import { createDeviceHpkeKey } from "./devicekey";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
-import { loadEnvelopeModule } from "./envelope";
 import { loadDeviceKeys, saveDeviceKeys, type DeviceKeys } from "./keystore";
 import { decodeSessionClaims, parseWorkerRequest } from "./protocol";
 import type { InitResult, SessionClaims, WorkerRequest, WorkerResponse } from "./protocol";
@@ -65,42 +65,61 @@ function respond(msg: WorkerResponse): void {
   scope.postMessage(msg);
 }
 
-async function ensureKeys(): Promise<{ keys: DeviceKeys; created: boolean }> {
-  if (deviceKeys) return { keys: deviceKeys, created: false };
+/** Give `keys` an HPKE key if it has none: on first setup, after the
+ *  envelope module failed to load before, or for a record saved before
+ *  ADR 0007's key storage. Without the module the drive still works and
+ *  the next call tries again. */
+async function withHpkeKey(keys: DeviceKeys): Promise<DeviceKeys> {
+  if (keys.hpke) return keys;
+  let hpke;
+  try {
+    hpke = await createDeviceHpkeKey(keys.tenantId);
+  } catch (err) {
+    console.warn("envelope module unavailable; no device HPKE key yet", err);
+    return keys;
+  }
+  const upgraded: DeviceKeys = { ...keys, hpke };
+  await saveDeviceKeys(upgraded);
+  return upgraded;
+}
 
-  const existing = await loadDeviceKeys();
+let ensuring: Promise<{ keys: DeviceKeys; created: boolean }> | null = null;
+
+/** One key setup at a time: two requests arriving together must not each
+ *  generate, and save, a different key. */
+function ensureKeys(): Promise<{ keys: DeviceKeys; created: boolean }> {
+  ensuring ??= loadOrCreateKeys().finally(() => {
+    ensuring = null;
+  });
+  return ensuring;
+}
+
+async function loadOrCreateKeys(): Promise<{ keys: DeviceKeys; created: boolean }> {
+  if (deviceKeys?.hpke) return { keys: deviceKeys, created: false };
+
+  const existing = deviceKeys ?? (await loadDeviceKeys());
   if (existing) {
-    deviceKeys = existing;
-    return { keys: existing, created: false };
+    deviceKeys = await withHpkeKey(existing);
+    return { keys: deviceKeys, created: false };
   }
 
-  const kek = await generateMasterKey();
-  const supported = await isX25519Supported();
-  const hpke = supported ? await generateHpkeKeypair() : null;
   const fresh: DeviceKeys = {
     tenantId: crypto.randomUUID(),
-    kek,
-    hpkePrivateKey: hpke?.privateKey ?? null,
-    hpkePublicKeyRaw: hpke?.publicKeyRaw ?? null,
+    kek: await generateMasterKey(),
+    hpke: null,
     createdAtIso: new Date().toISOString(),
   };
   await saveDeviceKeys(fresh);
-  deviceKeys = fresh;
-  return { keys: fresh, created: true };
+  deviceKeys = await withHpkeKey(fresh);
+  return { keys: deviceKeys, created: true };
 }
 
 async function handleInit(): Promise<InitResult> {
+  // ensureKeys loads the envelope module to create the HPKE key, so a
+  // browser that cannot run it is reported here, not first on an upload.
   const { keys, created } = await ensureKeys();
-  const x25519Supported = keys.hpkePublicKeyRaw !== null || (await isX25519Supported());
-  const hpkePublicKeyB64 = keys.hpkePublicKeyRaw ? toB64(keys.hpkePublicKeyRaw) : null;
-
-  // Load the envelope module now so a browser that cannot run it is reported
-  // here, not first on an upload. Seals stay refused until it loads.
-  try {
-    await loadEnvelopeModule();
-  } catch (err) {
-    console.warn("envelope module failed to load (sealing unavailable)", err);
-  }
+  const publicKeyRaw = keys.hpke?.publicKeyRaw ?? null;
+  const hpkePublicKeyB64 = publicKeyRaw ? toB64(publicKeyRaw) : null;
 
   // Enroll the public key so enclave pipelines can seal connector data to
   // this tenant. Best-effort: an unreachable backend must not block the drive.
@@ -115,9 +134,9 @@ async function handleInit(): Promise<InitResult> {
   return {
     created,
     tenantId: keys.tenantId,
-    x25519Supported,
+    hpkeKeyAvailable: publicKeyRaw !== null,
     hpkePublicKeyB64,
-    fingerprint: keys.hpkePublicKeyRaw ? await keyFingerprint(keys.hpkePublicKeyRaw) : null,
+    fingerprint: publicKeyRaw ? await keyFingerprint(publicKeyRaw) : null,
   };
 }
 

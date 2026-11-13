@@ -22,7 +22,8 @@ production requirements, including its failure paths.
 | --- | --- | --- |
 | Dataset plaintext | Steward's browser before upload; enclave memory during a query | Never persisted in the clear; zeroized after use |
 | Dataset ciphertext | Object store (`tenants/{t}/…`) | HPKE envelopes / AES-256-GCM, context-bound AAD |
-| Steward private keys | Steward's browser (Web Crypto, non-extractable) | Never sent to the server |
+| Steward HPKE private keys | Steward's browser: encrypted in IndexedDB under a non-extractable Web Crypto seed key, AAD-bound to tenant and public key (ADR 0007); plaintext only in the crypto worker and wasm memory for one open, then zeroed | Never sent to the server; a copy of the IndexedDB records is useless off the device (see residual risks) |
+| Researcher result private keys | Researcher's browser, held as steward keys are (ADR 0007); results open there (P56, to build) | Never sent to the server; the enclave seals results to the enrolled public key (P55, to build) |
 | Dataset data keys | Beside each dataset, wrapped to a Cloud KMS key; unwrapped only in enclave memory for one query | KMS decapsulates only for the attested workload (ADR 0004); its private key cannot be exported |
 | Research grants and budgets | `platform-tenancy` registries | Steward-scoped; no existence oracle |
 | Aggregate results | Researcher portal | Plan gate, genuine-count check, cohort suppression, budget |
@@ -187,6 +188,12 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   return one individual's actual value. This is standard for aggregate
   release; removing them from the allowlist, or applying a dominance rule,
   is a policy decision.
+* **Browser private keys during an open.** The envelope suite's KEM is not
+  in Web Crypto, so the device's HPKE private key is decrypted in the crypto
+  worker and copied into wasm memory for each open. Both copies are zeroed
+  when the open ends, but code running in the worker during an open can
+  read the key. That is the trust ADR 0005 already places in the served
+  bundle; a compromised device is out of scope.
 * **Metadata.** The server sees tenant ids, object ids, ciphertext lengths,
   and timestamps, including when each connector snapshot was written.
 * **Forged or rolled-back snapshots.** Connector objects and snapshot

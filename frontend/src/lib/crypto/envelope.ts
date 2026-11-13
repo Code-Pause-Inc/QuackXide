@@ -1,14 +1,19 @@
-// Tenant envelope sealing in the crypto worker: the wasm32 build of the
-// backend's own HPKE envelope code (backend/crates/envelope-wasm, built into
-// ./wasm/ by scripts/build-wasm.sh). Only worker-side code imports this
+// Tenant envelope seal and open in the crypto worker: the wasm32 build of
+// the backend's own HPKE envelope code (backend/crates/envelope-wasm, built
+// into ./wasm/ by scripts/build-wasm.sh). Only worker-side code imports this
 // module, and ESLint refuses the wasm glue anywhere else.
 //
-// Sealing uses only the recipient's public key: no private key, KEK or file
-// key enters wasm memory.
+// Sealing uses only the recipient's public key. Opening takes the device's
+// raw private key, which devicekey.ts decrypts just before the call; this
+// module overwrites the caller's copy with zeros and the wasm side
+// zeroizes its own (ADR 0007, "Browser private-key storage"). The KEK and
+// file keys never enter wasm memory.
 
 import envelopeWasmUrl from "./wasm/envelope_bg.wasm?url";
 import init, {
   connectorObjectInfo,
+  openEnvelope,
+  publicKeyFromPrivateKey,
   researchResultInfo,
   sealEnvelope,
   snapshotManifestInfo,
@@ -46,6 +51,32 @@ export async function sealToTenant(
   // wasm-bindgen returns a fresh copy out of wasm memory, so the buffer is
   // exactly the envelope.
   return envelope.buffer as ArrayBuffer;
+}
+
+/** Open a framed envelope with a raw private key under `info`; the suite
+ *  comes from the frame magic. `privateKey` is overwritten with zeros
+ *  before this returns, whether or not the open succeeds. Rejects on
+ *  tamper, wrong recipient, wrong `info` or an unknown frame. */
+export async function openWithPrivateKey(
+  privateKey: Uint8Array,
+  info: Uint8Array,
+  envelope: ArrayBuffer,
+): Promise<ArrayBuffer> {
+  try {
+    await loadEnvelopeModule();
+    // wasm-bindgen copies the key into wasm memory; Rust zeroizes that copy.
+    const plaintext = openEnvelope(privateKey, info, new Uint8Array(envelope));
+    return plaintext.buffer as ArrayBuffer;
+  } finally {
+    privateKey.fill(0);
+  }
+}
+
+/** The raw public key of a raw private key, for enrollment. Leaves the
+ *  caller's `privateKey` as it is: the caller still needs it. */
+export async function publicKeyOf(privateKey: Uint8Array): Promise<ArrayBuffer> {
+  await loadEnvelopeModule();
+  return publicKeyFromPrivateKey(privateKey).buffer as ArrayBuffer;
 }
 
 /** HPKE `info` strings, defined once in the backend (`platform_crypto::info`)

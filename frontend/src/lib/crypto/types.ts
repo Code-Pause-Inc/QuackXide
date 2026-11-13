@@ -4,8 +4,10 @@
 // * Per-file keys (DEKs) are extractable only for the instant they are
 //   wrapped under the KEK; every handle used for encryption is a
 //   non-extractable copy unwrapped from that wrapping.
-// * The HPKE X25519 private key is non-extractable; only the public half is
-//   exported, for tenant enrollment.
+// * The HPKE private key exists in plaintext only inside the crypto worker,
+//   for the length of one open; at rest it is encrypted under the
+//   non-extractable seed key (ADR 0007). Only the public half leaves the
+//   worker, for tenant enrollment.
 // * No file content or name reaches a vault in plaintext; filenames and
 //   metadata live inside the encrypted manifest.
 
@@ -48,11 +50,4 @@ export interface ChunkRecord {
   readonly chunkIndex: number;
   readonly iv: ArrayBuffer;
   readonly data: ArrayBuffer;
-}
-
-/** X25519 keypair for HPKE; matches the backend's DHKEM(X25519, HKDF-SHA256)
- *  suite (platform-crypto::TenantKem). */
-export interface HpkeKeypairHandle {
-  readonly privateKey: CryptoKey;
-  readonly publicKeyRaw: ArrayBuffer;
 }
