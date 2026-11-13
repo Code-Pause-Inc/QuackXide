@@ -3424,14 +3424,17 @@ name = "platform-crypto"
 version = "0.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
+ "base64 0.22.1",
  "criterion",
  "hmac 0.12.1",
  "hpke",
  "proptest",
  "rand 0.8.7",
+ "serde_json",
  "sha1",
  "sha2 0.10.9",
  "thiserror",
+ "x-wing",
  "zeroize",
 ]
 

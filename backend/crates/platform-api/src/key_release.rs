@@ -11,7 +11,7 @@
 //! compiled only with the `dev` feature, so a production build cannot
 //! release keys through them.
 
-use platform_crypto::{TenantKeypair, X25519_PUBLIC_KEY_BYTES};
+use platform_crypto::{EnvelopeSuite, TenantKeypair};
 use platform_enclave::{ReportDataBinding, fresh_nonce};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,12 @@ mod stand_in;
 #[cfg(feature = "dev")]
 pub use stand_in::*;
 
+/// Size of the enclave's key-release public key: X25519 (`HPK1`). It stays
+/// `HPK1` until P85 (#176) builds ADR 0010's binding v2, because binding v1
+/// (`platform_enclave::ReportDataBinding`) holds a 32-byte key. Only dev-only
+/// key release opens envelopes sealed to it.
+const ENCLAVE_HPKE_PUBLIC_KEY_BYTES: usize = 32;
+
 /// Ephemeral enclave identity generated in RAM at process boot.
 ///
 /// The private HPKE scalar lives only inside `ephemeral_hpke` (which zeroizes
@@ -32,7 +38,7 @@ pub struct EnclaveIdentity {
     // production build keeps no private half until P85 adds a production use.
     #[cfg(feature = "dev")]
     ephemeral_hpke: TenantKeypair,
-    ephemeral_hpke_public_raw: [u8; X25519_PUBLIC_KEY_BYTES],
+    ephemeral_hpke_public_raw: [u8; ENCLAVE_HPKE_PUBLIC_KEY_BYTES],
     result_signing_public_key: [u8; 32],
     tls_cert_sha256: [u8; 32],
     config_digest: [u8; 32],
@@ -48,8 +54,8 @@ impl EnclaveIdentity {
     /// Generate a fresh in-RAM enclave identity bound to `tls_cert_sha256` and
     /// `config_digest`.
     pub fn with_metadata(tls_cert_sha256: [u8; 32], config_digest: [u8; 32]) -> Self {
-        let ephemeral_hpke = TenantKeypair::generate();
-        let mut ephemeral_hpke_public_raw = [0u8; X25519_PUBLIC_KEY_BYTES];
+        let ephemeral_hpke = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+        let mut ephemeral_hpke_public_raw = [0u8; ENCLAVE_HPKE_PUBLIC_KEY_BYTES];
         ephemeral_hpke_public_raw.copy_from_slice(&ephemeral_hpke.public_key().to_raw());
         let result_signing_public_key = fresh_nonce();
         Self {
@@ -62,7 +68,7 @@ impl EnclaveIdentity {
         }
     }
 
-    pub fn enclave_hpke_public_key(&self) -> &[u8; X25519_PUBLIC_KEY_BYTES] {
+    pub fn enclave_hpke_public_key(&self) -> &[u8; ENCLAVE_HPKE_PUBLIC_KEY_BYTES] {
         &self.ephemeral_hpke_public_raw
     }
 
@@ -91,9 +97,11 @@ impl EnclaveIdentity {
 
     #[cfg(feature = "dev")]
     /// Open a key-release HPKE envelope inside enclave RAM and reconstruct a
-    /// transient zeroize-on-drop [`TenantKeypair`].
+    /// transient zeroize-on-drop [`TenantKeypair`]. Released tenant keys must
+    /// be `HPK2` in every mode: the stand-in holds no other suite.
     pub fn unwrap_released_key(
         &self,
+        tenant: platform_core::TenantId,
         info: &[u8],
         wrapped_key: &[u8],
     ) -> Result<TenantKeypair, ApiError> {
@@ -101,8 +109,21 @@ impl EnclaveIdentity {
             .ephemeral_hpke
             .open_envelope(info, wrapped_key)
             .map_err(|_| ApiError::AttestationUnavailable)?;
-        TenantKeypair::from_private_key_bytes(raw_sk.expose())
-            .map_err(|_| ApiError::AttestationUnavailable)
+        TenantKeypair::from_private_key_bytes(
+            raw_sk.expose(),
+            platform_crypto::SuitePolicy::PRODUCTION,
+        )
+        .map_err(|e| {
+            if matches!(e, platform_crypto::CryptoError::SuiteRefused) {
+                platform_telemetry::security_audit_event(
+                    platform_telemetry::AuditKind::SuiteRefused,
+                    Some(tenant),
+                    "denied",
+                    "refused a released tenant key that is not HPK2",
+                );
+            }
+            ApiError::AttestationUnavailable
+        })
     }
 }
 

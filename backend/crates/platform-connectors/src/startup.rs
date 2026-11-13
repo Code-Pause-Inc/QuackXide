@@ -8,7 +8,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use platform_config::{PlatformConfig, Service};
 use platform_core::TenantId;
-use platform_crypto::{TenantKeypair, TenantPublicKey};
+use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 
@@ -101,12 +101,13 @@ fn demo_tenant(config: &PlatformConfig) -> anyhow::Result<(TenantId, TenantPubli
             let raw = B64
                 .decode(key_b64.trim())
                 .map_err(|e| anyhow::anyhow!("invalid DEMO_TENANT_PUBLIC_KEY_B64: {e}"))?;
-            let key = TenantPublicKey::from_raw(&raw)
-                .map_err(|e| anyhow::anyhow!("invalid tenant public key: {e}"))?;
+            let policy = SuitePolicy::for_env(config.env.is_production());
+            let key = TenantPublicKey::from_raw(&raw, policy)
+                .map_err(|e| anyhow::anyhow!("invalid DEMO_TENANT_PUBLIC_KEY_B64: {e}"))?;
             Ok((tenant, key))
         }
         _ => {
-            let keypair = TenantKeypair::generate();
+            let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
             let tenant = TenantId::generate();
             tracing::warn!(
                 "no DEMO_TENANT_* env set — using an EPHEMERAL keypair; the private key is \

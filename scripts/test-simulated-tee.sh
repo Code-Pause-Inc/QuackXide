@@ -125,7 +125,9 @@ wait_for_http "http://127.0.0.1:8070/healthz"
 wait_for_http "http://127.0.0.1:8090/healthz"
 
 echo "==> [2/7] Enrolling the demo tenant's key with key-release-service..."
-PRIVATE_KEY_B64=$(openssl rand -base64 32)
+# A framed HPK2 (X-Wing) private key: the suite magic, then a random 32-byte
+# seed. key-release-service accepts no other suite.
+PRIVATE_KEY_B64=$( { printf 'HPK2'; openssl rand 32; } | base64 | tr -d '\n')
 ENROLL_JSON=$(curl -fsS -X PUT "http://127.0.0.1:8090/v1/keys" \
   -H "Content-Type: application/json" \
   -d "{\"tenant_id\":\"${TENANT_ID}\",\"private_key_b64\":\"${PRIVATE_KEY_B64}\"}")
@@ -152,18 +154,18 @@ if [[ "${OBJECT_COUNT}" -eq 0 ]]; then
   echo "ERROR: no tenant objects in the vault, so there is nothing to check" >&2
   exit 1
 fi
-# Every object must be an HPK1 envelope (platform-crypto's frame): the magic,
-# a 32-byte encapsulated key, then ciphertext ending in a 16-byte GCM tag.
-# The one exception is each snapshot's plaintext record
+# Every object must be an HPK2 envelope (platform-crypto's frame, ADR 0007):
+# the magic, a 1120-byte X-Wing encapsulated key, then ciphertext ending in a
+# 16-byte GCM tag. The one exception is each snapshot's plaintext record
 # (`connectors/{slug}/records/{version}.json`, ADR 0012). Only connector
 # snapshots are written here, and theirs must name their own version and the
-# HPK1 suite, and nothing else (`docs/THREAT_MODEL.md`, "Metadata").
+# HPK2 suite, and nothing else (`docs/THREAT_MODEL.md`, "Metadata").
 RECORD_COUNT=0
 RECORD_PATH='^connectors/[^/]+/records/([^/]+)\.json$'
 while IFS= read -r -d '' object; do
   if [[ "${object#"${TENANT_DATA}/"}" =~ ${RECORD_PATH} ]]; then
     if ! jq -e --arg version "${BASH_REMATCH[1]}" \
-        'keys == ["suite", "version"] and .version == $version and .suite == "HPK1"' \
+        'keys == ["suite", "version"] and .version == $version and .suite == "HPK2"' \
         "${object}" >/dev/null 2>&1; then
       echo "ERROR: ${object#"${VAULT_COPY}/"} is not a snapshot record holding only its suite" >&2
       exit 1
@@ -171,8 +173,8 @@ while IFS= read -r -d '' object; do
     RECORD_COUNT=$((RECORD_COUNT + 1))
     continue
   fi
-  if ! cmp -s -n 4 <(printf 'HPK1') "${object}" || (( $(wc -c < "${object}") < 52 )); then
-    echo "ERROR: ${object#"${VAULT_COPY}/"} is not an HPK1 envelope" >&2
+  if ! cmp -s -n 4 <(printf 'HPK2') "${object}" || (( $(wc -c < "${object}") < 1140 )); then
+    echo "ERROR: ${object#"${VAULT_COPY}/"} is not an HPK2 envelope" >&2
     exit 1
   fi
 done < <(find "${TENANT_DATA}" -type f -print0)
@@ -183,7 +185,7 @@ for plaintext in "Sample Customer" "PAR1"; do
     exit 1
   fi
 done
-echo "    ${OBJECT_COUNT} tenant objects stored: $((OBJECT_COUNT - RECORD_COUNT)) HPK1 envelopes and ${RECORD_COUNT} snapshot records holding only their suite, none with plaintext data."
+echo "    ${OBJECT_COUNT} tenant objects stored: $((OBJECT_COUNT - RECORD_COUNT)) HPK2 envelopes and ${RECORD_COUNT} snapshot records holding only their suite, none with plaintext data."
 
 TOKEN=$(mint_jwt "${TENANT_ID}")
 

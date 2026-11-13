@@ -96,7 +96,10 @@ fn app(setup: Setup) -> (Router, Arc<TestVault>) {
         let tenant = TenantId::generate();
         Arc::new(ConnectorQueryService::new(
             Arc::new(ObjectStoreVault::new_in_memory()),
-            Arc::new(DevKeyProvider::new(tenant, TenantKeypair::generate())),
+            Arc::new(DevKeyProvider::new(
+                tenant,
+                TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+            )),
             provider,
             EngineSettings {
                 zk: ZkMode::Enabled,

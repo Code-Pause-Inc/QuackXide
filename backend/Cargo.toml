@@ -121,6 +121,8 @@ datafusion = "55"                                                 # arrow/parque
 # Benchmarks only (docs/BENCHMARKS.md). No plotters or rayon; runs pass --noplot.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1"
+# X-Wing known-answer tests (ADR 0007); the same version hpke 0.14.1 uses.
+x-wing = "=0.1.1"
 # The RNG traits `hpke` 0.14 takes, for tests that pass a seeded RNG.
 rand_core = "0.10"
 # Seeded RNG for synth-data. synth-data uses rand_chacha's own rand_core

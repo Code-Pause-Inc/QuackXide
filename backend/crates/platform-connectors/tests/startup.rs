@@ -61,3 +61,35 @@ fn development_mode_builds_the_fixture_jobs() {
     .expect("development boots");
     assert_eq!(started.jobs.len(), 3);
 }
+
+fn development_with_demo_key(raw: &[u8]) -> anyhow::Result<startup::WorkerStartup> {
+    use base64::Engine as _;
+    let key = base64::engine::general_purpose::STANDARD.encode(raw);
+    startup::build(&config(&[
+        ("APP_ENV", "development"),
+        ("TEE_ATTESTATION_REQUIRED", "false"),
+        ("DEMO_TENANT_ID", "6f2c8a2e-1111-4222-8333-444455556666"),
+        ("DEMO_TENANT_PUBLIC_KEY_B64", &key),
+    ]))
+}
+
+#[test]
+fn development_accepts_demo_keys_of_both_suites() {
+    use platform_crypto::{EnvelopeSuite, TenantKeypair};
+    for suite in [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2] {
+        let raw = TenantKeypair::generate(suite).public_key().to_raw();
+        let started = development_with_demo_key(&raw).expect("development boots");
+        assert_eq!(started.jobs[0].tenant_public_key.suite(), suite);
+    }
+}
+
+#[test]
+fn demo_key_of_unknown_length_is_refused() {
+    for len in [31usize, 33, 1215, 1217] {
+        let err = development_with_demo_key(&vec![7u8; len])
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("DEMO_TENANT_PUBLIC_KEY_B64"), "{err}");
+    }
+}

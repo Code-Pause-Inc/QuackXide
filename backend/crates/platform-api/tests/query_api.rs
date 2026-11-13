@@ -43,7 +43,7 @@ async fn app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let service = ConnectorQueryService::new(
         vault.clone(),
@@ -385,7 +385,7 @@ async fn observed_service_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> (ConnectorQueryService, Arc<ObservedKeys>) {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, syncs).await;
     let keys = Arc::new(ObservedKeys {
         inner: DevKeyProvider::new(tenant, keypair),
@@ -528,7 +528,7 @@ async fn repeated_syncs_never_inflate_counts() {
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     for syncs in [1, 4] {
         let tenant = TenantId::generate();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
         let vault = synced_vault(tenant, &keypair, syncs).await;
         let service = service_over(tenant, keypair, vault, ZkMode::Enabled);
 
@@ -558,7 +558,7 @@ async fn repeated_syncs_never_inflate_counts() {
 #[tokio::test]
 async fn superseded_snapshots_are_pruned() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 3).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let manifests = vault
@@ -579,7 +579,7 @@ async fn superseded_snapshots_are_pruned() {
 #[tokio::test]
 async fn a_snapshot_without_its_record_fails_closed() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let record = vault
@@ -597,7 +597,7 @@ async fn a_snapshot_without_its_record_fails_closed() {
 #[tokio::test]
 async fn a_record_naming_a_suite_this_build_cannot_read_fails_closed() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let service = service_over(tenant, keypair, vault.clone(), ZkMode::Disabled);
@@ -627,7 +627,7 @@ async fn a_record_naming_a_suite_this_build_cannot_read_fails_closed() {
 #[tokio::test]
 async fn an_uncommitted_sync_changes_nothing_queries_see() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
 
@@ -658,7 +658,7 @@ async fn an_uncommitted_sync_changes_nothing_queries_see() {
 #[tokio::test]
 async fn a_manifest_listing_an_object_twice_fails_closed() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let manifest_path = vault
@@ -684,7 +684,7 @@ async fn a_manifest_listing_an_object_twice_fails_closed() {
     };
     let envelope = hpke_seal_to_tenant(
         &keypair.public_key(),
-        &manifest_info(&tenant, &connector, &version),
+        &manifest_info(keypair.suite(), &tenant, &connector, &version),
         &serde_json::to_vec(&doubled).expect("json"),
     )
     .expect("seal");

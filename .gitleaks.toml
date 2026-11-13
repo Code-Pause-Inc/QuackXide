@@ -10,3 +10,10 @@ title = "QuackXide"
 
 [extend]
 useDefault = true
+
+# Public X-Wing known-answer vectors (seeds, ciphertexts and shared secrets
+# from @noble/post-quantum, all test-only), checked by
+# backend/crates/platform-crypto/tests/hpk2_vectors.rs.
+[[allowlists]]
+description = "test-only X-Wing known-answer vectors"
+paths = ['''^fixtures/envelope/hpk2-kem\.json$''']

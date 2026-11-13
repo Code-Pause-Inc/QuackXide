@@ -308,7 +308,8 @@ production release (details in `docs/PROJECT_SCOPE.md`):
 * **Encrypted results** — results leave as JSON over TLS. Sealing them to the
   researcher's key and signing them in the enclave (P55) remain.
 * **Post-quantum cryptography** — target is X25519 + ML-KEM-768 and
-  Ed25519 + ML-DSA-65; current suites are X25519 and RS256.
+  Ed25519 + ML-DSA-65. Backend tenant envelopes are X-Wing (`HPK2`); the
+  browser is X25519 (`HPK1`, development only) and tokens are RS256.
 
 ## Contributing
 

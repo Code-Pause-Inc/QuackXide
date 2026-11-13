@@ -1,7 +1,8 @@
 //! The shared envelope vectors (`fixtures/envelope/hpk1.json`) against the
 //! API: the enrollment keys the browser accepts and refuses are the ones the
 //! enrollment route accepts and refuses, and the upload route refuses the
-//! envelopes whose framing is broken.
+//! envelopes whose framing is broken. The keys are `HPK1` (X25519), so they
+//! enroll only in development; production refuses every one of them.
 
 mod common;
 
@@ -24,7 +25,10 @@ async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
     );
     let vectors: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).expect("vector file")).expect("json");
-    let app = build_app(common::app_state(
+    let mut development = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    development.config = Arc::new(common::development_config());
+    let app = build_app(development);
+    let production = build_app(common::app_state(
         SECRET,
         Arc::new(ObjectStoreVault::new_in_memory()),
     ));
@@ -46,6 +50,21 @@ async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
             StatusCode::BAD_REQUEST
         };
         assert_eq!(status, expected, "{}", case["name"]);
+
+        let (status, _) = send(
+            &production,
+            "PUT",
+            "/api/v1/drive/enrollment",
+            &[bearer(&token), json_header()],
+            body.to_string().into_bytes(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "production: {}",
+            case["name"]
+        );
     }
 }
 
@@ -66,13 +85,18 @@ async fn badly_framed_envelope_vectors_are_refused_by_the_upload_route() {
     ));
     let steward = TenantId::generate();
     let token = common::token_for(SECRET, steward);
-    let keypair = platform_crypto::TenantKeypair::generate();
+    // The browser seals uploads under HPK1 until P36.
+    let keypair = platform_crypto::TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
 
+    // Opening the relabelled frame is a suite mismatch, since `HPK2` is a
+    // known magic; without a key the route refuses it as too short for one.
     let framing = vectors["envelopes"]
         .as_array()
         .expect("envelope cases")
         .iter()
-        .filter(|case| case["error"] == "invalid envelope framing")
+        .filter(|case| {
+            ["wrong frame magic", "truncated frame"].contains(&case["name"].as_str().unwrap_or(""))
+        })
         .collect::<Vec<_>>();
     assert_eq!(framing.len(), 2, "wrong frame magic and truncated frame");
     for case in framing {

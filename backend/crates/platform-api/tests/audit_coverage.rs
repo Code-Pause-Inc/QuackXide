@@ -15,7 +15,7 @@ use platform_api::{AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
-use platform_crypto::TenantKeypair;
+use platform_crypto::{EnvelopeSuite, TenantKeypair};
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
@@ -67,7 +67,7 @@ async fn full_app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
 
     let query = ConnectorQueryService::new(
@@ -143,6 +143,89 @@ async fn data_access_hits_misses_and_auth_denials_are_audited() {
     );
 }
 
+/// PUT an X25519 (`HPK1`) public key to the enrollment route of `app`.
+async fn enroll_x25519(app: &Router, token: &str) -> StatusCode {
+    use base64::Engine as _;
+    let raw = TenantKeypair::generate(EnvelopeSuite::Hpk1)
+        .public_key()
+        .to_raw();
+    let body = serde_json::json!({
+        "hpke_public_key_b64": base64::engine::general_purpose::STANDARD.encode(raw),
+    });
+    send(
+        app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(token), json_header()],
+        body.to_string().into_bytes(),
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn x25519_enrollment_is_refused_in_production_and_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    // The default config is production (APP_ENV unset, ADR 0009).
+    let app = build_app(common::app_state(
+        SECRET,
+        Arc::new(ObjectStoreVault::new_in_memory()),
+    ));
+    assert_eq!(
+        enroll_x25519(&app, &token_for(tenant)).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn x25519_enrollment_is_accepted_in_development() {
+    let tenant = TenantId::generate();
+    let mut state = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let token = token_for(tenant);
+    assert_eq!(enroll_x25519(&app, &token).await, StatusCode::NO_CONTENT);
+    let (status, stored) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&stored).expect("json");
+    assert_eq!(parsed["suite"], "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM");
+}
+
+#[tokio::test]
+async fn envelope_of_another_suite_is_refused_and_audited() {
+    use platform_api::query::EnclaveKeyProvider as _;
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+    let envelope =
+        platform_crypto::hpke_seal_to_tenant(&hpk1.public_key(), b"info", b"rows").expect("seal");
+    let provider = DevKeyProvider::new(tenant, TenantKeypair::generate(EnvelopeSuite::Hpk2));
+    assert!(
+        provider
+            .open_envelope(tenant, b"info", &envelope)
+            .await
+            .is_err()
+    );
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
 #[tokio::test]
 async fn key_enrollment_handshake_is_audited_and_validated() {
     let capture = AuditCapture::install();
@@ -150,8 +233,8 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
     let app = full_app(tenant, ZkMode::Disabled).await;
     let token = token_for(tenant);
 
-    // A real X25519 public key enrolls.
-    let keypair = TenantKeypair::generate();
+    // A real X-Wing public key enrolls, recorded with its suite.
+    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk2);
     let key_b64 = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(keypair.public_key().to_raw())
@@ -178,6 +261,7 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
     assert_eq!(status, StatusCode::OK);
     let parsed: serde_json::Value = serde_json::from_slice(&stored).expect("json");
     assert_eq!(parsed["hpke_public_key_b64"], key_b64);
+    assert_eq!(parsed["suite"], "X-Wing+HKDF-SHA256+AES-256-GCM");
 
     // Malformed keys are rejected — and the rejection is audited.
     let (status, _) = send(
@@ -482,7 +566,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let snp = sim(SimulatedClaims::default());
 
     let pipeline = EnclavePipeline::new(snp.clone(), vault.clone(), false);
@@ -831,7 +915,7 @@ async fn research_catalog_is_audited() {
     let app = common::research_app(
         SECRET,
         steward,
-        TenantKeypair::generate(),
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
         dev_attestation(),
         false,
     )
@@ -944,7 +1028,7 @@ fn assert_event(capture: &AuditCapture, kind: &str, outcome: &str, detail: &str)
 async fn dataset_upload_is_audited() {
     let capture = AuditCapture::install();
     let steward = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk1);
     let key = keypair.public_key();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());
@@ -1085,7 +1169,7 @@ fn object_bytes(body: &[u8]) -> usize {
 async fn connector_snapshot_commit_and_prune_are_audited() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     // Two syncs: the second commits and prunes the first.
     let _vault = synced_vault(tenant, &keypair, 2).await;
     let events = capture.events();
