@@ -21,8 +21,8 @@ use envelope_wasm::{
     connector_object_info, research_result_info, snapshot_manifest_info, steward_upload_info,
 };
 use platform_crypto::{TenantKeypair, hpke_seal_to_tenant_with_rng};
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::{RngCore as _, SeedableRng};
 use serde_json::{Value, json};
 
 const RNG_SEED: [u8; 32] = *b"envelope vectors, test-only seed";
@@ -34,6 +34,29 @@ const TENANT: &str = "6f2c8a2e-1111-4222-8333-444455556666";
 const DATASET: &str = "00000000-dddd-4ddd-8ddd-000000000001";
 const OBJECT: &str = "00000000-aaaa-4bbb-8ccc-000000000001";
 const PLAINTEXT: &str = "synthetic cohort rows: site-a,42\nsite-b,17\n";
+
+/// rand 0.8's `StdRng` behind the `rand_core` 0.10 traits `hpke` 0.14 takes,
+/// so the committed vectors keep the ephemeral keys they were generated with.
+struct Rng08(StdRng);
+
+impl rand_core::TryRng for Rng08 {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.0.next_u32())
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.next_u64())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.fill_bytes(dst);
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for Rng08 {}
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/envelope")
@@ -52,7 +75,7 @@ fn utf8(bytes: Vec<u8>) -> String {
 }
 
 fn generate() -> Value {
-    let mut rng = StdRng::from_seed(RNG_SEED);
+    let mut rng = Rng08(StdRng::from_seed(RNG_SEED));
     let a = recipient("a");
     let b = recipient("b");
     let a_raw = a.public_key().to_raw();
@@ -90,7 +113,7 @@ fn generate() -> Value {
 
     let upload_info = steward_upload_info(TENANT, DATASET, OBJECT).unwrap();
     let other_info = steward_upload_info(TENANT, DATASET, DATASET).unwrap();
-    let seal = |to: &TenantKeypair, rng: &mut StdRng| {
+    let seal = |to: &TenantKeypair, rng: &mut Rng08| {
         hpke_seal_to_tenant_with_rng(&to.public_key(), &upload_info, PLAINTEXT.as_bytes(), rng)
             .expect("seal")
     };

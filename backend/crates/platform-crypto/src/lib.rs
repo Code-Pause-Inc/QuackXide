@@ -19,8 +19,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
+use hpke::rand_core::CryptoRng;
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
-use rand::{CryptoRng, RngCore};
 #[cfg(feature = "server")]
 use sha2::Sha256;
 use std::io::{self, Write};
@@ -314,33 +314,45 @@ pub fn hpke_seal_to_tenant(
     info: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    hpke_seal_to_tenant_with_rng(recipient, info, plaintext, &mut rand::rngs::OsRng)
-}
-
-/// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
-/// committed test-vector generator passes a seeded RNG; everything else
-/// calls [`hpke_seal_to_tenant`].
-pub fn hpke_seal_to_tenant_with_rng<R: CryptoRng + RngCore>(
-    recipient: &TenantPublicKey,
-    info: &[u8],
-    plaintext: &[u8],
-    rng: &mut R,
-) -> Result<Vec<u8>, CryptoError> {
-    let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, TenantKem, _>(
+    let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, TenantKem>(
         &OpModeS::Base,
         &recipient.0,
         info,
         plaintext,
         b"",
-        rng,
     )
     .map_err(|_| CryptoError::SealFailed)?;
+    Ok(frame(&encapped, &ciphertext))
+}
 
+/// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
+/// committed test-vector generator passes a seeded RNG; everything else
+/// calls [`hpke_seal_to_tenant`].
+pub fn hpke_seal_to_tenant_with_rng(
+    recipient: &TenantPublicKey,
+    info: &[u8],
+    plaintext: &[u8],
+    rng: &mut impl CryptoRng,
+) -> Result<Vec<u8>, CryptoError> {
+    let (encapped, ciphertext) =
+        hpke::single_shot_seal_with_rng::<TenantAead, TenantKdf, TenantKem>(
+            &OpModeS::Base,
+            &recipient.0,
+            info,
+            plaintext,
+            b"",
+            rng,
+        )
+        .map_err(|_| CryptoError::SealFailed)?;
+    Ok(frame(&encapped, &ciphertext))
+}
+
+fn frame(encapped: &KemEncappedKey, ciphertext: &[u8]) -> Vec<u8> {
     let mut envelope = Vec::with_capacity(MAGIC_BYTES + ENCAPPED_KEY_BYTES + ciphertext.len());
     envelope.extend_from_slice(&EnvelopeSuite::CURRENT.magic());
     envelope.extend_from_slice(&encapped.to_bytes());
-    envelope.extend_from_slice(&ciphertext);
-    Ok(envelope)
+    envelope.extend_from_slice(ciphertext);
+    envelope
 }
 
 fn parse_envelope(envelope: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
@@ -358,7 +370,7 @@ pub struct TenantKeypair {
 
 impl TenantKeypair {
     pub fn generate() -> Self {
-        let (private_key, public_key) = TenantKem::gen_keypair(&mut rand::rngs::OsRng);
+        let (private_key, public_key) = TenantKem::gen_keypair();
         Self {
             private_key,
             public_key,
@@ -415,14 +427,6 @@ impl TenantKeypair {
         )
         .map(SecretBytes::new)
         .map_err(|_| CryptoError::OpenFailed)
-    }
-}
-
-impl Drop for TenantKeypair {
-    fn drop(&mut self) {
-        if let Ok(zero_sk) = KemPrivateKey::from_bytes(&[0u8; X25519_PUBLIC_KEY_BYTES]) {
-            self.private_key = zero_sk;
-        }
     }
 }
 
