@@ -80,7 +80,7 @@ export default defineConfig(({ mode }) => {
             // Timings run only on request (`npm run bench:browser`).
             include: [
               "src/**/*.browser.test.ts",
-              ...(env.TIMINGS ? ["src/**/*.browser.timing.ts"] : []),
+              ...(env.TIMINGS === "1" ? ["src/**/*.browser.timing.ts"] : []),
             ],
             browser: {
               enabled: true,
