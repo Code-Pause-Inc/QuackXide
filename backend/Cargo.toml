@@ -117,7 +117,7 @@ parquet = { version = "59", features = ["arrow"] }
 datafusion = "55"                                                 # arrow/parquet 59 chosen to match
 
 # ── testing ─────────────────────────────────────────────────────────────────
-# Benchmarks only (docs/BENCHMARKS.md); no plots or HTML reports.
+# Benchmarks only (docs/BENCHMARKS.md). No plotters or rayon; runs pass --noplot.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1"
 # Seeded RNG for synth-data. synth-data uses rand_chacha's own rand_core

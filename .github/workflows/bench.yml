@@ -39,6 +39,11 @@ jobs:
             echo "Reference numbers from a shared GitHub-hosted runner; they vary between runs and never gate."
             echo
             echo '```'
+            lscpu | grep -E '^(Model name|CPU\(s\)):'
+            rustc -V
+            echo '```'
+            echo
+            echo '```'
             cat "$RUNNER_TEMP/bench.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
