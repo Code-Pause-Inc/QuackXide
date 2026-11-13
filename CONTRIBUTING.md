@@ -45,8 +45,9 @@ Every pull request runs:
 * a gitleaks secret scan of the full history;
 * a coverage report in the job summary;
 * when `backend/` or `rust-toolchain.toml` changes, the benchmarks in
-  `docs/BENCHMARKS.md`, in the job summary (report only, never fails on
-  the numbers);
+  `docs/BENCHMARKS.md` at the base commit and the head, in one job, in the
+  job summary; it fails when a benchmark is significantly more than 10 %
+  slower (not a required check);
 * the browser tests (`npm run test:browser`) in Chromium. Pushes to `main`
   and a nightly run add Firefox and WebKit.
 
