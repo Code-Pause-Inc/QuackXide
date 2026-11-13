@@ -72,18 +72,21 @@ overheads.
 
 ## Times
 
-Criterion's estimate, both suites from one run: run TBD on a GitHub-hosted
-`ubuntu-latest` runner.
+Criterion's estimate, both suites from one run:
+[run 43391725261](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43391725261)
+at commit `871b55d`, on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC
+7763, 4 CPUs, `rustc 1.94.1`. The numbers hold until the benchmarked code
+changes; later runs of the same code differ only by runner noise.
 
 | Benchmark | Payload | `HPK1` time | `HPK2` time | `HPK1` throughput | `HPK2` throughput |
 | --- | --- | --- | --- | --- | --- |
-| `keygen` | | TBD | TBD | | |
-| `seal/32B` | 32 B | TBD | TBD | TBD | TBD |
-| `open/32B` | 32 B | TBD | TBD | TBD | TBD |
-| `seal/4KiB` | 4 KiB | TBD | TBD | TBD | TBD |
-| `open/4KiB` | 4 KiB | TBD | TBD | TBD | TBD |
-| `seal/4MiB` | 4 MiB | TBD | TBD | TBD | TBD |
-| `open/4MiB` | 4 MiB | TBD | TBD | TBD | TBD |
+| `keygen` | | 33.2 µs | 121.3 µs | | |
+| `seal/32B` | 32 B | 125.6 µs | 189.7 µs | 249 KiB/s | 165 KiB/s |
+| `open/32B` | 32 B | 93.3 µs | 308.3 µs | 335 KiB/s | 101 KiB/s |
+| `seal/4KiB` | 4 KiB | 128.2 µs | 191.8 µs | 30.5 MiB/s | 20.4 MiB/s |
+| `open/4KiB` | 4 KiB | 95.9 µs | 310.8 µs | 40.7 MiB/s | 12.6 MiB/s |
+| `seal/4MiB` | 4 MiB | 5.63 ms | 5.71 ms | 711 MiB/s | 701 MiB/s |
+| `open/4MiB` | 4 MiB | 2.65 ms | 2.87 ms | 1.47 GiB/s | 1.36 GiB/s |
 
 ## Targets and regression threshold
 
