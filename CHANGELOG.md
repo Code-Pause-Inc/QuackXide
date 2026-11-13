@@ -30,6 +30,13 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Engine query benchmarks and a regression check (P73, #185). Criterion
+  times two research-style queries in `quackxide-engine` over `synth-data`
+  tables of 10 000 to 1 000 000 rows. On pull requests the `bench` workflow
+  benchmarks the base commit and the head in one job, and
+  `scripts/bench-compare.sh` fails it when a benchmark's whole 95 %
+  interval is more than 10 % slower. `docs/BENCHMARKS.md` records targets
+  for the hybrid suite and the engine.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
   4 MiB, and a unit test pins the 52-byte envelope overhead. The `bench`
