@@ -11,7 +11,8 @@
     "typecheck": "node node_modules/typescript7/bin/tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run --project node --project dom",
-    "test:browser": "vitest run --project 'browser*'"
+    "test:browser": "vitest run --project 'browser*'",
+    "bench:browser": "TIMINGS=1 vitest run --project 'browser*' --silent=false timing"
   },
   "dependencies": {
     "react": "^19.3.1",
