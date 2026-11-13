@@ -11,16 +11,19 @@ From `backend/`:
 
 ```sh
 # Each benchmark once, as a quick check that they run.
-cargo bench -p platform-crypto --bench hpke --locked -- --test
+cargo bench -p platform-crypto -p quackxide-engine --bench hpke --bench query --locked -- --test
 
 # The full run.
-cargo bench -p platform-crypto --bench hpke --locked -- --noplot
+cargo bench -p platform-crypto -p quackxide-engine --bench hpke --bench query --locked -- --noplot
 ```
 
 The benchmarks use [criterion](https://docs.rs/criterion) and live in
-`backend/crates/platform-crypto/benches/`. The bench target sets
-`test = true`, so `cargo test` in `scripts/check.sh` runs each benchmark
-once, untimed: a failed seal or open, or the suite check, fails it.
+`backend/crates/platform-crypto/benches/` (envelope suites) and
+`backend/crates/quackxide-engine/benches/` (queries). The envelope bench
+target sets `test = true`, so `cargo test` in `scripts/check.sh` runs each
+envelope benchmark once, untimed: a failed seal or open, or the suite
+check, fails it. `quackxide-engine/tests/bench_queries.rs` checks that the
+engine benchmarks' queries pass the disclosure gate.
 
 ## Method
 
@@ -36,13 +39,24 @@ once, untimed: a failed seal or open, or the suite check, fails it.
   timed loop; open includes wiping the plaintext it returns. Every timed
   seal and open must succeed, and each group refuses to run on any suite
   but its own.
+* `engine/<query>/<rows>` times one research-style query in `QueryScope`:
+  register the Parquet, plan, execute and apply the disclosure gate
+  (`MinCountThreshold { k: 5 }`), on a multi-thread tokio runtime as
+  `platform-api` runs it. `count` is
+  `SELECT region, COUNT(*) AS n FROM t GROUP BY region`, `filter` is
+  `SELECT bucket, COUNT(*) AS n FROM t WHERE flag GROUP BY bucket`, over
+  `synth-data`'s `wide` table at 10 000, 100 000 and 1 000 000 rows, and
+  1 000 000 rows in 8 objects (`1000000x8`). The data is generated before
+  timing. These use 40 samples in 11 s, since a 1 M-row query takes about
+  0.1 s.
 * The `bench` workflow (`.github/workflows/bench.yml`) runs these on pull
   requests that touch `backend/` or `rust-toolchain.toml`, and on demand,
   and writes the output to the job summary. Shared GitHub-hosted runners
-  vary from run to run, so the numbers are a reference and never fail a
-  pull request. On pushes to `main` it only builds them, to save the build
-  cache that pull requests restore. Only that run saves a cache, so no
-  saved cache holds benchmark results.
+  vary from run to run, so a single run's numbers are a reference; the
+  regression check below compares the base and the head on one runner. On
+  pushes to `main` it only builds them, to save the build cache that pull
+  requests restore. Only that run saves a cache, so no saved cache holds
+  benchmark results.
 
 ## Comparing a change
 
@@ -63,6 +77,14 @@ fails if the branch adds a benchmark.
 This shows whether a change moved existing numbers. One suite's cost
 against another is read side by side from one run, where both groups run
 together; never compare tables from different runs.
+
+On a pull request, the `bench` workflow does this itself: it benchmarks the
+base commit with `--save-baseline base`, then the head with
+`--baseline-lenient base`, on the same runner, and
+`scripts/bench-compare.sh` judges the result (below). The job fails when a
+benchmark regressed; it is not a required check. Run the script on your own
+comparison with `scripts/bench-compare.sh backend/target/criterion` (needs
+`jq`).
 
 ## Suites
 
@@ -97,23 +119,38 @@ runner noise.
 | `seal/4MiB` | 4 MiB | 5.63 ms | 5.72 ms | 711 MiB/s | 699 MiB/s |
 | `open/4MiB` | 4 MiB | 2.64 ms | 2.86 ms | 1.48 GiB/s | 1.37 GiB/s |
 
+## Engine query times
+
+From this PR's CI run: TBD.
+
+| Benchmark | Rows | Objects | `count` | `filter` |
+| --- | --- | --- | --- | --- |
+| `engine/<query>/10000` | 10 000 | 1 | TBD | TBD |
+| `engine/<query>/100000` | 100 000 | 1 | TBD | TBD |
+| `engine/<query>/1000000` | 1 000 000 | 1 | TBD | TBD |
+| `engine/<query>/1000000x8` | 1 000 000 | 8 | TBD | TBD |
+
 ## Targets and regression threshold
 
-**Proposed, needs @AxolDad.**
+**Regression threshold.** A benchmark regresses when the lower bound of the
+95 % confidence interval of its mean change against the base commit is
+above +10 %, so the whole interval is a slowdown of more than 10 %.
+Comparing against the numbers recorded above instead would flag runner
+noise, which often exceeds 10 % between runs.
 
-* No absolute targets yet; the hybrid numbers above are the input for
-  them.
-* A regression check that benchmarks the base and head commits in the same
-  job, on the same runner, and flags a benchmark only when criterion reports
-  a significant change of more than 10 %. Comparing against the numbers
-  recorded above would flag runner noise, which often exceeds 10 % between
-  runs.
+**Targets**, on a GitHub-hosted `ubuntu-latest` runner, read against the
+recorded tables:
+
+* `hpk2/keygen` at most 1 ms.
+* `hpk2/seal/4KiB` and `hpk2/open/4KiB` at most 1 ms each.
+* `hpk2/seal/4MiB` and `hpk2/open/4MiB` at most 20 ms each.
+* The hybrid suite's cost: `hpk2` at most 4× `hpk1` from 32 B to 4 KiB, and
+  at most 1.25× at 4 MiB, in the same run.
+* Engine queries: TBD, set from the first recorded run at about 1.5× its
+  times.
 
 ## Still to come (#185)
 
-* Query latency in `quackxide-engine` at stated dataset sizes and object
-  counts, on data from `synth-data`.
 * Browser chunk encryption (`encryptPayload` in
   `frontend/src/lib/crypto/core.ts`) as a Vitest bench.
 * The wasm envelope build's bundle size and load time (#171).
-* The regression check above, on a schedule as well as on pull requests.
