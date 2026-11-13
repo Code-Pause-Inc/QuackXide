@@ -30,8 +30,10 @@ The benchmarks use [criterion](https://docs.rs/criterion) and live in
 * `hpk1/keygen` times `TenantKeypair::generate`. `hpk1/seal/<size>` and
   `hpk1/open/<size>` time one `HPK1` envelope seal or open at three payload
   sizes: 32 B (a wrapped key), 4 KiB (a sealed query or result) and 4 MiB
-  (one drive chunk, `CHUNK_SIZE_BYTES`). Keys and the envelope to open are
-  built outside the timed loop.
+  (a large object, such as a connector snapshot). Keys and the envelope to
+  open are built outside the timed loop; open includes wiping the plaintext
+  it returns. Every timed seal and open must succeed, and the `hpk1` IDs
+  refuse to run on any other suite.
 * The `bench` workflow (`.github/workflows/bench.yml`) runs these on pull
   requests that touch `backend/`, and on demand, and writes the output to
   the job summary. Shared GitHub-hosted runners vary from run to run, so the
@@ -40,18 +42,22 @@ The benchmarks use [criterion](https://docs.rs/criterion) and live in
 ## Comparing a change
 
 Compare on one machine, in one session, never against numbers from another
-run:
+machine (including the table below):
 
 ```sh
 # On main
-cargo bench -p platform-crypto --bench hpke --locked -- --noplot --save-baseline hpk1
+cargo bench -p platform-crypto --bench hpke --locked -- --noplot --save-baseline main
 # On the branch
-cargo bench -p platform-crypto --bench hpke --locked -- --noplot --baseline hpk1
+cargo bench -p platform-crypto --bench hpke --locked -- --noplot --baseline-lenient main
 ```
 
-criterion prints the change for each benchmark and whether it is
-significant. The hybrid suite (#187) reports its cost this way, and adds its
-own benchmarks next to the `hpk1` ones.
+criterion prints the change for each benchmark that exists on both sides and
+whether it is significant. `--baseline` instead of `--baseline-lenient`
+fails if the branch adds a benchmark.
+
+This shows whether a change moved existing numbers. A new suite's cost
+against `HPK1` is read side by side from one run: the hybrid suite (#187)
+adds its own group next to `hpk1`, and both run together.
 
 ## `HPK1` baseline
 
@@ -62,7 +68,8 @@ Suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
 tag. The unit test `hpk1_envelope_overhead_is_52_bytes` in
 `platform-crypto` pins it.
 
-**Times.** Machine: GitHub-hosted `ubuntu-latest` runner, run TBD.
+**Times.** Machine: GitHub-hosted `ubuntu-latest` runner (CPU and
+toolchain as the run's job summary records them), run TBD.
 
 | Benchmark | Payload | Time | Throughput |
 | --- | --- | --- | --- |
