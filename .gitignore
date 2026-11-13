@@ -17,3 +17,5 @@ coverage/
 
 # Browser envelope module, built by scripts/build-wasm.sh
 frontend/src/lib/crypto/wasm/
+# Vitest browser-mode failure screenshots
+frontend/.vitest/
