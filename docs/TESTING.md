@@ -119,8 +119,9 @@ which fails when the file and its generator disagree; regenerate with
 `scripts/build-wasm.sh`), which the Rust test must open.
 `frontend/src/lib/crypto/envelope.test.ts` checks the same files against the
 wasm module, including opening every `hpk1.json` envelope with the
-recipients' test-only private keys (the Rust-to-browser direction), and `platform-api/tests/envelope_vectors.rs` runs the
-enrollment cases through the enrollment route.
+recipients' test-only private keys (the Rust-to-browser direction), and
+`platform-api/tests/envelope_vectors.rs` runs the enrollment cases through
+the enrollment route.
 
 ### Fuzz targets
 

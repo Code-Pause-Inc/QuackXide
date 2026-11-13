@@ -46,8 +46,10 @@ pub fn open_envelope(
 ) -> Result<Vec<u8>, CryptoError> {
     let opened = hpke_open_with_private_key(&private_key, info, envelope);
     private_key.zeroize();
-    // The plaintext leaves wasm memory as a copy; this one is zeroized when
-    // `SecretBytes` drops.
+    // `SecretBytes` zeroizes its buffer on drop, but the `Vec` returned to
+    // JavaScript is a plain copy: wasm-bindgen copies it out and frees it
+    // without zeroing, so its bytes can linger in wasm linear memory until
+    // the allocator reuses them.
     opened.map(|plaintext| plaintext.expose().to_vec())
 }
 

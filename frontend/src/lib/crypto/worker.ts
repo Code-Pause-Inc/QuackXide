@@ -115,8 +115,9 @@ async function loadOrCreateKeys(): Promise<{ keys: DeviceKeys; created: boolean 
 }
 
 async function handleInit(): Promise<InitResult> {
-  // ensureKeys loads the envelope module to create the HPKE key, so a
-  // browser that cannot run it is reported here, not first on an upload.
+  // When no HPKE key is stored yet, ensureKeys loads the envelope module to
+  // create one, so a browser that cannot run it is reported here rather than
+  // first on an upload. With a stored key the module loads on first use.
   const { keys, created } = await ensureKeys();
   const publicKeyRaw = keys.hpke?.publicKeyRaw ?? null;
   const hpkePublicKeyB64 = publicKeyRaw ? toB64(publicKeyRaw) : null;

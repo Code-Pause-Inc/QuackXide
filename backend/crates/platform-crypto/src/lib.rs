@@ -325,13 +325,6 @@ fn private_key_from_raw(raw: &[u8]) -> Result<KemPrivateKey, CryptoError> {
     KemPrivateKey::from_bytes(raw).map_err(|_| CryptoError::InvalidKeyLength)
 }
 
-/// Overwrite a private key in place; the KEM type does not zeroize itself.
-fn scrub(private_key: &mut KemPrivateKey) {
-    if let Ok(zero) = KemPrivateKey::from_bytes(&[0u8; X25519_PRIVATE_KEY_BYTES]) {
-        *private_key = zero;
-    }
-}
-
 fn open_with(
     private_key: &KemPrivateKey,
     info: &[u8],
@@ -356,30 +349,27 @@ fn open_with(
 /// enrollment key this way from the private key it generated
 /// (ADR 0007, "Browser private-key storage").
 pub fn tenant_public_key_from_private(raw: &[u8]) -> Result<TenantPublicKey, CryptoError> {
-    let mut private_key = private_key_from_raw(raw)?;
-    let public_key = TenantKem::sk_to_pk(&private_key);
-    scrub(&mut private_key);
-    Ok(TenantPublicKey(public_key))
+    let private_key = private_key_from_raw(raw)?;
+    Ok(TenantPublicKey(TenantKem::sk_to_pk(&private_key)))
 }
 
 /// Open a framed envelope with a raw tenant private key, choosing the suite
 /// from the frame magic. This is the browser's open path: the crypto worker
-/// decrypts the device key just before the call and the key is scrubbed
-/// when it returns. Fails on tamper, wrong recipient, a mismatched `info`
+/// decrypts the device key just before the call and drops it when it
+/// returns. Fails on tamper, wrong recipient, a mismatched `info`
 /// binding or an unknown frame.
 pub fn hpke_open_with_private_key(
     private_key: &[u8],
     info: &[u8],
     envelope: &[u8],
 ) -> Result<SecretBytes, CryptoError> {
-    let mut private_key = private_key_from_raw(private_key)?;
-    let opened = open_with(&private_key, info, envelope);
-    scrub(&mut private_key);
-    opened
+    let private_key = private_key_from_raw(private_key)?;
+    open_with(&private_key, info, envelope)
 }
 
 /// Test/dev-only tenant keypair. Production tenant private keys are
-/// generated non-extractable in the browser and never exist server-side.
+/// generated in the browser, stored there sealed under the device seed key
+/// (ADR 0007, "Browser private-key storage"), and never exist server-side.
 pub struct TenantKeypair {
     private_key: KemPrivateKey,
     public_key: KemPublicKey,
@@ -432,12 +422,6 @@ impl TenantKeypair {
     /// mismatched `info` binding.
     pub fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, CryptoError> {
         open_with(&self.private_key, info, envelope)
-    }
-}
-
-impl Drop for TenantKeypair {
-    fn drop(&mut self) {
-        scrub(&mut self.private_key);
     }
 }
 
