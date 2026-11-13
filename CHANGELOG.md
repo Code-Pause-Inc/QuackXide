@@ -30,6 +30,12 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
+  `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
+  4 MiB, and a unit test pins the 52-byte envelope overhead. The `bench`
+  workflow runs them on pull requests that touch `backend/` and reports
+  only. `docs/BENCHMARKS.md` records the method and the baseline the
+  hybrid suite (#187) is compared against.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before

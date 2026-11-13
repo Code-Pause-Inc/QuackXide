@@ -43,7 +43,9 @@ Every pull request runs:
 * a build of every fuzz target (`backend/fuzz/`), which also fails if
   `backend/fuzz/Cargo.lock` is stale;
 * a gitleaks secret scan of the full history;
-* a coverage report in the job summary.
+* a coverage report in the job summary;
+* when `backend/` changes, the benchmarks in `docs/BENCHMARKS.md`, in the
+  job summary (report only, never fails on the numbers).
 
 Every cargo build, check, clippy and test command runs with `--locked`, so
 commit `Cargo.lock` (and `backend/fuzz/Cargo.lock`, which a workspace
