@@ -25,4 +25,10 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+synth-data.workspace = true
 tokio.workspace = true
+
+[[bench]]
+name = "query"
+harness = false
