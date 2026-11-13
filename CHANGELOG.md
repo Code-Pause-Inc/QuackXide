@@ -165,6 +165,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* A follow-up access request's approval adds its query budget to the
+  existing grant instead of being dropped, and a retry of the same
+  approval adds nothing (`BudgetLedger::top_up_once`). A pending request
+  for an unpublished listing can no longer be approved (#96).
 * GCS emulator writes (`STORAGE_EMULATOR_HOST`) no longer ask the GCE
   metadata server for a credential: `object_store` 0.13 skips signing on
   reads only, so the emulator client now carries a placeholder credential.

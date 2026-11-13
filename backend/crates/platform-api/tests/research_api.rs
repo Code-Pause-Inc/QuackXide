@@ -489,6 +489,15 @@ impl BudgetLedger for FailFirstOpen {
         self.inner.top_up(grant_id, additional).await
     }
 
+    async fn top_up_once(
+        &self,
+        grant_id: &str,
+        key: &str,
+        additional: u64,
+    ) -> Result<BudgetState, BudgetError> {
+        self.inner.top_up_once(grant_id, key, additional).await
+    }
+
     async fn state(&self, grant_id: &str) -> Result<Option<BudgetState>, TenancyError> {
         self.inner.state(grant_id).await
     }
@@ -959,4 +968,109 @@ async fn approving_a_denied_request_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = research_query(&app, researcher, steward).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Publishes the steward's `health` listing; returns its id.
+async fn publish(app: &Router, steward: TenantId) -> String {
+    let (status, listing) = post(app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
+    assert_eq!(status, StatusCode::OK, "publish: {listing}");
+    listing["listing_id"].as_str().expect("id").to_owned()
+}
+
+/// Files `researcher`'s request for `listing_id`; returns the request id.
+async fn request_listing(app: &Router, listing_id: &str, researcher: TenantId) -> String {
+    let (status, request) = post(
+        app,
+        &format!("/api/v1/catalog/{listing_id}/request"),
+        &token_for(researcher),
+        "{}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "request: {request}");
+    request["request_id"].as_str().expect("id").to_owned()
+}
+
+#[tokio::test]
+async fn follow_up_approval_adds_its_budget_to_the_grant() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let listing_id = publish(&app, steward).await;
+
+    // The first request is approved with 2 query units, and both are spent.
+    let first = request_listing(&app, &listing_id, researcher).await;
+    let approve = |id: &str| format!("/api/v1/research/requests/{id}/approve");
+    let (status, _) = post(&app, &approve(&first), &stoken, r#"{"query_budget":2}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    for _ in 0..2 {
+        assert_eq!(
+            research_query(&app, researcher, steward).await.0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        research_query(&app, researcher, steward).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // A follow-up request approved with 3 units adds them to what is spent.
+    let follow_up = request_listing(&app, &listing_id, researcher).await;
+    assert_ne!(follow_up, first);
+    let (status, resolved) =
+        post(&app, &approve(&follow_up), &stoken, r#"{"query_budget":3}"#).await;
+    assert_eq!(status, StatusCode::OK, "follow-up: {resolved}");
+    assert_eq!(resolved["grant"]["budget"]["limit"], 5);
+    assert_eq!(resolved["grant"]["budget"]["spent"], 2);
+    let (status, body) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(body["budget_remaining"], 2);
+
+    // Retrying the follow-up approval adds nothing more.
+    let (status, again) = post(&app, &approve(&follow_up), &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "retry: {again}");
+    assert_eq!(again["grant"]["budget"]["limit"], 5);
+}
+
+#[tokio::test]
+async fn approving_a_request_for_an_unpublished_listing_is_404() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let listing_id = publish(&app, steward).await;
+    let request_id = request_listing(&app, &listing_id, researcher).await;
+
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/v1/catalog/{listing_id}"),
+        &stoken,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Approval is refused and mints nothing; the steward can still deny.
+    let uri = |action: &str| format!("/api/v1/research/requests/{request_id}/{action}");
+    let (status, _) = post(&app, &uri("approve"), &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "research.catalog"
+                && e.outcome == "denied"
+                && e.detail
+                    .contains(&format!("request={request_id} reason=unpublished"))),
+        "{:?}",
+        capture.events()
+    );
+    assert_eq!(
+        research_query(&app, researcher, steward).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _) = post(&app, &uri("deny"), &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK);
 }

@@ -148,25 +148,41 @@ impl ResearchService {
             .create(steward, researcher, connector.as_str())
             .await
             .map_err(|_| ApiError::Backend)?;
-        self.fund_grant(&grant, query_budget).await
+        self.fund_grant(&grant, query_budget, None).await
     }
 
-    /// Open the query budget of a grant that was just created or found
-    /// active, audit the grant, and return it with its budget as JSON. Both
-    /// [`grant`](Self::grant) and the approval retry (`grant_on_retry`) use
-    /// it, so the two paths cannot drift apart.
+    /// Fund the query budget of a grant that was just created or found
+    /// active, audit the grant, and return it with its budget as JSON. A
+    /// direct grant opens its budget; re-granting reuses the grant id, so it
+    /// never resets spend. An access-request approval (`approval` is its
+    /// request id) adds its budget once, on top of what the grant already
+    /// has: a follow-up request tops the grant up, and a retry of the same
+    /// approval adds nothing. All grant paths use it, so they cannot drift.
     async fn fund_grant(
         &self,
         grant: &DatasetGrant,
         query_budget: Option<u64>,
+        approval: Option<&str>,
     ) -> Result<Value, ApiError> {
-        // Insert-if-absent: re-granting reuses the grant id, so it can never
-        // reset spend — allocation only rises, via explicit top-ups.
-        let budget = self
-            .budgets
-            .open(&grant.grant_id, query_budget.unwrap_or(self.default_budget))
-            .await
-            .map_err(|_| ApiError::Backend)?;
+        let units = query_budget.unwrap_or(self.default_budget);
+        let id = &grant.grant_id;
+        let budget = match approval {
+            None => self
+                .budgets
+                .open(id, units)
+                .await
+                .map_err(|_| ApiError::Backend)?,
+            Some(request_id) => {
+                self.budgets
+                    .open(id, 0)
+                    .await
+                    .map_err(|_| ApiError::Backend)?;
+                self.budgets
+                    .top_up_once(id, request_id, units)
+                    .await
+                    .map_err(|_| ApiError::Backend)?
+            }
+        };
         let researcher = grant.researcher_tenant;
         let connector = &grant.connector;
         security_audit_event(
@@ -442,10 +458,23 @@ impl ResearchService {
             // Re-run the steps below for the request's own steward only.
             // Denied stays terminal.
             None if approve => {
-                let request = self
-                    .approved_request(steward, request_id)
-                    .await?
-                    .ok_or(ApiError::NotFound)?;
+                let Some(request) = self.approved_request(steward, request_id).await? else {
+                    // Still Pending after an approval: its listing was
+                    // unpublished. The caller gets the same "not found".
+                    if self
+                        .own_request(steward, request_id, RequestStatus::Pending)
+                        .await?
+                        .is_some()
+                    {
+                        security_audit_event(
+                            AuditKind::ResearchCatalog,
+                            Some(steward),
+                            "denied",
+                            &format!("approve refused request={request_id} reason=unpublished"),
+                        );
+                    }
+                    return Err(ApiError::NotFound);
+                };
                 (request, true)
             }
             // Denying an Approved request is refused. Audit the refusal;
@@ -502,7 +531,12 @@ impl ResearchService {
             self.grant_on_retry(steward, &request, &connector, query_budget)
                 .await?
         } else {
-            self.grant(steward, request.researcher_tenant, &connector, query_budget)
+            let grant = self
+                .grants
+                .create(steward, request.researcher_tenant, connector.as_str())
+                .await
+                .map_err(|_| ApiError::Backend)?;
+            self.fund_grant(&grant, query_budget, Some(&request.request_id))
                 .await?
         };
         let retry_note = if retry { " retry=true" } else { "" };
@@ -526,6 +560,17 @@ impl ResearchService {
         steward: TenantId,
         request_id: &str,
     ) -> Result<Option<AccessRequest>, ApiError> {
+        self.own_request(steward, request_id, RequestStatus::Approved)
+            .await
+    }
+
+    /// The caller's own request `request_id` as steward, if it has `status`.
+    async fn own_request(
+        &self,
+        steward: TenantId,
+        request_id: &str,
+        status: RequestStatus,
+    ) -> Result<Option<AccessRequest>, ApiError> {
         Ok(self
             .catalog
             .list_requests_for(steward)
@@ -533,9 +578,7 @@ impl ResearchService {
             .map_err(|_| ApiError::Backend)?
             .into_iter()
             .find(|r| {
-                r.request_id == request_id
-                    && r.steward_tenant == steward
-                    && r.status == RequestStatus::Approved
+                r.request_id == request_id && r.steward_tenant == steward && r.status == status
             }))
     }
 
@@ -572,7 +615,8 @@ impl ResearchService {
                 return Err(ApiError::NotFound);
             }
         };
-        self.fund_grant(&grant, query_budget).await
+        self.fund_grant(&grant, query_budget, Some(&request.request_id))
+            .await
     }
 }
 

@@ -132,7 +132,8 @@ pub trait CatalogRegistry: Send + Sync {
     /// Approved request with `list_requests_for`. An approval records its
     /// query budget in the same step (`approved_budget`): `budget_override`,
     /// else the listing's included budget. A denial ignores
-    /// `budget_override`.
+    /// `budget_override`. A request whose listing is no longer published
+    /// cannot be approved (`None`, and it stays Pending); it can be denied.
     async fn resolve(
         &self,
         steward: TenantId,
@@ -305,9 +306,14 @@ impl CatalogRegistry for InMemoryCatalogRegistry {
                     && request.status == RequestStatus::Pending =>
             {
                 if approve {
-                    let listed = listings.get(&request.listing_id).map(|l| l.grant_budget);
+                    let Some(listing) = listings
+                        .get(&request.listing_id)
+                        .filter(|listing| listing.published)
+                    else {
+                        return Ok(None);
+                    };
                     request.status = RequestStatus::Approved;
-                    request.approved_budget = budget_override.or(listed);
+                    request.approved_budget = budget_override.or(Some(listing.grant_budget));
                 } else {
                     request.status = RequestStatus::Denied;
                 }
