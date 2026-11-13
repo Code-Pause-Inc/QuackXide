@@ -68,18 +68,20 @@ Suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
 tag. The unit test `hpk1_envelope_overhead_is_52_bytes` in
 `platform-crypto` pins it.
 
-**Times.** Machine: GitHub-hosted `ubuntu-latest` runner (CPU and
-toolchain as the run's job summary records them), run TBD.
+**Times.** Criterion's estimate from
+[run 43373874498](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43373874498)
+on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC 9V45, 4 CPUs,
+`rustc 1.94.1`.
 
 | Benchmark | Payload | Time | Throughput |
 | --- | --- | --- | --- |
-| `hpk1/keygen` | | TBD | |
-| `hpk1/seal/32B` | 32 B | TBD | TBD |
-| `hpk1/open/32B` | 32 B | TBD | TBD |
-| `hpk1/seal/4KiB` | 4 KiB | TBD | TBD |
-| `hpk1/open/4KiB` | 4 KiB | TBD | TBD |
-| `hpk1/seal/4MiB` | 4 MiB | TBD | TBD |
-| `hpk1/open/4MiB` | 4 MiB | TBD | TBD |
+| `hpk1/keygen` | | 22.0 µs | |
+| `hpk1/seal/32B` | 32 B | 80.2 µs | 390 KiB/s |
+| `hpk1/open/32B` | 32 B | 55.9 µs | 559 KiB/s |
+| `hpk1/seal/4KiB` | 4 KiB | 82.6 µs | 47.3 MiB/s |
+| `hpk1/open/4KiB` | 4 KiB | 59.7 µs | 65.4 MiB/s |
+| `hpk1/seal/4MiB` | 4 MiB | 5.70 ms | 702 MiB/s |
+| `hpk1/open/4MiB` | 4 MiB | 3.43 ms | 1.14 GiB/s |
 
 ## Targets and regression threshold
 
