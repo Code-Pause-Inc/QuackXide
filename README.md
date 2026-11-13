@@ -224,7 +224,8 @@ locally across isolated networks (`public_net` and `internal: true`
 
 `enclave-api` keeps its sealed snapshots in a directory on the
 `enclave_vault` volume (`STORAGE_LOCAL_DIR`, dev builds only), and the test
-script checks that it holds only ciphertext. No GCS emulator is part of the
+script checks that it holds only ciphertext, besides each snapshot's
+plaintext record, which names only its suite. No GCS emulator is part of the
 stack: `fake-gcs-server` does not accept the uploads `object_store` 0.13
 sends (#153).
 

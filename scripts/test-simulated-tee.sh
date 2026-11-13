@@ -4,7 +4,8 @@
 # checked by the token verifier before key release (ADR 0004), the research
 # lifecycle (publish, request, approve, query under disclosure control and a
 # budget, revoke), refusal of tampered tokens, and a vault that holds only
-# ciphertext. Needs Docker, curl, openssl and jq.
+# ciphertext, besides each snapshot's plaintext record. Needs Docker, curl,
+# openssl and jq.
 #
 # Not covered yet:
 # - An approval retry after a revoke. On main it still restores access
@@ -141,7 +142,7 @@ RESEARCH_MIN_COHORT_SIZE="${MIN_COHORT}" \
   docker compose -f "${COMPOSE_FILE}" up -d enclave-api
 wait_for_http "http://127.0.0.1:8080/healthz"
 
-echo "==> [4/7] Checking that the vault holds only ciphertext..."
+echo "==> [4/7] Checking that the vault holds only ciphertext and snapshot records..."
 # enclave-api's vault is a directory in the enclave_vault volume (#153).
 VAULT_COPY=$(mktemp -d)
 docker compose -f "${COMPOSE_FILE}" cp enclave-api:/var/lib/quackxide/vault/. "${VAULT_COPY}"
@@ -153,7 +154,23 @@ if [[ "${OBJECT_COUNT}" -eq 0 ]]; then
 fi
 # Every object must be an HPK1 envelope (platform-crypto's frame): the magic,
 # a 32-byte encapsulated key, then ciphertext ending in a 16-byte GCM tag.
+# The one exception is each snapshot's plaintext record
+# (`connectors/{slug}/records/{version}.json`, ADR 0012). Only connector
+# snapshots are written here, and theirs must name their own version and the
+# HPK1 suite, and nothing else (`docs/THREAT_MODEL.md`, "Metadata").
+RECORD_COUNT=0
+RECORD_PATH='^connectors/[^/]+/records/([^/]+)\.json$'
 while IFS= read -r -d '' object; do
+  if [[ "${object#"${TENANT_DATA}/"}" =~ ${RECORD_PATH} ]]; then
+    if ! jq -e --arg version "${BASH_REMATCH[1]}" \
+        'keys == ["suite", "version"] and .version == $version and .suite == "HPK1"' \
+        "${object}" >/dev/null 2>&1; then
+      echo "ERROR: ${object#"${VAULT_COPY}/"} is not a snapshot record holding only its suite" >&2
+      exit 1
+    fi
+    RECORD_COUNT=$((RECORD_COUNT + 1))
+    continue
+  fi
   if ! cmp -s -n 4 <(printf 'HPK1') "${object}" || (( $(wc -c < "${object}") < 52 )); then
     echo "ERROR: ${object#"${VAULT_COPY}/"} is not an HPK1 envelope" >&2
     exit 1
@@ -166,7 +183,7 @@ for plaintext in "Sample Customer" "PAR1"; do
     exit 1
   fi
 done
-echo "    ${OBJECT_COUNT} tenant objects stored, all HPK1 envelopes, none with plaintext."
+echo "    ${OBJECT_COUNT} tenant objects stored: $((OBJECT_COUNT - RECORD_COUNT)) HPK1 envelopes and ${RECORD_COUNT} snapshot records holding only their suite, none with plaintext data."
 
 TOKEN=$(mint_jwt "${TENANT_ID}")
 

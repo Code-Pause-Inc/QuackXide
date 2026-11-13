@@ -45,7 +45,8 @@ uses [Semantic Versioning](https://semver.org/).
   `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is set.
 * The simulated TEE stack keeps `enclave-api`'s vault in a directory on a
   Docker volume (`ObjectStoreVault::new_local_dir`, `STORAGE_LOCAL_DIR`),
-  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext.
+  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext,
+  besides each snapshot's plaintext record, which names only its suite.
   Only `dev` builds have this backend: a release `platform-api` refuses to
   start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
   accepts `object_store` 0.13's uploads (#153).
