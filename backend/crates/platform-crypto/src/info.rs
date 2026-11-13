@@ -32,7 +32,7 @@ pub fn snapshot_manifest(
     format!("tenant-snapshot-manifest-v1|{tenant}|{connector}|{version}").into_bytes()
 }
 
-/// An object of a dataset a steward uploads from the browser (ADR 0011):
+/// An object of a dataset a steward uploads from the browser (ADR 0012):
 /// `{tenant}` is the steward's tenant id, `{dataset}` the dataset's slug in
 /// the upload namespace (`upload_…`), and `{object}` the object id the
 /// browser chose before sealing. The snapshot's manifest uses

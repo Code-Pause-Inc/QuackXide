@@ -188,7 +188,7 @@ impl QueryScope {
     }
 
     /// As [`register_parquet_many`](Self::register_parquet_many), for a
-    /// dataset whose shape a steward declared (ADR 0011). Each blob's schema
+    /// dataset whose shape a steward declared (ADR 0012). Each blob's schema
     /// must match `schema` (names in order, and [`ColumnType`] families),
     /// and the rows its footer reports, summed, must not exceed `row_cap`,
     /// both checked before any batch is decoded. Decoded rows are counted
@@ -287,6 +287,16 @@ impl QueryScope {
                 return Err(QueryError::ZkPolicy);
             }
             disclosure::verify_count_column(df.logical_plan())?;
+            // Coercion inserts casts that can fail, so check the analyzed plan
+            // (ADR 0011).
+            let state = self.ctx.state();
+            let analyzed = state
+                .analyzer()
+                .execute_and_check(df.logical_plan().clone(), state.config_options(), |_, _| {})
+                .map_err(|_| QueryError::Execution(ExecutionStage::Plan))?;
+            if !policy::expressions_cannot_fail(&analyzed) {
+                return Err(QueryError::ZkPolicy);
+            }
         }
         let disclosure = match (&self.disclosure, gated) {
             (Some(policy), _) => Some(policy),

@@ -9,7 +9,7 @@
 //!
 //! Two writers share the layout: [`SnapshotWriter`] seals a connector
 //! sync's Parquet in the enclave, and [`crate::upload::commit_upload`]
-//! stores what a steward's browser already sealed (ADR 0011). Which one
+//! stores what a steward's browser already sealed (ADR 0012). Which one
 //! wrote a dataset follows from its slug ([`DatasetKind`]), and fixes the
 //! `info` string its objects open under ([`object_info`]).
 //!

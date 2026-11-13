@@ -1,4 +1,4 @@
-//! Steward dataset uploads (ADR 0011).
+//! Steward dataset uploads (ADR 0012).
 //!
 //! A steward's browser seals a Parquet file to the steward's key, under
 //! `steward-upload-v1|{tenant}|{dataset}|{object}`, and a manifest listing

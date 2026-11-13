@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use platform_core::TenantId;
 use serde::Serialize;
 
@@ -32,7 +33,22 @@ pub enum TenancyError {
 #[serde(rename_all = "snake_case")]
 pub enum TenantStatus {
     Active,
+    /// Paused; a newer resume reactivates it.
     Suspended,
+    /// Final: no billing event changes it.
+    Canceled,
+}
+
+/// Result of [`TenantRegistry::set_status`]. Every variant carries the
+/// record as it stands, so callers can audit without a second read.
+#[derive(Debug, Clone)]
+pub enum StatusOutcome {
+    /// The change was applied.
+    Applied(TenantRecord),
+    /// Not applied: the event is not newer than the last applied change.
+    Stale(TenantRecord),
+    /// Not applied: the tenant is canceled.
+    Canceled(TenantRecord),
 }
 
 /// One tenant's control-plane record.
@@ -40,6 +56,9 @@ pub enum TenantStatus {
 pub struct TenantRecord {
     pub tenant_id: TenantId,
     pub status: TenantStatus,
+    /// `occurred_at` of the billing event that last set `status`; older
+    /// events arriving later are not applied, except a cancel.
+    pub status_changed_at: Option<DateTime<Utc>>,
     /// Merchant-of-Record subscription id (Paddle) — the idempotency key.
     pub subscription_id: String,
     pub customer_id: String,
@@ -63,7 +82,8 @@ pub(crate) fn new_id() -> String {
 pub trait TenantRegistry: Send + Sync {
     /// Provision a tenant for a subscription. Idempotent on
     /// `subscription_id`: a repeated call (webhook retry) returns the
-    /// existing record and does not mint a new tenant.
+    /// existing record unchanged, never reactivating it, and does not mint
+    /// a new tenant.
     async fn provision(
         &self,
         subscription_id: &str,
@@ -78,12 +98,17 @@ pub trait TenantRegistry: Send + Sync {
     ) -> Result<Option<TenantRecord>, TenancyError>;
     async fn list(&self) -> Result<Vec<TenantRecord>, TenancyError>;
 
-    /// Set status by subscription id (cancellation/pause events).
+    /// Set status by subscription id (cancel, pause and resume events).
+    /// Nothing changes a `Canceled` tenant. `Canceled` applies whatever its
+    /// `occurred_at`; otherwise only an event that occurred after the last
+    /// applied change applies, and on a tie only `Suspended`. `None` for an
+    /// unknown subscription.
     async fn set_status(
         &self,
         subscription_id: &str,
         status: TenantStatus,
-    ) -> Result<Option<TenantRecord>, TenancyError>;
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Option<StatusOutcome>, TenancyError>;
 
     /// Toggle a connector for a tenant (admin console).
     async fn set_connector(
@@ -144,6 +169,7 @@ impl TenantRegistry for InMemoryTenantRegistry {
         let record = TenantRecord {
             tenant_id,
             status: TenantStatus::Active,
+            status_changed_at: None,
             subscription_id: subscription_id.to_owned(),
             customer_id: customer_id.to_owned(),
             plan: plan.to_owned(),
@@ -184,15 +210,27 @@ impl TenantRegistry for InMemoryTenantRegistry {
         &self,
         subscription_id: &str,
         status: TenantStatus,
-    ) -> Result<Option<TenantRecord>, TenancyError> {
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Option<StatusOutcome>, TenancyError> {
         let mut inner = self.lock();
         let Some(tenant) = inner.by_subscription.get(subscription_id).copied() else {
             return Ok(None);
         };
         let record = inner.by_tenant.get_mut(&tenant).expect("indexed record");
+        if record.status == TenantStatus::Canceled {
+            return Ok(Some(StatusOutcome::Canceled(record.clone())));
+        }
+        let stale = status != TenantStatus::Canceled
+            && record.status_changed_at.is_some_and(|last| {
+                occurred_at < last || (occurred_at == last && status == TenantStatus::Active)
+            });
+        if stale {
+            return Ok(Some(StatusOutcome::Stale(record.clone())));
+        }
         record.status = status;
+        record.status_changed_at = Some(occurred_at);
         record.updated_at_iso = now_iso();
-        Ok(Some(record.clone()))
+        Ok(Some(StatusOutcome::Applied(record.clone())))
     }
 
     async fn set_connector(
@@ -215,6 +253,7 @@ impl TenantRegistry for InMemoryTenantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn registry() -> InMemoryTenantRegistry {
         InMemoryTenantRegistry::new(vec!["quickbooks".into(), "odoo".into()])
@@ -239,6 +278,77 @@ mod tests {
         assert_eq!(reg.list().await.expect("list").len(), 1);
     }
 
+    fn at(day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, day, 0, 0, 0).unwrap()
+    }
+
+    /// What `set_status` did, and the status it left.
+    fn outcome(result: Option<StatusOutcome>) -> (&'static str, TenantStatus) {
+        match result.expect("record") {
+            StatusOutcome::Applied(r) => ("applied", r.status),
+            StatusOutcome::Stale(r) => ("stale", r.status),
+            StatusOutcome::Canceled(r) => ("canceled", r.status),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_status_applies_only_events_newer_than_the_last_change() {
+        use TenantStatus::{Active, Suspended};
+        let reg = registry();
+        reg.provision("sub_3", "cus_3", "pro")
+            .await
+            .expect("provision");
+        let set = |s, day| reg.set_status("sub_3", s, at(day));
+
+        assert_eq!(
+            outcome(set(Suspended, 2).await.unwrap()),
+            ("applied", Suspended)
+        );
+        // Older, and a tie, cannot resume; a tie may still suspend. A skip
+        // asking for the current status is still stale.
+        assert_eq!(outcome(set(Active, 1).await.unwrap()), ("stale", Suspended));
+        assert_eq!(outcome(set(Active, 2).await.unwrap()), ("stale", Suspended));
+        assert_eq!(
+            outcome(set(Suspended, 1).await.unwrap()),
+            ("stale", Suspended)
+        );
+        assert_eq!(outcome(set(Active, 3).await.unwrap()), ("applied", Active));
+        assert_eq!(outcome(set(Suspended, 2).await.unwrap()), ("stale", Active));
+        assert_eq!(
+            outcome(set(Suspended, 3).await.unwrap()),
+            ("applied", Suspended)
+        );
+
+        let again = reg
+            .provision("sub_3", "cus_3", "pro")
+            .await
+            .expect("provision");
+        assert_eq!(again.status, Suspended, "provision never reactivates");
+        assert_eq!(again.status_changed_at, Some(at(3)));
+    }
+
+    #[tokio::test]
+    async fn cancel_applies_late_and_nothing_changes_it_after() {
+        use TenantStatus::{Active, Canceled, Suspended};
+        let reg = registry();
+        reg.provision("sub_4", "cus_4", "pro")
+            .await
+            .expect("provision");
+        let set = |s, day| reg.set_status("sub_4", s, at(day));
+
+        assert_eq!(outcome(set(Active, 3).await.unwrap()), ("applied", Active));
+        assert_eq!(
+            outcome(set(Canceled, 2).await.unwrap()),
+            ("applied", Canceled)
+        );
+        for status in [Active, Suspended, Canceled] {
+            assert_eq!(
+                outcome(set(status, 4).await.unwrap()),
+                ("canceled", Canceled)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn suspend_by_subscription_and_toggle_connector() {
         let reg = registry();
@@ -248,11 +358,10 @@ mod tests {
             .expect("provision");
 
         let suspended = reg
-            .set_status("sub_2", TenantStatus::Suspended)
+            .set_status("sub_2", TenantStatus::Suspended, at(1))
             .await
-            .expect("set")
-            .expect("record");
-        assert_eq!(suspended.status, TenantStatus::Suspended);
+            .expect("set");
+        assert_eq!(outcome(suspended), ("applied", TenantStatus::Suspended));
 
         let toggled = reg
             .set_connector(rec.tenant_id, "quickbooks", true)
@@ -265,7 +374,7 @@ mod tests {
     async fn set_status_on_unknown_subscription_is_none() {
         let reg = registry();
         assert!(
-            reg.set_status("nope", TenantStatus::Suspended)
+            reg.set_status("nope", TenantStatus::Suspended, at(1))
                 .await
                 .expect("ok")
                 .is_none()

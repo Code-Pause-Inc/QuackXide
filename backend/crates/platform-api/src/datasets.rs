@@ -1,4 +1,4 @@
-//! Steward dataset uploads (ADR 0011): `PUT /api/v1/datasets/{dataset}`.
+//! Steward dataset uploads (ADR 0012): `PUT /api/v1/datasets/{dataset}`.
 //!
 //! The steward's browser seals a Parquet file and the snapshot manifest
 //! that lists it to the steward's key and sends both in one body

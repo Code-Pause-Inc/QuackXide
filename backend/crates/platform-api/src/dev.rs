@@ -32,7 +32,7 @@ use crate::key_release::{
     StaticKeySource,
 };
 use crate::query::{ConnectorQueryService, MultiTenantDevKeyProvider};
-use crate::research::ResearchStores;
+use crate::research::ResearchService;
 
 /// Process-environment variable a dev-only server requires, set to `1`.
 pub const OPT_IN_VAR: &str = "DEVSTACK_ALLOW_INSECURE";
@@ -95,15 +95,14 @@ impl DevResearchStack {
         Ok(version)
     }
 
-    /// The query service with research access on (in-memory catalog,
-    /// access requests, grants and budgets) on the simulated TEE. Each query
+    /// The query service with research queries on through `research` (give
+    /// `AppState::research` the same `Arc`), on the simulated TEE. Each query
     /// attests with a simulated token, and the in-process key-release
     /// stand-in releases the tenant's key only after that token verifies.
     pub fn query_service(
         self,
         settings: EngineSettings,
-        min_cohort: u64,
-        default_budget: u64,
+        research: Arc<ResearchService>,
     ) -> ConnectorQueryService {
         let signer = Arc::new(TokenSigner::generate(
             SIM_ISSUER,
@@ -132,18 +131,18 @@ impl DevResearchStack {
         ));
         // Simulated tokens never satisfy required attestation.
         ConnectorQueryService::new(self.vault, keys, attestation, settings, false)
-            .with_research(ResearchStores::in_memory(), min_cohort, default_budget)
+            .with_research(research)
             .with_enclave_identity(identity)
     }
 
-    /// The query service with research access on, with the attestation
-    /// gate's provider and whether it requires hardware evidence. Tenant keys
-    /// open straight from process memory, with no key release.
+    /// The query service with research queries on through `research`, with
+    /// the attestation gate's provider and whether it requires hardware
+    /// evidence. Tenant keys open straight from process memory, with no key
+    /// release.
     pub fn query_service_with_attestation(
         self,
         settings: EngineSettings,
-        min_cohort: u64,
-        default_budget: u64,
+        research: Arc<ResearchService>,
         attestation: Arc<dyn AttestationProvider>,
         require_attestation: bool,
     ) -> ConnectorQueryService {
@@ -158,7 +157,7 @@ impl DevResearchStack {
             settings,
             require_attestation,
         )
-        .with_research(ResearchStores::in_memory(), min_cohort, default_budget)
+        .with_research(research)
     }
 }
 

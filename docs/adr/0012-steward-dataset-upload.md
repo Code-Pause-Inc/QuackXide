@@ -1,4 +1,4 @@
-# 0011. Steward dataset upload
+# 0012. Steward dataset upload
 
 * Status: Proposed
 * Date: 2026-11-08
@@ -220,9 +220,10 @@ column names.
 
 A steward holds a dataset when it has a committed snapshot under the
 steward's tenant (`platform_connectors::snapshot::holds`). That is the one
-definition. `publish_listing` refuses a dataset the steward does not hold
-(404, `research.catalog` denied), and P39's listing uses the same
-function.
+definition. `ResearchService::publish_listing` refuses a dataset the
+steward does not hold (404, `research.catalog` denied); the service holds
+the app's vault for this check only, and opens nothing. P39's listing
+uses the same function.
 
 The upload route does not need "holds". Inside the upload namespace, the
 first upload creates the dataset, and the tenant comes from the token, so
@@ -283,8 +284,9 @@ APIs and features are built (no `with_context` streams, no `seekable`, no
 
 ## Open questions
 
-1. Numbers 0009 and 0010 are on open branches, so this record uses 0011.
-   The maintainer reserves numbers and may renumber it.
+1. 0009 to 0011 are taken on `main` and no open branch uses 0012, so
+   this record uses 0012. The maintainer reserves numbers and may renumber
+   it.
 2. Are 64 MiB as the default and 512 MiB as the ceiling acceptable until
    P34 and P40 measure the browser seal and upload?
 3. Should the declared schema move into the sealed manifest when manifests

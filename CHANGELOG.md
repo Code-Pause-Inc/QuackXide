@@ -8,7 +8,7 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-* Steward dataset upload (ADR 0011, P38): `PUT /api/v1/datasets/{dataset}`
+* Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
   (ADR 0003): the object, a plaintext record, then the manifest as the
@@ -27,6 +27,26 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
+  `development` selects development, and unset, blank or unknown values
+  are production. `APP_ENV` is read from the process environment before
+  `.env`, which is loaded only in development. At startup,
+  `PlatformConfig::check_production` refuses `JWT_HS256_SECRET`, an unset
+  `STORAGE_BUCKET`, `TEE_ATTESTATION_REQUIRED=false`,
+  `SIM_ATTESTATION_URL` and `KEY_RELEASE_URL`, and, in
+  `connector-worker`, the demo tenant and fixture sources. It lists every
+  reason by key name only and emits a `service.start` "denied" audit
+  event. Production mode cannot boot until the production key provider,
+  verification keys and durable stores land.
+* `npm run build:release` (`vite build --mode release`), run by
+  `release.yml`, fails unless `VITE_VAULT_MODE=http` and fails if
+  `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is set.
+* The simulated TEE stack keeps `enclave-api`'s vault in a directory on a
+  Docker volume (`ObjectStoreVault::new_local_dir`, `STORAGE_LOCAL_DIR`),
+  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext.
+  Only `dev` builds have this backend: a release `platform-api` refuses to
+  start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
+  accepts `object_store` 0.13's uploads (#153).
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
@@ -50,6 +70,22 @@ uses [Semantic Versioning](https://semver.org/).
   that the Rust and vitest tests both check. `platform-crypto`'s AEAD
   helpers, blind indexes and TOTP move behind its default `server`
   feature.
+* Drive orphan sweep: `platform-api` deletes, every hour, the chunks of
+  drive objects that have no manifest and no chunk written in the last
+  24 hours (`platform_api::sweep::ORPHAN_MIN_AGE`), as an aborted upload
+  leaves them. Each deletion emits a `data.access` audit event. The sweep
+  claims an object with a create-only marker
+  (`tenants/{tenant}/drive/sweeping/{object}`) before it deletes, and the
+  manifest PUT checks for that marker and for its chunks both before and
+  after it writes, so a manifest is never committed over chunks the sweep
+  deleted.
+  `VaultStore::list_entries` returns each object's size and last-modified
+  time, `platform_storage::list_drive_entries_all_tenants` is the only
+  cross-tenant listing, and `TenantPaths` can parse drive chunk and manifest
+  paths back to their tenant and object.
+* `PUT /api/v1/drive/objects/{id}/manifest` returns 409, audited as
+  `data.access` "denied", unless every chunk the manifest names is stored
+  and the orphan sweep is not deleting the object.
 * The drive listing (`GET /api/v1/drive/objects`) is bounded: it returns at
   most 1000 objects (`MAX_LISTED_OBJECTS`) and reads their manifests 16 at a
   time instead of one by one. A drive holding more is refused with 422 "too
@@ -177,9 +213,36 @@ uses [Semantic Versioning](https://semver.org/).
   a retry from a first approval (`retry=true` in the `research.catalog`
   detail), and a refused retry or a refused deny of an approved request
   is recorded as `denied`.
+* A paused tenant comes back when its subscription resumes: the MoR
+  webhook maps `subscription.resumed` to reactivation. Before, it was
+  ignored and the tenant stayed Suspended. A cancel is final (ADR 0006):
+  the tenant becomes Canceled whatever the cancel's `occurred_at`, and no
+  later pause or resume changes it. Paddle does not deliver in order, so
+  pauses and resumes apply only when their `occurred_at` is newer than the
+  last change applied (a tie keeps Suspended), and a late or retried event
+  cannot undo a newer one. Provisioning events never change an existing
+  tenant's status. Events without a valid RFC 3339 `occurred_at` are
+  refused with 400. Each status event is audited as `tenant.provisioned`:
+  `ok` when applied, `denied` with `reason=stale` or `reason=canceled`
+  when skipped, and `miss` for an unknown subscription.
 
 ### Security
 
+* `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
+  own-data queries (`POST /api/v1/query`) stops single-query row export
+  only. That route has no query budget, so differencing across queries is
+  unbounded, including with a stolen access token; only research queries
+  are budget-bounded. This is recorded as a residual risk.
+* Zero-knowledge and research queries whose expressions can fail at
+  runtime are refused at planning (ADR 0011). A conditional division by
+  zero or a failing cast used to return 400 for some data and 200 for
+  other data, answering a question about rows below the cohort threshold.
+  Researchers lose division and modulo by a column or an aggregate,
+  string-to-number casts, `LIKE` patterns over 1,000 characters, and
+  functions other than `COALESCE`, `NULLIF`, `lower` and `upper`;
+  `SUM(x) / COUNT(*)` and `SUBSTR(...)` are now refused. `AVG` and integer
+  division by a constant other than 0 and −1 still work. Unary minus works
+  on floats only; write `0 - x` for integers.
 * `tokio` 1.54.1 (RUSTSEC-2026-0384; 1.54.0 is yanked) and `zstd-sys`
   2.1.2 (RUSTSEC-2026-0410). `backend/deny.toml` records why
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5) and RUSTSEC-2026-0391, -0398 and
@@ -239,7 +302,39 @@ uses [Semantic Versioning](https://semver.org/).
   record, and a manifest that lists a missing object, with 502 (a missing
   object was a 404). Publishing a catalog listing for a dataset the
   steward does not hold, one without a committed snapshot, is refused with
-  404 and a `research.catalog` denial.
+  404 and a `research.catalog` denial. For this check
+  `ResearchService::new` and `from_config` take the vault the app serves.
+* ADR 0007's "Browser private-key storage" section is accepted, and ADR
+  0004 now says the researcher's result key is held as that section
+  describes instead of "non-extractable": a private key that HPKE opens
+  with is stored encrypted under a non-extractable AES-256-GCM key.
+* `GCP_PROJECT_ID` is removed: nothing read it. The GCS client takes its
+  bucket from `STORAGE_BUCKET` and its credentials from `object_store`'s
+  `GOOGLE_*` environment variables or the metadata server.
+* `docs/PROJECT_SCOPE.md` lists what is not in v1.0: live connector sync,
+  the admin connector toggles, charging catalog prices, blind-index search
+  and closing differencing. The merchant-of-record webhook and its tenant
+  status handling stay. Releases no longer ship `connector-worker`; it is a
+  development tool.
+* Local runs of `platform-api` and `connector-worker` need
+  `APP_ENV=development`, and `devtoken` needs `--features dev`.
+  `scripts/check.sh` also lints the release binaries without the `dev`
+  feature.
+* Research access runs in the `platform-api` binary without key release.
+  The catalog, access-request, grant and budget routes use a
+  `ResearchService` (`AppState::research`) instead of the confidential
+  query service, so they no longer answer 503 when `KEY_RELEASE_URL` is
+  unset. The binary always builds it from `RESEARCH_MIN_COHORT_SIZE` and
+  `RESEARCH_DEFAULT_QUERY_BUDGET` over in-memory stores, with a startup
+  warning that they are lost on restart. The query, research-query and
+  attestation routes still answer 503 without key release, and a research
+  query checks and charges grants through the same `ResearchService`.
+  Without one, the research routes answer 503 "research access not
+  configured". `platform_api::wiring::build_state` builds the binary's
+  state, so tests can run its exact wiring. `ConnectorQueryService::with_research`
+  takes an `Arc<ResearchService>`, and `DevResearchStack::query_service`
+  and `query_service_with_attestation` take one in place of the cohort
+  size and default budget.
 * The SEV-SNP simulation is retired: `SimulatedSnp`, the SEV-SNP report
   parser and P-384 chain verifier (`report`, `verifier`, `TrustRoot`), the
   `snp_report` fuzz target and the `SIMULATED_SNP_*` settings are removed,

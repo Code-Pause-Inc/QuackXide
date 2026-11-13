@@ -3008,6 +3008,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
  "hmac",
  "http-body-util",
@@ -3059,6 +3060,7 @@ dependencies = [
 name = "platform-billing"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hmac",
  "proptest",
  "serde",
@@ -3073,6 +3075,7 @@ version = "0.1.0"
 dependencies = [
  "dotenvy",
  "platform-core",
+ "platform-telemetry",
  "thiserror",
  "zeroize",
 ]
@@ -3157,10 +3160,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "object_store",
  "platform-config",
  "platform-core",
+ "platform-storage",
  "serde",
  "serde_json",
  "thiserror",
@@ -4162,7 +4167,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4557,9 +4562,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.29.0"
+version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

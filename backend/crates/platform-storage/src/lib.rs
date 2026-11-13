@@ -5,6 +5,7 @@
 //! ```text
 //! tenants/{tenant_id}/drive/manifests/{object_id}.json
 //! tenants/{tenant_id}/drive/objects/{object_id}/{chunk_index:08}
+//! tenants/{tenant_id}/drive/sweeping/{object_id}
 //! tenants/{tenant_id}/connectors/{slug}/snapshots/{version}/{object_id}.parquet
 //! tenants/{tenant_id}/connectors/{slug}/records/{version}.json
 //! tenants/{tenant_id}/connectors/{slug}/manifests/{version}.manifest
@@ -13,7 +14,7 @@
 //! ```
 //!
 //! `{slug}` names a research dataset: a connector's, or one a steward
-//! uploads, in the `upload_` namespace (ADR 0011). Each version is one
+//! uploads, in the `upload_` namespace (ADR 0012). Each version is one
 //! complete snapshot (ADR 0003): its sealed objects, then its plaintext
 //! [`SnapshotRecord`], then the sealed manifest that commits it.
 //! `connectors/{slug}/keys/{version}/` is reserved for the snapshot's wrapped
@@ -89,9 +90,55 @@ impl TenantPaths {
         ))
     }
 
+    /// Every tenant's data. Private: the only cross-tenant read is
+    /// [`list_drive_entries_all_tenants`], so no path spanning tenants
+    /// leaves this crate.
+    fn all_tenants() -> VaultPath {
+        VaultPath("tenants".to_owned())
+    }
+
+    /// The tenant and object of a [`drive_chunk`](Self::drive_chunk) path.
+    pub fn drive_chunk_parts(path: &VaultPath) -> Option<(TenantId, ObjectId)> {
+        let rest = path.as_str().strip_prefix("tenants/")?;
+        let (tenant, rest) = rest.split_once('/')?;
+        let (object, index) = rest.strip_prefix("drive/objects/")?.split_once('/')?;
+        if index.len() != 8 || !index.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((tenant.parse().ok()?, object.parse().ok()?))
+    }
+
+    /// The tenant and object of a [`drive_manifest`](Self::drive_manifest)
+    /// path.
+    pub fn drive_manifest_parts(path: &VaultPath) -> Option<(TenantId, ObjectId)> {
+        let rest = path.as_str().strip_prefix("tenants/")?;
+        let (tenant, rest) = rest.split_once('/')?;
+        let object = rest
+            .strip_prefix("drive/manifests/")?
+            .strip_suffix(".json")?;
+        Some((tenant.parse().ok()?, object.parse().ok()?))
+    }
+
     /// Prefix of all chunks of one drive object (deletion).
     pub fn drive_object_prefix(tenant: TenantId, object: ObjectId) -> VaultPath {
         VaultPath(format!("tenants/{tenant}/drive/objects/{object}"))
+    }
+
+    /// Marker the orphan sweep holds while it deletes one object's chunks.
+    /// It sits outside [`drive_object_prefix`](Self::drive_object_prefix)
+    /// and [`drive_manifest_prefix`](Self::drive_manifest_prefix), so chunk
+    /// and manifest listings never return it.
+    pub fn drive_sweep_marker(tenant: TenantId, object: ObjectId) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/drive/sweeping/{object}"))
+    }
+
+    /// The tenant and object of a
+    /// [`drive_sweep_marker`](Self::drive_sweep_marker) path.
+    pub fn drive_sweep_marker_parts(path: &VaultPath) -> Option<(TenantId, ObjectId)> {
+        let rest = path.as_str().strip_prefix("tenants/")?;
+        let (tenant, rest) = rest.split_once('/')?;
+        let object = rest.strip_prefix("drive/sweeping/")?;
+        Some((tenant.parse().ok()?, object.parse().ok()?))
     }
 
     /// One sealed Parquet object of a dataset snapshot: sealed in the enclave
@@ -222,7 +269,7 @@ impl TenantPaths {
     }
 }
 
-/// The plaintext record of one dataset snapshot (ADR 0011), stored at
+/// The plaintext record of one dataset snapshot (ADR 0012), stored at
 /// [`TenantPaths::connector_record`]. The operator can read it, so it holds
 /// only what the API needs without key release: the envelope suite, and for
 /// an upload the row cap and schema the steward declared. Connector
@@ -313,6 +360,66 @@ impl StorageError {
     }
 }
 
+/// One stored object as a listing reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultEntry {
+    pub path: VaultPath,
+    pub size: u64,
+    pub last_modified: chrono::DateTime<chrono::Utc>,
+}
+
+/// What a drive path holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveEntryKind {
+    Manifest,
+    Chunk,
+    /// A [`TenantPaths::drive_sweep_marker`].
+    SweepMarker,
+}
+
+/// One drive manifest or chunk found by [`list_drive_entries_all_tenants`].
+/// `entry.path` is the single-tenant path of that manifest or chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveEntry {
+    pub tenant: TenantId,
+    pub object: ObjectId,
+    pub kind: DriveEntryKind,
+    pub entry: VaultEntry,
+}
+
+/// Every drive manifest and chunk of every tenant, with size and
+/// last-modified time. Control plane only: the drive orphan sweep uses it.
+/// It returns only parsed drive entries, each with its own tenant's path;
+/// connector data, enrollments and anything unparsable are left out.
+pub async fn list_drive_entries_all_tenants(
+    vault: &dyn VaultStore,
+) -> Result<Vec<DriveEntry>, StorageError> {
+    Ok(vault
+        .list_entries(&TenantPaths::all_tenants())
+        .await?
+        .into_iter()
+        .filter_map(|entry| {
+            let (kind, (tenant, object)) =
+                if let Some(parts) = TenantPaths::drive_manifest_parts(&entry.path) {
+                    (DriveEntryKind::Manifest, parts)
+                } else if let Some(parts) = TenantPaths::drive_sweep_marker_parts(&entry.path) {
+                    (DriveEntryKind::SweepMarker, parts)
+                } else {
+                    (
+                        DriveEntryKind::Chunk,
+                        TenantPaths::drive_chunk_parts(&entry.path)?,
+                    )
+                };
+            Some(DriveEntry {
+                tenant,
+                object,
+                kind,
+                entry,
+            })
+        })
+        .collect())
+}
+
 /// Aggregate ciphertext footprint under a prefix (admin storage reporting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StorageUsage {
@@ -333,6 +440,9 @@ pub trait VaultStore: Send + Sync {
     async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError>;
     async fn delete(&self, path: &VaultPath) -> Result<(), StorageError>;
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError>;
+    /// As [`list`](Self::list), with each object's size and last-modified
+    /// time.
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError>;
     /// Object count and total ciphertext bytes under `prefix`.
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError>;
 }
@@ -352,6 +462,16 @@ impl ObjectStoreVault {
     /// Dev/test backend; contents vanish on process exit.
     pub fn new_in_memory() -> Self {
         Self::new(Arc::new(InMemory::new()))
+    }
+
+    /// DEV ONLY: each object is a file under `dir`, at its vault path. The
+    /// simulated TEE stack uses it because no GCS emulator accepts
+    /// `object_store`'s uploads (#153). `dir` must already exist.
+    #[cfg(feature = "dev")]
+    pub fn new_local_dir(dir: &std::path::Path) -> Result<Self, StorageError> {
+        let store = object_store::local::LocalFileSystem::new_with_prefix(dir)
+            .map_err(|e| StorageError::Fatal(e.to_string()))?;
+        Ok(Self::new(Arc::new(store)))
     }
 
     /// Google Cloud Storage backend. Credentials resolve from the environment
@@ -487,6 +607,19 @@ impl VaultStore for ObjectStoreVault {
             .await?
             .into_iter()
             .map(|meta| VaultPath(meta.location.to_string()))
+            .collect())
+    }
+
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        Ok(self
+            .list_meta(prefix)
+            .await?
+            .into_iter()
+            .map(|meta| VaultEntry {
+                path: VaultPath(meta.location.to_string()),
+                size: meta.size,
+                last_modified: meta.last_modified,
+            })
             .collect())
     }
 
@@ -701,6 +834,88 @@ mod tests {
     }
 
     #[test]
+    fn drive_paths_parse_back_to_tenant_and_object() {
+        let chunk = TenantPaths::drive_chunk(tenant_a(), object_1(), 7);
+        assert_eq!(
+            TenantPaths::drive_chunk_parts(&chunk),
+            Some((tenant_a(), object_1()))
+        );
+        let manifest = TenantPaths::drive_manifest(tenant_a(), object_1());
+        assert_eq!(
+            TenantPaths::drive_manifest_parts(&manifest),
+            Some((tenant_a(), object_1()))
+        );
+        let marker = TenantPaths::drive_sweep_marker(tenant_a(), object_1());
+        assert_eq!(
+            TenantPaths::drive_sweep_marker_parts(&marker),
+            Some((tenant_a(), object_1()))
+        );
+        // Each parser accepts only its own kind of path.
+        assert_eq!(TenantPaths::drive_chunk_parts(&manifest), None);
+        assert_eq!(TenantPaths::drive_manifest_parts(&chunk), None);
+        assert_eq!(TenantPaths::drive_chunk_parts(&marker), None);
+        assert_eq!(TenantPaths::drive_manifest_parts(&marker), None);
+        assert_eq!(TenantPaths::drive_sweep_marker_parts(&chunk), None);
+        assert_eq!(TenantPaths::drive_sweep_marker_parts(&manifest), None);
+        // A marker is outside the prefixes that chunk and manifest listings use.
+        let chunks = TenantPaths::drive_object_prefix(tenant_a(), object_1());
+        let manifests = TenantPaths::drive_manifest_prefix(tenant_a());
+        assert!(!marker.as_str().starts_with(chunks.as_str()));
+        assert!(!marker.as_str().starts_with(manifests.as_str()));
+        let t = tenant_a();
+        let o = object_1();
+        for raw in [
+            format!("tenants/{t}/drive/objects/{o}"),
+            format!("tenants/{t}/drive/objects/{o}/7"),
+            format!("tenants/{t}/drive/objects/{o}/0000000x"),
+            format!("tenants/{t}/drive/objects/not-a-uuid/00000001"),
+            format!("tenants/not-a-uuid/drive/objects/{o}/00000001"),
+            format!("tenants/{t}/connectors/x/{o}.parquet"),
+            format!("control/tenants/{t}.json"),
+        ] {
+            assert_eq!(
+                TenantPaths::drive_chunk_parts(&VaultPath(raw.clone())),
+                None,
+                "{raw}"
+            );
+            assert_eq!(
+                TenantPaths::drive_manifest_parts(&VaultPath(raw.clone())),
+                None,
+                "{raw}"
+            );
+            assert_eq!(
+                TenantPaths::drive_sweep_marker_parts(&VaultPath(raw.clone())),
+                None,
+                "{raw}"
+            );
+        }
+        assert!(
+            chunk
+                .as_str()
+                .starts_with(TenantPaths::all_tenants().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_entries_reports_size_and_last_modified() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let before = chrono::Utc::now();
+        let path = TenantPaths::drive_chunk(tenant_a(), object_1(), 0);
+        vault
+            .put(&path, Bytes::from_static(b"12345"))
+            .await
+            .expect("put");
+        let entries = vault
+            .list_entries(&TenantPaths::tenant_root(tenant_a()))
+            .await
+            .expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].size, 5);
+        assert!(entries[0].last_modified >= before - chrono::Duration::seconds(1));
+    }
+
+    #[test]
     fn tenant_root_is_a_prefix_of_every_tenant_path() {
         let root = TenantPaths::tenant_root(tenant_a());
         for path in [
@@ -797,6 +1012,66 @@ mod tests {
             .expect("list b");
         assert_eq!(b_list.len(), 1);
         assert_eq!(b_list[0], b_path);
+    }
+
+    /// A fresh directory for one test; the caller removes it.
+    #[cfg(feature = "dev")]
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vault-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[cfg(feature = "dev")]
+    #[tokio::test]
+    async fn local_dir_vault_stores_each_object_as_a_file_at_its_path() {
+        let dir = scratch_dir("local-layout");
+        let vault = ObjectStoreVault::new_local_dir(&dir).expect("vault");
+        let path = TenantPaths::drive_manifest(tenant_a(), object_1());
+
+        vault
+            .put(&path, Bytes::from_static(b"sealed"))
+            .await
+            .expect("put");
+        assert_eq!(
+            vault.get(&path).await.expect("get"),
+            Bytes::from_static(b"sealed")
+        );
+        assert_eq!(
+            vault
+                .list(&TenantPaths::drive_manifest_prefix(tenant_a()))
+                .await
+                .expect("list"),
+            vec![path.clone()]
+        );
+        // The simulated TEE's e2e script reads these files to check them.
+        assert_eq!(
+            std::fs::read(dir.join(path.as_str())).expect("file at the vault path"),
+            b"sealed"
+        );
+        assert!(matches!(
+            vault
+                .put_if_absent(&path, Bytes::from_static(b"other"))
+                .await,
+            Err(StorageError::AlreadyExists)
+        ));
+        vault.delete(&path).await.expect("delete");
+        assert!(matches!(
+            vault.get(&path).await,
+            Err(StorageError::NotFound)
+        ));
+
+        std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn local_dir_vault_refuses_a_missing_directory() {
+        let dir = std::env::temp_dir().join(format!("vault-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ObjectStoreVault::new_local_dir(&dir).is_err());
+        assert!(!dir.exists(), "the vault must not create its own directory");
     }
 
     #[tokio::test]
@@ -922,6 +1197,7 @@ mod tests {
             vault.get(&path).await.expect_err("get"),
             vault.delete(&path).await.expect_err("delete"),
             vault.list(&prefix).await.expect_err("list"),
+            vault.list_entries(&prefix).await.expect_err("list_entries"),
             vault.usage(&prefix).await.expect_err("usage"),
         ]
     }

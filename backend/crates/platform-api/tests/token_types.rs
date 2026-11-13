@@ -32,6 +32,7 @@ fn app() -> Router {
         config: Arc::new(default_config()),
         vault: Arc::new(ObjectStoreVault::new_in_memory()),
         jwt: Some(Arc::new(rs256_verifier())),
+        research: None,
         query: None,
         provisioning: None,
     })

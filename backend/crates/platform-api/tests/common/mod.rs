@@ -19,6 +19,7 @@ use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
 use platform_api::dev::DevResearchStack;
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
@@ -32,7 +33,9 @@ use platform_core::{
 };
 use platform_crypto::{TenantKeypair, TenantPublicKey, hpke_seal_to_tenant};
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
+use platform_storage::{
+    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+};
 use quackxide_engine::EngineSettings;
 use sha2::Sha256;
 use tower::ServiceExt;
@@ -214,13 +217,14 @@ pub fn config_with_mor_secret(secret: &str) -> PlatformConfig {
     .expect("config")
 }
 
-/// Default config, an HS256 verifier for `secret`, and no query or
-/// provisioning service. Override fields with struct update syntax.
+/// Default config, an HS256 verifier for `secret`, and no research, query
+/// or provisioning service. Override fields with struct update syntax.
 pub fn app_state(secret: &str, vault: Arc<dyn VaultStore>) -> AppState {
     AppState {
         config: Arc::new(default_config()),
         vault,
         jwt: Some(Arc::new(JwtVerifier::hs256(secret, ISS, AUD))),
+        research: None,
         query: None,
         provisioning: None,
     }
@@ -287,18 +291,24 @@ pub async fn research_app(
         .await
         .expect("commit");
     let vault = stack.vault();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
     let service = stack.query_service_with_attestation(
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
             max_concurrent_queries: 4,
         },
-        5,
-        100,
+        research.clone(),
         attestation,
         require_attestation,
     );
 
     build_app(AppState {
+        research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)
     })
@@ -309,7 +319,7 @@ pub fn dev_attestation() -> Arc<dyn AttestationProvider> {
     Arc::new(DevAttestation::allow_insecure_dev())
 }
 
-// ── Steward uploads (ADR 0011) ──
+// ── Steward uploads (ADR 0012) ──
 
 /// A declared schema from `(name, type)` pairs.
 pub fn declared(columns: &[(&str, ColumnType)]) -> DeclaredSchema {
@@ -443,17 +453,23 @@ pub fn upload_research_app(
     for (steward, keypair) in stewards {
         stack.register_key(steward, keypair);
     }
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
     let service = stack.query_service_with_attestation(
         EngineSettings {
             zk: ZkMode::Enabled,
             max_concurrent_queries: 4,
         },
-        5,
-        100,
+        research.clone(),
         dev_attestation(),
         false,
     );
     build_app(AppState {
+        research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)
     })
@@ -501,6 +517,17 @@ impl FlakyVault {
     fn check(&self, fails: bool) -> Result<(), StorageError> {
         if fails { Err((self.error)()) } else { Ok(()) }
     }
+
+    /// Store an object whatever the faults, as data written before the
+    /// outage began.
+    pub async fn seed(&self, path: &VaultPath, ciphertext: Bytes) {
+        self.inner.put(path, ciphertext).await.expect("seed");
+    }
+
+    /// Whether an object is stored, whatever the faults.
+    pub async fn holds(&self, path: &VaultPath) -> bool {
+        self.inner.get(path).await.is_ok()
+    }
 }
 
 /// A [`FlakyVault`] failing `faults` with [`outage`].
@@ -529,6 +556,10 @@ impl VaultStore for FlakyVault {
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.check(self.faults.list)?;
         self.inner.list(prefix).await
+    }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.check(self.faults.list)?;
+        self.inner.list_entries(prefix).await
     }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.check(self.faults.usage)?;

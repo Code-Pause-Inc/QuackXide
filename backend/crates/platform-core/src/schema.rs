@@ -1,4 +1,4 @@
-//! The schema a steward declares for an uploaded dataset (ADR 0011).
+//! The schema a steward declares for an uploaded dataset (ADR 0012).
 //!
 //! The upload route holds no key and cannot read an upload, so it keeps
 //! what the steward declared: column names and logical types, in order. The

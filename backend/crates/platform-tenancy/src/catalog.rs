@@ -24,7 +24,7 @@ pub struct DatasetListing {
     pub listing_id: String,
     pub steward_tenant: TenantId,
     /// Dataset selector: the dataset's slug under the steward's prefix, a
-    /// connector's or an upload's (`upload_…`, ADR 0011).
+    /// connector's or an upload's (`upload_…`, ADR 0012).
     pub connector: String,
     pub title: String,
     pub description: String,

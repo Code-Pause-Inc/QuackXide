@@ -164,8 +164,9 @@ relying party in `platform-api` is a development and simulation stand-in
 for KMS: it is built only with the `dev` feature, like `devstack`, so it
 cannot be deployed. The off-the-shelf requirement above stands.
 
-**The researcher's result key** is generated non-extractable in the
-researcher's browser and enrolled (P33). The enclave takes the recipient
+**The researcher's result key** is generated in the researcher's
+browser, held there as ADR 0007 ("Browser private-key storage")
+describes, and enrolled (P33). The enclave takes the recipient
 public key from the researcher's sealed request, sent after the browser
 verified the enclave, and accepts it only if it matches the enrolled
 key's fingerprint, so the operator-controlled enrollment record is never

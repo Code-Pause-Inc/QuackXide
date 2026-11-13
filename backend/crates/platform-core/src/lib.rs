@@ -105,7 +105,7 @@ impl fmt::Display for ObjectId {
 /// Restricted to `[a-z0-9_-]`, 1..=64 chars, so a slug can never smuggle `/`,
 /// `..`, or unicode into a path. A slug names either a connector's dataset
 /// or, in the reserved [`UPLOAD_DATASET_PREFIX`] namespace, a dataset a
-/// steward uploads ([`DatasetKind`], ADR 0011).
+/// steward uploads ([`DatasetKind`], ADR 0012).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ConnectorSlug(String);

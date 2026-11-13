@@ -169,7 +169,7 @@ async fn empty_result_serializes_to_empty_array() {
     assert_eq!(rows, serde_json::json!([]));
 }
 
-// ── Declared shapes (steward uploads, ADR 0011) ──
+// ── Declared shapes (steward uploads, ADR 0012) ──
 
 fn invoice_columns(types: &[(&str, platform_core::ColumnType)]) -> platform_core::DeclaredSchema {
     platform_core::DeclaredSchema::new(

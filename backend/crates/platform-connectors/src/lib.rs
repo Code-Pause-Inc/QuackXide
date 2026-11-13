@@ -8,7 +8,7 @@
 //! `oauth` → `source` (fetch) → `mappers` (payload → `dataset`) →
 //! `parquet_out` → `pipeline` (attestation gate, seal, flush) → `snapshot`
 //! (commit, prune) → `worker`. `upload` parses a steward's browser-sealed
-//! upload and stores it as a snapshot of the same layout (ADR 0011).
+//! upload and stores it as a snapshot of the same layout (ADR 0012).
 //!
 //! No connector's slug may start with `platform_core::UPLOAD_DATASET_PREFIX`.
 
@@ -23,6 +23,7 @@ pub mod parquet_out;
 pub mod pipeline;
 pub mod snapshot;
 pub mod source;
+pub mod startup;
 pub mod upload;
 pub mod worker;
 

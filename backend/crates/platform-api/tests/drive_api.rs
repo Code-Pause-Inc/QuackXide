@@ -14,7 +14,9 @@ use platform_api::{AppState, ManifestBody, build_app};
 use platform_core::TenantId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use platform_storage::{ObjectStoreVault, StorageError, StorageUsage, VaultPath, VaultStore};
+use platform_storage::{
+    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+};
 
 use common::{AUD, ISS, bearer, content_type, send};
 
@@ -57,6 +59,23 @@ fn sealed_chunk_body() -> Vec<u8> {
 }
 
 const OBJ: &str = "00000000-aaaa-4bbb-8ccc-000000000001";
+
+/// Upload chunks `0..count` of [`OBJ`]. Chunks go before the manifest, as
+/// the client sends them: `put_manifest` refuses a manifest whose chunks are
+/// not all stored.
+async fn put_chunks(app: &Router, token: &str, count: u32) {
+    for index in 0..count {
+        let (status, _) = send(
+            app,
+            "PUT",
+            &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
+            &[bearer(token), content_type("application/octet-stream")],
+            sealed_chunk_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "chunk {index}");
+    }
+}
 
 #[tokio::test]
 async fn requests_without_a_token_are_401() {
@@ -105,22 +124,13 @@ async fn manifest_and_chunk_round_trip() {
     let app = test_app();
     let token = token_for(TenantId::generate());
 
+    put_chunks(&app, &token, 1).await;
     let (status, _) = send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
         &[bearer(&token), content_type("application/json")],
         manifest_json().into_bytes(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    let (status, _) = send(
-        &app,
-        "PUT",
-        &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        &[bearer(&token), content_type("application/octet-stream")],
-        sealed_chunk_body(),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -163,13 +173,75 @@ async fn manifest_and_chunk_round_trip() {
 }
 
 #[tokio::test]
+async fn a_manifest_needs_every_chunk_it_names() {
+    let app = test_app();
+    let token = token_for(TenantId::generate());
+    let put = |chunks: u32| {
+        let (app, token) = (&app, &token);
+        async move {
+            send(
+                app,
+                "PUT",
+                &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+                &[bearer(token), content_type("application/json")],
+                manifest_json_with_chunks(chunks).into_bytes(),
+            )
+            .await
+            .0
+        }
+    };
+
+    // No chunks stored, or a gap in them: refused, and nothing is listed.
+    assert_eq!(put(2).await, StatusCode::CONFLICT);
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/chunks/1"),
+        &[bearer(&token), content_type("application/octet-stream")],
+        sealed_chunk_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(put(2).await, StatusCode::CONFLICT);
+    let (_, body) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/objects",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(body, b"[]".to_vec());
+
+    // Once chunk 0 is stored too, the same manifest is accepted.
+    put_chunks(&app, &token, 1).await;
+    assert_eq!(put(2).await, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn an_empty_file_needs_no_chunks() {
+    let app = test_app();
+    let token = token_for(TenantId::generate());
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json_with_chunks(0).into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn tenant_isolation_is_absolute() {
     let app = test_app();
     let token_a = token_for(TenantId::generate());
     let token_b = token_for(TenantId::generate());
 
     // Tenant A stores an object.
-    send(
+    put_chunks(&app, &token_a, 1).await;
+    let (status, _) = send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
@@ -177,14 +249,7 @@ async fn tenant_isolation_is_absolute() {
         manifest_json().into_bytes(),
     )
     .await;
-    send(
-        &app,
-        "PUT",
-        &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
-        &[bearer(&token_a), content_type("application/octet-stream")],
-        sealed_chunk_body(),
-    )
-    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Tenant B, with a fully valid token and the exact object id, sees nothing.
     let (status, _) = send(
@@ -258,7 +323,8 @@ async fn delete_removes_manifest_and_chunks() {
     let app = test_app();
     let token = token_for(TenantId::generate());
 
-    send(
+    put_chunks(&app, &token, 3).await;
+    let (status, _) = send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
@@ -266,16 +332,7 @@ async fn delete_removes_manifest_and_chunks() {
         manifest_json().into_bytes(),
     )
     .await;
-    for index in 0..3 {
-        send(
-            &app,
-            "PUT",
-            &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
-            &[bearer(&token), content_type("application/octet-stream")],
-            sealed_chunk_body(),
-        )
-        .await;
-    }
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, _) = send(
         &app,
@@ -376,7 +433,8 @@ async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
     let tenant = TenantId::generate();
     let token = token_for(tenant);
 
-    send(
+    put_chunks(&app, &token, 3).await;
+    let (status, _) = send(
         &app,
         "PUT",
         &format!("/api/v1/drive/objects/{OBJ}/manifest"),
@@ -384,16 +442,7 @@ async fn delete_after_shrinking_manifest_removes_trailing_chunks() {
         manifest_json_with_chunks(3).into_bytes(),
     )
     .await;
-    for index in 0..3 {
-        send(
-            &app,
-            "PUT",
-            &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
-            &[bearer(&token), content_type("application/octet-stream")],
-            sealed_chunk_body(),
-        )
-        .await;
-    }
+    assert_eq!(status, StatusCode::NO_CONTENT);
     // Overwrite with a smaller count: chunks 1 and 2 are now past its end.
     let (status, _) = send(
         &app,
@@ -452,6 +501,9 @@ impl VaultStore for RacingDeleteVault {
         }
         Ok(paths)
     }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.0.list_entries(prefix).await
+    }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.0.usage(prefix).await
     }
@@ -464,6 +516,7 @@ async fn listing_skips_manifests_deleted_concurrently() {
         Arc::new(RacingDeleteVault(ObjectStoreVault::new_in_memory())),
     ));
     let token = token_for(TenantId::generate());
+    put_chunks(&app, &token, 1).await;
     let (status, _) = send(
         &app,
         "PUT",
@@ -496,7 +549,27 @@ fn faulty_drive(faults: common::Faults, error: fn() -> StorageError) -> (Router,
     (app, token_for(TenantId::generate()))
 }
 
+/// [`faulty_drive`] with `OBJ`'s manifest already stored, as if written
+/// before the outage. A manifest cannot be committed through the API while
+/// reads fail: `put_manifest` must read the orphan sweep's marker.
+async fn faulty_drive_with_manifest(
+    faults: common::Faults,
+    error: fn() -> StorageError,
+) -> (Router, String) {
+    let vault = Arc::new(common::FlakyVault::new(faults, error));
+    let tenant = TenantId::generate();
+    vault
+        .seed(
+            &platform_storage::TenantPaths::drive_manifest(tenant, OBJ.parse().expect("object id")),
+            manifest_json().into_bytes().into(),
+        )
+        .await;
+    let app = build_app(common::app_state(SECRET, vault));
+    (app, token_for(tenant))
+}
+
 async fn put_manifest(app: &Router, token: &str) -> StatusCode {
+    put_chunks(app, token, 1).await;
     send(
         app,
         "PUT",
@@ -512,7 +585,7 @@ async fn put_manifest(app: &Router, token: &str) -> StatusCode {
 /// success.
 async fn assert_retryable_outage(app: &Router, token: &str, method: &str, uri: &str) {
     let body = if method == "PUT" {
-        manifest_json().into_bytes()
+        sealed_chunk_body()
     } else {
         Vec::new()
     };
@@ -542,22 +615,53 @@ async fn put_outage_is_retryable() {
         },
         common::outage,
     );
-    let uri = format!("/api/v1/drive/objects/{OBJ}/manifest");
+    let uri = format!("/api/v1/drive/objects/{OBJ}/chunks/0");
     assert_retryable_outage(&app, &token, "PUT", &uri).await;
 }
 
 #[tokio::test]
 async fn get_outage_is_retryable_not_not_found() {
-    let (app, token) = faulty_drive(
+    let (app, token) = faulty_drive_with_manifest(
         common::Faults {
             get: true,
             ..Default::default()
         },
         common::outage,
-    );
-    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    )
+    .await;
     let uri = format!("/api/v1/drive/objects/{OBJ}/manifest");
     assert_retryable_outage(&app, &token, "GET", &uri).await;
+}
+
+/// While reads fail, `put_manifest` cannot tell whether the orphan sweep
+/// holds the object, so it commits nothing.
+#[tokio::test]
+async fn manifest_is_refused_while_reads_fail() {
+    let vault = Arc::new(common::FlakyVault::new(
+        common::Faults {
+            get: true,
+            ..Default::default()
+        },
+        common::outage,
+    ));
+    let app = build_app(common::app_state(SECRET, vault.clone()));
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    put_chunks(&app, &token, 1).await;
+
+    let (status, headers, _) = common::send_with_headers(
+        &app,
+        "PUT",
+        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
+        &[bearer(&token), content_type("application/json")],
+        manifest_json().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+    let manifest =
+        platform_storage::TenantPaths::drive_manifest(tenant, OBJ.parse().expect("object id"));
+    assert!(!vault.holds(&manifest).await, "nothing was committed");
 }
 
 #[tokio::test]
@@ -598,9 +702,9 @@ async fn fatal_storage_failure_is_502_without_retry_after() {
     let (status, headers, _) = common::send_with_headers(
         &app,
         "PUT",
-        &format!("/api/v1/drive/objects/{OBJ}/manifest"),
-        &[bearer(&token), content_type("application/json")],
-        manifest_json().into_bytes(),
+        &format!("/api/v1/drive/objects/{OBJ}/chunks/0"),
+        &[bearer(&token), content_type("application/octet-stream")],
+        sealed_chunk_body(),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -672,6 +776,9 @@ impl VaultStore for FailOnceDeleteVault {
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.inner.list(prefix).await
     }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.inner.list_entries(prefix).await
+    }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.inner.usage(prefix).await
     }
@@ -679,7 +786,7 @@ impl VaultStore for FailOnceDeleteVault {
 
 const CHUNKS: u32 = 3;
 
-/// Upload a manifest and [`CHUNKS`] chunks, then delete with the
+/// Upload [`CHUNKS`] chunks and a manifest, then delete with the
 /// `fail_at`-th vault delete failing. Returns the app, token and vault.
 async fn delete_failing_at(fail_at: usize) -> (Router, String, Arc<FailOnceDeleteVault>, TenantId) {
     let vault = Arc::new(FailOnceDeleteVault {
@@ -690,6 +797,7 @@ async fn delete_failing_at(fail_at: usize) -> (Router, String, Arc<FailOnceDelet
     let app = build_app(common::app_state(SECRET, vault.clone()));
     let tenant = TenantId::generate();
     let token = token_for(tenant);
+    put_chunks(&app, &token, CHUNKS).await;
     let (status, _) = send(
         &app,
         "PUT",
@@ -699,17 +807,6 @@ async fn delete_failing_at(fail_at: usize) -> (Router, String, Arc<FailOnceDelet
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    for index in 0..CHUNKS {
-        let (status, _) = send(
-            &app,
-            "PUT",
-            &format!("/api/v1/drive/objects/{OBJ}/chunks/{index}"),
-            &[bearer(&token), content_type("application/octet-stream")],
-            sealed_chunk_body(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-    }
     (app, token, vault, tenant)
 }
 
@@ -862,6 +959,9 @@ impl VaultStore for ConcurrencyVault {
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.inner.list(prefix).await
     }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.inner.list_entries(prefix).await
+    }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.inner.usage(prefix).await
     }
@@ -888,13 +988,13 @@ async fn manifest_reads_run_concurrently_but_bounded() {
 
 #[tokio::test]
 async fn a_failed_manifest_read_fails_the_whole_listing() {
-    let (app, token) = faulty_drive(
+    let (app, token) = faulty_drive_with_manifest(
         common::Faults {
             get: true,
             ..Default::default()
         },
         common::outage,
-    );
-    assert_eq!(put_manifest(&app, &token).await, StatusCode::NO_CONTENT);
+    )
+    .await;
     assert_retryable_outage(&app, &token, "GET", "/api/v1/drive/objects").await;
 }

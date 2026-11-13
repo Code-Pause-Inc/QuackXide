@@ -1,4 +1,4 @@
-//! Steward dataset uploads (`PUT /api/v1/datasets/{dataset}`, ADR 0011): a
+//! Steward dataset uploads (`PUT /api/v1/datasets/{dataset}`, ADR 0012): a
 //! browser-sealed upload is stored as the dataset's new snapshot and is
 //! queryable in the enclave; a re-upload replaces it; an upload that fails
 //! partway is never visible. Refusals: no or non-access token (401), a
@@ -21,7 +21,7 @@ use platform_config::PlatformConfig;
 use platform_core::{ColumnType, ConnectorSlug, SnapshotVersion, TenantId};
 use platform_crypto::{TenantKeypair, TenantPublicKey};
 use platform_storage::{
-    ObjectStoreVault, StorageError, StorageUsage, TenantPaths, VaultPath, VaultStore,
+    ObjectStoreVault, StorageError, StorageUsage, TenantPaths, VaultEntry, VaultPath, VaultStore,
 };
 
 use common::{
@@ -404,6 +404,9 @@ impl VaultStore for FailingManifests {
     }
     async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
         self.inner.list(prefix).await
+    }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.inner.list_entries(prefix).await
     }
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.inner.usage(prefix).await

@@ -40,9 +40,13 @@ template:
   open it;
 * `register_key` keeps a tenant's keypair without writing anything, for
   data that arrives later through the upload route;
-* `query_service` adds in-memory grant, budget and catalog registries on
-  the simulated TEE: simulated tokens, with keys from the in-process
-  key-release stand-in;
+* `query_service` runs research queries through the `ResearchService` it
+  is given, on the simulated TEE: simulated tokens, with keys from the
+  in-process key-release stand-in. Give `AppState::research` the same
+  `Arc`, as `common::research_app` does, so the research routes and the
+  research query share one set of grants and budgets. Build the service
+  over the stack's vault (`stack.vault()`), so publishing a listing sees
+  the stack's snapshots;
   `query_service_with_attestation` takes the attestation provider and
   whether attestation is required, for attestation-refusal tests, and
   opens keys from process memory.
