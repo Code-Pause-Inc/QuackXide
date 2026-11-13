@@ -12,12 +12,14 @@ uses [Semantic Versioning](https://semver.org/).
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
   (ADR 0003): the object, a plaintext record, then the manifest as the
-  commit, then pruning. Uploaded datasets are named in a reserved
-  `upload_` slug namespace that no connector may use, and keep using the
-  existing grant, listing and research query fields. The route takes the
-  tenant from the token only, needs no query service, and refuses with
-  401, 404 (outside the upload namespace), 409 (a version not newer than
-  the current one), 413 (over `DATASET_MAX_MIB`, default 64, 1 to 512,
+  commit, then pruning of everything the new snapshot does not list,
+  including an object that an earlier attempt at the same version left.
+  Uploaded datasets are named in a reserved `upload_` slug namespace that
+  no connector may use, and keep using the existing grant, listing and
+  research query fields. The route takes the tenant from the token only,
+  needs no query service, and refuses with 401, 404 (outside the upload
+  namespace), 409 (a version not newer than the current one, or already
+  committed), 413 (over `DATASET_MAX_MIB`, default 64, 1 to 512,
   refused at startup when out of range) and 422 (a malformed body or
   envelope frame, a version more than five minutes ahead, or a declared
   schema unlike the recorded one), each audited as `data.access`. The
@@ -297,13 +299,15 @@ uses [Semantic Versioning](https://semver.org/).
 
 * Every dataset snapshot, a connector sync's included, writes a plaintext
   record (`platform_storage::SnapshotRecord`: its suite, and for an upload
-  the declared row cap and schema) before its manifest, and pruning
-  deletes superseded records. A query refuses a snapshot without a valid
-  record, and a manifest that lists a missing object, with 502 (a missing
-  object was a 404). Publishing a catalog listing for a dataset the
-  steward does not hold, one without a committed snapshot, is refused with
-  404 and a `research.catalog` denial. For this check
-  `ResearchService::new` and `from_config` take the vault the app serves.
+  the declared row cap and schema) before its manifest, writes the
+  manifest create-only, so a version commits once, and pruning deletes
+  superseded records. A query refuses a snapshot without a valid record
+  (one naming a suite this build reads), and a manifest that lists a
+  missing object, with 502 (a missing object was a 404). Publishing a
+  catalog listing for a dataset the steward does not hold, one without a
+  committed snapshot, is refused with 404 and a `research.catalog`
+  denial. For this check `ResearchService::new` and `from_config` take
+  the vault the app serves.
 * ADR 0007's "Browser private-key storage" section is accepted, and ADR
   0004 now says the researcher's result key is held as that section
   describes instead of "non-extractable": a private key that HPKE opens

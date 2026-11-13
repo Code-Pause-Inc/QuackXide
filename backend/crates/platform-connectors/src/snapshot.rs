@@ -4,8 +4,9 @@
 //! then its plaintext [`SnapshotRecord`], then a sealed manifest listing the
 //! objects. Queries read only the newest snapshot that has a manifest, so a
 //! write that stops partway changes nothing they see, and repeated writes
-//! never stack copies of the same rows. Superseded snapshots are deleted
-//! after the commit.
+//! never stack copies of the same rows. The manifest is written create-only,
+//! so a version commits once. After the commit, everything the new snapshot
+//! does not list is deleted.
 //!
 //! Two writers share the layout: [`SnapshotWriter`] seals a connector
 //! sync's Parquet in the enclave, and [`crate::upload::commit_upload`]
@@ -180,7 +181,7 @@ impl<'a> SnapshotWriter<'a> {
             &self.slug,
             &record,
             envelope.into(),
-            manifest.objects.len(),
+            &manifest.objects,
         )
         .await
         .map_err(|e| PipelineError::Storage(e.to_string()))?;
@@ -197,16 +198,22 @@ fn audit_labels(slug: &ConnectorSlug) -> (AuditKind, &'static str) {
     }
 }
 
-/// Commit a snapshot whose objects are already stored: write its plaintext
-/// `record`, then the sealed `manifest` (the commit), then prune superseded
-/// snapshots. Shared by both writers, so the order cannot drift.
+/// Commit a snapshot whose `objects` are already stored: write its
+/// plaintext `record`, then the sealed `manifest` (the commit), then prune
+/// what the snapshot does not list. Shared by both writers, so the order
+/// cannot drift.
+///
+/// The manifest is written create-only. If the version is already
+/// committed, this fails with [`StorageError::AlreadyExists`] and prunes
+/// nothing, so a second write at one version neither replaces the snapshot
+/// nor deletes its objects.
 pub(crate) async fn commit_snapshot(
     vault: &dyn VaultStore,
     tenant: TenantId,
     slug: &ConnectorSlug,
     record: &SnapshotRecord,
     manifest: Bytes,
-    objects: usize,
+    objects: &[ObjectId],
 ) -> Result<(), StorageError> {
     let version = &record.version;
     vault
@@ -216,7 +223,7 @@ pub(crate) async fn commit_snapshot(
         )
         .await?;
     vault
-        .put(
+        .put_if_absent(
             &TenantPaths::connector_manifest(tenant, slug, version),
             manifest,
         )
@@ -226,22 +233,29 @@ pub(crate) async fn commit_snapshot(
         kind,
         Some(tenant),
         "committed",
-        &format!("{label}={slug} snapshot={version} objects={objects}"),
+        &format!(
+            "{label}={slug} snapshot={version} objects={}",
+            objects.len()
+        ),
     );
-    prune_superseded(vault, tenant, slug, version).await;
+    prune_superseded(vault, tenant, slug, version, objects).await;
     Ok(())
 }
 
-/// Delete every snapshot older than `current`: manifests first, so an old
-/// snapshot leaves the read path before its objects go, then objects and
-/// records, including those of writes that never committed. Failures leave
-/// stale snapshots behind, which queries never read; the next commit
-/// retries.
+/// Delete everything outside the `current` snapshot, whose objects are
+/// `current_objects`. Older manifests go first, so an old snapshot leaves
+/// the read path before its objects go. Then older objects and records go,
+/// including those of writes that never committed, and so do objects at
+/// `current` that it does not list: an earlier attempt at the same version
+/// left them when it stopped before its manifest. Newer versions may be in
+/// progress and are left alone. Failures leave stale objects behind, which
+/// queries never read; the next commit retries.
 pub async fn prune_superseded(
     vault: &dyn VaultStore,
     tenant: TenantId,
     slug: &ConnectorSlug,
     current: &SnapshotVersion,
+    current_objects: &[ObjectId],
 ) {
     let (kind, label) = audit_labels(slug);
     let mut failed = false;
@@ -261,26 +275,32 @@ pub async fn prune_superseded(
         Err(_) => failed = true,
     }
 
-    // Objects pruned per superseded version.
+    // Objects pruned per superseded version, and at `current` those it does
+    // not list.
     let mut pruned: BTreeMap<SnapshotVersion, usize> = BTreeMap::new();
+    let mut uncommitted = 0usize;
     match vault
         .list(&TenantPaths::connector_snapshots_prefix(tenant, slug))
         .await
     {
         Ok(paths) => {
             for path in paths {
-                let Some((version, _)) =
+                let Some((version, object)) =
                     TenantPaths::connector_snapshot_object_parts(tenant, slug, &path)
                 else {
                     continue;
                 };
-                if version >= *current {
+                let superseded = version < *current;
+                let unlisted = version == *current && !current_objects.contains(&object);
+                if !superseded && !unlisted {
                     continue;
                 }
-                if vault.delete(&path).await.is_ok() {
+                if vault.delete(&path).await.is_err() {
+                    failed = true;
+                } else if superseded {
                     *pruned.entry(version).or_default() += 1;
                 } else {
-                    failed = true;
+                    uncommitted += 1;
                 }
             }
         }
@@ -315,6 +335,14 @@ pub async fn prune_superseded(
             Some(tenant),
             "pruned",
             &format!("{label}={slug} superseded_snapshot={version} objects={objects}"),
+        );
+    }
+    if uncommitted > 0 {
+        security_audit_event(
+            kind,
+            Some(tenant),
+            "pruned",
+            &format!("{label}={slug} snapshot={current} uncommitted_objects={uncommitted}"),
         );
     }
     if failed {

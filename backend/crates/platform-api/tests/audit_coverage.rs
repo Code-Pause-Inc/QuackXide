@@ -8,19 +8,20 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
+use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::query::{ConnectorQueryService, DevKeyProvider};
 use platform_api::{AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
-use platform_core::{TenantId, ZkMode};
+use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
 use platform_enclave::token::ReleasePolicy;
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, VaultStore};
+use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
@@ -945,19 +946,30 @@ async fn dataset_upload_is_audited() {
     let steward = TenantId::generate();
     let keypair = TenantKeypair::generate();
     let key = keypair.public_key();
-    let app = common::upload_research_app(
-        SECRET,
-        vec![(steward, keypair)],
-        Arc::new(ObjectStoreVault::new_in_memory()),
-    );
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());
     let token = token_for(steward);
 
-    // Two uploads: the second commits and prunes the first.
+    // Two uploads: the second commits and prunes the first, and an object
+    // that an earlier attempt at its version left.
     let first = common::cohorts_upload(steward, &key, "upload_cohorts", None);
     let (status, _) =
         common::put_upload(&app, Some(&token), "upload_cohorts", first.body.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let second = common::cohorts_upload(steward, &key, "upload_cohorts", Some(&first.version));
+    let dataset = ConnectorSlug::new("upload_cohorts").expect("slug");
+    vault
+        .put(
+            &TenantPaths::connector_snapshot_object(
+                steward,
+                &dataset,
+                &second.version,
+                ObjectId::generate(),
+            ),
+            Bytes::from_static(b"sealed"),
+        )
+        .await
+        .expect("put");
     let (status, _) =
         common::put_upload(&app, Some(&token), "upload_cohorts", second.body.clone()).await;
     assert_eq!(status, StatusCode::OK);
@@ -1018,6 +1030,15 @@ async fn dataset_upload_is_audited() {
         &format!(
             "dataset=upload_cohorts superseded_snapshot={} objects=1",
             first.version
+        ),
+    );
+    assert_event(
+        &capture,
+        "data.access",
+        "pruned",
+        &format!(
+            "dataset=upload_cohorts snapshot={} uncommitted_objects=1",
+            second.version
         ),
     );
     for reason in ["bad_magic", "stale_version"] {

@@ -23,7 +23,7 @@ use platform_connectors::snapshot::{
     SnapshotManifest, manifest_info, newest_manifest, object_info,
 };
 use platform_core::{ConnectorSlug, DatasetKind, DeclaredSchema, TenantId};
-use platform_crypto::{SecretBytes, TenantKeypair};
+use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
@@ -373,8 +373,9 @@ impl ConnectorQueryService {
     /// the objects listed by the newest manifest, and nothing else, so
     /// repeated or interrupted writes never add rows. Objects open under the
     /// `info` of the dataset's kind (ADR 0012). The snapshot's plaintext
-    /// record is read before any key is released, and an upload's declared
-    /// schema and row cap come back for the engine to check. The blobs
+    /// record is read before any key is released and must name a suite this
+    /// build reads, and an upload's declared schema and row cap come back
+    /// for the engine to check. The blobs
     /// zeroize on drop, so an error partway through wipes the objects
     /// already opened.
     async fn decrypt_dataset(
@@ -391,7 +392,9 @@ impl ConnectorQueryService {
             .get(&TenantPaths::connector_record(owner, dataset, &version))
             .await
         {
-            Ok(bytes) => SnapshotRecord::parse(&bytes, &version).ok(),
+            Ok(bytes) => SnapshotRecord::parse(&bytes, &version)
+                .ok()
+                .filter(|record| EnvelopeSuite::from_id(&record.suite).is_ok()),
             Err(StorageError::NotFound) => None,
             Err(other) => return Err(other.into()),
         };
@@ -414,7 +417,7 @@ impl ConnectorQueryService {
                 AuditKind::DataAccess,
                 Some(owner),
                 "failed",
-                "snapshot record is missing, malformed or incomplete",
+                "snapshot record is missing, malformed, incomplete or of an unknown suite",
             );
             return Err(ApiError::Backend);
         };

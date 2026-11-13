@@ -242,7 +242,8 @@ pub enum UploadCommitError {
     /// The version is more than [`MAX_VERSION_SKEW`] ahead of the clock.
     #[error("snapshot version is ahead of the server clock")]
     VersionAhead,
-    /// The dataset's current snapshot is this version or newer.
+    /// The dataset's current snapshot is this version or newer, or another
+    /// write committed this version first.
     #[error("a snapshot at or after this version is already committed")]
     StaleVersion,
     /// The declared schema differs from the current snapshot's.
@@ -281,10 +282,13 @@ pub struct UploadReport {
 
 /// Store `upload` as the new current snapshot of `tenant`'s `dataset`: the
 /// object, then the plaintext record (suite, declared row cap and schema),
-/// then the browser-sealed manifest, which commits it; then superseded
-/// snapshots are pruned. The first upload creates the dataset. A later one
-/// must carry a newer version and the schema already recorded. A failure
-/// before the manifest is written leaves the current snapshot as it was.
+/// then the browser-sealed manifest, which commits it; then everything the
+/// new snapshot does not list is pruned, including an object that an earlier
+/// attempt at the same version left. The first upload creates the dataset.
+/// A later one must carry a newer version and the schema already recorded.
+/// A version commits once, so an upload that another write beat to its
+/// version is stale. A failure before the manifest is written leaves the
+/// current snapshot as it was.
 pub async fn commit_upload(
     vault: &dyn VaultStore,
     tenant: TenantId,
@@ -357,7 +361,12 @@ pub async fn commit_upload(
         row_cap: Some(row_cap),
         schema: Some(schema),
     };
-    commit_snapshot(vault, tenant, dataset, &record, manifest, 1).await?;
+    match commit_snapshot(vault, tenant, dataset, &record, manifest, &[object_id]).await {
+        Ok(()) => {}
+        // Another write committed this version after the check above.
+        Err(StorageError::AlreadyExists) => return Err(UploadCommitError::StaleVersion),
+        Err(err) => return Err(err.into()),
+    }
     Ok(UploadReport {
         version,
         object: object_id,
@@ -368,11 +377,13 @@ pub async fn commit_upload(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::snapshot::{SnapshotManifest, manifest_info, object_info};
     use platform_core::{ColumnType, DeclaredColumn};
     use platform_crypto::{TenantKeypair, hpke_seal_to_tenant};
-    use platform_storage::ObjectStoreVault;
+    use platform_storage::{ObjectStoreVault, StorageUsage, VaultEntry, VaultPath};
 
     const MAX: u64 = 1024 * 1024;
 
@@ -800,6 +811,122 @@ mod tests {
         .collect::<Vec<_>>();
         expected.sort();
         assert_eq!(stored(&vault, tenant).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_retry_at_the_same_version_prunes_what_the_failed_attempt_left() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let fixture = Fixture::new();
+        let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
+        let version = version_at(-1_000);
+        // An attempt at `version` stored its object and stopped before its
+        // manifest, and a newer upload is in progress.
+        let left =
+            TenantPaths::connector_snapshot_object(tenant, dataset, &version, ObjectId::generate());
+        let newer = TenantPaths::connector_snapshot_object(
+            tenant,
+            dataset,
+            &version_from(version.unix_nanos() + 1),
+            ObjectId::generate(),
+        );
+        for path in [&left, &newer] {
+            vault
+                .put(path, Bytes::from_static(b"sealed"))
+                .await
+                .expect("put");
+        }
+
+        // The retry seals its object under a new id and commits `version`.
+        let report = fixture
+            .commit(&vault, fixture.body(&version, cohort_schema(), b"rows"))
+            .await
+            .expect("retry");
+        let mut expected = vec![
+            TenantPaths::connector_snapshot_object(tenant, dataset, &version, report.object),
+            TenantPaths::connector_record(tenant, dataset, &version),
+            TenantPaths::connector_manifest(tenant, dataset, &version),
+            newer,
+        ]
+        .into_iter()
+        .map(|path| path.as_str().to_owned())
+        .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(stored(&vault, tenant).await, expected);
+    }
+
+    /// A vault in which another write commits a snapshot (`theirs`: its
+    /// object and manifest) just before the first create-only write through
+    /// it lands, as a concurrent upload at the same version would.
+    struct CommittedFirst {
+        inner: ObjectStoreVault,
+        theirs: [(VaultPath, Bytes); 2],
+        raced: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl VaultStore for CommittedFirst {
+        async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+            self.inner.put(path, ciphertext).await
+        }
+        async fn put_if_absent(
+            &self,
+            path: &VaultPath,
+            ciphertext: Bytes,
+        ) -> Result<(), StorageError> {
+            if !self.raced.swap(true, Ordering::SeqCst) {
+                for (theirs, bytes) in &self.theirs {
+                    self.inner.put(theirs, bytes.clone()).await?;
+                }
+            }
+            self.inner.put_if_absent(path, ciphertext).await
+        }
+        async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+            self.inner.get(path).await
+        }
+        async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+            self.inner.list(prefix).await
+        }
+        async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+            self.inner.list_entries(prefix).await
+        }
+        async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+            self.inner.usage(prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_another_write_committed_first_is_stale() {
+        let fixture = Fixture::new();
+        let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
+        let version = version_at(0);
+        let their_object =
+            TenantPaths::connector_snapshot_object(tenant, dataset, &version, ObjectId::generate());
+        let manifest = TenantPaths::connector_manifest(tenant, dataset, &version);
+        let vault = CommittedFirst {
+            inner: ObjectStoreVault::new_in_memory(),
+            theirs: [
+                (their_object.clone(), Bytes::from_static(b"their object")),
+                (manifest.clone(), Bytes::from_static(b"their manifest")),
+            ],
+            raced: AtomicBool::new(false),
+        };
+        let err = fixture
+            .commit(&vault, fixture.body(&version, cohort_schema(), b"rows"))
+            .await
+            .expect_err("stale");
+        assert!(matches!(err, UploadCommitError::StaleVersion), "{err:?}");
+        // The other write's snapshot stands, and none of it was pruned.
+        assert_eq!(
+            vault.get(&manifest).await.expect("manifest"),
+            Bytes::from_static(b"their manifest")
+        );
+        assert_eq!(
+            vault.get(&their_object).await.expect("object"),
+            Bytes::from_static(b"their object")
+        );
     }
 
     #[tokio::test]

@@ -373,7 +373,8 @@ async fn a_re_upload_replaces_the_current_snapshot() {
 }
 
 /// An in-memory vault whose manifest writes fail while `fail` is set: an
-/// upload that stops after its object and record.
+/// upload that stops after its object and record. Manifests are written
+/// create-only, so both write methods fail.
 struct FailingManifests {
     inner: ObjectStoreVault,
     fail: std::sync::atomic::AtomicBool,
@@ -394,6 +395,9 @@ impl VaultStore for FailingManifests {
         self.inner.put(path, ciphertext).await
     }
     async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        if self.failing(path) {
+            return Err(common::outage());
+        }
         self.inner.put_if_absent(path, ciphertext).await
     }
     async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
@@ -458,6 +462,54 @@ async fn a_partial_upload_is_never_visible() {
     );
     assert_eq!(upload(&app, &steward, &retry).await, StatusCode::OK);
     assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn a_retry_at_the_same_version_replaces_the_failed_attempt() {
+    let vault = Arc::new(FailingManifests {
+        inner: ObjectStoreVault::new_in_memory(),
+        fail: true.into(),
+    });
+    let (app, steward) = app_over(vault.clone());
+    let version = next_version(None);
+
+    // The first attempt stops before its manifest.
+    let failed = sealed_upload(
+        steward.tenant,
+        &steward.key,
+        DATASET,
+        version.clone(),
+        &common::cohorts_parquet(),
+        cohorts_schema(),
+        7,
+    );
+    assert_eq!(
+        upload(&app, &steward, &failed).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // The retry at the same version seals other rows under a new object id.
+    // It commits, and the failed attempt's object is pruned.
+    vault.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let rows = synth_cohort(8);
+    let retry = sealed_upload(
+        steward.tenant,
+        &steward.key,
+        DATASET,
+        version,
+        &rows,
+        cohorts_schema(),
+        8,
+    );
+    assert_ne!(retry.object, failed.object);
+    assert_eq!(upload(&app, &steward, &retry).await, StatusCode::OK);
+    assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (1, 1, 1));
+    let (status, counted) = count(&app, &steward).await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    assert_eq!(counted["rows"][0]["n"], 8);
+
+    // The version is committed once: sending it again is stale.
+    assert_eq!(upload(&app, &steward, &retry).await, StatusCode::CONFLICT);
 }
 
 /// `rows` "flu" cohorts rows in the [`common::cohorts_schema`] shape.

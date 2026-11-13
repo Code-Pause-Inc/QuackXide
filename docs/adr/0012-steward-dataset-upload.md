@@ -66,11 +66,19 @@ tenants/{t}/connectors/{slug}/keys/{version}/                        reserved: w
 ```
 
 The upload is written in that order: the object, then the record, then
-the manifest. Writing the manifest is the commit. Superseded snapshots are
-then pruned, manifests first, then objects and records, including those of
-uploads that never committed. A re-upload replaces the dataset rather than
+the manifest. Writing the manifest is the commit, and it is create-only,
+so a version commits once: an upload whose version another write
+committed first gets 409 and prunes nothing. The commit then prunes
+everything its snapshot does not list. Older manifests go first, then
+older objects and records, including those of uploads that never
+committed, and then other objects at its own version, which an earlier
+attempt at that version left when it stopped before its manifest. Newer
+versions may be in progress and are left alone. An object that a
+concurrent attempt at the same version stores after the commit stays
+until the next upload. A re-upload replaces the dataset rather than
 adding to it, and an upload that stops before its manifest changes nothing
-a query reads.
+a query reads. Connector snapshots share this commit; each sync draws a
+fresh version, so for them only the order matters.
 
 `keys/{version}/` is reserved for the snapshot's wrapped data keys under
 ADR 0004: one wrapped to the KMS key, and for an upload one wrapped to the
@@ -90,9 +98,11 @@ without key release:
   name (`EnvelopeSuite::id`, today `HPK1`);
 * for an upload only, `row_cap` and `schema`: what the steward declared.
 
-A query refuses a snapshot without a valid record (502). P39 reads the
-suite from the record and the write time from the version, without
-opening anything.
+A query refuses a snapshot without a valid record (502). A valid record
+names a suite this build reads (`EnvelopeSuite::from_id`), so an unknown
+suite fails closed before any key is released. P39 reads the suite from
+the record and the write time from the version, without opening
+anything.
 
 ### Input format and declared schema
 
@@ -207,7 +217,7 @@ not what the API stores.
 | Malformed body, header, or envelope frame | 422 | denied, with the reason |
 | Version more than five minutes ahead | 422 | denied, `version_ahead` |
 | Declared schema unlike the recorded one | 422 | denied, `schema_mismatch` |
-| Version not newer than the current one | 409 | denied, `stale_version` |
+| Version not newer than the current one, or committed by another write first | 409 | denied, `stale_version` |
 | Current record unreadable | 502 | failed, `record_unreadable` |
 | Storage failure | 503 or 502 | failed, `storage` |
 
@@ -273,6 +283,10 @@ APIs and features are built (no `with_context` streams, no `seekable`, no
   dataset (P42) and uploading again is the path.
 * A retry of an upload that committed but lost its response gets 409. The
   browser checks the current version through P39 before retrying.
+* A bad seal replaces a good snapshot. The server cannot open envelopes,
+  so an upload sealed under the wrong key or binding commits and prunes
+  the working snapshot, and queries return 502 until the steward
+  re-uploads.
 * P39 lists over this layout. P40 builds the browser half: the header, the
   version choice, both seals, and the plaintext-schema notice. P42 deletes
   the whole dataset prefix, records included. P52 reuses
@@ -293,3 +307,8 @@ APIs and features are built (no `with_context` streams, no `seekable`, no
    move to the data key, leaving only a digest in plaintext?
 4. 404 or 403 for an upload outside the upload namespace? 404 is chosen,
    since the steward holds no upload dataset by that name.
+5. The schema lock depends on P42. A dataset keeps its first upload's
+   schema, so a wrong first schema, or the concurrent first uploads that
+   "Holds" accepts, can be fixed only by deleting the dataset (P42).
+   `docs/V1_PLAN.md` lists P42 as a v1.1 candidate; if it slips, such a
+   slug is stuck for good. Should P42 stay in v1?

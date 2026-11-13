@@ -164,7 +164,7 @@ header: version, obj, row cap,
                                      object ────────────────────────────────────▶ tenants/{t}/connectors/{ds}/snapshots/{v}/{obj}.parquet
                                      record: suite, row cap, schema ────────────▶ tenants/{t}/connectors/{ds}/records/{v}.json
                                      manifest, written last (commit) ───────────▶ tenants/{t}/connectors/{ds}/manifests/{v}.manifest
-                                     prune superseded snapshots
+                                     prune what the snapshot does not list
 ```
 
 `PUT /api/v1/datasets/{dataset}` ([ADR 0012](adr/0012-steward-dataset-upload.md)):
@@ -193,12 +193,17 @@ header: version, obj, row cap,
   `data.access` denial with a fixed reason.
 * **Snapshots** (ADR 0003). An upload is one complete snapshot: the
   object, then the plaintext record, then the manifest as the commit,
-  then pruning. The first upload creates the dataset, a re-upload replaces
-  it, and an upload that stops before its manifest changes nothing a
-  query reads.
+  then pruning of everything the snapshot does not list, including an
+  object that an earlier attempt at the same version left. The manifest
+  is written create-only, so a version commits once and another attempt
+  at it gets 409. The first upload creates the dataset, a re-upload
+  replaces it, and an upload that stops before its manifest changes
+  nothing a query reads.
 * **Record.** Each snapshot's plaintext record holds its suite and, for an
   upload, the declared row cap and schema (column names and type
-  families), so the API can describe a dataset without key release.
+  families), so the API can describe a dataset without key release. A
+  query refuses a snapshot whose record is missing or malformed, or names
+  a suite this build does not read (502).
 * **Catalog registration.** A steward can publish a listing only for a
   dataset it holds, one with a committed snapshot ("Research access").
 
@@ -262,7 +267,8 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 * **Snapshots** ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)):
   every sync is a full sync, so each one writes a complete snapshot under
   a new time-ordered version, then a plaintext record naming its suite,
-  and commits it by writing a sealed manifest last. Queries read only the
+  and commits it by writing a sealed manifest last, create-only, so a
+  version commits once. Queries read only the
   newest committed snapshot, so repeated syncs never multiply rows (which
   would inflate cohort counts past *k*) and a sync that stops partway
   changes nothing a query sees. Superseded snapshots, records included,
@@ -577,7 +583,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles, grants |
-| `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, and refusal |
+| `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
 | `engine.query` | Every confidential query, with metering fields |
 | `auth.decision` | Every rejected token, admin denial, signature rejection |
