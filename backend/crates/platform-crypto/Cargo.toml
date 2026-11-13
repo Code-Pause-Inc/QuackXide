@@ -15,25 +15,24 @@ workspace = true
 default = ["server"]
 # AEAD sealing, blind indexes and TOTP. The browser build (`envelope-wasm`)
 # turns it off and gets only the HPKE envelopes and their `info` strings.
-server = ["dep:aes-gcm", "dep:hmac", "dep:sha1", "dep:sha2"]
+server = ["dep:aes-gcm", "dep:hmac", "dep:rand", "dep:sha1", "dep:sha2"]
 
 [dependencies]
 aes-gcm = { workspace = true, optional = true }
 hpke.workspace = true
 hmac = { workspace = true, optional = true }
-rand.workspace = true
+rand = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-# Only turns on x25519-dalek's `zeroize` feature, which hpke 0.12 leaves off,
-# so hpke's X25519 private keys and DH results wipe themselves on drop. Keep
-# it on the major version hpke uses; `x25519_secrets_zeroize_on_drop` checks.
-x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 zeroize.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+# Without default features, so `x25519_secrets_zeroize_on_drop` fails if hpke
+# stops turning on `zeroize` itself. `static_secrets` exposes `StaticSecret`.
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
 
 [[bench]]
 name = "hpke"

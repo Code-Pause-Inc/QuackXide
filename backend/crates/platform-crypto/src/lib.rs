@@ -19,8 +19,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
+use hpke::rand_core::CryptoRng;
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
-use rand::{CryptoRng, RngCore};
 #[cfg(feature = "server")]
 use sha2::Sha256;
 use std::io::{self, Write};
@@ -316,33 +316,45 @@ pub fn hpke_seal_to_tenant(
     info: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    hpke_seal_to_tenant_with_rng(recipient, info, plaintext, &mut rand::rngs::OsRng)
-}
-
-/// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
-/// committed test-vector generator passes a seeded RNG; everything else
-/// calls [`hpke_seal_to_tenant`].
-pub fn hpke_seal_to_tenant_with_rng<R: CryptoRng + RngCore>(
-    recipient: &TenantPublicKey,
-    info: &[u8],
-    plaintext: &[u8],
-    rng: &mut R,
-) -> Result<Vec<u8>, CryptoError> {
-    let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, TenantKem, _>(
+    let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, TenantKem>(
         &OpModeS::Base,
         &recipient.0,
         info,
         plaintext,
         b"",
-        rng,
     )
     .map_err(|_| CryptoError::SealFailed)?;
+    Ok(frame(&encapped, &ciphertext))
+}
 
+/// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
+/// committed test-vector generator passes a seeded RNG; everything else
+/// calls [`hpke_seal_to_tenant`].
+pub fn hpke_seal_to_tenant_with_rng(
+    recipient: &TenantPublicKey,
+    info: &[u8],
+    plaintext: &[u8],
+    rng: &mut impl CryptoRng,
+) -> Result<Vec<u8>, CryptoError> {
+    let (encapped, ciphertext) =
+        hpke::single_shot_seal_with_rng::<TenantAead, TenantKdf, TenantKem>(
+            &OpModeS::Base,
+            &recipient.0,
+            info,
+            plaintext,
+            b"",
+            rng,
+        )
+        .map_err(|_| CryptoError::SealFailed)?;
+    Ok(frame(&encapped, &ciphertext))
+}
+
+fn frame(encapped: &KemEncappedKey, ciphertext: &[u8]) -> Vec<u8> {
     let mut envelope = Vec::with_capacity(MAGIC_BYTES + ENCAPPED_KEY_BYTES + ciphertext.len());
     envelope.extend_from_slice(&EnvelopeSuite::CURRENT.magic());
     envelope.extend_from_slice(&encapped.to_bytes());
-    envelope.extend_from_slice(&ciphertext);
-    Ok(envelope)
+    envelope.extend_from_slice(ciphertext);
+    envelope
 }
 
 fn parse_envelope(envelope: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
@@ -410,7 +422,7 @@ pub struct TenantKeypair {
 
 impl TenantKeypair {
     pub fn generate() -> Self {
-        let (private_key, public_key) = TenantKem::gen_keypair(&mut rand::rngs::OsRng);
+        let (private_key, public_key) = TenantKem::gen_keypair();
         Self {
             private_key,
             public_key,
@@ -737,18 +749,14 @@ mod tests {
     #[test]
     fn x25519_secrets_zeroize_on_drop() {
         // `TenantKeypair: ZeroizeOnDrop` rests on this. hpke's X25519
-        // private keys and DH results are these types. x25519-dalek 2 gives
-        // them `Zeroize` and a `Drop` that zeroizes (`#[zeroize(drop)]`,
-        // which adds no `ZeroizeOnDrop` marker) only with its `zeroize`
-        // feature; without it they have no drop glue at all.
-        fn assert_zeroize<T: zeroize::Zeroize>() {}
-        assert_zeroize::<x25519_dalek::StaticSecret>();
-        assert_zeroize::<x25519_dalek::SharedSecret>();
+        // private keys and DH results are these types, and hpke turns on
+        // x25519-dalek's `zeroize` feature for them; this crate's own
+        // x25519-dalek dev-dependency leaves it off, so it can't mask hpke
+        // losing the feature.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<x25519_dalek::StaticSecret>();
+        assert_zeroize_on_drop::<x25519_dalek::SharedSecret>();
         const {
-            assert!(std::mem::needs_drop::<x25519_dalek::StaticSecret>());
-            assert!(std::mem::needs_drop::<x25519_dalek::SharedSecret>());
-            // hpke's own key type, so this fails if hpke ever uses an
-            // x25519-dalek without the feature.
             assert!(std::mem::needs_drop::<KemPrivateKey>());
         };
     }
