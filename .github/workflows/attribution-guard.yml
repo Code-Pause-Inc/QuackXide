@@ -3,6 +3,7 @@ name: attribution-guard
 on:
   push:
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -19,6 +20,9 @@ jobs:
       - name: Commit messages (pull request)
         if: github.event_name == 'pull_request'
         run: scripts/attribution-guard.sh range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+      - name: Commit messages (merge group)
+        if: github.event_name == 'merge_group'
+        run: scripts/attribution-guard.sh range "${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}"
       - name: Commit messages (push)
         if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         run: scripts/attribution-guard.sh range "${{ github.event.before }}..${{ github.event.after }}"

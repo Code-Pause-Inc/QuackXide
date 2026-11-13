@@ -89,7 +89,9 @@ Client key architecture:
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
-  `ObjectStoreVault` covers GCS (production) and in-memory (dev/tests).
+  `ObjectStoreVault` covers GCS (production), in-memory (dev/tests) and,
+  in `dev` builds only, a local directory (`STORAGE_LOCAL_DIR`, used by
+  the simulated TEE stack). A release build refuses `STORAGE_LOCAL_DIR`.
   Storage errors are classified: missing objects are 404, lost
   create-only writes 409, transient failures (after the storage client's
   own retries) 503 with `Retry-After`, and permanent ones (credentials,
@@ -112,6 +114,42 @@ Deleting an object removes its chunks first and its manifest last, so a
 delete that fails partway leaves the object listed and a retry finishes it.
 Until then the object's download fails, since some chunks are gone. An
 object whose manifest is gone is a 404.
+
+An upload sends its chunks first and its manifest last. The manifest PUT
+is refused with 409 unless every chunk `0..chunk_count` is stored, so a
+listed object always had all its chunks when it was committed.
+
+An upload that stops before its manifest leaves chunks nothing points to.
+`platform-api` sweeps every hour (`platform_api::sweep`): it deletes an
+object's chunks when the object has no manifest and no chunk of it has been
+written for 24 hours (`ORPHAN_MIN_AGE`). An upload that pauses longer than
+that between chunks loses the chunks it had sent, and its manifest is then
+refused.
+
+The sweep and a manifest PUT for the same object cannot both succeed.
+Before deleting, the sweep claims the object by creating a marker
+(`tenants/{tenant}/drive/sweeping/{object}`, create-only), then checks for
+a manifest and re-lists the chunks, so a manifest or chunk written since
+its first listing saves the object. It removes the marker only after its
+last delete. The manifest PUT checks the marker and the chunks, writes the
+manifest, then checks both again and deletes the manifest it wrote if
+either check fails. Each side writes before it reads what the other wrote,
+so either the sweep finds the manifest and deletes nothing, or the upload
+finds the marker or a missing chunk and gets 409. An object another run has
+claimed is skipped. A marker left by a run that stopped partway keeps its
+object refused until a later run finds the marker older than
+`ORPHAN_MIN_AGE` and removes it. Replacing an existing manifest skips the
+second check: the sweep never deletes the chunks of an object that has a
+manifest.
+
+Each deletion is audited; a run that deletes nothing audits nothing. One
+object's storage error does not stop the run. The sweep's cross-tenant
+listing stays inside `platform-storage` (`list_drive_entries_all_tenants`),
+which returns only single-tenant drive paths. Ages are the store's
+last-modified times, so the API host's clock must be within hours of the
+store's. The claim depends on the store's create-only write; the local GCS
+emulator does not enforce it, so two sweeps there can both claim an object,
+which deletes the same orphan twice and nothing else.
 
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
@@ -174,8 +212,9 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
   aborts siblings. On SIGTERM or Ctrl-C it lets the sync in flight commit
   and starts no more. The `connector-worker` binary runs fixture jobs
-  end-to-end without live credentials; `HttpJsonSource` (OAuth refresh →
-  GET → mapper) is the production fetch path.
+  end-to-end without live credentials. It is a development tool, not a
+  release artifact: live sync through `HttpJsonSource` (OAuth refresh →
+  GET → mapper) is not in v1.0 (`docs/PROJECT_SCOPE.md`).
 
 ### 3. Query (zero-trust analytics)
 
@@ -212,6 +251,13 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   "Research access" below). Refusals return HTTP 422; results report
   `suppressed_rows`. A ZK scope without a threshold, or with `k = 0`,
   refuses every query.
+* **What the ZK gate does not bound.** On own-data queries it stops a
+  single query from returning rows, and nothing more. `POST /api/v1/query`
+  has no query budget, so anyone holding the tenant's access token can run
+  overlapping aggregates without limit and rebuild suppressed cohorts by
+  differencing. Only research queries are budget-bounded (`BudgetLedger`,
+  below). A per-tenant, per-dataset budget for this route is planned, with
+  its own ADR.
 * **Key-release trust boundary.** The server cannot decrypt tenant data on
   its own (envelopes are sealed to a private key it does not hold at rest).
   In a `dev` build, when `KEY_RELEASE_URL` is configured,
@@ -222,8 +268,9 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
   key into a zeroize-on-drop `TenantKeypair` for the duration of that
   query. The relying party checks the token with the production verifier
-  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query endpoint
-  fails closed with 503. That relying party is the development and
+  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query,
+  research-query and attestation endpoints fail closed with 503; research
+  access (below) does not need key release. That relying party is the development and
   simulation stand-in (ADR 0004): it and its clients compile only with the
   `dev` feature, and a build without it refuses to start when
   `KEY_RELEASE_URL` is set. In production each dataset has its own
@@ -271,8 +318,15 @@ Three enforcement layers at one choke point, all in code:
   arguments, and value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`,
   `FIRST_VALUE`) are refused — each can inflate a cohort count, single out
   an individual, or put a subtotal beside its parts in one result.
-  `tests/bypass.rs` holds the adversarial cases; add to it whenever the
-  allowlist changes.
+  After type coercion, every expression must also be one that cannot fail
+  at runtime (`policy::expressions_cannot_fail`, ADR 0011): comparisons,
+  boolean logic, `IN`, `LIKE` with a pattern of at most 1,000 characters,
+  `BETWEEN`, integer and float arithmetic, division by a literal other
+  than 0 and −1, `CASE`, `COALESCE`, `NULLIF`, `lower`, `upper`,
+  `TRY_CAST`, and casts that accept every value; the gate evaluates
+  constant subexpressions itself. A failure on some rows would otherwise
+  answer a question about rows that suppression hides. `tests/bypass.rs` holds the adversarial cases; add to
+  it whenever the allowlist changes.
 * **Result level** (`disclosure::DisclosurePolicy`): `MinCountThreshold`
   suppresses sub-`k` cohorts; a perturbation/DP policy composes after it via
   `CompositePolicy` without touching the engine.
@@ -290,6 +344,16 @@ same response, so nothing leaks existence. Budget standing is visible to the
 grant's parties only; top-up is steward-only. Metering rides the
 `engine.query` event and doubles as the billing meter.
 
+Catalog, access requests, grants and budgets need no key material. They
+live in `research::ResearchService` (`AppState::research`), which
+`platform_api::wiring::build_state` always builds from
+`RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`, so their
+routes answer without key release; with no research service they refuse
+with 503. The query service holds the same `Arc`, so a research query
+checks and charges the grant those routes created. The stores are in
+memory: grants, budgets, listings and requests are lost on restart (P62
+makes them durable).
+
 
 
 **Catalog** (`platform_tenancy::CatalogRegistry`, frontend Research tab):
@@ -297,10 +361,15 @@ publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. Researchers file access requests (idempotent while
 pending); approval mints the grant through the same code path as a direct
-grant. The approval is recorded first, so a failure partway leaves an
-approved request without a usable grant, never a grant behind a pending or
-denied one, and the steward's retry re-runs the idempotent grant and budget
-steps. Denied is terminal. `research.catalog` events carry identifiers only.
+grant. The approval is recorded first, with its query budget, so a failure
+partway leaves an approved request without a usable grant, never a grant
+behind a pending or denied one, and the steward's retry re-runs the
+idempotent grant and budget steps with the approved budget; a retry cannot
+change it. A retry never undoes a revoke: while the steward's grant to that
+researcher for that connector is revoked, the retry is refused (404) with a
+`denied` event, and only an explicit re-grant or a new request restores
+access. Denied is terminal. `research.catalog` events carry identifiers
+only.
 
 **Residual risk:** overlapping-query differencing. See
 `docs/THREAT_MODEL.md`.
@@ -317,7 +386,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
    │                        ▼
    │                identity service ── exchanges code, verifies Auth0 ID token (JWKS)
    │                        │            looks up (iss, sub) → tid, adm
-   │◀── preauth ────────────┤            refuses unknown or Suspended tenants
+   │◀── preauth ────────────┤            refuses unknown, Suspended or Canceled tenants
    │── TOTP code ──────────▶│
    │◀── access + refresh ───┘
    │
@@ -338,7 +407,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 * **Tenant identity.** Each signed-in person maps to exactly one tenant
   through the identity registry, keyed by the provider's `(iss, sub)`,
   never by email. `tid` remains the only source of tenant identity in the
-  API, and an unknown or Suspended tenant is refused.
+  API, and an unknown, Suspended or Canceled tenant is refused.
 * **Roles.** Steward and researcher stay grant relationships between
   tenants (see "Research access"); tokens carry no role claims. `adm`
   grants cross-tenant administrative powers and comes only from a
@@ -365,7 +434,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
 | platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out | Plaintext persistence |
 | platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
-| platform-billing | MoR (Paddle) webhook signature verification, replay guard | Webhook secrets in Debug output |
+| platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |
 | quackxide-engine | `QueryScope` RAII, plan gate, disclosure policies | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
 | synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |
@@ -454,7 +523,8 @@ Rules, enforced by the capture tests:
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
-   and provisioning.
+   provisioning, and the research catalog (ok + denied): publish, request,
+   approval and its retry, deny, and the refused retry and deny.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on
@@ -485,13 +555,52 @@ listener (`METRICS_BIND_ADDR`, default `127.0.0.1:9464`), never on the
 API's port. Labels are route patterns, methods, status codes and error
 kinds only: no tenant ids, paths, messages, SQL text or engine name.
 
+## Production mode
+
+Production mode is the deployment mode of `platform-api` and
+`connector-worker`, chosen by `APP_ENV` (ADR 0009). It is the default:
+unset, blank, or any value other than `development` is production. `APP_ENV`
+is read from the process environment before anything else, and `.env` is
+loaded only in development, so a stray `.env` can neither select
+development nor change a production setting.
+
+At startup each service calls `PlatformConfig::check_production` before it
+builds anything. In production it refuses to start, with every reason
+listed and a `service.start` "denied" audit event naming keys only, when:
+
+* `JWT_HS256_SECRET` is set (shared-secret tokens are development-only);
+* `STORAGE_BUCKET` is unset (the in-memory vault);
+* `TEE_ATTESTATION_REQUIRED=false` (development or simulated attestation);
+* `SIM_ATTESTATION_URL` is set (the simulated attestation provider);
+* `KEY_RELEASE_URL` is set (the key-release stand-in, which trusts only the
+  simulated root);
+* for `connector-worker`, the demo tenant is configured or the jobs are the
+  embedded fixtures (today, always).
+
+Later plan items add their refusals to the same function. Until the
+production key provider, verification keys, durable registries and
+identity stores land, production mode cannot boot, and local runs, CI and
+the simulated TEE set `APP_ENV=development`.
+
+The `dev` Cargo feature is separate: it decides which development code is
+compiled at all (`devstack`, `devtoken`, `key-release`, `query-demo`,
+`sim-attestation`, the simulated token provider). Release builds omit it;
+production mode refuses development configuration in any build.
+
+The frontend's release build (`npm run build:release`, `vite build --mode
+release`, run by `release.yml`) fails unless `VITE_VAULT_MODE` is `http` and
+`VITE_DEV_JWT` and `VITE_ADMIN_JWT` are empty.
+
 ## Structural enforcement
 
 * Cross-tenant storage access is unrepresentable: `VaultPath` has no public
   constructor; ids are UUID-validated at parse time.
 * Fail closed is the default everywhere: unset auth secret → 503; unwired
-  key release → 503; `KEY_RELEASE_URL` without the `dev` feature → refusal
-  to start; unverifiable attestation → refusal; fabricated dev evidence
+  key release → 503 on the query, research-query and attestation routes;
+  no research service → 503 on the catalog, access-request, grant and
+  budget routes; `KEY_RELEASE_URL` without the `dev` feature → refusal
+  to start; any development-only path in production mode → refusal to
+  start; unverifiable attestation → refusal; fabricated dev evidence
   requires an explicit, logged `allow_insecure_dev()`.
 * Workspace-wide `unsafe_code = "deny"`.
 * `scripts/check.sh` fails the build if the engine name appears in the

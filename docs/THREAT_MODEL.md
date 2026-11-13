@@ -59,6 +59,7 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | Picking rows by position below the aggregate (`ORDER BY … LIMIT`/`OFFSET` in a subquery or CTE) | Plan allowlist: only filters and column renames below the aggregate | Built, tested (`tests/bypass.rs`) |
 | Running statements before the gate (`CREATE TABLE … AS`, `DROP TABLE`, `SET`, `PREPARE`) | Statements are refused before planning finishes, so nothing runs ahead of the plan gate | Built, tested (`tests/bypass.rs`) |
 | Spoofed cohort size (`9999 AS n`) | `disclosure::verify_count_column` requires a genuine `COUNT(*) AS n` | Built, tested |
+| Runtime-error oracle (a conditional division by zero or failing cast answers one bit about rows below *k*) | Expression allowlist on the analyzed plan ([ADR 0011](adr/0011-refuse-expressions-that-can-fail-at-runtime.md)) | Built, tested (`tests/bypass.rs`, `research_api.rs`) |
 | Small-cohort queries that isolate individuals | `MinCountThreshold` drops rows with `n < RESEARCH_MIN_COHORT_SIZE` | Built, tested |
 | Unlimited adaptive probing | `BudgetLedger`: charged before execution, no refunds, monotonic per grant | Built, tested |
 | Querying without a grant, or after revocation | `GrantRegistry` check before any decryption (403) | Built, tested |
@@ -83,7 +84,7 @@ could then decrypt; policy changes and break-glass access are audited
 | Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
 | Run a query outside a genuine enclave, or a modified binary inside one | Attestation gate with `TEE_ATTESTATION_REQUIRED=true`; Google's attestation token must name TDX hardware, a production Confidential Space image, debug disabled and an allowed image digest | Seam and token verifier built (`platform_enclave::token`, tested on the simulated TEE); **token acquisition and verified gates on hardware to build** (P48) — fails closed until then |
-| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false` | Built, tested (CI `release build has no dev binaries`); **refusal of simulated evidence at startup to build** |
+| Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false`. Production mode, the default unless `APP_ENV=development` is set in the process environment, refuses to start when `TEE_ATTESTATION_REQUIRED=false`, `SIM_ATTESTATION_URL` or `KEY_RELEASE_URL` is set, so production refuses these by default (ADR 0009); `APP_ENV=development` re-enables them (see residual risks) | Built, tested (CI `release build has no dev binaries`; `platform-api/tests/startup.rs`) |
 | Obtain a dataset's key for a query | Cloud KMS unwraps the dataset's data key only for the attested workload, per query, with nothing cached (ADR 0004); the steward's private key never leaves their browser | Seam built (`EnclaveKeyProvider`); **production key release to build** — returns 503 until then |
 | Authorize a modified image | The KMS key and its release policy live in a separate key project that no deployment identity administers (ADR 0004) | **Residual risk** for the key project's administrator — see below |
 | Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** — results currently leave as JSON over TLS |
@@ -97,7 +98,7 @@ Goal: gain access through the API.
 | --- | --- | --- |
 | Forged or algorithm-confused tokens | RS256 verifier with a fixed algorithm allowlist; HS256-with-public-key forgery rejected | Built, tested |
 | Skipping the second factor, or using a refresh token as an access token | Only `typ = access` tokens pass the API's authentication; `preauth` and `refresh` tokens and tokens with no `typ` get 401 on every data and admin route | Built, tested (`tests/token_types.rs`) |
-| Cross-tenant reads, lists, deletes | Tenant only from the verified `tid` claim; `VaultPath` constructible only from typed ids | Built, tested |
+| Cross-tenant reads, lists, deletes | Tenant only from the verified `tid` claim; `VaultPath` constructible only from typed ids. The one cross-tenant read, the drive orphan sweep's listing, stays private to `platform-storage` and returns only single-tenant drive paths | Built, tested |
 | Missing configuration used as a bypass | Unset auth secret → 503; unwired key release → 503; ZK gate and attestation requirement default to on | Built, tested |
 | Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
 | Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
@@ -105,8 +106,9 @@ Goal: gain access through the API.
 | Account takeover of a steward, researcher or administrator | Sign-in through Auth0, then the platform's TOTP before any `access` token is issued, for every role including administrators (ADR 0006); TOTP replay and rate limits; recovery only by audited administrator reset, with an out-of-band identity check, no self-reset and at least two administrators | **To build** (P29, P30) — TOTP module exists |
 | Theft of the token signing key, which can mint any `tid` and `adm` token | Key held in Cloud KMS and released only to the attested identity-service Confidential VM (ADR 0006, ADR 0004 option A); never on an API replica | **To build** (P29) |
 | Self-assigned administrator access | `adm` set only from a server-side allowlist keyed by the provider's `(iss, sub)`, never from a provider attribute (ADR 0006) | **To build** (P29) |
-| Access by a suspended or unknown tenant | The exchange and `require_tenant` / `require_admin` refuse unknown or Suspended tenants with 403 (ADR 0006) | **To build** (P29) — today any validly signed `tid` passes |
+| Access by a suspended or unknown tenant | The exchange and `require_tenant` / `require_admin` refuse unknown, Suspended or Canceled tenants with 403 (ADR 0006) | **To build** (P29) — today any validly signed `tid` passes |
 | Login CSRF or a replayed sign-in response | Authorization code with PKCE (S256), single-use `state` and OIDC `nonce` checked by the identity service, exact-match redirect URIs; no token in a URL (ADR 0006) | **To build** (P13, P29, P32) |
+| Rebuilding records through own-data queries with a stolen access token | ZK gate stops single-query row export; `POST /api/v1/query` has no query budget, so differencing is unbounded | **Residual risk** — see below |
 | Stolen or replayed refresh token | Rotation on every use; reuse revokes the token family; sign-out and administrator disable revoke immediately (ADR 0006) | **To build** (P30) |
 | Token theft from browser storage | Access token held in memory only, never `localStorage`, `sessionStorage` or IndexedDB; provider tokens never reach the browser (ADR 0006) | **To build** (P31, P32) |
 
@@ -148,11 +150,20 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
 ## Residual risks
 
 * **Overlapping-query differencing.** Two aggregate queries whose cohorts
-  differ by one record can reveal that record. The budget makes this finite
-  and priced; it does not prevent it within an allocation. The closure is a
-  perturbation `DisclosurePolicy` composed at the existing choke point,
-  followed by a formal privacy-loss accountant in place of the constant
-  per-query cost.
+  differ by one record can reveal that record. For research queries the
+  budget makes this finite and priced; it does not prevent it within an
+  allocation. The closure is a perturbation `DisclosurePolicy` composed at
+  the existing choke point, followed by a formal privacy-loss accountant in
+  place of the constant per-query cost.
+* **Differencing on own-data queries.** `ZkMode::Enabled` on
+  `POST /api/v1/query` stops a single query from exporting rows. It does
+  not bound differencing across queries: the route has no budget, so the
+  tenant's own users, or anyone who steals one of their access tokens, can
+  run overlapping aggregates without limit and rebuild suppressed cohorts
+  one record at a time. Only research queries are budget-bounded. A stolen
+  access token can't be revoked; it works until it expires (10 minutes
+  under ADR 0006). A per-tenant, per-dataset budget on this route is
+  planned, with its own ADR for who sets and tops up the limit.
 * **Unzeroized working memory.** Decrypted Parquet bytes, OAuth secrets,
   connector response bodies, `Dataset` cells, the Parquet output buffer
   and the query-result JSON buffer are zeroized. Decoded Arrow arrays, the
@@ -166,6 +177,13 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   `SecretString`s, but the original values stay in the process
   environment for the life of the process, readable by anything that can
   read that process's memory or `/proc/<pid>/environ`.
+* **Development mode on a production host.** Production mode (ADR 0009)
+  refuses development-only paths by default, but `APP_ENV` is set by the
+  operator, and the in-memory vault, HS256 verifier and demo seed are
+  compiled into release binaries. `APP_ENV=development` on a production
+  host turns them all back on; the startup audit event records the mode.
+  The simulator and key-release stand-in are not affected: they compile
+  only with the `dev` feature.
 * **Extreme values.** `MIN` and `MAX` over a cohort of at least *k* still
   return one individual's actual value. This is standard for aggregate
   release; removing them from the allowlist, or applying a dominance rule,
@@ -190,7 +208,8 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   not prevented. Google is trusted for hardware verification, workload
   identity and key custody, and the platform is tied to GCP.
 * **Differencing across snapshots.** Querying before and after a dataset
-  update can reveal the rows that changed, bounded by the budget like any
-  other overlapping-query differencing.
+  update can reveal the rows that changed. On research queries the budget
+  bounds it like any other overlapping-query differencing; on own-data
+  queries nothing does.
 * **Unfinished controls.** Every item marked "to build" above is a gap, and
   the corresponding path fails closed until it is built.

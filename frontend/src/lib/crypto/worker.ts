@@ -13,8 +13,8 @@ import { generateMasterKey, keyFingerprint } from "./core";
 import { createDeviceHpkeKey } from "./devicekey";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
 import { loadDeviceKeys, saveDeviceKeys, type DeviceKeys } from "./keystore";
-import { parseWorkerRequest } from "./protocol";
-import type { InitResult, WorkerRequest, WorkerResponse } from "./protocol";
+import { decodeSessionClaims, parseWorkerRequest } from "./protocol";
+import type { InitResult, SessionClaims, WorkerRequest, WorkerResponse } from "./protocol";
 
 type WorkerScope = {
   addEventListener(type: "message", cb: (ev: MessageEvent) => void): void;
@@ -27,15 +27,33 @@ const scope = globalThis as unknown as WorkerScope;
 let deviceKeys: DeviceKeys | null = null;
 let vaultInstance: VaultClient | null = null;
 
+/** The session bearer token and its decoded claims, in memory only: never
+ *  written to localStorage or IndexedDB. Replaced by each session message. */
+let session: { token: string; claims: SessionClaims } | null = null;
+
+function handleSession(token: string): null {
+  const claims = decodeSessionClaims(token);
+  if (!claims) {
+    // Clear rather than keep the previous session, so a broken refresh can
+    // never leave stale credentials in use.
+    session = null;
+    throw new Error("malformed session token");
+  }
+  session = { token, claims };
+  return null;
+}
+
 function vaultFor(keys: DeviceKeys): VaultClient {
+  const vaultConfig = resolveVaultConfig(import.meta.env);
+  // Refuse before any request leaves the worker.
+  if (vaultConfig.mode === "http" && !session) throw new Error("no session token");
   if (!vaultInstance) {
-    const vaultConfig = resolveVaultConfig(import.meta.env);
     const brand = resolveBrand(import.meta.env);
     vaultInstance =
       vaultConfig.mode === "http"
         ? new HttpVault({
             baseUrl: brand.apiBaseUrl,
-            token: vaultConfig.devJwt,
+            getToken: () => session?.token ?? null,
             tenantId: keys.tenantId,
           })
         : new LocalVault();
@@ -127,6 +145,7 @@ async function context(id?: number): Promise<DriveContext> {
   return {
     keys,
     vault: vaultFor(keys),
+    session: session ? { ...session.claims } : null,
     onProgress:
       id === undefined
         ? undefined
@@ -136,6 +155,8 @@ async function context(id?: number): Promise<DriveContext> {
 
 async function dispatch(req: WorkerRequest): Promise<unknown> {
   switch (req.op) {
+    case "session":
+      return handleSession(req.token);
     case "init":
       return handleInit();
     case "upload":

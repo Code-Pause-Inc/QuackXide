@@ -5,6 +5,7 @@
 //! `platform_storage::TenantPaths`, so cross-tenant access cannot be
 //! expressed. Drive payloads are opaque ciphertext to this process.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -34,10 +35,13 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+pub mod sweep;
+pub mod wiring;
 use admin::ProvisioningService;
 use query::{
     ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
 };
+use research::ResearchService;
 
 /// 4 MiB plaintext chunk + GCM tag + IV prefix, with headroom.
 pub const MAX_CHUNK_BODY_BYTES: usize = 5 * 1024 * 1024;
@@ -54,7 +58,12 @@ pub struct AppState {
     pub vault: Arc<dyn VaultStore>,
     /// None ⇒ auth not configured ⇒ drive routes refuse (fail closed).
     pub jwt: Option<Arc<JwtVerifier>>,
-    /// None ⇒ query, grant, catalog, and research routes refuse with 503.
+    /// Research access, which needs no key material. None ⇒ catalog,
+    /// access-request, grant and budget routes refuse with 503. A query
+    /// service that runs research queries holds the same `Arc`.
+    pub research: Option<Arc<ResearchService>>,
+    /// None ⇒ the query, research-query and attestation routes refuse with
+    /// 503.
     pub query: Option<Arc<ConnectorQueryService>>,
     /// None ⇒ admin and webhook routes refuse with 503.
     pub provisioning: Option<Arc<ProvisioningService>>,
@@ -555,13 +564,20 @@ pub(crate) fn query_service(state: &AppState) -> Result<&Arc<ConnectorQueryServi
     state.query.as_ref().ok_or(ApiError::QueryUnavailable)
 }
 
+pub(crate) fn research_service(state: &AppState) -> Result<&ResearchService, ApiError> {
+    state
+        .research
+        .as_deref()
+        .ok_or(ApiError::ResearchUnavailable)
+}
+
 /// Steward grants a researcher aggregate access to one of its connectors.
 async fn create_grant(
     State(state): State<AppState>,
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Json(req): Json<GrantRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     let researcher: TenantId = req
         .researcher_tenant
         .parse()
@@ -572,7 +588,7 @@ async fn create_grant(
     let connector = ConnectorSlug::new(&req.connector)
         .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
     Ok(Json(
-        service
+        research
             .grant(steward, researcher, &connector, req.query_budget)
             .await?,
     ))
@@ -585,12 +601,12 @@ async fn top_up_budget(
     Path(grant_id): Path<String>,
     Json(req): Json<TopUpRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
+    let research = research_service(&state)?;
     if req.additional == 0 {
         return Err(ApiError::BadRequest("top-up amount must be positive"));
     }
     Ok(Json(
-        service
+        research
             .top_up_budget(steward, &grant_id, req.additional)
             .await?,
     ))
@@ -602,8 +618,8 @@ async fn get_budget(
     Extension(AuthedTenant(caller)): Extension<AuthedTenant>,
     Path(grant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.budget_state(caller, &grant_id).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.budget_state(caller, &grant_id).await?))
 }
 
 async fn revoke_grant(
@@ -611,16 +627,16 @@ async fn revoke_grant(
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
     Path(grant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.revoke_grant(steward, &grant_id).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.revoke_grant(steward, &grant_id).await?))
 }
 
 async fn list_grants(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let service = query_service(&state)?;
-    Ok(Json(service.list_grants(tenant).await?))
+    let research = research_service(&state)?;
+    Ok(Json(research.list_grants(tenant).await?))
 }
 
 async fn run_research_query(
@@ -660,6 +676,32 @@ fn validate_payload(payload: &EncPayloadB64) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Why a manifest for `chunk_count` chunks cannot be committed now: the
+/// orphan sweep holds the object's marker, or a chunk is not stored.
+async fn manifest_blocker(
+    vault: &dyn VaultStore,
+    tenant: TenantId,
+    object_id: ObjectId,
+    chunk_count: u32,
+) -> Result<Option<String>, StorageError> {
+    match vault
+        .get(&TenantPaths::drive_sweep_marker(tenant, object_id))
+        .await
+    {
+        Ok(_) => return Ok(Some("reason=sweeping".to_owned())),
+        Err(StorageError::NotFound) => {}
+        Err(err) => return Err(err),
+    }
+    let stored: HashSet<platform_storage::VaultPath> = vault
+        .list(&TenantPaths::drive_object_prefix(tenant, object_id))
+        .await?
+        .into_iter()
+        .collect();
+    Ok((0..chunk_count)
+        .find(|&i| !stored.contains(&TenantPaths::drive_chunk(tenant, object_id, i)))
+        .map(|missing| format!("missing_chunk={missing}")))
+}
+
 async fn put_manifest(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
@@ -673,14 +715,72 @@ async fn put_manifest(
     validate_payload(&body.wrapped_key)?;
     validate_payload(&body.manifest)?;
 
+    let vault = state.vault.as_ref();
+    let refused = |reason: &str| {
+        security_audit_event(
+            AuditKind::DataAccess,
+            Some(tenant),
+            "denied",
+            &format!(
+                "put_manifest object={object_id} chunk_count={} {reason}",
+                body.chunk_count
+            ),
+        );
+        ApiError::Conflict
+    };
+
+    // Every chunk the manifest names must be stored, and the orphan sweep
+    // must not be deleting them. An upload that paused long enough to be
+    // swept would otherwise commit a file that cannot be downloaded.
+    if let Some(reason) = manifest_blocker(vault, tenant, object_id, body.chunk_count).await? {
+        return Err(refused(&reason));
+    }
+
     let stored = serde_json::to_vec(&body).map_err(|_| ApiError::Backend)?;
-    state
-        .vault
-        .put(
-            &TenantPaths::drive_manifest(tenant, object_id),
-            stored.into(),
-        )
-        .await?;
+    let manifest_path = TenantPaths::drive_manifest(tenant, object_id);
+    let created = match vault
+        .put_if_absent(&manifest_path, stored.clone().into())
+        .await
+    {
+        Ok(()) => true,
+        // Replacing a manifest: the object was already complete, and the
+        // sweep never deletes the chunks of an object that has a manifest.
+        Err(StorageError::AlreadyExists) => {
+            vault.put(&manifest_path, stored.into()).await?;
+            false
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if created {
+        // The sweep claims an object and then looks for its manifest; this
+        // handler has written the manifest and now looks for the claim, so
+        // one of the two sees the other (`sweep` module docs). The sweep
+        // releases its claim only after its last delete, so if the claim is
+        // gone, the chunk check shows what it deleted.
+        match manifest_blocker(vault, tenant, object_id, body.chunk_count).await {
+            Ok(None) => {}
+            blocked => {
+                // Take the manifest back, so the upload is missing, not
+                // broken.
+                match vault.delete(&manifest_path).await {
+                    Ok(()) | Err(StorageError::NotFound) => {}
+                    Err(err) => {
+                        security_audit_event(
+                            AuditKind::DataAccess,
+                            Some(tenant),
+                            "failed",
+                            &format!("put_manifest object={object_id} rollback"),
+                        );
+                        return Err(err.into());
+                    }
+                }
+                return Err(match blocked {
+                    Ok(reason) => refused(&format!("{} rolled_back", reason.unwrap_or_default())),
+                    Err(err) => err.into(),
+                });
+            }
+        }
+    }
     security_audit_event(
         AuditKind::DataAccess,
         Some(tenant),

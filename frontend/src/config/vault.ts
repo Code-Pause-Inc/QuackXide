@@ -6,8 +6,9 @@ export type VaultMode = "local" | "http";
 
 export interface VaultRuntimeConfig {
   mode: VaultMode;
-  /** DEV ONLY: bearer token from the backend `devtoken` binary. Never put
-   *  production credentials in env files. */
+  /** DEV ONLY: bearer token from the backend `devtoken` binary. Read on the
+   *  UI thread and passed to the crypto worker in a session message; the
+   *  worker never reads it. Never put production credentials in env files. */
   devJwt: string | null;
 }
 
