@@ -884,6 +884,17 @@ async fn research_catalog_is_audited() {
     let (status, _) = post(&app, &fresh_deny, &stoken, "{}").await;
     assert_eq!(status, StatusCode::OK);
 
+    // Approving a request whose listing was unpublished is refused.
+    let (status, last) = post(&app, &request_uri, &rtoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "request: {last}");
+    let last_id = last["request_id"].as_str().expect("request id");
+    let unpublish = format!("/api/v1/catalog/{listing_id}");
+    let (status, _) = call(&app, "DELETE", &unpublish, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let last_approve = format!("/api/v1/research/requests/{last_id}/approve");
+    let (status, _) = post(&app, &last_approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
     assert_catalog_event(
         &capture,
         "ok",
@@ -925,6 +936,11 @@ async fn research_catalog_is_audited() {
         &capture,
         "ok",
         &format!("denied request={fresh_id} researcher={researcher}"),
+    );
+    assert_catalog_event(
+        &capture,
+        "denied",
+        &format!("approve refused request={last_id} researcher={researcher} reason=unpublished"),
     );
 }
 

@@ -135,7 +135,8 @@ impl ResearchService {
     /// Steward grants a researcher aggregate access to one of its connectors,
     /// allocating a query budget (default from config when unspecified).
     /// `create` re-activates a revoked grant, so this is only for a new
-    /// decision by the steward: a direct grant or a first approval.
+    /// decision by the steward. Approvals mint their grant in
+    /// [`resolve_access_request`](Self::resolve_access_request).
     pub async fn grant(
         &self,
         steward: TenantId,
@@ -418,21 +419,23 @@ impl ResearchService {
     ///
     /// Approval marks the request Approved first, recording its query budget
     /// (the steward's override, else the listing's included budget) in the
-    /// same step, then mints the grant and budget through the same path as a
-    /// direct grant. If a later step fails, the request stays Approved
+    /// same step, then mints the grant and adds that budget to it once,
+    /// keyed by the request (see `fund_grant`). If a later step fails, the request stays Approved
     /// without a usable grant (fail closed) and the steward retries:
     /// approving an already-Approved request re-runs every step after
     /// `resolve` (slug, grant and budget), all idempotent, so the retry
-    /// converges. A retry finishes the recorded decision: it opens the
-    /// approved budget, and a retry that names a different `query_budget`
-    /// is refused (400) and audited as `denied`. A retry never undoes a
+    /// converges. A retry finishes the recorded decision: it adds the
+    /// approved budget if the failed attempt did not, and a retry that names
+    /// a different `query_budget` is refused (400) and audited as `denied`. A retry never undoes a
     /// revoke: in place of `create`, it mints with
     /// [`GrantRegistry::create_unless_revoked`], which checks for a revoked
     /// grant and creates in one atomic step, so a revoke that lands while
     /// the retry runs holds too. A retry that finds this researcher's grant
     /// for the connector revoked is refused with the same "not found", even
-    /// when the revoke came before the approval (fail closed). Only an
-    /// explicit re-grant or a new request restores access. A retry is
+    /// when the revoke came before the approval (fail closed). A retry is
+    /// also refused once the grant was revoked after the approval and then
+    /// re-granted: that re-grant is a newer decision with its own budget.
+    /// Only an explicit re-grant or a new request restores access. A retry is
     /// audited with `retry=true`, and a refused retry as `denied`.
     ///
     /// Denial acts only on a Pending request and only records the outcome.
@@ -461,16 +464,18 @@ impl ResearchService {
                 let Some(request) = self.approved_request(steward, request_id).await? else {
                     // Still Pending after an approval: its listing was
                     // unpublished. The caller gets the same "not found".
-                    if self
+                    if let Some(pending) = self
                         .own_request(steward, request_id, RequestStatus::Pending)
                         .await?
-                        .is_some()
                     {
                         security_audit_event(
                             AuditKind::ResearchCatalog,
                             Some(steward),
                             "denied",
-                            &format!("approve refused request={request_id} reason=unpublished"),
+                            &format!(
+                                "approve refused request={request_id} researcher={} reason=unpublished",
+                                pending.researcher_tenant
+                            ),
                         );
                     }
                     return Err(ApiError::NotFound);
@@ -522,8 +527,7 @@ impl ResearchService {
         }
         let connector = ConnectorSlug::new(&request.connector).map_err(|_| ApiError::Backend)?;
         // The approval recorded its budget: the steward's override, else the
-        // listing's included budget. `fund_grant` applies the platform
-        // default only if neither existed.
+        // listing's included budget.
         let query_budget = request.approved_budget;
         // A first approval is a new decision, so it may re-activate a revoked
         // grant. A retry may not.
@@ -585,8 +589,10 @@ impl ResearchService {
     /// Mint the grant for an approval retry. The revoked check and the grant
     /// are one registry step ([`GrantRegistry::create_unless_revoked`]), so a
     /// retry never undoes a revoke, even one that lands while it runs. A
-    /// revoked grant stays revoked: the refusal is audited and the caller
-    /// gets the same "not found" as an unknown request.
+    /// revoked grant stays revoked, and a grant revoked since the approval
+    /// was re-granted by a newer decision, which this retry must not add to.
+    /// Either refusal is audited and the caller gets the same "not found" as
+    /// an unknown request.
     async fn grant_on_retry(
         &self,
         steward: TenantId,
@@ -599,24 +605,42 @@ impl ResearchService {
             .create_unless_revoked(steward, request.researcher_tenant, connector.as_str())
             .await
             .map_err(|_| ApiError::Backend)?;
-        let grant = match outcome {
-            GrantOutcome::Active(grant) => grant,
-            GrantOutcome::Revoked(revoked) => {
-                let request_id = &request.request_id;
-                security_audit_event(
-                    AuditKind::ResearchCatalog,
-                    Some(steward),
-                    "denied",
-                    &format!(
-                        "approve refused request={request_id} grant={} retry=true reason=revoked",
-                        revoked.grant_id
-                    ),
-                );
-                return Err(ApiError::NotFound);
+        let (grant, reason) = match outcome {
+            GrantOutcome::Revoked(revoked) => (revoked, "revoked"),
+            GrantOutcome::Active(grant) if revoked_since(&grant, request) => {
+                (grant, "revoked_since")
+            }
+            GrantOutcome::Active(grant) => {
+                return self
+                    .fund_grant(&grant, query_budget, Some(&request.request_id))
+                    .await;
             }
         };
-        self.fund_grant(&grant, query_budget, Some(&request.request_id))
-            .await
+        let request_id = &request.request_id;
+        security_audit_event(
+            AuditKind::ResearchCatalog,
+            Some(steward),
+            "denied",
+            &format!(
+                "approve refused request={request_id} grant={} retry=true reason={reason}",
+                grant.grant_id
+            ),
+        );
+        Err(ApiError::NotFound)
+    }
+}
+
+/// Whether `grant` was revoked at or after `request` was approved. A
+/// re-grant since then is a new decision, so the stale approval's retry
+/// must not add to it. Unparseable timestamps count as revoked (fail closed).
+fn revoked_since(grant: &DatasetGrant, request: &AccessRequest) -> bool {
+    let Some(revoked_at) = &grant.revoked_at_iso else {
+        return false;
+    };
+    let parse = |iso: &str| chrono::DateTime::parse_from_rfc3339(iso).ok();
+    match (parse(revoked_at), parse(&request.updated_at_iso)) {
+        (Some(revoked), Some(approved)) => revoked >= approved,
+        _ => true,
     }
 }
 

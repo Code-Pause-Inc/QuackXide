@@ -657,9 +657,19 @@ const PUBLISH_BODY: &str = r#"{
 /// Publishes the steward's `health` listing (25 query units on approval)
 /// and files a request for it as `researcher`. Returns the request id.
 async fn pending_request(app: &Router, steward: TenantId, researcher: TenantId) -> String {
+    let listing_id = publish(app, steward).await;
+    request_listing(app, &listing_id, researcher).await
+}
+
+/// Publishes the steward's `health` listing; returns its id.
+async fn publish(app: &Router, steward: TenantId) -> String {
     let (status, listing) = post(app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     assert_eq!(status, StatusCode::OK, "publish: {listing}");
-    let listing_id = listing["listing_id"].as_str().expect("id");
+    listing["listing_id"].as_str().expect("id").to_owned()
+}
+
+/// Files `researcher`'s request for `listing_id`; returns the request id.
+async fn request_listing(app: &Router, listing_id: &str, researcher: TenantId) -> String {
     let (status, request) = post(
         app,
         &format!("/api/v1/catalog/{listing_id}/request"),
@@ -970,26 +980,6 @@ async fn approving_a_denied_request_is_404() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// Publishes the steward's `health` listing; returns its id.
-async fn publish(app: &Router, steward: TenantId) -> String {
-    let (status, listing) = post(app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
-    assert_eq!(status, StatusCode::OK, "publish: {listing}");
-    listing["listing_id"].as_str().expect("id").to_owned()
-}
-
-/// Files `researcher`'s request for `listing_id`; returns the request id.
-async fn request_listing(app: &Router, listing_id: &str, researcher: TenantId) -> String {
-    let (status, request) = post(
-        app,
-        &format!("/api/v1/catalog/{listing_id}/request"),
-        &token_for(researcher),
-        "{}",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "request: {request}");
-    request["request_id"].as_str().expect("id").to_owned()
-}
-
 #[tokio::test]
 async fn follow_up_approval_adds_its_budget_to_the_grant() {
     let steward = TenantId::generate();
@@ -1062,8 +1052,9 @@ async fn approving_a_request_for_an_unpublished_listing_is_404() {
             .iter()
             .any(|e| e.audit_kind == "research.catalog"
                 && e.outcome == "denied"
-                && e.detail
-                    .contains(&format!("request={request_id} reason=unpublished"))),
+                && e.detail == format!(
+                    "approve refused request={request_id} researcher={researcher} reason=unpublished"
+                )),
         "{:?}",
         capture.events()
     );
@@ -1073,4 +1064,58 @@ async fn approving_a_request_for_an_unpublished_listing_is_404() {
     );
     let (status, _) = post(&app, &uri("deny"), &stoken, "{}").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stale_approval_retry_after_a_revoke_and_regrant_adds_nothing() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(FailFirstOpen::default()),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let stoken = token_for(steward);
+    let listing_id = publish(&app, steward).await;
+    let approve = |id: &str| format!("/api/v1/research/requests/{id}/approve");
+
+    // Approval A (7 units) mints the grant and fails before funding it.
+    let a = request_listing(&app, &listing_id, researcher).await;
+    let (status, _) = post(&app, &approve(&a), &stoken, r#"{"query_budget":7}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // The steward revokes instead of retrying, then approves request B.
+    let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    let grant_id = grants["grants"][0]["grant_id"]
+        .as_str()
+        .expect("grant id")
+        .to_owned();
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/v1/grants/{grant_id}"),
+        &stoken,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let b = request_listing(&app, &listing_id, researcher).await;
+    let (status, resolved) = post(&app, &approve(&b), &stoken, r#"{"query_budget":2}"#).await;
+    assert_eq!(status, StatusCode::OK, "approve B: {resolved}");
+    assert_eq!(resolved["grant"]["budget"]["limit"], 2);
+
+    // A stale retry of A predates the revoke: refused, and adds nothing.
+    let (status, _) = post(&app, &approve(&a), &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+    let (_, budget) = call(&app, "GET", &budget_uri, &stoken, None).await;
+    assert_eq!(budget["limit"], 2, "{budget}");
+    assert!(
+        capture.events().iter().any(|e| e.detail.contains(&format!(
+            "approve refused request={a} grant={grant_id} retry=true reason=revoked_since"
+        ))),
+        "{:?}",
+        capture.events()
+    );
 }

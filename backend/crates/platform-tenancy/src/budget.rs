@@ -46,9 +46,10 @@ pub enum BudgetError {
 pub trait BudgetLedger: Send + Sync {
     /// Open a grant's entry with an initial allocation. Insert-if-absent, so
     /// re-granting (which reuses the grant id) never resets spend; only
-    /// [`top_up`] raises the allocation.
+    /// [`top_up`] and [`top_up_once`] raise the allocation.
     ///
     /// [`top_up`]: BudgetLedger::top_up
+    /// [`top_up_once`]: BudgetLedger::top_up_once
     async fn open(&self, grant_id: &str, limit: u64) -> Result<BudgetState, TenancyError>;
 
     /// Atomically consume `cost` units. Refuses without partial spend when
@@ -61,7 +62,9 @@ pub trait BudgetLedger: Send + Sync {
 
     /// [`top_up`] at most once per `key` (an access request id): a repeat
     /// with the same key returns the standing unchanged, so a retried
-    /// approval cannot add its budget twice.
+    /// approval cannot add its budget twice. The key check, the top-up and
+    /// recording the key must be one atomic step, and a durable backend must
+    /// persist the applied keys with the allocation.
     ///
     /// [`top_up`]: BudgetLedger::top_up
     async fn top_up_once(
