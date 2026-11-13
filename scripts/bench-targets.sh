@@ -7,9 +7,11 @@
 # criterion's flags. Needs jq.
 # =============================================================================
 set -euo pipefail
-cargo metadata --no-deps --format-version 1 --locked |
+targets="$(cargo metadata --no-deps --format-version 1 --locked |
     jq -r '.packages[]
         | select(.name == "platform-crypto" or .name == "quackxide-engine")
         | .name as $pkg
         | .targets[] | select(.kind == ["bench"])
-        | "-p \($pkg) --bench \(.name)"' | paste -sd' ' -
+        | "-p \($pkg) --bench \(.name)"' | paste -sd' ' -)"
+[[ -n "$targets" ]] || { echo "bench-targets: no bench targets found" >&2; exit 1; }
+echo "$targets"

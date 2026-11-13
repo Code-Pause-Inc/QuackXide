@@ -35,14 +35,14 @@ uses [Semantic Versioning](https://semver.org/).
   tables of 10 000 to 1 000 000 rows. On pull requests the `bench` workflow
   benchmarks the base commit and the head in one job, and
   `scripts/bench-compare.sh` fails it when a benchmark's whole 95 %
-  interval is more than 10 % slower. `docs/BENCHMARKS.md` records targets
-  for the hybrid suite and the engine.
+  interval is more than 10 % slower. `docs/BENCHMARKS.md` records the
+  hybrid suite's targets.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
   4 MiB, and a unit test pins the 52-byte envelope overhead. The `bench`
-  workflow runs them on pull requests that touch `backend/` and reports
-  only. `docs/BENCHMARKS.md` records the method and the baseline the
-  hybrid suite (#187) is compared against.
+  workflow runs them on pull requests that touch `backend/`.
+  `docs/BENCHMARKS.md` records the method and the baseline the hybrid
+  suite (#187) is compared against.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before

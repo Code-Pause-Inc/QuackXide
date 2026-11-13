@@ -76,7 +76,8 @@ base commit with `--save-baseline base`, then the head with
 `scripts/bench-compare.sh` judges the result (below). The job fails when a
 benchmark regressed; it is not a required check. Run the script on your own
 comparison with `scripts/bench-compare.sh backend/target/criterion` (needs
-`jq`).
+`jq`), starting from an empty `backend/target/criterion`: it judges every
+earlier comparison it finds there.
 
 ## Suites
 
@@ -131,8 +132,9 @@ recorded tables:
 * `hpk2/keygen` at most 1 ms.
 * `hpk2/seal/4KiB` and `hpk2/open/4KiB` at most 1 ms each.
 * `hpk2/seal/4MiB` and `hpk2/open/4MiB` at most 20 ms each.
-* The hybrid suite's cost: `hpk2` at most 4× `hpk1` from 32 B to 4 KiB, and
-  at most 1.25× at 4 MiB, in the same run.
+* The hybrid suite's cost: `hpk2` at most 4× `hpk1` for key generation and
+  for seal and open from 32 B to 4 KiB, and at most 1.25× at 4 MiB, in the
+  same run.
 * Engine queries: TBD, set from the first recorded run at about 1.5× its
   times.
 

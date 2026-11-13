@@ -51,7 +51,8 @@ jobs:
           set -o pipefail
           git worktree add "$RUNNER_TEMP/base" "$BASE_SHA"
           cd "$RUNNER_TEMP/base/backend"
-          read -r -a benches < <("$GITHUB_WORKSPACE/scripts/bench-targets.sh")
+          targets="$("$GITHUB_WORKSPACE/scripts/bench-targets.sh")"
+          read -r -a benches <<<"$targets"
           cargo bench --locked "${benches[@]}" -- --noplot --save-baseline base | tee "$RUNNER_TEMP/base.txt"
       - name: Benchmarks at the head
         working-directory: backend
@@ -61,7 +62,11 @@ jobs:
           set -o pipefail
           compare=()
           if [[ "$EVENT" == pull_request ]]; then compare=(--baseline-lenient base); fi
-          read -r -a benches < <(../scripts/bench-targets.sh)
+          # Cargo decides freshness by mtime, and this checkout predates the
+          # base build in the shared target dir: without this it reuses base's code.
+          git ls-files -z | xargs -0 touch
+          targets="$(../scripts/bench-targets.sh)"
+          read -r -a benches <<<"$targets"
           cargo bench --locked "${benches[@]}" -- --noplot "${compare[@]}" | tee "$RUNNER_TEMP/bench.txt"
       - name: Compare with the base commit
         if: github.event_name == 'pull_request'
