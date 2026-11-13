@@ -20,7 +20,7 @@ usage() { echo "usage: bench-compare.sh <criterion-dir> [threshold] | selftest" 
 pct() { awk -v x="$1" 'BEGIN { printf "%+.1f %%", x * 100 }'; }
 
 compare() {
-    local dir="$1" threshold="$2" file id lower point upper verdict regressed=0 rows=0
+    local dir="$1" threshold="$2" file id values lower point upper verdict regressed=0 rows=0
     [[ -d "$dir" ]] || { echo "bench-compare: no such directory: $dir" >&2; return 2; }
     [[ "$threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "bench-compare: bad threshold: $threshold" >&2; return 2; }
     command -v jq >/dev/null || { echo "bench-compare: needs jq" >&2; return 2; }
@@ -30,7 +30,11 @@ compare() {
     while IFS= read -r file; do
         id="${file#"$dir"/}"
         id="${id%/change/estimates.json}"
-        read -r lower point upper < <(jq -r '.mean | "\(.confidence_interval.lower_bound) \(.point_estimate) \(.confidence_interval.upper_bound)"' "$file")
+        values="$(jq -r '.mean
+            | [.confidence_interval.lower_bound, .point_estimate, .confidence_interval.upper_bound]
+            | if all(type == "number") then map(tostring) | join(" ") else error("not numbers") end' \
+            "$file" 2>/dev/null)" || { echo "bench-compare: unreadable estimates: $file" >&2; return 2; }
+        read -r lower point upper <<<"$values"
         if awk -v l="$lower" -v t="$threshold" 'BEGIN { exit !(l > t) }'; then
             verdict="regressed"
             regressed=1
@@ -57,7 +61,7 @@ selftest() {
     }
     expect() { # <want-exit> <dir> <grep-pattern>
         local out status=0
-        out="$(compare "$2" 0.10)" || status=$?
+        out="$(compare "$2" 0.10 2>/dev/null)" || status=$?
         [[ "$status" == "$1" ]] || { echo "FAIL: selftest: exit $status, want $1, for $2"; exit 1; }
         grep -qE "$3" <<<"$out" || { echo "FAIL: selftest: no '$3' in output for $2"; exit 1; }
     }
@@ -75,10 +79,20 @@ selftest() {
     fixture "$tmp/new" "g/old" -0.01 0.00 0.01
     mkdir -p "$tmp/new/g/new/new"
     expect 0 "$tmp/new" '\| `g/old` '
-    ! compare "$tmp/new" 0.10 | grep -q 'g/new' || { echo "FAIL: selftest: judged a benchmark with no change/"; exit 1; }
+    local out
+    out="$(compare "$tmp/new" 0.10)"
+    ! grep -q 'g/new' <<<"$out" || { echo "FAIL: selftest: judged a benchmark with no change/"; exit 1; }
 
     mkdir -p "$tmp/empty"
     expect 0 "$tmp/empty" 'no compared benchmarks'
+
+    # Malformed estimates are an error, never a verdict.
+    mkdir -p "$tmp/null/g/x/change"
+    echo '{"mean":{"confidence_interval":{"lower_bound":null,"upper_bound":0.01},"point_estimate":0}}' >"$tmp/null/g/x/change/estimates.json"
+    expect 2 "$tmp/null" 'Benchmark'
+    mkdir -p "$tmp/truncated/g/x/change"
+    printf '{"mean":{"confidence_' >"$tmp/truncated/g/x/change/estimates.json"
+    expect 2 "$tmp/truncated" 'Benchmark'
 
     echo "bench-compare selftest passed"
 }
