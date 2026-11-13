@@ -51,8 +51,6 @@ pub const MAX_CHUNK_BODY_BYTES: usize = 5 * 1024 * 1024;
 const MIN_CHUNK_BODY_BYTES: usize = 28;
 const MAX_CHUNK_INDEX: u32 = 1 << 20;
 const GCM_IV_BYTES: usize = 12;
-/// HPKE suite recorded alongside an enrolled tenant key.
-const HPKE_SUITE: &str = "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1033,13 +1031,15 @@ async fn delete_object(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentBody {
-    /// Base64 raw X25519 public key: the browser-generated tenant HPKE key.
+    /// Base64 raw tenant HPKE public key: X-Wing (`HPK2`, 1216 bytes), or
+    /// X25519 (`HPK1`, 32 bytes) in development only, until P36.
     pub hpke_public_key_b64: String,
 }
 
 /// Enroll the tenant's HPKE public key, which enclave pipelines use to seal
-/// connector data to the tenant. The key is validated as an X25519 point
-/// before storage, and every attempt is audited.
+/// connector data to the tenant. The key's length names its suite; the
+/// deployment's suite policy decides whether that suite is accepted, and the
+/// record stores the suite. Every attempt is audited.
 async fn put_enrollment(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
@@ -1049,19 +1049,32 @@ async fn put_enrollment(
     let raw = B64
         .decode(public_key_b64)
         .map_err(|_| ApiError::BadRequest("invalid base64 public key"))?;
-    if platform_crypto::TenantPublicKey::from_raw(&raw).is_err() {
-        security_audit_event(
-            AuditKind::KeyEnrollment,
-            Some(tenant),
-            "denied",
-            "rejected malformed public key",
-        );
-        return Err(ApiError::BadRequest("invalid public key"));
-    }
+    let policy = platform_crypto::SuitePolicy::for_env(state.config.env.is_production());
+    let key = match platform_crypto::TenantPublicKey::from_raw(&raw, policy) {
+        Ok(key) => key,
+        Err(platform_crypto::CryptoError::SuiteRefused) => {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(tenant),
+                "denied",
+                "refused enrollment key of a suite this deployment does not accept",
+            );
+            return Err(ApiError::BadRequest("public key suite not accepted"));
+        }
+        Err(_) => {
+            security_audit_event(
+                AuditKind::KeyEnrollment,
+                Some(tenant),
+                "denied",
+                "rejected malformed public key",
+            );
+            return Err(ApiError::BadRequest("invalid public key"));
+        }
+    };
 
     let record = json!({
         "hpke_public_key_b64": public_key_b64,
-        "suite": HPKE_SUITE,
+        "suite": key.suite().name(),
     });
     let stored = serde_json::to_vec(&record).map_err(|_| ApiError::Backend)?;
     state

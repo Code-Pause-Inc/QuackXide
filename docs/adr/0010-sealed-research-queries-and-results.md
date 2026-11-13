@@ -72,8 +72,9 @@ Linux, outside the repository:
 At start, `ConnectorQueryService` generates a key set and holds it in
 memory only, in zeroize-on-drop types, never written, logged or exported:
 
-* a **request key**: a `TenantKem` key pair (X25519 today, X-Wing after
-  P35), with its private half in production builds;
+* a **request key**: an X25519 (`HPK1`) key pair today, X-Wing (`HPK2`)
+  once P85 (#176) builds binding v2, with its private half in production
+  builds;
 * a **result-signing key**: an Ed25519 key pair (`ed25519-dalek`) and an
   ML-DSA-65 key pair (`ml-dsa`).
 
@@ -281,8 +282,8 @@ identities.
 
 ### No downgrade
 
-Once P35 ships the hybrid suite, every step refuses the classical one, as
-ADR 0007 requires for stored data: the browser refuses an evidence bundle
+Once P85 (#176) moves the request key to the hybrid suite, every step
+refuses the classical one, as ADR 0007 requires for stored data: the browser refuses an evidence bundle
 whose request key is `HPK1`, and the enclave refuses an `HPK1` envelope
 and an X25519-only recipient key. There is no fallback mode. The
 signatures are hybrid from the first build.

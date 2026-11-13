@@ -66,10 +66,11 @@ uses [Semantic Versioning](https://semver.org/).
   accepts `object_store` 0.13's uploads (#153).
 * Browser envelope open (P34 checkpoint B): `envelope-wasm` exports
   `openEnvelope` and `publicKeyFromPrivateKey`, over the new
-  `platform_crypto::hpke_open_with_private_key` and
-  `tenant_public_key_from_private`. The crypto worker holds the device's
-  HPKE private key as ADR 0007 describes: 32 random bytes, stored only
-  encrypted under a non-extractable AES-256-GCM seed key with AAD
+  `platform_crypto::hpk1_open_with_private_key` and
+  `hpk1_public_key_from_private` (`HPK1` only until P36). The crypto
+  worker holds the device's HPKE private key as ADR 0007 describes: 32
+  random bytes, stored only encrypted under a non-extractable AES-256-GCM
+  seed key with AAD
   `x25519-key-v1|{tenant}|{SHA-256 of the public key}`, decrypted just
   before an open and zeroed after (`lib/crypto/devicekey.ts`). The Web
   Crypto X25519 key, which could not open anything, is gone; device
@@ -280,6 +281,19 @@ uses [Semantic Versioning](https://semver.org/).
   ephemeral key, in the enclave and in the browser's envelope module, was
   freed without being wiped. `platform-crypto` turns the feature on, and
   `TenantKeypair` implements `ZeroizeOnDrop`.
+* Tenant envelopes use the hybrid post-quantum suite `HPK2` (ADR 0007, P35,
+  #187): HPKE with X-Wing (X25519 + ML-KEM-768), HKDF-SHA256 and
+  AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
+  Enrollment and snapshot records name the key's suite, and the upload
+  route accepts a complete frame of either suite, which opens only under a
+  key of the same suite. Every key loader takes a suite
+  policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
+  with a `crypto.suite_refused` audit event; development still accepts
+  them until the browser moves to `HPK2` (P36). Private keys are exported
+  as `magic || key`; the key-release stand-in imports only `HPK2` tenant
+  keys, and the enclave accepts only `HPK2` released keys.
+  X-Wing known-answer tests against `@noble/post-quantum` and frames sealed
+  by `hpke-js` pin interoperability. ADR 0007 is accepted.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is

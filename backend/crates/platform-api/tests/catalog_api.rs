@@ -40,7 +40,11 @@ const AGG_SQL: &str =
 async fn publish_browse_request_approve_query_lifecycle() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     // Steward publishes a priced listing.
     let (status, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
@@ -135,7 +139,11 @@ async fn publish_browse_request_approve_query_lifecycle() {
 async fn denial_records_outcome_and_leaves_no_access() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     let listing_id = listing["listing_id"].as_str().expect("id").to_owned();
@@ -187,7 +195,11 @@ async fn catalog_scoping_and_input_bounds() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let outsider = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     let listing_id = listing["listing_id"].as_str().expect("id").to_owned();
@@ -286,7 +298,7 @@ async fn catalog_scoping_and_input_bounds() {
 async fn publishing_a_dataset_the_steward_does_not_hold_is_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
     let key = keypair.public_key();
     let app = common::upload_research_app(
         SECRET,

@@ -62,7 +62,7 @@
     },
     {
       "envelope_b64": "SFBLMpfnrk2yXrX/aOQS4ZgAp3FrQQ2B52Nct5yh6WphqKxvPL1bMHv3qRtUWCrK2nRuOzSxUeZD/KR4zqs9clnStooyP1ssqqjqk7UST7VzDtCqpKGWoNt3dZiVw94=",
-      "error": "invalid envelope framing",
+      "error": "envelope suite does not match the key",
       "info": "steward-upload-v1|6f2c8a2e-1111-4222-8333-444455556666|00000000-dddd-4ddd-8ddd-000000000001|00000000-aaaa-4bbb-8ccc-000000000001",
       "name": "wrong frame magic",
       "plaintext": "synthetic cohort rows: site-a,42\nsite-b,17\n",

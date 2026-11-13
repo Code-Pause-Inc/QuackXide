@@ -1,7 +1,7 @@
 # 0007. Hybrid suite construction, libraries, browser key storage and migration
 
-* Status: Proposed. The "Browser private-key storage" section is accepted
-  (2026-11-12); the rest waits on the open questions.
+* Status: Accepted (2026-11-12, with P35). The "Browser private-key
+  storage" section was accepted first, on its own.
 * Date: 2026-10-19
 
 ## Context
@@ -194,12 +194,21 @@ is an accepted risk:
 ### Migration
 
 v1 ships no `HPK1`-reading migration mode and no re-seal tool: nothing is
-deployed and only synthetic data exists. A hybrid reader refuses `HPK1`
-frames and X25519-only enrollment keys, with a negative test and a
-`crypto.*` audit event (P35). This supersedes, for v1, ADR 0001's
-consequence that existing classical ciphertext needs an audited,
-time-limited migration mode. If data is ever deployed under `HPK1` before
-the hybrid suite ships, a new record reinstates it.
+deployed and only synthetic data exists. In production (ADR 0009's
+default, `APP_ENV` unset) a reader refuses `HPK1` frames and X25519-only
+enrollment keys, with negative tests and a `crypto.suite_refused` audit
+event (P35). This supersedes, for v1, ADR 0001's consequence that existing
+classical ciphertext needs an audited, time-limited migration mode. If
+data is ever deployed under `HPK1` before the hybrid suite ships, a new
+record reinstates it.
+
+Development (`APP_ENV=development`) also accepts `HPK1` keys and frames,
+because the browser still enrolls and seals X25519 keys until P36 (#186),
+which removes `HPK1`. This is not a migration mode: no production path
+reads `HPK1`, and nothing is re-sealed. The enclave's own key-release key
+also stays X25519 until P85 (#176) builds ADR 0010's binding v2, whose
+`request-key` entry holds a key of any length; its only use is
+development key release.
 
 ## Consequences
 
@@ -222,11 +231,11 @@ the hybrid suite ships, a new record reinstates it.
 * On acceptance: P35 and P36 may merge; P34's vector file gains the hybrid
   vectors.
 
-## Open questions
+## Resolved questions (2026-11-12)
 
-1. Is the maintainer content to pin draft-06, given the RustCrypto crate
-   tracks it and the later revisions did not change the bytes?
-2. Should the second implementation for committed vectors be `hpke-js`
-   (the only other HPKE X-Wing implementation found), or should vectors
-   also come from Cloud KMS (ADR 0004)?
-3. Accept "established" as defined above, in place of "audited"?
+1. Pin draft-06? Yes, as `x-wing` 0.1.1 implements it: the later
+   revisions did not change the bytes.
+2. Second implementation for committed vectors? `hpke-js` for suite
+   vectors and `@noble/post-quantum` for KEM known-answer values; no
+   Cloud KMS vectors.
+3. "Established" as defined above, in place of "audited"? Yes.

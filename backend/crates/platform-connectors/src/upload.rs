@@ -437,10 +437,15 @@ mod tests {
     }
 
     impl Fixture {
+        /// Sealed as the browser seals until P36: `HPK1`.
         fn new() -> Self {
+            Self::sealed_under(EnvelopeSuite::Hpk1)
+        }
+
+        fn sealed_under(suite: EnvelopeSuite) -> Self {
             Self {
                 tenant: TenantId::generate(),
-                keypair: TenantKeypair::generate(),
+                keypair: TenantKeypair::generate(suite),
                 dataset: ConnectorSlug::new("upload_cohorts").expect("slug"),
             }
         }
@@ -456,7 +461,7 @@ mod tests {
             let object = ObjectId::generate();
             let sealed = hpke_seal_to_tenant(
                 &key,
-                &object_info(&self.tenant, &self.dataset, &object),
+                &object_info(key.suite(), &self.tenant, &self.dataset, &object),
                 parquet,
             )
             .expect("seal object");
@@ -467,7 +472,7 @@ mod tests {
             .expect("manifest");
             let manifest = hpke_seal_to_tenant(
                 &key,
-                &manifest_info(&self.tenant, &self.dataset, version),
+                &manifest_info(key.suite(), &self.tenant, &self.dataset, version),
                 &manifest,
             )
             .expect("seal manifest");
@@ -742,64 +747,70 @@ mod tests {
 
     #[tokio::test]
     async fn an_upload_is_stored_as_a_snapshot_that_opens() {
-        let vault = ObjectStoreVault::new_in_memory();
-        let fixture = Fixture::new();
-        let version = version_at(0);
-        let report = fixture
-            .commit(
-                &vault,
-                fixture.body(&version, cohort_schema(), b"parquet bytes"),
-            )
-            .await
-            .expect("commit");
-        assert_eq!(report.version, version);
-        assert_eq!(report.suite, EnvelopeSuite::Hpk1);
+        // The browser seals HPK1 until P36; the route stores either suite.
+        for suite in [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2] {
+            let vault = ObjectStoreVault::new_in_memory();
+            let fixture = Fixture::sealed_under(suite);
+            let version = version_at(0);
+            let report = fixture
+                .commit(
+                    &vault,
+                    fixture.body(&version, cohort_schema(), b"parquet bytes"),
+                )
+                .await
+                .expect("commit");
+            assert_eq!(report.version, version);
+            assert_eq!(report.suite, suite);
 
-        let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
-        let mut expected = vec![
-            TenantPaths::connector_snapshot_object(tenant, dataset, &version, report.object),
-            TenantPaths::connector_record(tenant, dataset, &version),
-            TenantPaths::connector_manifest(tenant, dataset, &version),
-        ]
-        .into_iter()
-        .map(|path| path.as_str().to_owned())
-        .collect::<Vec<_>>();
-        expected.sort();
-        assert_eq!(stored(&vault, tenant).await, expected);
+            let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
+            let mut expected = vec![
+                TenantPaths::connector_snapshot_object(tenant, dataset, &version, report.object),
+                TenantPaths::connector_record(tenant, dataset, &version),
+                TenantPaths::connector_manifest(tenant, dataset, &version),
+            ]
+            .into_iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(stored(&vault, tenant).await, expected);
 
-        let record = vault
-            .get(&TenantPaths::connector_record(tenant, dataset, &version))
-            .await
-            .expect("record");
-        let record = SnapshotRecord::parse(&record, &version).expect("parse");
-        assert_eq!(record.suite, "HPK1");
-        assert_eq!(record.row_cap, Some(7));
-        assert_eq!(record.schema, Some(cohort_schema()));
+            let record = vault
+                .get(&TenantPaths::connector_record(tenant, dataset, &version))
+                .await
+                .expect("record");
+            let record = SnapshotRecord::parse(&record, &version).expect("parse");
+            assert_eq!(record.suite, suite.id());
+            assert_eq!(record.row_cap, Some(7));
+            assert_eq!(record.schema, Some(cohort_schema()));
 
-        // The steward's key opens both envelopes under the bindings the
-        // query path uses.
-        let object = vault
-            .get(&TenantPaths::connector_snapshot_object(
-                tenant,
-                dataset,
-                &version,
-                report.object,
-            ))
-            .await
-            .expect("object");
-        let opened = fixture
-            .keypair
-            .open_envelope(&object_info(&tenant, dataset, &report.object), &object)
-            .expect("open object");
-        assert_eq!(opened.expose(), b"parquet bytes");
-        let manifest = vault
-            .get(&TenantPaths::connector_manifest(tenant, dataset, &version))
-            .await
-            .expect("manifest");
-        fixture
-            .keypair
-            .open_envelope(&manifest_info(&tenant, dataset, &version), &manifest)
-            .expect("open manifest");
+            // The steward's key opens both envelopes under the bindings the
+            // query path uses.
+            let object = vault
+                .get(&TenantPaths::connector_snapshot_object(
+                    tenant,
+                    dataset,
+                    &version,
+                    report.object,
+                ))
+                .await
+                .expect("object");
+            let opened = fixture
+                .keypair
+                .open_envelope(
+                    &object_info(suite, &tenant, dataset, &report.object),
+                    &object,
+                )
+                .expect("open object");
+            assert_eq!(opened.expose(), b"parquet bytes");
+            let manifest = vault
+                .get(&TenantPaths::connector_manifest(tenant, dataset, &version))
+                .await
+                .expect("manifest");
+            fixture
+                .keypair
+                .open_envelope(&manifest_info(suite, &tenant, dataset, &version), &manifest)
+                .expect("open manifest");
+        }
     }
 
     #[tokio::test]

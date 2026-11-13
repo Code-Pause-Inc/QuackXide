@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     platform_telemetry::init_from_env();
 
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let tenant = TenantId::generate();
     let signer = Arc::new(TokenSigner::generate(
         "urn:query-demo:sim",

@@ -131,7 +131,7 @@ async fn research_app(steward: TenantId) -> Router {
     stack
         .commit_snapshot(
             steward,
-            TenantKeypair::generate(),
+            TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
             &connector,
             "rows",
             &sentinel_parquet(),

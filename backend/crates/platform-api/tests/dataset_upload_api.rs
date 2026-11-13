@@ -48,7 +48,8 @@ struct Steward {
 
 fn steward() -> (Steward, TenantKeypair) {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    // The browser seals uploads under HPK1 until P36.
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
     let steward = Steward {
         tenant,
         key: keypair.public_key(),
@@ -153,7 +154,7 @@ async fn uploads_without_an_access_token_are_401() {
         ..app_state(SECRET, vault.clone())
     });
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
     let sealed = cohorts_upload(tenant, &keypair.public_key(), DATASET, None);
 
     let (status, _) = put_upload(&app, None, DATASET, sealed.body.clone()).await;

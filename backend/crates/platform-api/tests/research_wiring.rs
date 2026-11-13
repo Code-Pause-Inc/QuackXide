@@ -74,7 +74,7 @@ async fn research_routes_answer_while_queries_stay_fail_closed() {
 
     // Upload: the steward stores a dataset, which needs no key release
     // either. Publishing refuses a dataset the steward does not hold.
-    let key = TenantKeypair::generate().public_key();
+    let key = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1).public_key();
     let upload = common::cohorts_upload(steward, &key, DATASET, None);
     let (status, body) =
         common::put_upload(&app, Some(&token_for(steward)), DATASET, upload.body).await;

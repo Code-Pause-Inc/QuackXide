@@ -40,23 +40,30 @@ pub struct SnapshotManifest {
     pub objects: Vec<ObjectId>,
 }
 
-/// HPKE `info` binding for a snapshot manifest
+/// HPKE `info` binding for a snapshot manifest sealed under `suite`
 /// ([`platform_crypto::info::snapshot_manifest`]), for both dataset kinds.
 pub fn manifest_info(
+    suite: EnvelopeSuite,
     tenant: &TenantId,
     slug: &ConnectorSlug,
     version: &SnapshotVersion,
 ) -> Vec<u8> {
-    platform_crypto::info::snapshot_manifest(tenant, slug, version)
+    platform_crypto::info::snapshot_manifest(suite, tenant, slug, version)
 }
 
-/// HPKE `info` binding for one object of `slug`'s snapshots: a connector's
-/// objects are sealed under [`platform_crypto::info::connector_object`], an
-/// upload's under [`platform_crypto::info::steward_upload`].
-pub fn object_info(tenant: &TenantId, slug: &ConnectorSlug, object: &ObjectId) -> Vec<u8> {
+/// HPKE `info` binding for one object of `slug`'s snapshots sealed under
+/// `suite`: a connector's objects are sealed under
+/// [`platform_crypto::info::connector_object`], an upload's under
+/// [`platform_crypto::info::steward_upload`].
+pub fn object_info(
+    suite: EnvelopeSuite,
+    tenant: &TenantId,
+    slug: &ConnectorSlug,
+    object: &ObjectId,
+) -> Vec<u8> {
     match slug.kind() {
-        DatasetKind::Connector => envelope_info(tenant, slug, object),
-        DatasetKind::Upload => platform_crypto::info::steward_upload(tenant, slug, object),
+        DatasetKind::Connector => envelope_info(suite, tenant, slug, object),
+        DatasetKind::Upload => platform_crypto::info::steward_upload(suite, tenant, slug, object),
     }
 }
 
@@ -139,7 +146,7 @@ impl<'a> SnapshotWriter<'a> {
     ) -> Result<WrittenObject, PipelineError> {
         self.connector_only()?;
         let object = ObjectId::generate();
-        let info = envelope_info(&self.tenant, &self.slug, &object);
+        let info = envelope_info(self.key.suite(), &self.tenant, &self.slug, &object);
         let envelope =
             hpke_seal_to_tenant(self.key, &info, parquet).map_err(|_| PipelineError::Seal)?;
         let ciphertext_bytes = envelope.len();
@@ -167,12 +174,12 @@ impl<'a> SnapshotWriter<'a> {
             objects: self.objects,
         };
         let plaintext = serde_json::to_vec(&manifest).map_err(|_| PipelineError::Seal)?;
-        let info = manifest_info(&self.tenant, &self.slug, &self.version);
+        let info = manifest_info(self.key.suite(), &self.tenant, &self.slug, &self.version);
         let envelope =
             hpke_seal_to_tenant(self.key, &info, &plaintext).map_err(|_| PipelineError::Seal)?;
         let record = SnapshotRecord {
             version: self.version.clone(),
-            suite: EnvelopeSuite::CURRENT.id().to_owned(),
+            suite: self.key.suite().id().to_owned(),
             row_cap: None,
             schema: None,
         };
@@ -397,20 +404,22 @@ mod tests {
         let object = ObjectId::generate();
         let connector = slug("quickbooks");
         let upload = slug("upload_cohorts");
-        assert_eq!(
-            object_info(&tenant, &connector, &object),
-            platform_crypto::info::connector_object(tenant, &connector, object)
-        );
-        assert_eq!(
-            object_info(&tenant, &upload, &object),
-            platform_crypto::info::steward_upload(tenant, &upload, object)
-        );
+        for suite in [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2] {
+            assert_eq!(
+                object_info(suite, &tenant, &connector, &object),
+                platform_crypto::info::connector_object(suite, tenant, &connector, object)
+            );
+            assert_eq!(
+                object_info(suite, &tenant, &upload, &object),
+                platform_crypto::info::steward_upload(suite, tenant, &upload, object)
+            );
+        }
     }
 
     #[tokio::test]
     async fn connector_writer_refuses_the_upload_namespace() {
         let vault = ObjectStoreVault::new_in_memory();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
         let key = keypair.public_key();
         let tenant = TenantId::generate();
         let mut writer = SnapshotWriter::begin(&vault, tenant, &key, slug("upload_cohorts"));
@@ -432,7 +441,9 @@ mod tests {
     #[tokio::test]
     async fn a_commit_writes_a_record_and_holds_follows_the_manifest() {
         let vault = ObjectStoreVault::new_in_memory();
-        let keypair = TenantKeypair::generate();
+        // Not the current suite: the record names the suite the key seals
+        // under.
+        let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk1);
         let key = keypair.public_key();
         let tenant = TenantId::generate();
         let health = slug("health");
@@ -470,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn pruning_removes_superseded_records_with_their_snapshots() {
         let vault = ObjectStoreVault::new_in_memory();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
         let key = keypair.public_key();
         let tenant = TenantId::generate();
         let health = slug("health");

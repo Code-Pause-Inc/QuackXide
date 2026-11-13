@@ -208,6 +208,12 @@ pub fn default_config() -> PlatformConfig {
     PlatformConfig::from_source(|_| None).expect("config")
 }
 
+/// Config with `APP_ENV=development`, where `HPK1` keys are still accepted.
+pub fn development_config() -> PlatformConfig {
+    PlatformConfig::from_source(|k| (k == "APP_ENV").then(|| "development".to_owned()))
+        .expect("config")
+}
+
 /// Config with the merchant-of-record webhook secret set.
 pub fn config_with_mor_secret(secret: &str) -> PlatformConfig {
     PlatformConfig::from_source(|k| match k {
@@ -376,15 +382,19 @@ pub fn sealed_upload(
 ) -> SealedUpload {
     let slug = ConnectorSlug::new(dataset).expect("slug");
     let object = ObjectId::generate();
-    let sealed = hpke_seal_to_tenant(key, &object_info(&steward, &slug, &object), parquet)
-        .expect("seal object");
+    let sealed = hpke_seal_to_tenant(
+        key,
+        &object_info(key.suite(), &steward, &slug, &object),
+        parquet,
+    )
+    .expect("seal object");
     let manifest = SnapshotManifest {
         version: version.clone(),
         objects: vec![object],
     };
     let manifest = hpke_seal_to_tenant(
         key,
-        &manifest_info(&steward, &slug, &version),
+        &manifest_info(key.suite(), &steward, &slug, &version),
         &serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("seal manifest");

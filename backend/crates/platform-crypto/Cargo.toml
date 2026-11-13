@@ -28,8 +28,11 @@ zeroize.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 criterion.workspace = true
 proptest.workspace = true
+serde_json.workspace = true
+x-wing.workspace = true
 # Without default features, so `x25519_secrets_zeroize_on_drop` fails if hpke
 # stops turning on `zeroize` itself. `static_secrets` exposes `StaticSecret`.
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }

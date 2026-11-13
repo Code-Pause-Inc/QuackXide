@@ -216,7 +216,10 @@ async fn maybe_seed_demo_fixture(
 
     let tenant: platform_core::TenantId = raw_tenant.parse()?;
     let pk_bytes = B64.decode(raw_pk_b64)?;
-    let tenant_public_key = platform_crypto::TenantPublicKey::from_raw(&pk_bytes)?;
+    let tenant_public_key = platform_crypto::TenantPublicKey::from_raw(
+        &pk_bytes,
+        platform_crypto::SuitePolicy::for_env(config.env.is_production()),
+    )?;
 
     let pipeline = platform_connectors::pipeline::EnclavePipeline::new(
         attestation.clone(),

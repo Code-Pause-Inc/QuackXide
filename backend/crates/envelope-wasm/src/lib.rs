@@ -8,27 +8,31 @@
 //! this module zeroizes its copy before returning. The drive KEK and
 //! per-file keys never enter this module's memory.
 //!
+//! The browser stays on `HPK1` (X25519) until P36 (#186): this module accepts
+//! only 32-byte X25519 recipient keys and builds `-v1` info strings, so it
+//! never produces an `HPK2` envelope with a mismatched info string.
+//!
 //! The functions without `wasm_bindgen` hold the logic and are tested
 //! natively; the exported wrappers only convert errors.
 
 use platform_crypto::{
-    CryptoError, TenantPublicKey, hpke_open_with_private_key, hpke_seal_to_tenant, info,
-    tenant_public_key_from_private,
+    CryptoError, EnvelopeSuite, SuitePolicy, TenantPublicKey, hpk1_open_with_private_key,
+    hpk1_public_key_from_private, hpke_seal_to_tenant, info,
 };
+
+/// The one suite the browser seals with until P36.
+const SUITE: EnvelopeSuite = EnvelopeSuite::Hpk1;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroize;
 
-/// Seal `plaintext` to a raw tenant public key under `info`, returning the
-/// framed envelope. The suite is the current one ([`EnvelopeSuite::CURRENT`]);
-/// the frame's magic names it.
-///
-/// [`EnvelopeSuite::CURRENT`]: platform_crypto::EnvelopeSuite::CURRENT
+/// Seal `plaintext` to a raw X25519 tenant public key under `info`,
+/// returning the framed `HPK1` envelope. A hybrid (`HPK2`) key is refused.
 pub fn seal_envelope(
     recipient_public_key: &[u8],
     info: &[u8],
     mut plaintext: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    let sealed = TenantPublicKey::from_raw(recipient_public_key)
+    let sealed = TenantPublicKey::from_raw(recipient_public_key, SuitePolicy::HPK1_ONLY)
         .and_then(|recipient| hpke_seal_to_tenant(&recipient, info, &plaintext));
     // The JavaScript caller keeps its own copy; this one is wasm memory that
     // is reused, never returned to the browser.
@@ -36,15 +40,15 @@ pub fn seal_envelope(
     sealed
 }
 
-/// Open a framed envelope with the device's raw private key. The suite comes
-/// from the frame magic. The key is zeroized here whether or not the open
-/// succeeds; the JavaScript caller zeroizes its own copy.
+/// Open an `HPK1` envelope with the device's raw X25519 private key; an
+/// `HPK2` frame is refused until P36. The key is zeroized here whether or not
+/// the open succeeds; the JavaScript caller zeroizes its own copy.
 pub fn open_envelope(
     mut private_key: Vec<u8>,
     info: &[u8],
     envelope: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let opened = hpke_open_with_private_key(&private_key, info, envelope);
+    let opened = hpk1_open_with_private_key(&private_key, info, envelope);
     private_key.zeroize();
     // `SecretBytes` zeroizes its buffer on drop, but the `Vec` returned to
     // JavaScript is a plain copy: wasm-bindgen copies it out and frees it
@@ -53,10 +57,10 @@ pub fn open_envelope(
     opened.map(|plaintext| plaintext.expose().to_vec())
 }
 
-/// The raw public key of a raw private key, for enrollment. The key is
-/// zeroized here; the caller zeroizes its own copy.
+/// The raw `HPK1` public key of a raw X25519 private key, for enrollment.
+/// The key is zeroized here; the caller zeroizes its own copy.
 pub fn public_key_from_private_key(mut private_key: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
-    let public = tenant_public_key_from_private(&private_key);
+    let public = hpk1_public_key_from_private(&private_key);
     private_key.zeroize();
     public.map(|key| key.to_raw())
 }
@@ -69,6 +73,7 @@ pub fn steward_upload_info(
     object: &str,
 ) -> Result<Vec<u8>, CryptoError> {
     Ok(info::steward_upload(
+        SUITE,
         info::check_field(tenant)?,
         info::check_field(dataset)?,
         info::check_field(object)?,
@@ -83,6 +88,7 @@ pub fn connector_object_info(
     object: &str,
 ) -> Result<Vec<u8>, CryptoError> {
     Ok(info::connector_object(
+        SUITE,
         info::check_field(tenant)?,
         info::check_field(connector)?,
         info::check_field(object)?,
@@ -97,6 +103,7 @@ pub fn snapshot_manifest_info(
     version: &str,
 ) -> Result<Vec<u8>, CryptoError> {
     Ok(info::snapshot_manifest(
+        SUITE,
         info::check_field(tenant)?,
         info::check_field(connector)?,
         info::check_field(version)?,
@@ -107,6 +114,7 @@ pub fn snapshot_manifest_info(
 /// [`steward_upload_info`].
 pub fn research_result_info(researcher_tenant: &str, query: &str) -> Result<Vec<u8>, CryptoError> {
     Ok(info::research_result(
+        SUITE,
         info::check_field(researcher_tenant)?,
         info::check_field(query)?,
     ))
@@ -178,23 +186,25 @@ pub fn research_result_info_js(researcher_tenant: &str, query: &str) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platform_crypto::{HPKE_ENVELOPE_MAGIC, TenantKeypair};
+    use platform_crypto::{EnvelopeSuite, TenantKeypair};
 
     #[test]
     fn sealed_envelope_opens_with_the_recipient_key() {
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk1);
         let info = steward_upload_info("t", "d", "o").expect("info");
+        assert!(info.starts_with(b"steward-upload-v1|"));
         let envelope =
             seal_envelope(&keypair.public_key().to_raw(), &info, b"rows".to_vec()).expect("seal");
-        assert_eq!(envelope[..4], HPKE_ENVELOPE_MAGIC);
+        assert_eq!(envelope[..4], *b"HPK1");
         let opened = keypair.open_envelope(&info, &envelope).expect("open");
         assert_eq!(opened.expose(), b"rows");
     }
 
     #[test]
     fn open_round_trips_with_the_raw_private_key() {
-        let keypair = TenantKeypair::generate();
-        let raw = keypair.to_private_key_bytes().expose().to_vec();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+        // The raw key is the framed export without its 4-byte magic.
+        let raw = keypair.to_private_key_bytes().expose()[4..].to_vec();
         let public = public_key_from_private_key(raw.clone()).expect("public key");
         assert_eq!(public, keypair.public_key().to_raw());
         let info = research_result_info("t", "q").expect("info");
@@ -206,6 +216,18 @@ mod tests {
         assert!(matches!(
             open_envelope(raw, b"other", &envelope),
             Err(CryptoError::OpenFailed)
+        ));
+    }
+
+    #[test]
+    fn seal_refuses_hybrid_recipient() {
+        // The browser stays on HPK1 until P36 (#186).
+        let hybrid = TenantKeypair::generate(EnvelopeSuite::Hpk2)
+            .public_key()
+            .to_raw();
+        assert!(matches!(
+            seal_envelope(&hybrid, b"i", b"x".to_vec()),
+            Err(CryptoError::SuiteRefused)
         ));
     }
 
