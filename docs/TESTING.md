@@ -146,15 +146,8 @@ the module cache.
 
 The numbers are report only. The `browser` workflow writes them, and the
 module's raw and gzipped size, to each run's job summary: Chromium on pull
-requests, and Chromium, Firefox and WebKit on `main` and nightly. The step
-is marked failed, without failing the run, if no timings come out.
-
-| Timing | Chromium |
-| --- | --- |
-| `encryptPayload/4KiB` | TBD |
-| `encryptPayload/4MiB` | TBD |
-| `wasm/first-load` | TBD |
-| wasm module size | TBD |
+requests, and Chromium, Firefox and WebKit on `main`, nightly and on demand.
+The step is marked failed, without failing the run, if no timings come out.
 
 ### Envelope vectors
 
