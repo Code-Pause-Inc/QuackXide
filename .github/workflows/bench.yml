@@ -32,6 +32,8 @@ jobs:
         working-directory: backend
         run: |
           set -o pipefail
+          # In the log as well as the summary, so the machine can be read back with `gh run view --log`.
+          { lscpu | grep -E '^(Model name|CPU\(s\)):'; rustc -V; } | tee "$RUNNER_TEMP/machine.txt"
           cargo bench -p platform-crypto --bench hpke --locked -- --noplot | tee "$RUNNER_TEMP/bench.txt"
           {
             echo "## HPKE envelope benchmarks"
@@ -39,8 +41,7 @@ jobs:
             echo "Reference numbers from a shared GitHub-hosted runner; they vary between runs and never gate."
             echo
             echo '```'
-            lscpu | grep -E '^(Model name|CPU\(s\)):'
-            rustc -V
+            cat "$RUNNER_TEMP/machine.txt"
             echo '```'
             echo
             echo '```'
