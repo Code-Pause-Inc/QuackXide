@@ -74,7 +74,7 @@ overheads.
 
 Criterion's estimate, both suites from one run:
 [run 43391725261](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43391725261)
-at commit `871b55d`, on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC
+of #228's HPK2 change, on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC
 7763, 4 CPUs, `rustc 1.94.1`. The numbers hold until the benchmarked code
 changes; later runs of the same code differ only by runner noise.
 
