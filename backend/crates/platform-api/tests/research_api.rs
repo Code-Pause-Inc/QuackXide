@@ -1,5 +1,6 @@
 //! Research-access integration tests: a steward grants a researcher
-//! aggregate access to a sealed dataset; the researcher runs
+//! aggregate access to a sealed dataset, seeded directly or uploaded
+//! through the steward upload route; the researcher runs
 //! disclosure-controlled queries (small cohorts suppressed); ungranted and
 //! revoked access is refused; row-level egress is blocked; an approval
 //! that fails part-way converges when the steward retries it; and a retry
@@ -96,6 +97,57 @@ async fn granted_researcher_gets_disclosure_controlled_aggregates() {
     assert_eq!(rows[0]["condition"], "flu");
     assert_eq!(rows[0]["n"], 6);
     // One unit of the default allocation (100) consumed.
+    assert_eq!(body["budget_remaining"], 99);
+}
+
+#[tokio::test]
+async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    let key = keypair.public_key();
+    let app = common::upload_research_app(
+        SECRET,
+        vec![(steward, keypair)],
+        Arc::new(platform_storage::ObjectStoreVault::new_in_memory()),
+    );
+
+    // The steward's browser seals the cohort and uploads it; nothing else
+    // seeds the dataset.
+    let upload = common::cohorts_upload(steward, &key, "upload_cohorts", None);
+    let (status, body) = common::put_upload(
+        &app,
+        Some(&token_for(steward)),
+        "upload_cohorts",
+        upload.body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "upload: {body}");
+
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"upload_cohorts"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+
+    let sql = "SELECT condition, COUNT(*) AS n FROM upload_cohorts GROUP BY condition";
+    let (status, body) = post(
+        &app,
+        "/api/v1/research/query",
+        &token_for(researcher),
+        &format!(r#"{{"steward_tenant":"{steward}","connector":"upload_cohorts","sql":"{sql}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(body["mode"], "research");
+    assert_eq!(body["suppressed_rows"], 1);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["condition"], "flu");
+    assert_eq!(rows[0]["n"], 6);
     assert_eq!(body["budget_remaining"], 99);
 }
 
@@ -628,7 +680,7 @@ async fn research_app_with_stores(
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
     };
-    let research = Arc::new(ResearchService::new(stores, 5, 100));
+    let research = Arc::new(ResearchService::new(stores, vault.clone(), 5, 100));
     let service = stack.query_service(settings, research.clone());
     build_app(AppState {
         research: Some(research),

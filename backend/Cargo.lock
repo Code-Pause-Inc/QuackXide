@@ -3112,6 +3112,7 @@ name = "platform-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
  "zeroize",
@@ -3165,6 +3166,8 @@ dependencies = [
  "platform-config",
  "platform-core",
  "platform-storage",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

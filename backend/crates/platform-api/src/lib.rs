@@ -3,7 +3,8 @@
 //! Tenant identity comes only from the verified JWT `tid` claim, never from a
 //! path, query, or body, and every storage path is derived from it through
 //! `platform_storage::TenantPaths`, so cross-tenant access cannot be
-//! expressed. Drive payloads are opaque ciphertext to this process.
+//! expressed. Drive payloads and dataset uploads are opaque ciphertext to
+//! this process.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 
 pub mod admin;
+mod datasets;
 #[cfg(feature = "dev")]
 pub mod dev;
 pub mod key_release;
@@ -137,6 +139,20 @@ pub enum ApiError {
     BudgetExhausted,
     /// The drive holds more than [`MAX_LISTED_OBJECTS`] objects (422).
     ListTooLarge,
+    /// A dataset upload over the dataset size limit (413).
+    PayloadTooLarge,
+    /// A dataset upload body that is malformed (422). A fixed reason, never
+    /// input.
+    MalformedUpload(&'static str),
+    /// An upload declares another schema than the dataset's recorded one
+    /// (422).
+    SchemaMismatch,
+    /// An upload's snapshot version is not newer than the dataset's current
+    /// one (409).
+    StaleSnapshot,
+    /// The decrypted dataset does not match the schema or row cap its
+    /// steward declared, so the query does not run (502).
+    DatasetMismatch,
 }
 
 /// `Retry-After` on a transient storage failure. The storage client has
@@ -174,6 +190,11 @@ impl ApiError {
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
             ApiError::ListTooLarge => "list_too_large",
+            ApiError::PayloadTooLarge => "payload_too_large",
+            ApiError::MalformedUpload(_) => "malformed_upload",
+            ApiError::SchemaMismatch => "schema_mismatch",
+            ApiError::StaleSnapshot => "stale_snapshot",
+            ApiError::DatasetMismatch => "dataset_mismatch",
         }
     }
 }
@@ -224,6 +245,23 @@ impl IntoResponse for ApiError {
             ApiError::ListTooLarge => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "too many objects to list")
             }
+            ApiError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload exceeds the dataset size limit",
+            ),
+            ApiError::MalformedUpload(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+            ApiError::SchemaMismatch => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "declared schema does not match the dataset's recorded schema",
+            ),
+            ApiError::StaleSnapshot => (
+                StatusCode::CONFLICT,
+                "a snapshot at or after this version is already committed",
+            ),
+            ApiError::DatasetMismatch => (
+                StatusCode::BAD_GATEWAY,
+                "stored dataset does not match its declared schema or row cap",
+            ),
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
@@ -388,6 +426,13 @@ fn routes(state: AppState) -> Router {
         )
         .layer(tenant_auth());
 
+    // Steward uploads need only the vault and the configuration, so they
+    // work where research queries are not configured.
+    let datasets = Router::new()
+        .route("/{dataset}", put(datasets::put_dataset))
+        .layer(DefaultBodyLimit::max(datasets::body_limit(&state.config)))
+        .layer(tenant_auth());
+
     let catalog = Router::new()
         .route(
             "/",
@@ -423,6 +468,7 @@ fn routes(state: AppState) -> Router {
         .nest("/api/v1/query", query)
         .nest("/api/v1/grants", grants)
         .nest("/api/v1/research", research)
+        .nest("/api/v1/datasets", datasets)
         .nest("/api/v1/catalog", catalog)
         .nest("/admin/tenants", admin_tenants)
         .nest("/admin/webhooks", webhooks)

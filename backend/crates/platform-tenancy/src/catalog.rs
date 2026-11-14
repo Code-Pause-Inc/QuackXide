@@ -1,7 +1,8 @@
 //! Dataset catalog and access requests.
 //!
-//! A steward publishes a listing for one of its sealed connector datasets;
-//! researchers browse published listings and request access; the steward
+//! A steward publishes a listing for a dataset it holds (a connector's or a
+//! steward upload's); researchers browse published listings and request
+//! access; the steward
 //! approves (minting a grant and budget) or denies. Publishing is an explicit
 //! opt-in to discoverability: unpublished datasets are indistinguishable
 //! from nonexistent ones.
@@ -22,7 +23,8 @@ use crate::{TenancyError, new_id, now_iso};
 pub struct DatasetListing {
     pub listing_id: String,
     pub steward_tenant: TenantId,
-    /// Dataset selector: the connector slug under the steward's prefix.
+    /// Dataset selector: the dataset's slug under the steward's prefix, a
+    /// connector's or an upload's (`upload_…`, ADR 0012).
     pub connector: String,
     pub title: String,
     pub description: String,
@@ -62,6 +64,7 @@ pub struct AccessRequest {
     pub listing_id: String,
     pub steward_tenant: TenantId,
     pub researcher_tenant: TenantId,
+    /// The listing's dataset slug.
     pub connector: String,
     /// Researcher-stated purpose (bounded at the API edge; may be empty).
     pub note: String,

@@ -29,6 +29,10 @@ pub enum PipelineError {
     Storage(String),
     #[error("envelope seal failed")]
     Seal,
+    /// A connector writer was given a slug in the upload namespace, which
+    /// only steward uploads write (ADR 0012).
+    #[error("dataset slug is in the upload namespace")]
+    UploadNamespace,
 }
 
 /// One tenant-connector sync assignment.

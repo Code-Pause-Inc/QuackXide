@@ -60,8 +60,24 @@ async fn full_confidential_sync_round_trip() {
         .expect("list");
     assert_eq!(
         paths.len(),
-        2,
-        "one sealed object and its snapshot manifest"
+        3,
+        "one sealed object, its snapshot record and its manifest"
+    );
+    let record = vault
+        .get(&TenantPaths::connector_record(
+            tenant,
+            &slug,
+            &report.snapshot,
+        ))
+        .await
+        .expect("get record");
+    let record = platform_storage::SnapshotRecord::parse(&record, &report.snapshot)
+        .expect("snapshot record");
+    assert_eq!(record.suite, "HPK1");
+    assert_eq!(
+        (record.row_cap, record.schema),
+        (None, None),
+        "a connector snapshot records its suite only"
     );
 
     // The manifest commits exactly the object this sync wrote.
@@ -154,8 +170,8 @@ async fn scheduler_tick_runs_all_jobs_and_isolates_results() {
             .expect("list");
         assert_eq!(
             stored.len(),
-            6,
-            "one sealed object and one manifest per connector"
+            9,
+            "one sealed object, one record and one manifest per connector"
         );
     }
 }
@@ -233,8 +249,8 @@ async fn stopping_the_scheduler_finishes_the_sync_in_flight_and_starts_no_more()
         .expect("list");
     assert_eq!(
         stored.len(),
-        2,
-        "only that sync's object and manifest; the next job never started"
+        3,
+        "only that sync's object, record and manifest; the next job never started"
     );
 }
 

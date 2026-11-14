@@ -281,3 +281,66 @@ async fn catalog_scoping_and_input_bounds() {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
+
+#[tokio::test]
+async fn publishing_a_dataset_the_steward_does_not_hold_is_404() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    let key = keypair.public_key();
+    let app = common::upload_research_app(
+        SECRET,
+        vec![(steward, keypair)],
+        std::sync::Arc::new(platform_storage::ObjectStoreVault::new_in_memory()),
+    );
+    let publish = |dataset: &str| {
+        format!(
+            r#"{{"connector":"{dataset}","title":"Cohorts","license_fee_cents":0,"compute_rate_cents":0}}"#
+        )
+    };
+
+    // Nothing uploaded yet, and a connector with no synced data: neither
+    // is held, so no listing appears.
+    for dataset in ["upload_cohorts", "quickbooks"] {
+        let (status, body) = post(
+            &app,
+            "/api/v1/catalog",
+            &token_for(steward),
+            &publish(dataset),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{dataset}: {body}");
+    }
+    let (_, catalog) = call(&app, "GET", "/api/v1/catalog", &token_for(researcher), None).await;
+    assert!(catalog["listings"].as_array().expect("listings").is_empty());
+
+    // After an upload commits, the same publish succeeds.
+    let upload = common::cohorts_upload(steward, &key, "upload_cohorts", None);
+    let (status, body) = common::put_upload(
+        &app,
+        Some(&token_for(steward)),
+        "upload_cohorts",
+        upload.body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "upload: {body}");
+    let (status, listing) = post(
+        &app,
+        "/api/v1/catalog",
+        &token_for(steward),
+        &publish("upload_cohorts"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "publish: {listing}");
+    assert_eq!(listing["connector"], "upload_cohorts");
+
+    // Holding is per tenant: the researcher holds no such dataset.
+    let (status, _) = post(
+        &app,
+        "/api/v1/catalog",
+        &token_for(researcher),
+        &publish("upload_cohorts"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

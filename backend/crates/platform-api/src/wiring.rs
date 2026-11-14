@@ -88,9 +88,11 @@ pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
 
     // One `Arc` for the research routes and the query service, so the grant
     // a route creates is the one `research_query` checks and charges. The
-    // stores are in memory until P62 makes them durable.
+    // stores are in memory until P62 makes them durable. The vault is the
+    // one the app serves, so publishing sees what uploads and syncs stored.
     let research = Arc::new(ResearchService::from_config(
         ResearchStores::in_memory(),
+        vault.clone(),
         &config.research,
     ));
     tracing::warn!(
