@@ -591,7 +591,7 @@ browser and signatures are still classical.
 
 | Use | Current | Target |
 | --- | --- | --- |
-| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The browser (`envelope-wasm`) and the enclave's key-release key are still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186; key-release key: P85, #176) |
+| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The enclave's request key is `HPK2` too. The browser (`envelope-wasm`) is still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186) |
 | Bulk encryption | AES-256-GCM | AES-256-GCM |
 | Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 for keys only an attested workload holds; tokens per ADR 0006 |
 
@@ -612,10 +612,10 @@ Migration rules:
   they are the browser's `HPK1` path and go away with P36 (#186). Tenant
   enrollment and the demo tenant build it from `APP_ENV` (ADR 0009):
   production accepts only `HPK2` keys, development also `HPK1`, so the
-  browser works until P36. The
-  key-release stand-in and released keys accept only `HPK2` in every mode;
-  the browser build and the enclave's key-release key accept only `HPK1`
-  until P36 and P85. A key opens only frames of its own suite. Refusals at
+  browser works until P36. The enclave's request key, the key-release
+  stand-in and released keys accept only `HPK2` in every mode; the browser
+  build accepts only `HPK1` until P36. A key opens only frames of its own
+  suite. Refusals at
   enrollment, upload, key release and open emit `crypto.suite_refused`.
 * No silent downgrade: production refuses `HPK1` frames and X25519
   enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):

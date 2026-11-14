@@ -72,9 +72,8 @@ Linux, outside the repository:
 At start, `ConnectorQueryService` generates a key set and holds it in
 memory only, in zeroize-on-drop types, never written, logged or exported:
 
-* a **request key**: an X25519 (`HPK1`) key pair today, X-Wing (`HPK2`)
-  once P85 (#176) builds binding v2, with its private half in production
-  builds;
+* a **request key**: an `HPK2` key pair (X-Wing), with its private half in
+  production builds;
 * a **result-signing key**: an Ed25519 key pair (`ed25519-dalek`) and an
   ML-DSA-65 key pair (`ml-dsa`).
 
@@ -98,7 +97,7 @@ SHA-256( "attestation-binding-v2"
 
 | Label | Value |
 | --- | --- |
-| `request-key` | suite magic (`HPK1`, later `HPK2`) ‖ raw public key |
+| `request-key` | suite magic (`HPK2`) ‖ raw public key |
 | `signing-ed25519` | 32-byte public key |
 | `signing-ml-dsa-65` | encoded public key |
 | `kms-public-key` | KMS public key; empty until P50 |
@@ -141,7 +140,7 @@ builds use the same audience. The body:
   "version": 1,
   "key_id": "…",
   "token": "<OIDC token>",
-  "request_key": { "suite": "HPK1", "public_key": "…" },
+  "request_key": { "suite": "HPK2", "public_key": "…" },
   "signing_keys": { "ed25519": "…", "ml_dsa_65": "…" },
   "kms_public_key": null,
   "tls_spki_sha256": null
@@ -282,11 +281,12 @@ identities.
 
 ### No downgrade
 
-Once P85 (#176) moves the request key to the hybrid suite, every step
-refuses the classical one, as ADR 0007 requires for stored data: the browser refuses an evidence bundle
-whose request key is `HPK1`, and the enclave refuses an `HPK1` envelope
-and an X25519-only recipient key. There is no fallback mode. The
-signatures are hybrid from the first build.
+The request key is hybrid (`HPK2`) from the first build, and so are the
+signatures. Once the browser seals with the hybrid suite (P36, #186),
+every step refuses the classical one, as ADR 0007 requires for stored
+data: the browser refuses an evidence bundle whose request key is
+`HPK1`, and the enclave refuses an `HPK1` envelope and an X25519-only
+recipient key. There is no fallback mode.
 
 ### Sealed and signed result
 
