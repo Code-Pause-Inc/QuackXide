@@ -1,7 +1,7 @@
 # 0012. Steward dataset upload
 
-* Status: Proposed
-* Date: 2026-11-08
+* Status: Accepted
+* Date: 2026-11-13
 
 ## Context
 
@@ -66,19 +66,23 @@ tenants/{t}/connectors/{slug}/keys/{version}/                        reserved: w
 ```
 
 The upload is written in that order: the object, then the record, then
-the manifest. Writing the manifest is the commit, and it is create-only,
-so a version commits once: an upload whose version another write
-committed first gets 409 and prunes nothing. The commit then prunes
-everything its snapshot does not list. Older manifests go first, then
-older objects and records, including those of uploads that never
-committed, and then other objects at its own version, which an earlier
-attempt at that version left when it stopped before its manifest. Newer
-versions may be in progress and are left alone. An object that a
-concurrent attempt at the same version stores after the commit stays
-until the next upload. A re-upload replaces the dataset rather than
-adding to it, and an upload that stops before its manifest changes nothing
-a query reads. Connector snapshots share this commit; each sync draws a
-fresh version, so for them only the order matters.
+the manifest. Writing the manifest is the commit. The record and the
+manifest are both written create-only, so a version keeps the first
+record stored for it and commits once. An upload gets 409 and prunes
+nothing if another write committed its version first, or stored a record
+for it unlike the upload's (another row cap, schema or suite). A retry of
+an attempt that stopped before its manifest goes through if it declares
+the same record. The commit then prunes everything its snapshot does not
+list. Older manifests go first, then older objects and records, including
+those of uploads that never committed, and then other objects at its own
+version, which an earlier attempt at that version left when it stopped
+before its manifest. Newer versions may be in progress and are left
+alone. An object that a concurrent attempt at the same version stores
+after the commit stays until the next upload. A re-upload replaces the
+dataset rather than adding to it, and an upload that stops before its
+manifest changes nothing a query reads. Connector snapshots share this
+commit; each sync draws a fresh version, so for them only the order
+matters.
 
 `keys/{version}/` is reserved for the snapshot's wrapped data keys under
 ADR 0004: one wrapped to the KMS key, and for an upload one wrapped to the
@@ -217,9 +221,12 @@ not what the API stores.
 | Malformed body, header, or envelope frame | 422 | denied, with the reason |
 | Version more than five minutes ahead | 422 | denied, `version_ahead` |
 | Declared schema unlike the recorded one | 422 | denied, `schema_mismatch` |
-| Version not newer than the current one, or committed by another write first | 409 | denied, `stale_version` |
+| Version not newer than the current one, or another write committed it or recorded it differently first | 409 | denied, `stale_version` |
 | Current record unreadable | 502 | failed, `record_unreadable` |
 | Storage failure | 503 or 502 | failed, `storage` |
+
+An upload outside the upload namespace is 404 rather than 403, since the
+steward holds no upload dataset by that name.
 
 The stored object is audited `ok`, and the commit and pruning are audited
 `committed` and `pruned`, as connector snapshots are under
@@ -238,10 +245,11 @@ uses the same function.
 The upload route does not need "holds". Inside the upload namespace, the
 first upload creates the dataset, and the tenant comes from the token, so
 a steward can write only their own datasets. A separate create step (for
-example a `put_if_absent` dataset record) was rejected: it would add a
-second notion of existence and a second request to protect only the
-first schema against two concurrent first uploads. If that race happens,
-the newer upload becomes current and its schema is the recorded one.
+example a `put_if_absent` record per dataset, not per snapshot) was
+rejected: it would add a second notion of existence and a second request
+to protect only the first schema against two concurrent first uploads. If
+that race happens, the newer upload becomes current and its schema is the
+recorded one.
 
 ### Query
 
@@ -282,7 +290,9 @@ APIs and features are built (no `with_context` streams, no `seekable`, no
 * A steward cannot change a dataset's schema by re-uploading. Deleting the
   dataset (P42) and uploading again is the path.
 * A retry of an upload that committed but lost its response gets 409. The
-  browser checks the current version through P39 before retrying.
+  browser checks the current version through P39 before retrying. A retry
+  at the same version must declare what the first attempt declared; one
+  that changes the row cap or schema gets 409 and needs a newer version.
 * A bad seal replaces a good snapshot. The server cannot open envelopes,
   so an upload sealed under the wrong key or binding commits and prunes
   the working snapshot, and queries return 502 until the steward
@@ -298,16 +308,11 @@ APIs and features are built (no `with_context` streams, no `seekable`, no
 
 ## Open questions
 
-1. 0009 to 0011 are taken on `main` and no open branch uses 0012, so
-   this record uses 0012. The maintainer reserves numbers and may renumber
-   it.
-2. Are 64 MiB as the default and 512 MiB as the ceiling acceptable until
+1. Are 64 MiB as the default and 512 MiB as the ceiling acceptable until
    P34 and P40 measure the browser seal and upload?
-3. Should the declared schema move into the sealed manifest when manifests
+2. Should the declared schema move into the sealed manifest when manifests
    move to the data key, leaving only a digest in plaintext?
-4. 404 or 403 for an upload outside the upload namespace? 404 is chosen,
-   since the steward holds no upload dataset by that name.
-5. The schema lock depends on P42. A dataset keeps its first upload's
+3. The schema lock depends on P42. A dataset keeps its first upload's
    schema, so a wrong first schema, or the concurrent first uploads that
    "Holds" accepts, can be fixed only by deleting the dataset (P42).
    `docs/V1_PLAN.md` lists P42 as a v1.1 candidate; if it slips, such a

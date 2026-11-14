@@ -21,7 +21,8 @@ use platform_config::PlatformConfig;
 use platform_core::{ColumnType, ConnectorSlug, SnapshotVersion, TenantId};
 use platform_crypto::{TenantKeypair, TenantPublicKey};
 use platform_storage::{
-    ObjectStoreVault, StorageError, StorageUsage, TenantPaths, VaultEntry, VaultPath, VaultStore,
+    ObjectStoreVault, SnapshotRecord, StorageError, StorageUsage, TenantPaths, VaultEntry,
+    VaultPath, VaultStore,
 };
 
 use common::{
@@ -472,35 +473,48 @@ async fn a_retry_at_the_same_version_replaces_the_failed_attempt() {
     });
     let (app, steward) = app_over(vault.clone());
     let version = next_version(None);
+    let attempt = |parquet: &[u8], row_cap: u64| {
+        sealed_upload(
+            steward.tenant,
+            &steward.key,
+            DATASET,
+            version.clone(),
+            parquet,
+            cohorts_schema(),
+            row_cap,
+        )
+    };
 
-    // The first attempt stops before its manifest.
-    let failed = sealed_upload(
-        steward.tenant,
-        &steward.key,
-        DATASET,
-        version.clone(),
-        &common::cohorts_parquet(),
-        cohorts_schema(),
-        7,
-    );
+    // The first attempt stores its object and its record (row cap 8), and
+    // stops before its manifest.
+    let failed = attempt(&common::cohorts_parquet(), 8);
     assert_eq!(
         upload(&app, &steward, &failed).await,
         StatusCode::SERVICE_UNAVAILABLE
     );
-
-    // The retry at the same version seals other rows under a new object id.
-    // It commits, and the failed attempt's object is pruned.
     vault.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // A body at that version declaring another row cap is stale, and the
+    // stored record is kept.
     let rows = synth_cohort(8);
-    let retry = sealed_upload(
-        steward.tenant,
-        &steward.key,
-        DATASET,
-        version,
-        &rows,
-        cohorts_schema(),
-        8,
+    assert_eq!(
+        upload(&app, &steward, &attempt(&rows, 9)).await,
+        StatusCode::CONFLICT
     );
+    let record = vault
+        .get(&TenantPaths::connector_record(
+            steward.tenant,
+            &slug(),
+            &version,
+        ))
+        .await
+        .expect("record");
+    let record = SnapshotRecord::parse(&record, &version).expect("parse");
+    assert_eq!(record.row_cap, Some(8));
+
+    // The retry declares the same record and seals other rows under a new
+    // object id. It commits, and both earlier objects are pruned.
+    let retry = attempt(&rows, 8);
     assert_ne!(retry.object, failed.object);
     assert_eq!(upload(&app, &steward, &retry).await, StatusCode::OK);
     assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (1, 1, 1));

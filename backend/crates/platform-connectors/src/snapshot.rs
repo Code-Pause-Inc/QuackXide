@@ -4,9 +4,10 @@
 //! then its plaintext [`SnapshotRecord`], then a sealed manifest listing the
 //! objects. Queries read only the newest snapshot that has a manifest, so a
 //! write that stops partway changes nothing they see, and repeated writes
-//! never stack copies of the same rows. The manifest is written create-only,
-//! so a version commits once. After the commit, everything the new snapshot
-//! does not list is deleted.
+//! never stack copies of the same rows. The record and the manifest are
+//! written create-only, so a version keeps the first record stored for it
+//! and commits once. After the commit, everything the new snapshot does not
+//! list is deleted.
 //!
 //! Two writers share the layout: [`SnapshotWriter`] seals a connector
 //! sync's Parquet in the enclave, and [`crate::upload::commit_upload`]
@@ -203,10 +204,13 @@ fn audit_labels(slug: &ConnectorSlug) -> (AuditKind, &'static str) {
 /// what the snapshot does not list. Shared by both writers, so the order
 /// cannot drift.
 ///
-/// The manifest is written create-only. If the version is already
-/// committed, this fails with [`StorageError::AlreadyExists`] and prunes
-/// nothing, so a second write at one version neither replaces the snapshot
-/// nor deletes its objects.
+/// Both writes are create-only. A record already stored at the version is
+/// kept if it equals `record`: an earlier attempt at the version stored it
+/// and stopped before its manifest, and this is its retry. If the stored
+/// record differs, or the version is already committed, this fails with
+/// [`StorageError::AlreadyExists`] and prunes nothing, so a second write at
+/// one version replaces neither the snapshot nor its record, and deletes
+/// none of its objects.
 pub(crate) async fn commit_snapshot(
     vault: &dyn VaultStore,
     tenant: TenantId,
@@ -216,12 +220,7 @@ pub(crate) async fn commit_snapshot(
     objects: &[ObjectId],
 ) -> Result<(), StorageError> {
     let version = &record.version;
-    vault
-        .put(
-            &TenantPaths::connector_record(tenant, slug, version),
-            record.to_bytes(),
-        )
-        .await?;
+    write_record(vault, tenant, slug, record).await?;
     vault
         .put_if_absent(
             &TenantPaths::connector_manifest(tenant, slug, version),
@@ -240,6 +239,33 @@ pub(crate) async fn commit_snapshot(
     );
     prune_superseded(vault, tenant, slug, version, objects).await;
     Ok(())
+}
+
+/// Store `record` create-only, or keep the record already stored at its
+/// version if that one is equal. A stored record that differs, cannot be
+/// parsed, or is gone again (a newer commit pruned it) fails with
+/// [`StorageError::AlreadyExists`].
+async fn write_record(
+    vault: &dyn VaultStore,
+    tenant: TenantId,
+    slug: &ConnectorSlug,
+    record: &SnapshotRecord,
+) -> Result<(), StorageError> {
+    let path = TenantPaths::connector_record(tenant, slug, &record.version);
+    match vault.put_if_absent(&path, record.to_bytes()).await {
+        Err(StorageError::AlreadyExists) => {}
+        written => return written,
+    }
+    match vault.get(&path).await {
+        Ok(stored)
+            if SnapshotRecord::parse(&stored, &record.version)
+                .is_ok_and(|stored| stored == *record) =>
+        {
+            Ok(())
+        }
+        Ok(_) | Err(StorageError::NotFound) => Err(StorageError::AlreadyExists),
+        Err(err) => Err(err),
+    }
 }
 
 /// Delete everything outside the `current` snapshot, whose objects are
@@ -359,7 +385,7 @@ pub async fn prune_superseded(
 mod tests {
     use super::*;
     use platform_crypto::TenantKeypair;
-    use platform_storage::ObjectStoreVault;
+    use platform_storage::{ObjectStoreVault, StorageUsage, VaultEntry};
 
     fn slug(raw: &str) -> ConnectorSlug {
         ConnectorSlug::new(raw).expect("slug")
@@ -464,5 +490,92 @@ mod tests {
                 "{prefix}"
             );
         }
+    }
+
+    /// A vault whose reads find nothing, as if a newer commit pruned what a
+    /// create-only write had just found.
+    struct PrunedOnRead(ObjectStoreVault);
+
+    #[async_trait::async_trait]
+    impl VaultStore for PrunedOnRead {
+        async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+            self.0.put(path, ciphertext).await
+        }
+        async fn put_if_absent(
+            &self,
+            path: &VaultPath,
+            ciphertext: Bytes,
+        ) -> Result<(), StorageError> {
+            self.0.put_if_absent(path, ciphertext).await
+        }
+        async fn get(&self, _path: &VaultPath) -> Result<Bytes, StorageError> {
+            Err(StorageError::NotFound)
+        }
+        async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+            self.0.delete(path).await
+        }
+        async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+            self.0.list(prefix).await
+        }
+        async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+            self.0.list_entries(prefix).await
+        }
+        async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+            self.0.usage(prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_unlike_the_one_stored_at_its_version_is_refused() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let tenant = TenantId::generate();
+        let health = slug("health");
+        let record = SnapshotRecord {
+            version: SnapshotVersion::generate(),
+            suite: EnvelopeSuite::CURRENT.id().to_owned(),
+            row_cap: None,
+            schema: None,
+        };
+        let path = TenantPaths::connector_record(tenant, &health, &record.version);
+        write_record(&vault, tenant, &health, &record)
+            .await
+            .expect("first write");
+        // A retry storing the same record goes through.
+        write_record(&vault, tenant, &health, &record)
+            .await
+            .expect("retry");
+
+        // Another record is refused, and the stored one is kept.
+        let other = SnapshotRecord {
+            row_cap: Some(1),
+            ..record.clone()
+        };
+        assert!(matches!(
+            write_record(&vault, tenant, &health, &other).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(vault.get(&path).await.expect("get"), record.to_bytes());
+
+        // So is any record when the stored one cannot be parsed.
+        vault
+            .put(&path, Bytes::from_static(b"not json"))
+            .await
+            .expect("put");
+        assert!(matches!(
+            write_record(&vault, tenant, &health, &record).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            vault.get(&path).await.expect("get"),
+            Bytes::from_static(b"not json")
+        );
+
+        // And when the stored record is gone by the time it is read, even
+        // though it was the same.
+        vault.put(&path, record.to_bytes()).await.expect("put");
+        assert!(matches!(
+            write_record(&PrunedOnRead(vault), tenant, &health, &record).await,
+            Err(StorageError::AlreadyExists)
+        ));
     }
 }
