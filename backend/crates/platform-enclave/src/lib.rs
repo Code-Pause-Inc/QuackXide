@@ -14,7 +14,7 @@ pub mod binding;
 pub mod simulated_token;
 pub mod token;
 
-pub use binding::{REPORT_DATA_BYTES, ReportDataBinding};
+pub use binding::{EnclaveKeyBinding, REPORT_DATA_BYTES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeePlatform {

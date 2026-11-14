@@ -175,7 +175,7 @@ fn key_release_query_service(
         }
         _ => [0u8; 32],
     };
-    let identity = Arc::new(EnclaveIdentity::with_metadata([0u8; 32], config_digest));
+    let identity = Arc::new(EnclaveIdentity::with_metadata(None, config_digest));
     let keys = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
         attestation.clone(),

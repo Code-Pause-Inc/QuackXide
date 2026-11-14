@@ -18,14 +18,14 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::key_release::{
     AttestationBundle, AttestedKeyProvider, EnclaveIdentity, HttpKeyReleaseClient, HttpKeySource,
-    InProcessKeyReleaseClient, KeyReleaseRelyingParty, KeyReleaseRequest, KeySource,
-    StaticKeySource, sim_attestation_router,
+    InProcessKeyReleaseClient, KeyReleaseRelyingParty, KeyReleaseRequest, KeySource, KeyWire,
+    SigningKeysWire, StaticKeySource, sim_attestation_router,
 };
 use platform_api::query::ConnectorQueryService;
 use platform_api::research::{ResearchService, ResearchStores};
@@ -165,16 +165,16 @@ fn request(
         tenant_id: tenant.to_string(),
         nonce_b64: nonce_b64.to_owned(),
         token,
-        enclave_hpke_public_key_b64: B64.encode(identity.enclave_hpke_public_key()),
-        result_signing_public_key_b64: B64.encode(identity.result_signing_public_key()),
-        tls_cert_sha256_b64: B64.encode(identity.tls_cert_sha256()),
-        config_digest_b64: B64.encode(identity.config_digest()),
+        request_key: KeyWire::from_public_key(&identity.request_public_key()),
+        signing_keys: SigningKeysWire::from_verifying_keys(&identity.verifying_keys()),
+        tls_spki_sha256: identity.binding().tls_spki_sha256.map(|d| B64URL.encode(d)),
+        config_digest_b64: B64.encode(identity.binding().config_digest),
     }
 }
 
 fn binding_nonces(identity: &EnclaveIdentity, nonce_b64: &str) -> Vec<String> {
     let nonce: [u8; 32] = B64.decode(nonce_b64).unwrap().try_into().unwrap();
-    nonces_from_bytes(&identity.binding_for_nonce(nonce).to_report_data()).unwrap()
+    nonces_from_bytes(&identity.binding().report_data(&nonce)).unwrap()
 }
 
 /// Ask `rp` to release `tenant`'s key with a token from `token_signer`.
@@ -231,7 +231,7 @@ impl KeySource for UnreachableSource {
 async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let attestation = provider(SimulatedClaims::default());
-    let identity = Arc::new(EnclaveIdentity::with_metadata([0x11; 32], [0x42; 32]));
+    let identity = Arc::new(EnclaveIdentity::with_metadata(Some([0x11; 32]), [0x42; 32]));
     let key_provider = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
         attestation.clone(),
@@ -268,19 +268,30 @@ async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let bundle: AttestationBundle = serde_json::from_slice(&body).expect("json");
-    assert_eq!(bundle.platform, "simulated");
-    assert_eq!(bundle.tls_cert_sha256_b64, B64.encode([0x11; 32]));
-    assert_eq!(bundle.config_digest_b64, B64.encode([0x42; 32]));
+    assert_eq!(bundle.version, 1);
+    assert_eq!(bundle.key_id, identity.key_id());
+    assert_eq!(bundle.request_key.suite, "HPK2");
     assert_eq!(
-        bundle.enclave_hpke_public_key_b64,
-        B64.encode(identity.enclave_hpke_public_key())
+        bundle.request_key,
+        KeyWire::from_public_key(&identity.request_public_key())
     );
+    assert_eq!(
+        bundle.signing_keys,
+        SigningKeysWire::from_verifying_keys(&identity.verifying_keys())
+    );
+    assert_eq!(bundle.kms_public_key, None);
+    assert_eq!(bundle.tls_spki_sha256, Some(B64URL.encode([0x11; 32])));
 
     // The token verifies against the signer's keys, bound to the caller's
     // nonce and the enclave's keys.
     let verifier =
         TokenVerifier::new(&signer().jwks(), SIM_ISSUER, SIMULATED_AUDIENCE, policy()).unwrap();
-    let expected = nonces_from_bytes(&identity.binding_for_nonce(nonce).to_report_data()).unwrap();
+    // The second nonce is the binding digest, which is the key id.
+    let expected = nonces_from_bytes(&identity.binding().report_data(&nonce)).unwrap();
+    assert_eq!(
+        B64URL.decode(&bundle.key_id).unwrap(),
+        identity.binding().digest()
+    );
     verifier
         .verify(&bundle.token, &expected)
         .expect("bundle token must verify");
@@ -455,6 +466,71 @@ async fn token_bound_to_other_keys_is_refused() {
     let req = request(tenant, &attacker, &challenge.nonce_b64, token);
     assert!(rp.release_key(&req).await.is_err());
     assert_eq!(rp.release_count(), 0);
+}
+
+#[tokio::test]
+async fn a_swapped_signing_key_is_refused() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let other = SigningKeysWire::from_verifying_keys(&EnclaveIdentity::generate().verifying_keys());
+    // Either signing key swapped for another no longer matches the token's binding.
+    for swap in [
+        |keys: &mut SigningKeysWire, other: &SigningKeysWire| keys.ed25519 = other.ed25519.clone(),
+        |keys: &mut SigningKeysWire, other: &SigningKeysWire| {
+            keys.ml_dsa_65 = other.ml_dsa_65.clone()
+        },
+    ] {
+        let challenge = rp.issue_challenge();
+        let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+        let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+        let mut req = request(tenant, &identity, &challenge.nonce_b64, token);
+        swap(&mut req.signing_keys, &other);
+        assert!(matches!(
+            rp.release_key(&req).await,
+            Err(platform_api::ApiError::Forbidden)
+        ));
+    }
+    assert_eq!(rp.release_count(), 0);
+    assert!(
+        capture.contains("crypto.key_release", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn an_hpk1_request_key_is_refused() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let challenge = rp.issue_challenge();
+    // A token correctly bound to an HPK1 request key: only the suite policy
+    // refuses it.
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+    let binding = platform_enclave::EnclaveKeyBinding {
+        request_key: [&hpk1.suite().magic()[..], &hpk1.to_raw()].concat(),
+        ..identity.binding().clone()
+    };
+    let nonce: [u8; 32] = B64
+        .decode(&challenge.nonce_b64)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let nonces = nonces_from_bytes(&binding.report_data(&nonce)).unwrap();
+    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    let mut req = request(tenant, &identity, &challenge.nonce_b64, token);
+    req.request_key = KeyWire::from_public_key(&hpk1);
+    assert!(matches!(
+        rp.release_key(&req).await,
+        Err(platform_api::ApiError::Forbidden)
+    ));
+    assert_eq!(rp.release_count(), 0);
+    for kind in ["crypto.key_release", "crypto.suite_refused"] {
+        assert!(capture.contains(kind, "denied"), "{:?}", capture.events());
+    }
 }
 
 async fn refused_for(claims: SimulatedClaims) {
