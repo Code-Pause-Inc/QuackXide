@@ -3,12 +3,13 @@
 //! `dev` feature.
 //!
 //! Protocol:
-//! 1. At startup, the enclave generates an ephemeral in-RAM HPKE keypair
-//!    ([`EnclaveIdentity`]) whose private key never leaves process memory.
+//! 1. At startup, the enclave generates its in-RAM key set
+//!    ([`EnclaveIdentity`]), whose private keys never leave process memory.
 //! 2. Per query, [`AttestedKeyProvider`] requests a single-use 32-byte
 //!    challenge nonce from the key-release relying party, binds the nonce and
-//!    the enclave's key set (binding v2, ADR 0010) into 64 bytes, and obtains a simulated Confidential Space token carrying
-//!    them as its two nonces from [`AttestationProvider`].
+//!    the enclave's key set (binding v2, ADR 0010) into 64 bytes, and obtains
+//!    a simulated Confidential Space token carrying them as its two nonces
+//!    from [`AttestationProvider`].
 //! 3. [`KeyReleaseRelyingParty`] consumes the single-use nonce, recomputes the
 //!    binding, verifies the token with the production [`TokenVerifier`]
 //!    against the simulator's key set ([`KeySource`]), and HPKE-seals the

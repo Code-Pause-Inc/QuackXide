@@ -500,7 +500,7 @@ struct AttestationQuery {
 
 /// `GET /api/v1/attestation` — public enclave attestation evidence bundle
 /// binding a caller-supplied 32-byte challenge nonce (`?nonce_b64=...`) and
-/// the enclave's ephemeral HPKE and result-signing public keys.
+/// the enclave's key set (ADR 0010).
 async fn get_attestation(
     State(state): State<AppState>,
     Query(query): Query<AttestationQuery>,

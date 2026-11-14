@@ -545,7 +545,9 @@ struct Hpk2Keypair {
     public_key: <Hpk2Kem as KemTrait>::PublicKey,
 }
 
-/// Test/dev-only tenant keypair. Both suites' private keys zeroize on drop
+/// An HPKE keypair in either suite: a tenant's (tests and development only;
+/// a tenant's private key otherwise stays in its browser) or the enclave's
+/// request key (ADR 0010). Both suites' private keys zeroize on drop
 /// (`x25519-dalek` and `x-wing`).
 pub struct TenantKeypair(KeypairInner);
 
