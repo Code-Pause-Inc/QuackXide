@@ -37,6 +37,7 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+pub mod sealed;
 pub mod sweep;
 pub mod wiring;
 use admin::ProvisioningService;
