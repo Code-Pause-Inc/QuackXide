@@ -17,6 +17,7 @@ except fuzzing; `CONTRIBUTING.md` lists what CI runs on each pull request.
 | Property tests (TypeScript) | `frontend/src/**/*.property.test.ts` (fast-check) | `frontend/src/lib/vault/wire.property.test.ts` |
 | Frontend unit tests | `frontend/src/**/*.test.ts` (vitest `node` project) | `frontend/src/lib/vault/wire.test.ts` |
 | Frontend component tests | `frontend/src/**/*.test.tsx` (vitest `dom` project, jsdom) | `frontend/src/components/DrivePanel.test.tsx` |
+| Browser tests | `frontend/src/**/*.browser.test.ts` (vitest `browser` project, Playwright) | `frontend/src/lib/crypto/worker.browser.test.ts` |
 | Fuzz targets | `backend/fuzz/fuzz_targets/` | `backend/fuzz/fuzz_targets/jwt_verify.rs` |
 
 ### Crate unit tests
@@ -109,10 +110,25 @@ input": round-trips, and "arbitrary input is never accepted". Rust uses
 
 ### Frontend tests
 
-`frontend/vite.config.ts` defines two vitest projects. The `node` project
+`frontend/vite.config.ts` defines three vitest projects. The `node` project
 runs `*.test.ts` and has no DOM. The `dom` project runs `*.test.tsx` under
 jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
-Neither project runs a real browser; see
+
+The `browser` project runs `*.browser.test.ts` in real headless browsers
+through Playwright, with nothing mocked: the module crypto worker, Web
+Crypto keys and IndexedDB. The worker loads the wasm envelope module (build
+it first with `scripts/build-wasm.sh`), but no browser test seals with it
+yet. It needs no backend. Failure screenshots and Playwright traces go to
+`frontend/.vitest/`, which the `browser` workflow keeps when a job fails. `npm test` does not run it;
+from `frontend/`:
+
+```sh
+npx playwright install chromium firefox webkit   # once
+npm run test:browser                              # Chromium
+BROWSERS=chromium,firefox,webkit npm run test:browser
+```
+
+The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
 
 ### Envelope vectors

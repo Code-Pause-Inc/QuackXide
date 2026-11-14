@@ -1,9 +1,27 @@
 /// <reference types="vitest/config" />
 import tailwindcss from "@tailwindcss/vite";
+import { playwright } from "@vitest/browser-playwright";
 import react from "@vitejs/plugin-react";
 import { defineConfig, loadEnv } from "vite";
 
 import { releaseEnvProblems } from "./src/config/release";
+
+// Browsers for the `browser` test project: a comma list in BROWSERS
+// (chromium, firefox, webkit), Chromium when unset.
+const BROWSERS = ["chromium", "firefox", "webkit"] as const;
+type Browser = (typeof BROWSERS)[number];
+
+function browserInstances(list: string | undefined): { browser: Browser }[] {
+  return (list?.trim() || "chromium")
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0)
+    .map((name) => {
+      const browser = BROWSERS.find((known) => known === name);
+      if (!browser) throw new Error(`BROWSERS: unknown browser "${name}" (use ${BROWSERS.join(", ")})`);
+      return { browser };
+    });
+}
 
 // Branding and endpoints come from VITE_* env vars (see .env.example).
 export default defineConfig(({ mode }) => {
@@ -12,6 +30,7 @@ export default defineConfig(({ mode }) => {
   // the proxy forwards, so no CORS preflight crosses origins.
   const env = loadEnv(mode, ".", "");
   const target = env.API_PROXY_TARGET?.trim() || "http://127.0.0.1:8080";
+  const browsers = browserInstances(env.BROWSERS);
   // Release builds (`npm run build:release`, release.yml) refuse
   // development paths (ADR 0009).
   if (mode === "release") {
@@ -36,7 +55,12 @@ export default defineConfig(({ mode }) => {
       projects: [
         {
           extends: true,
-          test: { name: "node", environment: "node", include: ["src/**/*.test.ts"] },
+          test: {
+            name: "node",
+            environment: "node",
+            include: ["src/**/*.test.ts"],
+            exclude: ["src/**/*.browser.test.ts"],
+          },
         },
         {
           extends: true,
@@ -45,6 +69,23 @@ export default defineConfig(({ mode }) => {
             environment: "jsdom",
             include: ["src/**/*.test.tsx"],
             setupFiles: ["src/test/setup.ts"],
+          },
+        },
+        {
+          // Real browsers (Playwright): the crypto worker, Web Crypto and
+          // IndexedDB. Run with `npm run test:browser`, not `npm test`.
+          extends: true,
+          test: {
+            name: "browser",
+            include: ["src/**/*.browser.test.ts"],
+            browser: {
+              enabled: true,
+              provider: playwright(),
+              headless: true,
+              instances: browsers,
+              // Failure screenshots and traces land in .vitest/ (CI keeps them).
+              trace: { mode: "retain-on-failure", tracesDir: ".vitest/traces" },
+            },
           },
         },
       ],

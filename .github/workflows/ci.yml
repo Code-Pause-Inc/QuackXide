@@ -115,7 +115,7 @@ jobs:
         working-directory: frontend
         run: |
           npm ci --no-audit --no-fund
-          npx vitest run --coverage --coverage.reporter=text-summary | tee coverage.txt
+          npx vitest run --project node --project dom --coverage --coverage.reporter=text-summary | tee coverage.txt
           { echo '## Frontend coverage'; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   release-binaries:
