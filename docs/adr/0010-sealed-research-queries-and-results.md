@@ -1,6 +1,6 @@
 # 0010. Sealed research queries and results
 
-* Status: Proposed
+* Status: Accepted (2026-11-14, with the P85 and P55 foundation)
 * Date: 2026-11-04
 
 ## Context

@@ -365,8 +365,10 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   In a `dev` build, when `KEY_RELEASE_URL` is configured,
   `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
   `KeyReleaseRelyingParty`: it fetches a single-use challenge nonce, binds
-  the nonce and its in-RAM `EnclaveIdentity` public keys into a 64-byte
-  `ReportDataBinding`, presents a simulated Confidential Space token
+  the nonce and its in-RAM `EnclaveIdentity` key set into 64 bytes (binding
+  v2, ADR 0010: the nonce, then a digest of its `HPK2` request key, both
+  result-signing keys and its configuration), presents a simulated
+  Confidential Space token
   carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
   key into a zeroize-on-drop `TenantKeypair` for the duration of that
   query. The relying party checks the token with the production verifier

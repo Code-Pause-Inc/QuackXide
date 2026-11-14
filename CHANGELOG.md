@@ -8,6 +8,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* The base for sealed research queries and results (ADR 0010; part of P85
+  and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
+  together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must
+  verify) and gains the `research_query` `info` string and the query
+  binding that `research_result` takes, pinned in `fixtures/envelope/hpk1.json`
+  and exposed by the wasm module. `platform-enclave`'s binding v2
+  (`EnclaveKeyBinding`) replaces the fixed 32-byte fields of
+  `ReportDataBinding` with labelled, length-prefixed values. The enclave's
+  key set (`EnclaveIdentity`) is an `HPK2` request key, whose private half
+  now exists in every build, and a result-signing key, with a `key_id`.
+  `GET /api/v1/attestation` returns ADR 0010's evidence bundle, and the
+  key-release stand-in checks binding v2 and refuses a request key that is
+  not `HPK2`. The sealed-query wire types are defined; nothing routes to
+  them yet. ADR 0005 and ADR 0010 are accepted.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
