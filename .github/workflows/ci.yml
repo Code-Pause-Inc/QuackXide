@@ -328,9 +328,14 @@ jobs:
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar -xzf gitleaks.tar.gz gitleaks
           rm gitleaks.tar.gz
-      # HEAD only: on a pull request that is the merge with main, so the whole
-      # history being merged is scanned under the PR's own .gitleaks.toml.
-      # Without it gitleaks scans every fetched branch, so one PR's allowed
-      # test file fails every other PR.
+      # The script scans HEAD only: on a pull request that is the merge with
+      # main, so the history being merged is scanned under the PR's own
+      # .gitleaks.toml, and no other branch's allowlist applies.
+      - name: Self-test the scan
+        env:
+          GITLEAKS: ./gitleaks
+        run: scripts/secret-scan.sh selftest
       - name: Scan the history being merged
-        run: ./gitleaks git --no-banner --redact --config .gitleaks.toml --log-opts=HEAD .
+        env:
+          GITLEAKS: ./gitleaks
+        run: scripts/secret-scan.sh

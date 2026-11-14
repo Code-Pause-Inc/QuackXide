@@ -124,7 +124,9 @@ follow `docs/DATA_POLICY.md`.
 gitleaks found something that looks like a credential. If it is real, do
 not just delete it: follow `docs/DATA_POLICY.md` "Enforcement". If it is a
 synthetic test literal, allow that exact value or path in `.gitleaks.toml`
-with a comment naming the test, never a whole rule.
+with a comment naming the test, never a whole rule. If it says the scan is
+incomplete, git failed partway through the history: fix the git error
+printed above it (`git fsck` finds a damaged repository).
 
 ### Attribution guard
 

@@ -97,8 +97,9 @@ uses [Semantic Versioning](https://semver.org/).
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
 * CI compiles every fuzz target on each pull request, and runs a gitleaks
-  secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
-  runs the same scan when gitleaks is installed.
+  secret scan over every diff in the history being merged (`.gitleaks.toml`,
+  `scripts/secret-scan.sh`); `scripts/check.sh` runs a similar scan of the
+  branch when gitleaks is installed.
 * `VaultStore::put_if_absent`, a create-only write (`PutMode::Create`;
   `x-goog-if-generation-match: 0` on GCS). `StorageError` gains
   `AlreadyExists` and `PreconditionFailed`, which the API returns as 409

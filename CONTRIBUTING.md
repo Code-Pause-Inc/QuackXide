@@ -42,7 +42,7 @@ Every pull request runs:
   contains the dev-only `devstack` binary;
 * a build of every fuzz target (`backend/fuzz/`), which also fails if
   `backend/fuzz/Cargo.lock` is stale;
-* a gitleaks secret scan of the full history being merged;
+* a gitleaks secret scan of the full history;
 * a coverage report in the job summary.
 
 Every cargo build, check, clippy and test command runs with `--locked`, so
