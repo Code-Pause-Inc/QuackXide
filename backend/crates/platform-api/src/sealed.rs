@@ -6,6 +6,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::ApiError;
 use crate::key_release::{KeyWire, SigningKeysWire};
@@ -21,15 +22,28 @@ pub struct SealedQueryRequest {
     pub envelope: String,
 }
 
-/// What `envelope` opens to inside the enclave.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What `envelope` opens to inside the enclave. The SQL text is plaintext
+/// only here (ADR 0010): `Debug` redacts it, and it is wiped on drop, also
+/// when a later field fails to parse.
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealedQueryPlaintext {
     pub steward_tenant: String,
     pub connector: String,
-    pub sql: String,
+    pub sql: Zeroizing<String>,
     pub request_nonce: String,
     pub recipient_key: KeyWire,
+}
+
+impl std::fmt::Debug for SealedQueryPlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedQueryPlaintext")
+            .field("steward_tenant", &self.steward_tenant)
+            .field("connector", &self.connector)
+            .field("sql", &"[redacted]")
+            .field("recipient_key", &self.recipient_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SealedQueryPlaintext {
@@ -105,11 +119,24 @@ mod tests {
     }
 
     #[test]
+    fn debug_does_not_print_the_sql() {
+        let plaintext = SealedQueryPlaintext {
+            steward_tenant: "s".to_owned(),
+            connector: "c".to_owned(),
+            sql: Zeroizing::new("SELECT secret_column FROM t".to_owned()),
+            request_nonce: "n".to_owned(),
+            recipient_key: serde_json::from_value(recipient()).unwrap(),
+        };
+        let printed = format!("{plaintext:?}");
+        assert!(!printed.contains("secret_column"), "{printed}");
+    }
+
+    #[test]
     fn the_request_nonce_must_be_32_bytes_of_base64url() {
         let plaintext = |nonce: &str| SealedQueryPlaintext {
             steward_tenant: "s".to_owned(),
             connector: "c".to_owned(),
-            sql: "q".to_owned(),
+            sql: Zeroizing::new("q".to_owned()),
             request_nonce: nonce.to_owned(),
             recipient_key: serde_json::from_value(recipient()).unwrap(),
         };
