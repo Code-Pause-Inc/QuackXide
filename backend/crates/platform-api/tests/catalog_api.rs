@@ -298,7 +298,7 @@ async fn catalog_scoping_and_input_bounds() {
 async fn publishing_a_dataset_the_steward_does_not_hold_is_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let key = keypair.public_key();
     let app = common::upload_research_app(
         SECRET,

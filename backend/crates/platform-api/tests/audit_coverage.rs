@@ -1284,7 +1284,7 @@ async fn refused_grant_id_requests_are_audited() {
 async fn dataset_upload_is_audited() {
     let capture = AuditCapture::install();
     let steward = TenantId::generate();
-    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     let key = keypair.public_key();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());

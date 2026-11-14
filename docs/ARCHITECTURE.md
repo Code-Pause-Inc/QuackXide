@@ -600,7 +600,7 @@ Migration rules:
   key-release stand-in and released keys accept only `HPK2` in every mode;
   the browser build and the enclave's key-release key accept only `HPK1`
   until P36 and P85. A key opens only frames of its own suite. Refusals at
-  enrollment, key release and open emit `crypto.suite_refused`.
+  enrollment, upload, key release and open emit `crypto.suite_refused`.
 * No silent downgrade: production refuses `HPK1` frames and X25519
   enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):
   nothing has been sealed under `HPK1` outside development.

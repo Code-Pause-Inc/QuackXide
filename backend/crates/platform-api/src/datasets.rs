@@ -90,6 +90,21 @@ pub(crate) async fn put_dataset(
                 other => ApiError::MalformedUpload(other.message()),
             }
         })?;
+    // A frame of a suite this deployment refuses (HPK1 in production) could
+    // never be opened, so it is refused here rather than stored.
+    if platform_crypto::SuitePolicy::for_env(state.config.env.is_production())
+        .check(upload.suite)
+        .is_err()
+    {
+        security_audit_event(
+            AuditKind::SuiteRefused,
+            Some(steward),
+            "denied",
+            "refused an upload sealed in a suite this deployment does not accept",
+        );
+        audit_refusal(steward, dataset.as_str(), "denied", "suite_refused");
+        return Err(ApiError::MalformedUpload("upload suite not accepted"));
+    }
 
     let report = upload::commit_upload(&*state.vault, steward, &dataset, upload, SystemTime::now())
         .await

@@ -285,8 +285,8 @@ uses [Semantic Versioning](https://semver.org/).
   #187): HPKE with X-Wing (X25519 + ML-KEM-768), HKDF-SHA256 and
   AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
   Enrollment and snapshot records name the key's suite, and the upload
-  route accepts a complete frame of either suite, which opens only under a
-  key of the same suite. Every key loader takes a suite
+  route refuses a frame of a suite the deployment does not accept (`HPK1`
+  in production) with 422. Every key loader takes a suite
   policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
   with a `crypto.suite_refused` audit event; development still accepts
   them until the browser moves to `HPK2` (P36). Private keys are exported
