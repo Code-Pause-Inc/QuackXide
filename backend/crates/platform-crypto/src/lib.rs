@@ -234,13 +234,51 @@ impl EnvelopeSuite {
         }
     }
 
-    /// The suite a framed envelope declares. Unknown magic is refused.
+    /// The suite's stable name in stored plaintext records: its frame magic
+    /// as text, which names exactly one suite.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Hpk1 => "HPK1",
+        }
+    }
+
+    /// The suite a stored name refers to; unknown names are refused.
+    pub fn from_id(id: &str) -> Result<Self, CryptoError> {
+        match id {
+            "HPK1" => Ok(Self::Hpk1),
+            _ => Err(CryptoError::InvalidEnvelope),
+        }
+    }
+
+    /// The shortest complete frame: magic, encapsulated key and AEAD tag
+    /// (an empty plaintext).
+    pub fn min_frame_bytes(self) -> usize {
+        match self {
+            Self::Hpk1 => MAGIC_BYTES + ENCAPPED_KEY_BYTES + GCM_TAG_BYTES,
+        }
+    }
+
+    /// The suite a framed envelope declares. Unknown magic is refused. This
+    /// reads only the magic; [`check_envelope_frame`] also checks length.
     pub fn of_envelope(envelope: &[u8]) -> Result<Self, CryptoError> {
         match envelope.get(..MAGIC_BYTES) {
             Some(magic) if magic == HPKE_ENVELOPE_MAGIC => Ok(Self::Hpk1),
             _ => Err(CryptoError::InvalidEnvelope),
         }
     }
+}
+
+/// Check that `envelope` is a complete frame of a suite this build reads: a
+/// known magic, and at least that suite's encapsulated key and tag. Returns
+/// the suite. Only opening authenticates an envelope; this lets a party that
+/// holds no key for it (the upload route, for a browser-sealed upload)
+/// refuse anything that could never open.
+pub fn check_envelope_frame(envelope: &[u8]) -> Result<EnvelopeSuite, CryptoError> {
+    let suite = EnvelopeSuite::of_envelope(envelope)?;
+    if envelope.len() < suite.min_frame_bytes() {
+        return Err(CryptoError::InvalidEnvelope);
+    }
+    Ok(suite)
 }
 
 type KemPublicKey = <TenantKem as KemTrait>::PublicKey;
@@ -306,13 +344,8 @@ pub fn hpke_seal_to_tenant_with_rng<R: CryptoRng + RngCore>(
 }
 
 fn parse_envelope(envelope: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
-    match EnvelopeSuite::of_envelope(envelope)? {
-        EnvelopeSuite::Hpk1 => {
-            if envelope.len() < MAGIC_BYTES + ENCAPPED_KEY_BYTES + GCM_TAG_BYTES {
-                return Err(CryptoError::InvalidEnvelope);
-            }
-            Ok(envelope[MAGIC_BYTES..].split_at(ENCAPPED_KEY_BYTES))
-        }
+    match check_envelope_frame(envelope)? {
+        EnvelopeSuite::Hpk1 => Ok(envelope[MAGIC_BYTES..].split_at(ENCAPPED_KEY_BYTES)),
     }
 }
 
@@ -541,6 +574,41 @@ mod tests {
             keypair.open_envelope(b"i", &relabelled),
             Err(CryptoError::InvalidEnvelope)
         ));
+    }
+
+    #[test]
+    fn frame_check_refuses_unknown_magic_and_truncated_frames() {
+        let keypair = TenantKeypair::generate();
+        let empty = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"").expect("seal");
+        assert_eq!(empty.len(), EnvelopeSuite::Hpk1.min_frame_bytes());
+        assert_eq!(
+            check_envelope_frame(&empty).expect("complete frame"),
+            EnvelopeSuite::Hpk1
+        );
+        // A known magic alone does not make a frame: the committed
+        // "truncated frame" vector is 20 bytes starting `HPK1`.
+        for short in [&empty[..4], &empty[..20], &empty[..empty.len() - 1]] {
+            assert!(EnvelopeSuite::of_envelope(short).is_ok());
+            assert!(matches!(
+                check_envelope_frame(short),
+                Err(CryptoError::InvalidEnvelope)
+            ));
+        }
+        let mut relabelled = empty.clone();
+        relabelled[..4].copy_from_slice(b"HPK2");
+        assert!(check_envelope_frame(&relabelled).is_err());
+    }
+
+    #[test]
+    fn suite_ids_are_stable_and_round_trip() {
+        assert_eq!(EnvelopeSuite::Hpk1.id(), "HPK1");
+        assert_eq!(
+            EnvelopeSuite::from_id(EnvelopeSuite::CURRENT.id()).expect("known"),
+            EnvelopeSuite::CURRENT
+        );
+        for unknown in ["", "hpk1", "HPK2", "HPK1 "] {
+            assert!(EnvelopeSuite::from_id(unknown).is_err(), "{unknown:?}");
+        }
     }
 
     #[test]

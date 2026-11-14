@@ -6,8 +6,12 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod schema;
 mod secret;
 
+pub use schema::{
+    ColumnType, DeclaredColumn, DeclaredSchema, MAX_COLUMN_NAME_BYTES, MAX_DECLARED_COLUMNS,
+};
 pub use secret::SecretString;
 
 /// Errors for core identifier parsing/validation.
@@ -21,6 +25,8 @@ pub enum CoreError {
     InvalidConnectorSlug,
     #[error("invalid snapshot version")]
     InvalidSnapshotVersion,
+    #[error("invalid declared schema")]
+    InvalidDeclaredSchema,
 }
 
 /// Opaque tenant identifier.
@@ -93,18 +99,44 @@ impl fmt::Display for ObjectId {
     }
 }
 
-/// Validated connector identifier used as a storage path segment
-/// (`tenants/{t}/connectors/{slug}/…`).
+/// Validated dataset identifier used as a storage path segment
+/// (`tenants/{t}/connectors/{slug}/…`) and as the dataset's SQL table name.
 ///
 /// Restricted to `[a-z0-9_-]`, 1..=64 chars, so a slug can never smuggle `/`,
-/// `..`, or unicode into a path.
+/// `..`, or unicode into a path. A slug names either a connector's dataset
+/// or, in the reserved [`UPLOAD_DATASET_PREFIX`] namespace, a dataset a
+/// steward uploads ([`DatasetKind`], ADR 0012).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ConnectorSlug(String);
 
 const MAX_SLUG_LEN: usize = 64;
 
+/// Slugs starting with this name datasets that stewards upload. No
+/// connector's slug may start with it, so the two never collide.
+pub const UPLOAD_DATASET_PREFIX: &str = "upload_";
+
+/// Who writes a dataset, which fixes the `info` string its objects are
+/// sealed under. It follows from the slug alone, never from stored state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetKind {
+    /// Written by a connector sync in the enclave (`tenant-envelope-v1`).
+    Connector,
+    /// Sealed in the steward's browser and uploaded (`steward-upload-v1`).
+    Upload,
+}
+
 impl ConnectorSlug {
+    /// The kind of dataset this slug names: [`DatasetKind::Upload`] in the
+    /// [`UPLOAD_DATASET_PREFIX`] namespace, otherwise a connector's.
+    pub fn kind(&self) -> DatasetKind {
+        if self.0.starts_with(UPLOAD_DATASET_PREFIX) {
+            DatasetKind::Upload
+        } else {
+            DatasetKind::Connector
+        }
+    }
+
     pub fn new(raw: &str) -> Result<Self, CoreError> {
         let len_ok = (1..=MAX_SLUG_LEN).contains(&raw.len());
         let chars_ok = raw
@@ -174,6 +206,14 @@ impl SnapshotVersion {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The writer's clock when the version was made, in nanoseconds since
+    /// the Unix epoch: the snapshot's write time.
+    pub fn unix_nanos(&self) -> u128 {
+        self.0[..SNAPSHOT_TIME_DIGITS]
+            .parse()
+            .expect("20 ASCII digits, checked at construction")
     }
 }
 
@@ -297,6 +337,28 @@ mod tests {
     fn connector_slug_accepts_expected_names() {
         for good in ["quickbooks", "odoo", "generic_crm", "crm-2"] {
             assert!(ConnectorSlug::new(good).is_ok(), "{good} should be valid");
+        }
+    }
+
+    #[test]
+    fn snapshot_version_exposes_its_write_time() {
+        let version: SnapshotVersion = "00000000001700000000-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid");
+        assert_eq!(version.unix_nanos(), 1_700_000_000);
+        let now = SnapshotVersion::generate();
+        assert!(now.unix_nanos() > 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn upload_namespace_decides_the_dataset_kind() {
+        for upload in ["upload_cohorts", "upload_2026-q1", "upload_"] {
+            let slug = ConnectorSlug::new(upload).expect("valid");
+            assert_eq!(slug.kind(), DatasetKind::Upload, "{upload}");
+        }
+        for connector in ["quickbooks", "health", "uploads", "upload-x", "my_upload_x"] {
+            let slug = ConnectorSlug::new(connector).expect("valid");
+            assert_eq!(slug.kind(), DatasetKind::Connector, "{connector}");
         }
     }
 

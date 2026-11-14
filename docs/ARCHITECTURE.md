@@ -17,9 +17,10 @@ and row-level egress for ordinary users are intentionally absent.
 
 The platform is designed so that **the operator is outside the trust boundary
 for customer data**. Drive content is encrypted with browser-held keys the
-server never sees. Connector data is plaintext only inside hardware-attested
-TEE memory, and is re-encrypted to the tenant's public key before it touches
-any persistent medium. Analytics run inside the same enclave boundary over
+server never sees. A steward's research dataset is sealed in the steward's
+browser before it is uploaded. Connector data is plaintext only inside
+hardware-attested TEE memory, and is re-encrypted to the tenant's public key
+before it touches any persistent medium. Analytics run inside the same enclave boundary over
 encrypted Parquet, using blind indexes so equality search never reveals
 values. Compromise of the object store, of the API host's disk, or of an
 operator credential yields ciphertext only.
@@ -144,7 +145,80 @@ which deletes the same orphan twice and nothing else.
 The server knows tenant id, object id, ciphertext length, and timestamps;
 it does not know filenames, content, or keys.
 
-### 2. Connectors (confidential ingress)
+### 2. Steward upload (confidential ingress from the browser)
+
+```
+Browser crypto worker                API (Axum)                                   Object store
+─────────────────────                ──────────                                   ────────────
+Parquet file (device only)
+seal object to steward key
+  steward-upload-v1|t|ds|obj
+seal manifest {version, [obj]}
+  tenant-snapshot-manifest-v1|t|ds|v
+header: version, obj, row cap,
+  declared schema ──────────TLS────▶ PUT /api/v1/datasets/{ds}
+                                     authn (JWT); tenant from the token only
+                                     ds in the upload_ namespace?    ──no──▶ 404
+                                     size, framing, header           ──bad─▶ 413 / 422
+                                     newer version, same schema?     ──no──▶ 409 / 422
+                                     object ────────────────────────────────────▶ tenants/{t}/connectors/{ds}/snapshots/{v}/{obj}.parquet
+                                     record: suite, row cap, schema ────────────▶ tenants/{t}/connectors/{ds}/records/{v}.json
+                                     manifest, written last (commit) ───────────▶ tenants/{t}/connectors/{ds}/manifests/{v}.manifest
+                                     prune what the snapshot does not list
+```
+
+`PUT /api/v1/datasets/{dataset}` ([ADR 0012](adr/0012-steward-dataset-upload.md)):
+
+* **Dataset namespace.** An uploaded dataset is named by a slug that
+  starts with `upload_`, chosen by the steward, under the same
+  `tenants/{t}/connectors/` prefix as connector datasets. No connector's
+  slug may start with it and the connector writer refuses one, so a
+  dataset's kind follows from its slug. The slug is also the grant,
+  listing and request key and the SQL table name. Any other slug is
+  refused with 404.
+* **Sealed in the browser.** The steward's browser seals the Parquet and
+  the snapshot manifest to the steward's key; the upload route opens and
+  seals nothing. The browser chooses the object id and the version before
+  sealing. The API refuses a version that is not newer than the dataset's
+  current one (409) or is more than five minutes ahead of its clock (422).
+  A body sealed for another tenant or object is stored but never opens,
+  so queries over it fail closed.
+* **Checked without opening.** The route has its own body limit
+  (`DATASET_MAX_MIB`, default 64, refused at startup when out of range).
+  The parser (`platform_connectors::upload`, fuzzed) checks every length
+  before reading past it, bounds the header, and requires both envelopes
+  to be complete frames of one suite it reads (`HPK1`). A declared schema
+  unlike the dataset's recorded one is refused (422). Every refusal after
+  authentication, except a malformed dataset id (400), is an audited
+  `data.access` denial with a fixed reason.
+* **Snapshots** (ADR 0003). An upload is one complete snapshot: the
+  object, then the plaintext record, then the manifest as the commit,
+  then pruning of everything the snapshot does not list, including an
+  object that an earlier attempt at the same version left. The record and
+  the manifest are written create-only, so a version keeps the first
+  record stored for it and commits once: another attempt at a committed
+  version, or one declaring another record, gets 409. A retry declaring
+  the same record goes through. The first upload creates the dataset, a
+  re-upload replaces it, and an upload that stops before its manifest
+  changes nothing a query reads.
+* **Record.** Each snapshot's plaintext record holds its suite and, for an
+  upload, the declared row cap and schema (column names and type
+  families), so the API can describe a dataset without key release. A
+  query refuses a snapshot whose record is missing or malformed, or names
+  a suite this build does not read (502).
+* **Catalog registration.** A steward can publish a listing only for a
+  dataset it holds, one with a committed snapshot ("Research access").
+
+The route needs only the vault and the configuration, so it works where
+the query service is not configured. The browser half (sealing and the
+upload form) is not built yet (P40).
+
+The operator can see the tenant id, the dataset name, the object id, the
+snapshot versions and their times, ciphertext lengths, the suite, and the
+declared row cap and schema. The rows are plaintext only in the steward's
+browser and, during a query, in enclave memory.
+
+### 3. Connectors (confidential ingress)
 
 ```
 External APIs      TEE enclave (TDX, attested)                    Object store
@@ -152,6 +226,7 @@ External APIs      TEE enclave (TDX, attested)                    Object store
 OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (RAM only)
                    HPKE seal to tenant public key ───────────────▶ tenants/{t}/connectors/{slug}/snapshots/{v}/{obj}.parquet
                    zeroize plaintext buffers
+                   record (suite) ───────────────────────────────▶ tenants/{t}/connectors/{slug}/records/{v}.json
                    seal manifest, written last ──────────────────▶ tenants/{t}/connectors/{slug}/manifests/{v}.manifest
 ```
 
@@ -193,12 +268,16 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   without redesigning storage.
 * **Snapshots** ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)):
   every sync is a full sync, so each one writes a complete snapshot under
-  a new time-ordered version and commits it by writing a sealed manifest
-  last. Queries read only the newest committed snapshot, so repeated syncs
-  never multiply rows (which would inflate cohort counts past *k*) and a
-  sync that stops partway changes nothing a query sees. Superseded
-  snapshots are deleted after the commit. The manifest's HPKE `info` is
-  `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`.
+  a new time-ordered version, then a plaintext record naming its suite,
+  and commits it by writing a sealed manifest last. The record and the
+  manifest are written create-only, so a version keeps one record and
+  commits once. Queries read only the
+  newest committed snapshot, so repeated syncs never multiply rows (which
+  would inflate cohort counts past *k*) and a sync that stops partway
+  changes nothing a query sees. Superseded snapshots, records included,
+  are deleted after the commit. The manifest's HPKE `info` is
+  `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`. Steward uploads
+  share this layout and code (section 2).
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
   aborts siblings. On SIGTERM or Ctrl-C it lets the sync in flight commit
   and starts no more. The `connector-worker` binary runs fixture jobs
@@ -206,14 +285,16 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   release artifact: live sync through `HttpJsonSource` (OAuth refresh →
   GET → mapper) is not in v1.0 (`docs/PROJECT_SCOPE.md`).
 
-### 3. Query (zero-trust analytics)
+### 4. Query (zero-trust analytics)
 
 ```
 POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapshot
    (JWT tenant)        (gate_execution)       tenants/{t}/connectors/{slug}/manifests/*
+                                              its record (no record ⇒ 502)
                                               │
                           key released into enclave (EnclaveKeyProvider)
-                          open HPKE envelopes → Parquet in RAM
+                          open HPKE envelopes (info by dataset kind) → Parquet in RAM
+                          upload: schema and row cap as declared? (no ⇒ 502)
                                               │
                           QueryScope: DataFusion SQL over decrypted frames
                           ZkMode::Enabled → plan allowlist + cohort threshold
@@ -235,6 +316,16 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
 * **Bounded plaintext.** `max_concurrent_queries` caps how many queries
   hold decrypted data at once; further queries wait for a slot, and a limit
   of zero refuses with 503.
+* **The snapshot as written.** Before any key is released, the query reads
+  the newest snapshot's plaintext record; a snapshot without a valid one
+  fails closed (502), as does a manifest that lists a missing object.
+  Objects open under their dataset kind's binding: `tenant-envelope-v1`
+  for a connector's, `steward-upload-v1` for an upload's. For an upload,
+  `QueryScope::register_parquet_declared` checks each object's schema
+  and the rows its footer reports against what the steward declared before
+  decoding, and the decoded rows after; a mismatch is refused with 502
+  (`QueryError::DeclarationMismatch`, which names no column). A research
+  query is charged before this check.
 * **ZK gate.** In `ZkMode::Enabled` every query passes the same disclosure
   gate as research access: the plan allowlist, a genuine `COUNT(*) AS n`,
   and suppression of cohorts below `RESEARCH_MIN_COHORT_SIZE` (see
@@ -272,11 +363,11 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
 Disabling it permits row-level queries and removes the no-naked-data
 guarantee for that deployment.
 
-### 4. Research access (two principals)
+### 5. Research access (two principals)
 
 The research product is the query path with a second principal. The
-**steward** holds the key and seals the data; the **researcher** may run
-aggregate queries but never read rows.
+**steward** holds the key and seals the data, through a connector or an
+upload; the **researcher** may run aggregate queries but never read rows.
 
 ```
 Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
@@ -342,15 +433,16 @@ routes answer without key release; with no research service they refuse
 with 503. The query service holds the same `Arc`, so a research query
 checks and charges the grant those routes created. The stores are in
 memory: grants, budgets, listings and requests are lost on restart (P62
-makes them durable).
-
-
+makes them durable). The service also holds the app's vault, which it
+reads only to check that a steward holds a dataset before publishing it.
 
 **Catalog** (`platform_tenancy::CatalogRegistry`, frontend Research tab):
 publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
-discoverability. Researchers file access requests (idempotent while
-pending); approval mints the grant through the same code path as a direct
+discoverability. It is refused (404, a `research.catalog` denial) for a
+dataset the steward does not hold, one with no committed snapshot under
+its tenant (`platform_connectors::snapshot::holds`). Researchers file
+access requests (idempotent while pending); approval mints the grant through the same code path as a direct
 grant. The approval is recorded first, with its query budget, so a failure
 partway leaves an approved request without a usable grant, never a grant
 behind a pending or denied one, and the steward's retry re-runs the
@@ -414,18 +506,18 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 
 | Crate | Owns | Never contains |
 | --- | --- | --- |
-| platform-core | Typed ids (`TenantId`, `ObjectId`, `ConnectorSlug`), `ZkMode` | I/O, crypto |
-| platform-config | Env → `PlatformConfig` (brand/server/storage/research) | Hardcoded brand strings |
+| platform-core | Typed ids (`TenantId`, `ObjectId`, `ConnectorSlug` and its upload namespace, `SnapshotVersion`), `DeclaredSchema`, `ZkMode` | I/O, crypto |
+| platform-config | Env → `PlatformConfig` (brand/server/storage/research/dataset size) | Hardcoded brand strings |
 | platform-telemetry | JSON tracing init, `SECURITY_AUDIT_EVENT` emitter | Secrets/customer content in events |
-| platform-crypto | AEAD seal/open, HPKE suite pin, envelope `info` strings, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
+| platform-crypto | AEAD seal/open, HPKE suite pin, envelope frame check and suite names, envelope `info` strings, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
 | envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and `info` strings, for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys, the drive KEK or file keys; I/O or logging |
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
-| platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait | Raw-string storage paths |
+| platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait, the plaintext `SnapshotRecord` | Raw-string storage paths |
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
-| platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out | Plaintext persistence |
+| platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out, dataset snapshots (commit, prune, "holds"), the upload body parser and writer | Plaintext persistence |
 | platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
 | platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |
-| quackxide-engine | `QueryScope` RAII, plan gate, disclosure policies | Customer-facing naming |
+| quackxide-engine | `QueryScope` RAII, declared-shape check, plan gate, disclosure policies | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
 | synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |
 
@@ -494,12 +586,12 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles, grants |
-| `data.access` | Every vault read, write, delete, and list — including misses |
+| `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
 | `engine.query` | Every confidential query, with metering fields |
 | `auth.decision` | Every rejected token, admin denial, signature rejection |
 | `research.budget` | Budget top-ups and exhaustion refusals |
-| `research.catalog` | Listing and access-request lifecycle |
+| `research.catalog` | Listing and access-request lifecycle, including a refused publish |
 
 Rules, enforced by the capture tests:
 
@@ -513,8 +605,10 @@ Rules, enforced by the capture tests:
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
-   provisioning, and the research catalog (ok + denied): publish, request,
-   approval and its retry, deny, and the refused retry and deny.
+   provisioning, steward uploads (ok, committed, pruned, denied),
+   connector snapshot commit and prune, and the research catalog (ok +
+   denied): publish and its refusal, request, approval and its retry, deny,
+   and the refused retry and deny.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on

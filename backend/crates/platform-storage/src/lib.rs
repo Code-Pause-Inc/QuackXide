@@ -6,14 +6,27 @@
 //! tenants/{tenant_id}/drive/manifests/{object_id}.json
 //! tenants/{tenant_id}/drive/objects/{object_id}/{chunk_index:08}
 //! tenants/{tenant_id}/drive/sweeping/{object_id}
-//! tenants/{tenant_id}/connectors/{connector_slug}/{object_id}.parquet
+//! tenants/{tenant_id}/connectors/{slug}/snapshots/{version}/{object_id}.parquet
+//! tenants/{tenant_id}/connectors/{slug}/records/{version}.json
+//! tenants/{tenant_id}/connectors/{slug}/manifests/{version}.manifest
+//! control/enrollments/{tenant_id}.json
+//! control/tenants/{tenant_id}.json
 //! ```
+//!
+//! `{slug}` names a research dataset: a connector's, or one a steward
+//! uploads, in the `upload_` namespace (ADR 0012). Each version is one
+//! complete snapshot (ADR 0003): its sealed objects, then its plaintext
+//! [`SnapshotRecord`], then the sealed manifest that commits it.
+//! `connectors/{slug}/keys/{version}/` is reserved for the snapshot's wrapped
+//! data keys (ADR 0004); nothing writes there yet.
 //!
 //! Invariants:
 //! 1. Every path is built through [`TenantPaths`] from typed, validated ids;
 //!    the vault never accepts a raw string path.
-//! 2. The vault stores ciphertext only. Object names are opaque UUIDs; user
-//!    filenames live inside the client-encrypted manifest.
+//! 2. The vault stores ciphertext, except the small plaintext records named
+//!    above, whose contents are listed in `docs/THREAT_MODEL.md` ("Metadata").
+//!    Object names are opaque UUIDs; user filenames live inside the
+//!    client-encrypted manifest.
 //! 3. `object_store` matches list prefixes by whole path parts, so a prefix
 //!    for tenant `abc…` can never match tenant `abcd…`.
 
@@ -31,7 +44,8 @@ use object_store::{
     RetryConfig,
 };
 use platform_config::StorageClientConfig;
-use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
+use platform_core::{ConnectorSlug, DeclaredSchema, ObjectId, SnapshotVersion, TenantId};
+use serde::{Deserialize, Serialize};
 
 /// A storage path that can only be constructed through [`TenantPaths`] (or
 /// returned from a listing).
@@ -127,9 +141,9 @@ impl TenantPaths {
         Some((tenant.parse().ok()?, object.parse().ok()?))
     }
 
-    /// An enclave-encrypted Parquet object produced by a connector sync.
-    /// One sealed object of a connector snapshot. A snapshot is complete
-    /// only once its manifest exists.
+    /// One sealed Parquet object of a dataset snapshot: sealed in the enclave
+    /// by a connector sync, or in the steward's browser for an upload. A
+    /// snapshot is complete only once its manifest exists.
     pub fn connector_snapshot_object(
         tenant: TenantId,
         connector: &ConnectorSlug,
@@ -160,6 +174,23 @@ impl TenantPaths {
     /// Every committed snapshot's manifest for one tenant-connector pair.
     pub fn connector_manifests_prefix(tenant: TenantId, connector: &ConnectorSlug) -> VaultPath {
         VaultPath(format!("tenants/{tenant}/connectors/{connector}/manifests"))
+    }
+
+    /// The plaintext [`SnapshotRecord`] of one snapshot, written after its
+    /// objects and before its manifest.
+    pub fn connector_record(
+        tenant: TenantId,
+        connector: &ConnectorSlug,
+        version: &SnapshotVersion,
+    ) -> VaultPath {
+        VaultPath(format!(
+            "tenants/{tenant}/connectors/{connector}/records/{version}.json"
+        ))
+    }
+
+    /// Every snapshot's record for one tenant-connector pair (pruning).
+    pub fn connector_records_prefix(tenant: TenantId, connector: &ConnectorSlug) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/connectors/{connector}/records"))
     }
 
     /// Prefix of all objects for one tenant-connector pair (query listing).
@@ -218,6 +249,86 @@ impl TenantPaths {
             .strip_suffix(".parquet")?
             .split_once('/')?;
         Some((version.parse().ok()?, object.parse().ok()?))
+    }
+
+    /// Recover the snapshot version from a
+    /// [`connector_record`](Self::connector_record) path; `None` if it is
+    /// not one for this tenant and connector.
+    pub fn connector_record_version(
+        tenant: TenantId,
+        connector: &ConnectorSlug,
+        path: &VaultPath,
+    ) -> Option<SnapshotVersion> {
+        let prefix = Self::connector_records_prefix(tenant, connector);
+        path.as_str()
+            .strip_prefix(prefix.as_str())?
+            .strip_prefix('/')?
+            .strip_suffix(".json")?
+            .parse()
+            .ok()
+    }
+}
+
+/// The plaintext record of one dataset snapshot (ADR 0012), stored at
+/// [`TenantPaths::connector_record`]. The operator can read it, so it holds
+/// only what the API needs without key release: the envelope suite, and for
+/// an upload the row cap and schema the steward declared. Connector
+/// snapshots record their suite only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRecord {
+    /// The snapshot this record describes; a record naming another is
+    /// refused.
+    pub version: SnapshotVersion,
+    /// The envelope suite of the snapshot's objects and manifest, by its
+    /// stable name (`platform_crypto::EnvelopeSuite::id`, for example
+    /// `HPK1`).
+    pub suite: String,
+    /// The most rows the steward declared the upload holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_cap: Option<u64>,
+    /// The columns the steward declared the upload holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<DeclaredSchema>,
+}
+
+/// Why a stored [`SnapshotRecord`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RecordError {
+    #[error("snapshot record is malformed")]
+    Malformed,
+    #[error("snapshot record names another snapshot")]
+    WrongVersion,
+}
+
+impl SnapshotRecord {
+    /// Largest stored record read; a declared schema at its limits fits.
+    pub const MAX_BYTES: usize = 256 * 1024;
+    /// Longest suite name.
+    const MAX_SUITE_BYTES: usize = 16;
+
+    pub fn to_bytes(&self) -> Bytes {
+        serde_json::to_vec(self)
+            .expect("a record of validated fields always serializes")
+            .into()
+    }
+
+    /// Parse the record stored for `version`, refusing one that is
+    /// oversized, malformed, or written for another snapshot.
+    pub fn parse(bytes: &[u8], version: &SnapshotVersion) -> Result<Self, RecordError> {
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(RecordError::Malformed);
+        }
+        let record: Self = serde_json::from_slice(bytes).map_err(|_| RecordError::Malformed)?;
+        let suite_ok = (1..=Self::MAX_SUITE_BYTES).contains(&record.suite.len())
+            && record.suite.bytes().all(|b| b.is_ascii_alphanumeric());
+        if !suite_ok {
+            return Err(RecordError::Malformed);
+        }
+        if record.version != *version {
+            return Err(RecordError::WrongVersion);
+        }
+        Ok(record)
     }
 }
 
@@ -579,7 +690,16 @@ mod tests {
             TenantPaths::connector_manifest_version(tenant_a(), &slug, &manifest),
             Some(version_1())
         );
-        for path in [&object, &manifest] {
+        let record = TenantPaths::connector_record(tenant_a(), &slug, &version_1());
+        assert_eq!(
+            record.as_str(),
+            "tenants/6f2c8a2e-1111-4222-8333-444455556666/connectors/quickbooks/records/00000000000000000001-0123456789abcdef0123456789abcdef.json"
+        );
+        assert_eq!(
+            TenantPaths::connector_record_version(tenant_a(), &slug, &record),
+            Some(version_1())
+        );
+        for path in [&object, &manifest, &record] {
             assert!(
                 path.as_str()
                     .starts_with(TenantPaths::connector_prefix(tenant_a(), &slug).as_str())
@@ -610,6 +730,107 @@ mod tests {
             TenantPaths::connector_snapshot_object_parts(tenant_a(), &slug, &manifest),
             None
         );
+        let record = TenantPaths::connector_record(tenant_a(), &slug, &version_1());
+        assert_eq!(
+            TenantPaths::connector_record_version(tenant_a(), &other, &record),
+            None
+        );
+        assert_eq!(
+            TenantPaths::connector_record_version(tenant_b(), &slug, &record),
+            None
+        );
+        for not_a_record in [&object, &manifest] {
+            assert_eq!(
+                TenantPaths::connector_record_version(tenant_a(), &slug, not_a_record),
+                None
+            );
+        }
+        assert_eq!(
+            TenantPaths::connector_snapshot_object_parts(tenant_a(), &slug, &record),
+            None
+        );
+    }
+
+    fn upload_record() -> SnapshotRecord {
+        use platform_core::{ColumnType, DeclaredColumn};
+        SnapshotRecord {
+            version: version_1(),
+            suite: "HPK1".into(),
+            row_cap: Some(7),
+            schema: Some(
+                DeclaredSchema::new(vec![
+                    DeclaredColumn {
+                        name: "condition".into(),
+                        column_type: ColumnType::String,
+                    },
+                    DeclaredColumn {
+                        name: "age".into(),
+                        column_type: ColumnType::Int64,
+                    },
+                ])
+                .expect("schema"),
+            ),
+        }
+    }
+
+    #[test]
+    fn snapshot_records_round_trip() {
+        let record = upload_record();
+        let bytes = record.to_bytes();
+        assert_eq!(
+            SnapshotRecord::parse(&bytes, &version_1()).expect("parse"),
+            record
+        );
+        // A connector snapshot records its suite only.
+        let connector = SnapshotRecord {
+            row_cap: None,
+            schema: None,
+            ..upload_record()
+        };
+        let bytes = connector.to_bytes();
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("utf-8"),
+            r#"{"version":"00000000000000000001-0123456789abcdef0123456789abcdef","suite":"HPK1"}"#
+        );
+        assert_eq!(
+            SnapshotRecord::parse(&bytes, &version_1()).expect("parse"),
+            connector
+        );
+    }
+
+    #[test]
+    fn malformed_or_misplaced_records_are_refused() {
+        let other: SnapshotVersion = "00000000000000000002-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid");
+        assert_eq!(
+            SnapshotRecord::parse(&upload_record().to_bytes(), &other),
+            Err(RecordError::WrongVersion)
+        );
+        let version = version_1();
+        let with = |field: &str| {
+            format!(r#"{{"version":"{version}","suite":"HPK1"{field}}}"#).into_bytes()
+        };
+        for bad in [
+            b"".to_vec(),
+            b"not json".to_vec(),
+            format!(r#"{{"version":"{version}"}}"#).into_bytes(),
+            format!(r#"{{"version":"{version}","suite":""}}"#).into_bytes(),
+            format!(r#"{{"version":"{version}","suite":"HPK 1"}}"#).into_bytes(),
+            format!(r#"{{"version":"{version}","suite":"HPK1HPK1HPK1HPK1X"}}"#).into_bytes(),
+            format!(r#"{{"version":"../{version}","suite":"HPK1"}}"#).into_bytes(),
+            with(r#","objects":[]"#),
+            with(r#","row_cap":-1"#),
+            with(r#","schema":[]"#),
+            vec![b' '; SnapshotRecord::MAX_BYTES + 1],
+        ] {
+            assert_eq!(
+                SnapshotRecord::parse(&bad, &version),
+                Err(RecordError::Malformed),
+                "{}",
+                String::from_utf8_lossy(&bad[..bad.len().min(80)])
+            );
+        }
     }
 
     #[test]

@@ -65,3 +65,10 @@ path = "fuzz_targets/attestation_claims.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "upload_body"
+path = "fuzz_targets/upload_body.rs"
+test = false
+doc = false
+bench = false

@@ -51,8 +51,13 @@ pub struct DevResearchStack {
 impl DevResearchStack {
     /// An empty in-memory vault and no tenant keys.
     pub fn new() -> Self {
+        Self::with_vault(Arc::new(ObjectStoreVault::new_in_memory()))
+    }
+
+    /// `vault` and no tenant keys, for tests that inject storage faults.
+    pub fn with_vault(vault: Arc<dyn VaultStore>) -> Self {
         Self {
-            vault: Arc::new(ObjectStoreVault::new_in_memory()),
+            vault,
             keys: Vec::new(),
         }
     }
@@ -60,6 +65,13 @@ impl DevResearchStack {
     /// The vault, for `AppState`.
     pub fn vault(&self) -> Arc<dyn VaultStore> {
         self.vault.clone()
+    }
+
+    /// Keeps `keypair` as `tenant`'s key without writing anything, so
+    /// research queries can open data that arrives later, such as a steward
+    /// upload through `PUT /api/v1/datasets/{dataset}`.
+    pub fn register_key(&mut self, tenant: TenantId, keypair: TenantKeypair) {
+        self.keys.push((tenant, keypair));
     }
 
     /// Seals `parquet` to `keypair` and commits it as `tenant`'s snapshot of

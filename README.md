@@ -56,9 +56,13 @@ key that opens the data.
 ## How it works
 
 1. **Ingress.** Drive files are encrypted in the browser (Web Crypto,
-   non-extractable keys, AES-256-GCM). Connector pipelines sync external
-   sources into attested enclave memory, shape them into Parquet, and seal
-   them to the tenant's HPKE key before anything persists.
+   non-extractable keys, AES-256-GCM). A steward uploads a research
+   dataset as Parquet sealed in the browser to the steward's HPKE key
+   (`PUT /api/v1/datasets/{dataset}`); each upload replaces the dataset's
+   snapshot, and its size is capped by `DATASET_MAX_MIB`. Connector
+   pipelines sync external sources into attested enclave memory, shape
+   them into Parquet, and seal them to the tenant's HPKE key before
+   anything persists.
 2. **Storage.** Ciphertext only, in HPKE envelopes with versioned framing
    and context binding. Storage paths are built only from typed tenant ids,
    so cross-tenant access cannot be expressed.
@@ -88,14 +92,14 @@ Every security decision, including denials, is written to a
 
 ```
 backend/crates/
-  platform-core/          Typed tenant/object ids, connector slugs, ZK mode
+  platform-core/          Typed tenant/object ids, dataset slugs, declared schemas, ZK mode
   platform-config/        Env-driven config (brand, features, research)
   platform-telemetry/     JSON tracing + SECURITY_AUDIT_EVENT stream
   platform-crypto/        AEAD, HPKE envelopes, blind indexes, TOTP
   platform-auth/          JWT verification (dev HS256, RS256/JWKS) + keygen
   platform-storage/       Tenant-isolated ciphertext vault (GCS / emulator / in-memory / dev-only local directory)
   platform-enclave/       Attestation gates, Confidential Space token verifier; dev-only token simulator (feature "simulated")
-  platform-connectors/    Connector catalog, OAuth2, NDJSON, Parquet-out
+  platform-connectors/    Connector catalog, OAuth2, NDJSON, Parquet-out, snapshots, steward uploads
   platform-tenancy/       Tenants, grants, budgets, dataset catalog
   platform-billing/       Merchant-of-Record webhook verification
   quackxide-engine/       QueryScope, plan gate, disclosure policies
@@ -220,7 +224,8 @@ locally across isolated networks (`public_net` and `internal: true`
 
 `enclave-api` keeps its sealed snapshots in a directory on the
 `enclave_vault` volume (`STORAGE_LOCAL_DIR`, dev builds only), and the test
-script checks that it holds only ciphertext. No GCS emulator is part of the
+script checks that it holds only ciphertext, besides each snapshot's
+plaintext record, which names only its suite. No GCS emulator is part of the
 stack: `fake-gcs-server` does not accept the uploads `object_store` 0.13
 sends (#153).
 

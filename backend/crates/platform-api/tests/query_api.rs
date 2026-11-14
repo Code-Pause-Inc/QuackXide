@@ -19,7 +19,7 @@ use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_i
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::{SecretBytes, TenantKeypair, hpke_seal_to_tenant};
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
+use platform_storage::{ObjectStoreVault, SnapshotRecord, TenantPaths, VaultStore};
 use quackxide_engine::EngineSettings;
 
 use common::{app_state, bearer, dev_attestation, post_query, send, synced_vault};
@@ -569,7 +569,59 @@ async fn superseded_snapshots_are_pruned() {
         .list(&TenantPaths::connector_snapshots_prefix(tenant, &connector))
         .await
         .expect("list");
-    assert_eq!((manifests.len(), objects.len()), (1, 1));
+    let records = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list");
+    assert_eq!((manifests.len(), objects.len(), records.len()), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn a_snapshot_without_its_record_fails_closed() {
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let record = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list")
+        .remove(0);
+    vault.delete(&record).await.expect("delete");
+
+    let service = service_over(tenant, keypair, vault, ZkMode::Disabled);
+    let result = service.query(tenant, &connector, COUNT_SQL).await;
+    assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn a_record_naming_a_suite_this_build_cannot_read_fails_closed() {
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let service = service_over(tenant, keypair, vault.clone(), ZkMode::Disabled);
+    service
+        .query(tenant, &connector, COUNT_SQL)
+        .await
+        .map_err(|_| "query failed")
+        .expect("the synced snapshot opens");
+
+    // The same record, naming a suite no build has.
+    let path = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list")
+        .remove(0);
+    let version =
+        TenantPaths::connector_record_version(tenant, &connector, &path).expect("record path");
+    let stored = vault.get(&path).await.expect("record");
+    let mut record = SnapshotRecord::parse(&stored, &version).expect("record parses");
+    record.suite = "HPK9".to_owned();
+    vault.put(&path, record.to_bytes()).await.expect("put");
+
+    let result = service.query(tenant, &connector, COUNT_SQL).await;
+    assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

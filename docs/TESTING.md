@@ -32,15 +32,21 @@ that need research access build it with `platform_api::dev::DevResearchStack`,
 the same wiring the `devstack` server runs; `research_api.rs` is the
 template:
 
-* `DevResearchStack::new()` is an in-memory vault with no tenant keys;
+* `DevResearchStack::new()` is an in-memory vault with no tenant keys, and
+  `with_vault` takes another vault (for example one that fails some
+  writes);
 * `commit_snapshot` seals a dataset to a tenant's keypair, commits it as
   that tenant's connector snapshot, and keeps the keypair so queries can
   open it;
+* `register_key` keeps a tenant's keypair without writing anything, for
+  data that arrives later through the upload route;
 * `query_service` runs research queries through the `ResearchService` it
   is given, on the simulated TEE: simulated tokens, with keys from the
   in-process key-release stand-in. Give `AppState::research` the same
   `Arc`, as `common::research_app` does, so the research routes and the
-  research query share one set of grants and budgets;
+  research query share one set of grants and budgets. Build the service
+  over the stack's vault (`stack.vault()`), so publishing a listing sees
+  the stack's snapshots;
   `query_service_with_attestation` takes the attestation provider and
   whether attestation is required, for attestation-refusal tests, and
   opens keys from process memory.
@@ -56,7 +62,10 @@ enable it and `cargo test` needs no flag.
 `mod common;`. It has the HS256 token minters (`token_for`, `admin_token`,
 taking the file's secret), the request helpers (`send`, `send_with_headers`,
 `send_json`, `call`, `post`, `post_query`), the app builders (`app_state`,
-`synced_vault`, `research_app`), and `FlakyVault`, an in-memory vault that
+`synced_vault`, `research_app`, `upload_research_app`), the steward upload
+helpers (`sealed_upload` and `cohorts_upload` seal a body as the browser
+does, `put_upload` sends it, `next_version` picks a newer snapshot
+version), and `FlakyVault`, an in-memory vault that
 fails the operations chosen in `Faults` with a transient (`outage`) or
 permanent (`misconfigured`) storage error. Use them rather than writing new ones, and add a helper
 there when a second file needs it. Tests that need RS256 tokens use its
@@ -119,7 +128,8 @@ which fails when the file and its generator disagree; regenerate with
 `scripts/build-wasm.sh`), which the Rust test must open.
 `frontend/src/lib/crypto/envelope.test.ts` checks the same files against the
 wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
-enrollment cases through the enrollment route.
+enrollment cases through the enrollment route and the badly framed
+envelopes through the upload route.
 
 ### Fuzz targets
 
