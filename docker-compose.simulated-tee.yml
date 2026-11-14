@@ -4,7 +4,10 @@
 #   1. enclave-api         -> Confidential Space workload (simulated token provider)
 #   2. sim-attestation     -> Google's attestation service (signs tokens, serves keys)
 #   3. key-release-service -> Cloud KMS stand-in, verifying tokens before release
-# enclave-api keeps its vault in the `enclave_vault` volume, so
+# and, run on demand:
+#   4. seal-upload         -> the steward's browser, sealing an upload body (ADR 0012)
+# enclave-api starts with an empty vault; its data arrives as a steward
+# upload. It keeps its vault in the `enclave_vault` volume, so
 # scripts/test-simulated-tee.sh can check that only ciphertext is stored. No
 # GCS emulator accepts the uploads object_store 0.13 sends (#153).
 #
@@ -88,8 +91,6 @@ services:
       JWT_HS256_SECRET: "${JWT_HS256_SECRET:-simulated-tee-local-jwt-secret-32b!!}"
       JWT_ISSUER: "${JWT_ISSUER:-quackxide.local}"
       JWT_AUDIENCE: "${JWT_AUDIENCE:-quackxide-api}"
-      DEMO_TENANT_ID: "${DEMO_TENANT_ID:-}"
-      DEMO_TENANT_PUBLIC_KEY_B64: "${DEMO_TENANT_PUBLIC_KEY_B64:-}"
       RESEARCH_MIN_COHORT_SIZE: "${RESEARCH_MIN_COHORT_SIZE:-}"
       STORAGE_LOCAL_DIR: /var/lib/quackxide/vault
       RUST_LOG: "${RUST_LOG:-info}"
@@ -103,6 +104,26 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Seals a synthetic cohort to the steward's public key, as the browser
+  # seals an upload, and writes the body to stdout; whoever runs it sends
+  # the body to enclave-api. It has no network and no private key. The
+  # `tools` profile keeps `up` from starting it:
+  #   docker compose -f docker-compose.simulated-tee.yml run --rm -T seal-upload \
+  #     --tenant <uuid> --public-key <base64> --dataset upload_<name> > body
+  seal-upload:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: seal-upload
+    profiles:
+      - tools
+    network_mode: none
+    read_only: true
     cap_drop:
       - ALL
     security_opt:

@@ -87,7 +87,7 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 └──────────────────┘ └──────────────────┘
 ```
 
-`enclave-api` keeps sealed snapshots in a directory on the `enclave_vault` volume (`STORAGE_LOCAL_DIR`, which only `dev` builds accept). `fake-gcs-server` routes `object_store` 0.13's simple uploads (`PUT /{bucket}/{object}`) to its JSON upload handler and refuses them (still so in 1.56.1; #153), so the stack has no storage emulator; the GCS client is covered by `platform-storage`'s tests against local fake servers.
+`enclave-api` starts with an empty vault, which it keeps in a directory on the `enclave_vault` volume (`STORAGE_LOCAL_DIR`, which only `dev` builds accept); its data arrives as a steward upload. `fake-gcs-server` routes `object_store` 0.13's simple uploads (`PUT /{bucket}/{object}`) to its JSON upload handler and refuses them (still so in 1.56.1; #153), so the stack has no storage emulator; the GCS client is covered by `platform-storage`'s tests against local fake servers.
 
 `setup_net` (not internal) connects `key-release-service` and `sim-attestation` to `127.0.0.1` ports, only so the test script can enroll a tenant key and wait for the simulator: Docker publishes no ports for containers that are only on an internal network.
 
@@ -97,6 +97,7 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 | **`sim-attestation` (target `sim-attestation`)** | **Google's attestation service** | Issues the token format and claims production verifies; its key is throwaway, so a verifier holding Google's keys refuses its tokens. |
 | **`key-release-service` (target `key-release`)** | **Cloud KMS + Workload Identity Federation** in the maintainer's key project | Checks the same claims as the attribute condition above before release. Holds tenant private keys itself; production KMS holds a non-exportable key and per-dataset data keys are wrapped to it. |
 | **`enclave_internal_net` (`internal: true`)** | **VPC Service Controls perimeter + Private Google Access** | Keeps enclave-to-KMS and enclave-to-storage traffic off the public ingress network (`public_net`). |
+| **`seal-upload` (target `seal-upload`, profile `tools`)** | **The steward's browser** (P40) | Seals a synthetic cohort and its snapshot manifest to the steward's public key, as the browser's crypto worker seals an upload (ADR 0012), and writes the upload body to stdout. It runs on demand with no network and holds no private key; the test script sends the body. |
 
 ### Running the Local Simulated TEE Verification Suite
 
@@ -104,14 +105,15 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 ./scripts/test-simulated-tee.sh
 ```
 
-It runs seven stages:
+It runs eight stages:
 1. Builds every image and starts `sim-attestation` and `key-release-service`.
-2. Enrolls a tenant key (`PUT /v1/keys`, which returns the public key).
-3. Starts `enclave-api`, which seals the synthetic QuickBooks fixture into its vault under the tenant's public key.
-4. Copies the vault out of the container and requires tenant objects with no plaintext: no fixture customer name and no Parquet magic bytes.
-5. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
-6. Runs the research lifecycle: publish, request, approve, a query under disclosure control and a budget, revoke.
-7. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
+2. Enrolls the steward's key (`PUT /v1/keys`, which returns the public key).
+3. Starts `enclave-api` with an empty vault.
+4. Seals a synthetic cohort with `seal-upload` and uploads it as the steward (`PUT /api/v1/datasets/{dataset}`); requires `HTTP 401` without a token, `404` outside the upload namespace and `409` when the same version is sent again.
+5. Copies the vault out of the container and requires only the uploaded dataset, stored as `HPK1` envelopes and one plaintext record holding the suite and the row cap and schema the steward declared, with no plaintext: no cohort value and no Parquet magic bytes.
+6. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
+7. Runs the research lifecycle on the upload: publish, request, approve, a query under disclosure control and a budget, revoke; then requires `HTTP 404` for an approval retry and `403` for the query after it.
+8. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
 
 ---
 

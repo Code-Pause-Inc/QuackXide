@@ -154,6 +154,47 @@ async fn an_upload_is_stored_sealed_and_queryable() {
     assert_eq!(rows["suppressed_rows"], 1);
 }
 
+/// The body `seal-upload` writes for `scripts/test-simulated-tee.sh`: a
+/// synthetic cohort declared as the enclave finds it.
+#[tokio::test]
+async fn the_seal_upload_tools_cohort_is_stored_and_queryable() {
+    let vault = in_memory();
+    let (app, steward) = app_over(vault.clone());
+    let sealed = platform_api::dev::seal_cohort_upload(steward.tenant, &steward.key, &slug(), 5)
+        .expect("seal");
+    assert_eq!(upload(&app, &steward, &sealed).await, StatusCode::OK);
+
+    // The record holds the declaration: the cohort's columns and its 9k + 1
+    // rows.
+    let record = vault
+        .get(&TenantPaths::connector_record(
+            steward.tenant,
+            &slug(),
+            &sealed.version,
+        ))
+        .await
+        .expect("record");
+    let record = SnapshotRecord::parse(&record, &sealed.version).expect("record");
+    assert_eq!(record.row_cap, Some(46));
+    assert_eq!(
+        record.schema,
+        Some(declared(&[
+            ("person_id", ColumnType::String),
+            ("email", ColumnType::String),
+            ("condition", ColumnType::String),
+            ("age", ColumnType::Int64),
+            ("cost_cents", ColumnType::Int64),
+        ]))
+    );
+
+    // The enclave opens it and finds it as declared. With k = 5, the group
+    // of k - 1 rows and the single-row group are suppressed.
+    let (status, rows) = count(&app, &steward).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["rows"].as_array().map(Vec::len), Some(7), "{rows}");
+    assert_eq!(rows["suppressed_rows"], 2, "{rows}");
+}
+
 #[tokio::test]
 async fn uploads_without_an_access_token_are_401() {
     let vault = in_memory();

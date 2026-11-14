@@ -756,8 +756,9 @@ the simulated TEE set `APP_ENV=development`.
 
 The `dev` Cargo feature is separate: it decides which development code is
 compiled at all (`devstack`, `devtoken`, `key-release`, `query-demo`,
-`sim-attestation`, the simulated token provider). Release builds omit it;
-production mode refuses development configuration in any build.
+`seal-upload`, `sim-attestation`, the simulated token provider). Release
+builds omit it; production mode refuses development configuration in any
+build.
 
 The frontend's release build (`npm run build:release`, `vite build --mode
 release`, run by `release.yml`) fails unless `VITE_VAULT_MODE` is `http` and

@@ -8,6 +8,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
+  seeding it at startup. The dev-only `seal-upload` binary, run on demand
+  as its own image with no network, plays the steward's browser: it seals
+  a synthetic cohort and its manifest to the steward's public key
+  (ADR 0012) and writes the upload body, which the script sends through
+  `PUT /api/v1/datasets/{dataset}` before it publishes the dataset and
+  runs the research lifecycle on it. The script also checks that an upload
+  is refused without a token (401), outside the upload namespace (404) and
+  at a stale version (409), that an approval retry after a revoke is
+  refused (404), and that the vault holds only `HPK1` envelopes and the
+  upload's record, whose row cap and schema are the ones the steward
+  declared. The compose stack no longer passes `DEMO_TENANT_*` to
+  `enclave-api`. The API tests seal uploads with the same code
+  (`platform_api::dev::seal_upload`), and CI checks that release builds
+  cannot contain `seal-upload`.
 * Steward dataset listing (P39): `GET /api/v1/datasets` lists every
   research dataset the caller's tenant holds, connectors' and uploads'
   alike: exactly those it may publish, decided by the same function as

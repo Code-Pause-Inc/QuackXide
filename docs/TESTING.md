@@ -64,8 +64,9 @@ taking the file's secret), the request helpers (`send`, `send_with_headers`,
 `send_json`, `call`, `post`, `post_query`), the app builders (`app_state`,
 `synced_vault`, `research_app`, `upload_research_app`), the steward upload
 helpers (`sealed_upload` and `cohorts_upload` seal a body as the browser
-does, `put_upload` sends it, `next_version` picks a newer snapshot
-version), and `FlakyVault`, an in-memory vault that
+does, with `platform_api::dev::seal_upload`, which the `seal-upload` tool
+of the simulated TEE also runs; `put_upload` sends it, `next_version`
+picks a newer snapshot version), and `FlakyVault`, an in-memory vault that
 fails the operations chosen in `Faults` with a transient (`outage`) or
 permanent (`misconfigured`) storage error. Use them rather than writing new ones, and add a helper
 there when a second file needs it. Tests that need RS256 tokens use its
