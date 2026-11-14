@@ -8,6 +8,28 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
+  stores Parquet that the steward's browser sealed, with the snapshot
+  manifest the browser also sealed, as the dataset's new snapshot
+  (ADR 0003): the object, a plaintext record, then the manifest as the
+  commit, then pruning of everything the new snapshot does not list,
+  including an object that an earlier attempt at the same version left.
+  Uploaded datasets are named in a reserved `upload_` slug namespace that
+  no connector may use, and keep using the existing grant, listing and
+  research query fields. The route takes the tenant from the token only,
+  needs no query service, and refuses with 401, 404 (outside the upload
+  namespace), 409 (a version not newer than the current one, already
+  committed, or recorded with another row cap, schema or suite), 413
+  (over `DATASET_MAX_MIB`, default 64, 1 to 512, refused at startup when
+  out of range) and 422 (a malformed body or envelope frame, a version
+  more than five minutes ahead, or a declared schema unlike the recorded
+  one), each audited as `data.access`. The
+  body parser (`platform_connectors::upload`) has the `upload_body` fuzz
+  target. In the enclave, `QueryScope::register_parquet_declared` refuses
+  data unlike its declared schema or row cap
+  (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
+  `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
+  and `DevResearchStack` gains `register_key` and `with_vault`.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
@@ -24,7 +46,8 @@ uses [Semantic Versioning](https://semver.org/).
   `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is set.
 * The simulated TEE stack keeps `enclave-api`'s vault in a directory on a
   Docker volume (`ObjectStoreVault::new_local_dir`, `STORAGE_LOCAL_DIR`),
-  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext.
+  and `scripts/test-simulated-tee.sh` checks that it holds only ciphertext,
+  besides each snapshot's plaintext record, which names only its suite.
   Only `dev` builds have this backend: a release `platform-api` refuses to
   start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
   accepts `object_store` 0.13's uploads (#153).
@@ -97,8 +120,9 @@ uses [Semantic Versioning](https://semver.org/).
   as `npm run lint` from `scripts/check.sh` with zero warnings allowed, and
   `CONTRIBUTING.md` "Before every push" says the frontend is linted too.
 * CI compiles every fuzz target on each pull request, and runs a gitleaks
-  secret scan over the full history (`.gitleaks.toml`); `scripts/check.sh`
-  runs the same scan when gitleaks is installed.
+  secret scan over every diff in the history being merged (`.gitleaks.toml`,
+  `scripts/secret-scan.sh`); `scripts/check.sh` runs a similar scan of the
+  branch when gitleaks is installed.
 * `VaultStore::put_if_absent`, a create-only write (`PutMode::Create`;
   `x-goog-if-generation-match: 0` on GCS). `StorageError` gains
   `AlreadyExists` and `PreconditionFailed`, which the API returns as 409
@@ -282,6 +306,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* Every dataset snapshot, a connector sync's included, writes a plaintext
+  record (`platform_storage::SnapshotRecord`: its suite, and for an upload
+  the declared row cap and schema) before its manifest, writes both
+  create-only, so a version keeps its first record and commits once, and
+  pruning deletes superseded records. A query refuses a snapshot without
+  a valid record (one naming a suite this build reads), and a manifest
+  that lists a missing object, with 502 (a missing object was a 404).
+  Publishing a catalog listing for a dataset the steward does not hold,
+  one without a committed snapshot, is refused with 404 and a
+  `research.catalog` denial. For this check `ResearchService::new` and
+  `from_config` take the vault the app serves.
 * ADR 0007's "Browser private-key storage" section is accepted, and ADR
   0004 now says the researcher's result key is held as that section
   describes instead of "non-extractable": a private key that HPKE opens

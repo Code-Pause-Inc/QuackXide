@@ -51,7 +51,7 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | `SELECT *`, bare columns, `DISTINCT` row dumps | Logical-plan allowlist (`policy::is_aggregate_only`), applied in ZK and research mode; ZK mode is on unless explicitly disabled | Built, tested |
 | Rebuilding the dataset one group per person (`GROUP BY id`) | Genuine `COUNT(*) AS n` required and cohorts below *k* suppressed, in ZK and research mode | Built, tested (`tests/bypass.rs`) |
 | Inflated cohort counts (self-joins, `UNION ALL`, `UNNEST`, table functions) | Plan allowlist: one table scan under one aggregate; joins and set operations refused | Built, tested (`tests/bypass.rs`) |
-| Inflated cohort counts through storage (repeated connector syncs leaving every row several times) | A query reads one committed snapshot per connector; a manifest that lists an object twice fails closed ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)) | Built, tested (`query_api.rs`, `pipeline_e2e.rs`) |
+| Inflated cohort counts through storage (repeated connector syncs or steward re-uploads leaving every row several times) | A query reads one committed snapshot per dataset, and a re-upload replaces the snapshot rather than adding to it; a manifest that lists an object twice fails closed ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md), [ADR 0012](adr/0012-steward-dataset-upload.md)) | Built, tested (`query_api.rs`, `pipeline_e2e.rs`, `dataset_upload_api.rs`) |
 | Singling out one person inside a large group (`SUM(CASE WHEN id = …)`, computed columns, subquery expressions) | Aggregate arguments must be plain columns; subquery expressions refused | Built, tested |
 | Value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) | Aggregate allowlist: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Built, tested |
 | Overlapping groups in one result (`ROLLUP`, `CUBE`, `GROUPING SETS`: a subtotal minus its published groups reveals a suppressed cohort) | Plan allowlist refuses grouping sets ([ADR 0002](adr/0002-refuse-grouping-sets-and-positional-subsets.md)) | Built, tested (`tests/bypass.rs`) |
@@ -100,6 +100,7 @@ Goal: gain access through the API.
 | Cross-tenant reads, lists, deletes | Tenant only from the verified `tid` claim; `VaultPath` constructible only from typed ids. The one cross-tenant read, the drive orphan sweep's listing, stays private to `platform-storage` and returns only single-tenant drive paths | Built, tested |
 | Missing configuration used as a bypass | Unset auth secret → 503; unwired key release → 503; ZK gate and attestation requirement default to on | Built, tested |
 | Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
+| Oversized or malformed dataset uploads | A body limit from `DATASET_MAX_MIB` (bounded; an invalid value refuses startup); every length checked before it is read past; header bounded and validated; both envelopes must be complete frames of a known suite; refused with 413 or 422 and audited; uploads only into the caller's own `upload_` namespace; the enclave refuses data unlike its declared schema or row cap ([ADR 0012](adr/0012-steward-dataset-upload.md)) | Built, tested (`dataset_upload_api.rs`, fuzz target `upload_body`) |
 | Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
 | Forged billing webhooks | Signature verification with replay tolerance | Built, tested |
 | Account takeover of a steward, researcher or administrator | Sign-in through Auth0, then the platform's TOTP before any `access` token is issued, for every role including administrators (ADR 0006); TOTP replay and rate limits; recovery only by audited administrator reset, with an out-of-band identity check, no self-reset and at least two administrators | **To build** (P29, P30) — TOTP module exists |
@@ -188,21 +189,31 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   release; removing them from the allowlist, or applying a dominance rule,
   is a policy decision.
 * **Metadata.** The server sees tenant ids, object ids, ciphertext lengths,
-  and timestamps, including when each connector snapshot was written.
-* **Forged or rolled-back snapshots.** Connector objects and snapshot
-  manifests are sealed to the tenant's public key, which binds them to
-  tenant, connector and object or version but does not authenticate the
-  writer. An operator can therefore write a fabricated snapshot, or delete
-  the newest manifest so queries read an older one. Closing this needs
-  an enclave signing key bound to attestation.
+  and timestamps, including when each connector snapshot was written. For
+  each uploaded dataset, published or not, it also sees the dataset's name
+  and snapshot versions, which are storage path segments (a version
+  carries its write time, chosen by the steward's browser and at most five
+  minutes ahead of the server's clock), and, in a plaintext record beside
+  each snapshot, the envelope suite and the steward's declared row cap and
+  schema: column names and type families (ADR 0012). A connector
+  snapshot's record holds only its suite.
+* **Forged or rolled-back snapshots.** Connector objects, uploaded objects
+  and snapshot manifests are sealed to the tenant's public key, which binds
+  them to tenant, dataset and object or version but does not authenticate
+  the writer. An operator can therefore write a fabricated snapshot, or
+  delete the newest manifest so queries read an older one, and can rewrite
+  the plaintext record, which makes queries fail but opens nothing. For
+  uploads the API cannot check that the browser-sealed manifest lists what
+  it stored; a manifest that names a missing object fails closed. Closing
+  this needs an enclave signing key bound to attestation.
 * **The key project's administrator.** Whoever administers the KMS key
   project can add an image digest to the release policy, and that image
   can then decrypt. This is the maintainer; changes are audited (P77),
   not prevented. Google is trusted for hardware verification, workload
   identity and key custody, and the platform is tied to GCP.
 * **Differencing across snapshots.** Querying before and after a dataset
-  update can reveal the rows that changed. On research queries the budget
-  bounds it like any other overlapping-query differencing; on own-data
-  queries nothing does.
+  update, a connector sync or a steward re-upload, can reveal the rows
+  that changed. On research queries the budget bounds it like any other
+  overlapping-query differencing; on own-data queries nothing does.
 * **Unfinished controls.** Every item marked "to build" above is a gap, and
   the corresponding path fails closed until it is built.

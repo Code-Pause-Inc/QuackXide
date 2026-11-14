@@ -1,12 +1,16 @@
-//! Confidential connector ingestion.
+//! Confidential ingestion of research datasets.
 //!
 //! Background workers fetch SaaS data with stored OAuth2 credentials,
 //! normalize and Parquet-encode it in enclave RAM, seal it to the tenant's
-//! HPKE public key, and flush the ciphertext to
-//! `tenants/{tenant_id}/connectors/{slug}/{object_id}.parquet`.
+//! HPKE public key, and store the ciphertext as a versioned snapshot under
+//! `tenants/{tenant_id}/connectors/{slug}/` (ADR 0003).
 //!
 //! `oauth` → `source` (fetch) → `mappers` (payload → `dataset`) →
-//! `parquet_out` → `pipeline` (attestation gate, seal, flush) → `worker`.
+//! `parquet_out` → `pipeline` (attestation gate, seal, flush) → `snapshot`
+//! (commit, prune) → `worker`. `upload` parses a steward's browser-sealed
+//! upload and stores it as a snapshot of the same layout (ADR 0012).
+//!
+//! No connector's slug may start with `platform_core::UPLOAD_DATASET_PREFIX`.
 
 use platform_core::ConnectorSlug;
 use serde::Serialize;
@@ -20,6 +24,7 @@ pub mod pipeline;
 pub mod snapshot;
 pub mod source;
 pub mod startup;
+pub mod upload;
 pub mod worker;
 
 #[derive(Debug, thiserror::Error)]
@@ -116,5 +121,17 @@ mod tests {
         assert!(!catalog.is_empty());
         let slugs: HashSet<&str> = catalog.iter().map(|c| c.slug.as_str()).collect();
         assert_eq!(slugs.len(), catalog.len(), "slugs must be unique");
+    }
+
+    #[test]
+    fn catalog_slugs_stay_out_of_the_upload_namespace() {
+        for connector in catalog() {
+            assert_eq!(
+                connector.slug.kind(),
+                platform_core::DatasetKind::Connector,
+                "{}",
+                connector.slug
+            );
+        }
     }
 }

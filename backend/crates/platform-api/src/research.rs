@@ -8,8 +8,10 @@
 //! `Arc<ResearchService>`, so the grant a route here creates is the one the
 //! query checks and charges.
 //!
-//! A steward publishes a listing for one of its sealed connector datasets,
-//! opting it into discoverability. Researchers browse the catalog and file
+//! A steward publishes a listing for a dataset it holds (a connector's or an
+//! upload's, with a committed snapshot), opting it into discoverability. The
+//! service reads the vault only for that check, which lists the dataset's
+//! manifests and opens nothing. Researchers browse the catalog and file
 //! access requests; approval mints the grant and budget through the same path
 //! as a direct grant, except that a retried approval never re-activates a
 //! revoked grant. Prices are integer cents in the configured currency.
@@ -20,6 +22,7 @@ use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use platform_config::ResearchConfig;
 use platform_core::{ConnectorSlug, TenantId};
+use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
     AccessRequest, BudgetError, BudgetLedger, BudgetState, CatalogError, CatalogRegistry,
@@ -57,6 +60,9 @@ pub struct ResearchService {
     budgets: Arc<dyn BudgetLedger>,
     /// Dataset catalog and access requests.
     catalog: Arc<dyn CatalogRegistry>,
+    /// The vault `AppState::vault` serves, read only to check that a steward
+    /// holds a dataset before publishing it.
+    vault: Arc<dyn VaultStore>,
     /// Minimum cohort size `k` for disclosure control
     /// (`RESEARCH_MIN_COHORT_SIZE`). Zero refuses every research query.
     min_cohort: u64,
@@ -75,6 +81,7 @@ pub const MAX_NOTE_CHARS: usize = 1000;
 
 #[derive(Debug, Deserialize)]
 pub struct PublishListingRequest {
+    /// The dataset's slug: a connector's, or an upload's (`upload_…`).
     pub connector: String,
     pub title: String,
     #[serde(default)]
@@ -107,11 +114,19 @@ pub struct ApproveRequestBody {
 // ── Service methods ──────────────────────────────────────────────────────────
 
 impl ResearchService {
-    pub fn new(stores: ResearchStores, min_cohort: u64, default_budget: u64) -> Self {
+    /// `vault` must be the one the app serves (`AppState::vault`), so a
+    /// dataset uploaded or synced there is one the steward can publish.
+    pub fn new(
+        stores: ResearchStores,
+        vault: Arc<dyn VaultStore>,
+        min_cohort: u64,
+        default_budget: u64,
+    ) -> Self {
         Self {
             grants: stores.grants,
             budgets: stores.budgets,
             catalog: stores.catalog,
+            vault,
             min_cohort,
             default_budget,
         }
@@ -120,8 +135,17 @@ impl ResearchService {
     /// From `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`.
     /// `RESEARCH_PRICING_CURRENCY` stays on `PlatformConfig`, where
     /// `catalog_index` reads it.
-    pub fn from_config(stores: ResearchStores, config: &ResearchConfig) -> Self {
-        Self::new(stores, config.min_cohort_size, config.default_query_budget)
+    pub fn from_config(
+        stores: ResearchStores,
+        vault: Arc<dyn VaultStore>,
+        config: &ResearchConfig,
+    ) -> Self {
+        Self::new(
+            stores,
+            vault,
+            config.min_cohort_size,
+            config.default_query_budget,
+        )
     }
 
     /// The configured `k`. The query service applies it to research queries
@@ -312,14 +336,31 @@ impl ResearchService {
 
     // ── Catalog and access requests ──
 
+    /// Whether `owner` holds `dataset`: it has a committed snapshot
+    /// (`platform_connectors::snapshot::holds`, the one definition).
+    async fn holds(&self, owner: TenantId, dataset: &ConnectorSlug) -> Result<bool, ApiError> {
+        Ok(platform_connectors::snapshot::holds(&*self.vault, owner, dataset).await?)
+    }
+
     /// Publish or re-publish a catalog listing for one of the steward's
-    /// connectors (upsert; the listing id is stable).
+    /// datasets (upsert; the listing id is stable). A dataset the steward
+    /// does not hold (no committed snapshot) is refused with 404 and a
+    /// `denied` event, so a listing never points at nothing.
     pub async fn publish_listing(
         &self,
         steward: TenantId,
         connector: &ConnectorSlug,
         req: &PublishListingRequest,
     ) -> Result<Value, ApiError> {
+        if !self.holds(steward, connector).await? {
+            security_audit_event(
+                AuditKind::ResearchCatalog,
+                Some(steward),
+                "denied",
+                &format!("publish refused connector={connector} reason=not_held"),
+            );
+            return Err(ApiError::NotFound);
+        }
         let details = ListingDetails {
             title: req.title.trim().to_owned(),
             description: req.description.trim().to_owned(),

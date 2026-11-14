@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let vault = stack.vault();
     let research = Arc::new(ResearchService::from_config(
         ResearchStores::in_memory(),
+        vault.clone(),
         &config.research,
     ));
     let service = stack.query_service(engine_settings(&config), research.clone());
@@ -251,6 +252,7 @@ mod tests {
             .expect("commit");
         let research = Arc::new(ResearchService::from_config(
             ResearchStores::in_memory(),
+            stack.vault(),
             &config.research,
         ));
         let service = stack.query_service(engine_settings(&config), research.clone());

@@ -8,19 +8,20 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
+use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::query::{ConnectorQueryService, DevKeyProvider};
 use platform_api::{AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
-use platform_core::{TenantId, ZkMode};
+use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
 use platform_enclave::token::ReleasePolicy;
 use platform_enclave::{AttestationProvider, DevAttestation};
-use platform_storage::{ObjectStoreVault, VaultStore};
+use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
@@ -942,6 +943,176 @@ async fn research_catalog_is_audited() {
         "denied",
         &format!("approve refused request={last_id} researcher={researcher} reason=unpublished"),
     );
+}
+
+/// Asserts an event of `kind` with this outcome and exactly this detail.
+fn assert_event(capture: &AuditCapture, kind: &str, outcome: &str, detail: &str) {
+    let events = capture.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.audit_kind == kind && e.outcome == outcome && e.detail == detail),
+        "no {kind} {outcome} event {detail:?} in {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn dataset_upload_is_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    let key = keypair.public_key();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());
+    let token = token_for(steward);
+
+    // Two uploads: the second commits and prunes the first, and an object
+    // that an earlier attempt at its version left.
+    let first = common::cohorts_upload(steward, &key, "upload_cohorts", None);
+    let (status, _) =
+        common::put_upload(&app, Some(&token), "upload_cohorts", first.body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let second = common::cohorts_upload(steward, &key, "upload_cohorts", Some(&first.version));
+    let dataset = ConnectorSlug::new("upload_cohorts").expect("slug");
+    vault
+        .put(
+            &TenantPaths::connector_snapshot_object(
+                steward,
+                &dataset,
+                &second.version,
+                ObjectId::generate(),
+            ),
+            Bytes::from_static(b"sealed"),
+        )
+        .await
+        .expect("put");
+    let (status, _) =
+        common::put_upload(&app, Some(&token), "upload_cohorts", second.body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Refusals: a body that is not an upload, a dataset outside the upload
+    // namespace, and a stale version.
+    let (status, _) = common::put_upload(
+        &app,
+        Some(&token),
+        "upload_cohorts",
+        b"not an upload".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) =
+        common::put_upload(&app, Some(&token), "research_extract", first.body.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        common::put_upload(&app, Some(&token), "upload_cohorts", first.body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Publishing a dataset the steward does not hold.
+    let (status, _) = post(
+        &app,
+        "/api/v1/catalog",
+        &token,
+        r#"{"connector":"upload_other","title":"Cohorts","license_fee_cents":0,"compute_rate_cents":0}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for upload in [&first, &second] {
+        assert_event(
+            &capture,
+            "data.access",
+            "ok",
+            &format!(
+                "upload object dataset=upload_cohorts snapshot={} object={} ciphertext_bytes={}",
+                upload.version,
+                upload.object,
+                object_bytes(&upload.body)
+            ),
+        );
+        assert_event(
+            &capture,
+            "data.access",
+            "committed",
+            &format!(
+                "dataset=upload_cohorts snapshot={} objects=1",
+                upload.version
+            ),
+        );
+    }
+    assert_event(
+        &capture,
+        "data.access",
+        "pruned",
+        &format!(
+            "dataset=upload_cohorts superseded_snapshot={} objects=1",
+            first.version
+        ),
+    );
+    assert_event(
+        &capture,
+        "data.access",
+        "pruned",
+        &format!(
+            "dataset=upload_cohorts snapshot={} uncommitted_objects=1",
+            second.version
+        ),
+    );
+    for reason in ["bad_magic", "stale_version"] {
+        assert_event(
+            &capture,
+            "data.access",
+            "denied",
+            &format!("upload refused dataset=upload_cohorts reason={reason}"),
+        );
+    }
+    assert_event(
+        &capture,
+        "data.access",
+        "denied",
+        "upload refused dataset=research_extract reason=not_upload_dataset",
+    );
+    assert_event(
+        &capture,
+        "research.catalog",
+        "denied",
+        "publish refused connector=upload_other reason=not_held",
+    );
+    // Nothing from the body, such as a declared column name, reaches the
+    // stream.
+    assert!(
+        capture
+            .events()
+            .iter()
+            .all(|e| !e.detail.contains("condition")),
+        "{:?}",
+        capture.events()
+    );
+}
+
+/// The object envelope's length in an upload body.
+fn object_bytes(body: &[u8]) -> usize {
+    let header = u32::from_be_bytes(body[4..8].try_into().expect("4 bytes")) as usize;
+    let at = 8 + header;
+    let manifest = u32::from_be_bytes(body[at..at + 4].try_into().expect("4 bytes")) as usize;
+    body.len() - (at + 4 + manifest)
+}
+
+#[tokio::test]
+async fn connector_snapshot_commit_and_prune_are_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate();
+    // Two syncs: the second commits and prunes the first.
+    let _vault = synced_vault(tenant, &keypair, 2).await;
+    let events = capture.events();
+    for outcome in ["committed", "pruned"] {
+        assert!(
+            events.iter().any(|e| e.audit_kind == "connector.sync"
+                && e.outcome == outcome
+                && e.detail.starts_with("connector=quickbooks ")),
+            "no connector.sync {outcome} in {events:?}"
+        );
+    }
 }
 
 #[tokio::test]

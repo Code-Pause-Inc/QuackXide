@@ -143,7 +143,12 @@ async fn research_app(steward: TenantId) -> Router {
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
     };
-    let research = Arc::new(ResearchService::new(ResearchStores::in_memory(), 5, 100));
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
     let service = stack.query_service(settings, research.clone());
     build_app(AppState {
         research: Some(research),

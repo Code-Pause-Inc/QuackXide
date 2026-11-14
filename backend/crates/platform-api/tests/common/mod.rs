@@ -24,9 +24,14 @@ use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
+use platform_connectors::snapshot::{SnapshotManifest, manifest_info, object_info};
 use platform_connectors::source::FixtureSource;
-use platform_core::{ConnectorSlug, TenantId, ZkMode};
-use platform_crypto::TenantKeypair;
+use platform_connectors::upload::{UploadHeader, encode_upload_body};
+use platform_core::{
+    ColumnType, ConnectorSlug, DeclaredColumn, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
+    ZkMode,
+};
+use platform_crypto::{TenantKeypair, TenantPublicKey, hpke_seal_to_tenant};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
@@ -286,7 +291,12 @@ pub async fn research_app(
         .await
         .expect("commit");
     let vault = stack.vault();
-    let research = Arc::new(ResearchService::new(ResearchStores::in_memory(), 5, 100));
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
     let service = stack.query_service_with_attestation(
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
@@ -307,6 +317,162 @@ pub async fn research_app(
 /// The insecure development attestation, for builders that take one.
 pub fn dev_attestation() -> Arc<dyn AttestationProvider> {
     Arc::new(DevAttestation::allow_insecure_dev())
+}
+
+// ── Steward uploads (ADR 0012) ──
+
+/// A declared schema from `(name, type)` pairs.
+pub fn declared(columns: &[(&str, ColumnType)]) -> DeclaredSchema {
+    DeclaredSchema::new(
+        columns
+            .iter()
+            .map(|(name, column_type)| DeclaredColumn {
+                name: (*name).to_owned(),
+                column_type: *column_type,
+            })
+            .collect(),
+    )
+    .expect("schema")
+}
+
+/// The schema of [`cohorts_parquet`], as its steward declares it.
+pub fn cohorts_schema() -> DeclaredSchema {
+    declared(&[
+        ("condition", ColumnType::String),
+        ("age", ColumnType::Int64),
+    ])
+}
+
+/// A snapshot version for a new upload: now, or just after `after` if the
+/// clock has not passed it, as the browser picks one.
+pub fn next_version(after: Option<&SnapshotVersion>) -> SnapshotVersion {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let nanos = after.map_or(now, |after| now.max(after.unix_nanos() + 1));
+    let suffix = ObjectId::generate().to_string().replace('-', "");
+    format!("{nanos:020}-{suffix}").parse().expect("version")
+}
+
+/// What a steward's browser sends to upload one dataset.
+pub struct SealedUpload {
+    pub version: SnapshotVersion,
+    pub object: ObjectId,
+    pub body: Vec<u8>,
+}
+
+/// Seals `parquet` and a manifest listing it to `key`, as the browser does
+/// for `steward`'s upload of `dataset`, and frames them with a header
+/// declaring `schema` and `row_cap`.
+pub fn sealed_upload(
+    steward: TenantId,
+    key: &TenantPublicKey,
+    dataset: &str,
+    version: SnapshotVersion,
+    parquet: &[u8],
+    schema: DeclaredSchema,
+    row_cap: u64,
+) -> SealedUpload {
+    let slug = ConnectorSlug::new(dataset).expect("slug");
+    let object = ObjectId::generate();
+    let sealed = hpke_seal_to_tenant(key, &object_info(&steward, &slug, &object), parquet)
+        .expect("seal object");
+    let manifest = SnapshotManifest {
+        version: version.clone(),
+        objects: vec![object],
+    };
+    let manifest = hpke_seal_to_tenant(
+        key,
+        &manifest_info(&steward, &slug, &version),
+        &serde_json::to_vec(&manifest).expect("manifest json"),
+    )
+    .expect("seal manifest");
+    let header = UploadHeader {
+        version: version.clone(),
+        object,
+        row_cap,
+        schema,
+    };
+    let body = encode_upload_body(&header, &manifest, &sealed).expect("encode");
+    SealedUpload {
+        version,
+        object,
+        body,
+    }
+}
+
+/// [`sealed_upload`] of [`cohorts_parquet`] with its schema and row count.
+pub fn cohorts_upload(
+    steward: TenantId,
+    key: &TenantPublicKey,
+    dataset: &str,
+    after: Option<&SnapshotVersion>,
+) -> SealedUpload {
+    sealed_upload(
+        steward,
+        key,
+        dataset,
+        next_version(after),
+        &cohorts_parquet(),
+        cohorts_schema(),
+        7,
+    )
+}
+
+/// `PUT /api/v1/datasets/{dataset}` with `body`, as `token` if given.
+pub async fn put_upload(
+    app: &Router,
+    token: Option<&str>,
+    dataset: &str,
+    body: Vec<u8>,
+) -> (StatusCode, serde_json::Value) {
+    let mut headers = vec![content_type("application/octet-stream")];
+    if let Some(token) = token {
+        headers.push(bearer(token));
+    }
+    send_json(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{dataset}"),
+        &headers,
+        body,
+    )
+    .await
+}
+
+/// An app over `vault` where each steward's key is held for queries but no
+/// data exists until it is uploaded, with the research layer (k=5, default
+/// budget 100) on the development attestation.
+pub fn upload_research_app(
+    secret: &str,
+    stewards: Vec<(TenantId, TenantKeypair)>,
+    vault: Arc<dyn VaultStore>,
+) -> Router {
+    let mut stack = DevResearchStack::with_vault(vault.clone());
+    for (steward, keypair) in stewards {
+        stack.register_key(steward, keypair);
+    }
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
+    let service = stack.query_service_with_attestation(
+        EngineSettings {
+            zk: ZkMode::Enabled,
+            max_concurrent_queries: 4,
+        },
+        research.clone(),
+        dev_attestation(),
+        false,
+    );
+    build_app(AppState {
+        research: Some(research),
+        query: Some(Arc::new(service)),
+        ..app_state(secret, vault)
+    })
 }
 
 // ── Fault injection ──

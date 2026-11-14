@@ -339,7 +339,12 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         attestation.clone(),
         Arc::new(HttpKeyReleaseClient::new(format!("http://{addr}"))),
     ));
-    let research = Arc::new(ResearchService::new(ResearchStores::in_memory(), 11, 100));
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        11,
+        100,
+    ));
     let query = ConnectorQueryService::new(
         vault.clone(),
         key_provider.clone(),

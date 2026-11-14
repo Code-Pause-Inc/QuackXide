@@ -1,10 +1,10 @@
 //! Research access in the binary's own wiring
 //! (`platform_api::wiring::build_state`), independent of key release.
 //!
-//! With only a token secret configured, the catalog, access-request, grant
-//! and budget routes answer, while the confidential query routes still
-//! refuse with 503 and charge nothing. Without a research layer, the
-//! research routes refuse with 503.
+//! With only a token secret configured, a steward's upload and the catalog,
+//! access-request, grant and budget routes answer, while the confidential
+//! query routes still refuse with 503 and charge nothing. Without a research
+//! layer, the research routes refuse with 503.
 
 mod common;
 
@@ -16,15 +16,19 @@ use platform_api::build_app;
 use platform_api::wiring::build_state;
 use platform_config::PlatformConfig;
 use platform_core::TenantId;
+use platform_crypto::TenantKeypair;
 use platform_storage::ObjectStoreVault;
 
 use common::{call, post};
 
 const SECRET: &str = "research-wiring-itest-secret";
 
-/// A listing whose approval grants 25 query units.
+/// The dataset the steward uploads and lists.
+const DATASET: &str = "upload_cohorts";
+
+/// A listing of [`DATASET`] whose approval grants 25 query units.
 const PUBLISH_BODY: &str = r#"{
-    "connector": "health",
+    "connector": "upload_cohorts",
     "title": "Synthetic respiratory cohort",
     "license_fee_cents": 0,
     "compute_rate_cents": 0,
@@ -68,7 +72,15 @@ async fn research_routes_answer_while_queries_stay_fail_closed() {
     let researcher = TenantId::generate();
     let other_researcher = TenantId::generate();
 
-    // Publish: steward lists a dataset.
+    // Upload: the steward stores a dataset, which needs no key release
+    // either. Publishing refuses a dataset the steward does not hold.
+    let key = TenantKeypair::generate().public_key();
+    let upload = common::cohorts_upload(steward, &key, DATASET, None);
+    let (status, body) =
+        common::put_upload(&app, Some(&token_for(steward)), DATASET, upload.body).await;
+    assert_eq!(status, StatusCode::OK, "upload: {body}");
+
+    // Publish: steward lists the dataset.
     let (status, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     assert_eq!(status, StatusCode::OK, "publish: {listing}");
     let listing_id = listing["listing_id"]
@@ -126,7 +138,7 @@ async fn research_routes_answer_while_queries_stay_fail_closed() {
         &app,
         "/api/v1/grants",
         &token_for(steward),
-        &format!(r#"{{"researcher_tenant":"{other_researcher}","connector":"health"}}"#),
+        &format!(r#"{{"researcher_tenant":"{other_researcher}","connector":"{DATASET}"}}"#),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
@@ -137,7 +149,7 @@ async fn research_routes_answer_while_queries_stay_fail_closed() {
         "/api/v1/research/query",
         &token_for(researcher),
         &format!(
-            r#"{{"steward_tenant":"{steward}","connector":"health","sql":"SELECT condition, COUNT(*) AS n FROM health GROUP BY condition"}}"#
+            r#"{{"steward_tenant":"{steward}","connector":"{DATASET}","sql":"SELECT condition, COUNT(*) AS n FROM {DATASET} GROUP BY condition"}}"#
         ),
     )
     .await;
@@ -152,7 +164,7 @@ async fn research_routes_answer_while_queries_stay_fail_closed() {
         &app,
         "/api/v1/query",
         &token_for(steward),
-        r#"{"connector":"health","sql":"SELECT COUNT(*) AS n FROM health"}"#,
+        &format!(r#"{{"connector":"{DATASET}","sql":"SELECT COUNT(*) AS n FROM {DATASET}"}}"#),
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "query: {body}");

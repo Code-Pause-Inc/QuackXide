@@ -124,7 +124,9 @@ follow `docs/DATA_POLICY.md`.
 gitleaks found something that looks like a credential. If it is real, do
 not just delete it: follow `docs/DATA_POLICY.md` "Enforcement". If it is a
 synthetic test literal, allow that exact value or path in `.gitleaks.toml`
-with a comment naming the test, never a whole rule.
+with a comment naming the test, never a whole rule. If it says the scan is
+incomplete, git failed partway through the history: fix the git error
+printed above it (`git fsck` finds a damaged repository).
 
 ### Attribution guard
 
@@ -141,9 +143,10 @@ reword it and commit again.
 | `docs/ARCHITECTURE.md` section | Start at |
 | --- | --- |
 | [Drive](ARCHITECTURE.md#1-drive-zero-knowledge-storage) | `frontend/src/lib/crypto/worker.ts`, then `frontend/src/lib/vault/`; server side, `authenticate` and `require_tenant` in `backend/crates/platform-api/src/lib.rs` |
-| [Connectors](ARCHITECTURE.md#2-connectors-confidential-ingress) | `EnclavePipeline` in `backend/crates/platform-connectors/src/pipeline.rs` |
-| [Query](ARCHITECTURE.md#3-query-zero-trust-analytics) | `backend/crates/platform-api/src/query.rs`, then `backend/crates/quackxide-engine/` (`QueryScope` in `src/lib.rs`, the gate in `src/policy.rs` and `src/disclosure.rs`) |
-| [Research access](ARCHITECTURE.md#4-research-access-two-principals) | `backend/crates/platform-api/src/research.rs`, then `backend/crates/platform-tenancy/` |
+| [Steward upload](ARCHITECTURE.md#2-steward-upload-confidential-ingress-from-the-browser) | `backend/crates/platform-api/src/datasets.rs`, then `backend/crates/platform-connectors/src/upload.rs` and `src/snapshot.rs` |
+| [Connectors](ARCHITECTURE.md#3-connectors-confidential-ingress) | `EnclavePipeline` in `backend/crates/platform-connectors/src/pipeline.rs` |
+| [Query](ARCHITECTURE.md#4-query-zero-trust-analytics) | `backend/crates/platform-api/src/query.rs`, then `backend/crates/quackxide-engine/` (`QueryScope` in `src/lib.rs`, the gate in `src/policy.rs` and `src/disclosure.rs`) |
+| [Research access](ARCHITECTURE.md#5-research-access-two-principals) | `backend/crates/platform-api/src/research.rs`, then `backend/crates/platform-tenancy/` |
 
 ## Glossary
 
