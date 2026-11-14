@@ -131,6 +131,24 @@ BROWSERS=chromium,firefox,webkit npm run test:browser
 The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
 
+### Browser timings
+
+`npm run bench:browser` (from `frontend/`) times chunk encryption
+(`encryptPayload` at 4 KiB and 4 MiB) and the first, cold load of the wasm
+envelope module in real browsers (`src/lib/crypto/timings.browser.timing.ts`,
+which `npm run test:browser` leaves out). Vitest cannot run `bench` in
+browser mode, so each encryption timing is the median and nearest-rank p95
+per operation over 20 samples. Browsers coarsen `performance.now()` (to
+1 ms in Firefox and WebKit), so each sample is a batch of calls lasting at
+least 50 ms. The wasm first load is one sample per run, fetched from the
+Vite dev server, so it carries the clock's coarseness: repeated loads hit
+the module cache.
+
+The numbers are report only. The `browser` workflow writes them, and the
+module's raw and gzipped size, to each run's job summary: Chromium on pull
+requests, and Chromium, Firefox and WebKit on `main`, nightly and on demand.
+The step is marked failed, without failing the run, if no timings come out.
+
 ### Envelope vectors
 
 `fixtures/envelope/` holds the vectors that keep the browser and the backend

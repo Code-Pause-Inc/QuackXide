@@ -77,7 +77,11 @@ export default defineConfig(({ mode }) => {
           extends: true,
           test: {
             name: "browser",
-            include: ["src/**/*.browser.test.ts"],
+            // Timings run only on request (`npm run bench:browser`).
+            include: [
+              "src/**/*.browser.test.ts",
+              ...(env.TIMINGS === "1" ? ["src/**/*.browser.timing.ts"] : []),
+            ],
             browser: {
               enabled: true,
               provider: playwright(),

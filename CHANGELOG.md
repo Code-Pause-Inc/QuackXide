@@ -30,6 +30,11 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser timings (P73, #185). `npm run bench:browser` times
+  `encryptPayload` at 4 KiB and 4 MiB and the wasm envelope module's first
+  load in Chromium, Firefox and WebKit, as the median and p95 per operation;
+  the `browser` workflow reports them and the module's size in every run,
+  report only.
 * Browser tests (#223 stage A). A vitest `browser` project runs the module
   crypto worker, Web Crypto keys, IndexedDB persistence across a worker
   restart, a drive round trip and the X25519 probe in real browsers

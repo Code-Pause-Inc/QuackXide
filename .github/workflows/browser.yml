@@ -61,6 +61,32 @@ jobs:
         env:
           BROWSERS: ${{ matrix.browser }}
         run: npm run test:browser
+      # Report only: browser timings and the wasm module's size (#185).
+      # Runs even when the tests failed (WebKit until #200), on every event.
+      - name: Browser timings in ${{ matrix.browser }}
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        working-directory: frontend
+        env:
+          BROWSERS: ${{ matrix.browser }}
+          # Vitest colours its output under CI, which breaks the TIMING grep.
+          NO_COLOR: "1"
+        run: |
+          set -o pipefail
+          status=0
+          npm run bench:browser | tee "$RUNNER_TEMP/timings.txt" || status=$?
+          wasm=src/lib/crypto/wasm/envelope_bg.wasm
+          {
+            echo "## Browser timings (${{ matrix.browser }})"
+            echo
+            echo "Report only; one shared runner. Per operation; the wasm first load is one sample."
+            echo
+            echo '```'
+            grep '^TIMING' "$RUNNER_TEMP/timings.txt" || { echo "(no timings)"; status=1; }
+            echo "wasm envelope module: $(wc -c < "$wasm") bytes, $(gzip -c "$wasm" | wc -c) gzipped"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Keep failure screenshots and traces
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
