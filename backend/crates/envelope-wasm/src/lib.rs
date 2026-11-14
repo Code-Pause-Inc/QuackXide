@@ -120,6 +120,36 @@ pub fn research_result_info(researcher_tenant: &str, query: &str) -> Result<Vec<
     ))
 }
 
+/// The `info` string for a research query sealed to the enclave, checked as
+/// [`steward_upload_info`].
+pub fn research_query_info(tenant: &str, grant_id: &str) -> Result<Vec<u8>, CryptoError> {
+    Ok(info::research_query(
+        SUITE,
+        info::check_field(tenant)?,
+        info::check_field(grant_id)?,
+    ))
+}
+
+/// The `query` field of a research result's `info` string. The grant id is
+/// checked as [`steward_upload_info`] checks fields; the request nonce must be
+/// 32 bytes.
+pub fn research_query_binding(
+    grant_id: &str,
+    request_nonce: &[u8],
+    sql: &str,
+    schema_version: Option<String>,
+) -> Result<String, CryptoError> {
+    let request_nonce: &[u8; 32] = request_nonce
+        .try_into()
+        .map_err(|_| CryptoError::InvalidInfoField)?;
+    info::research_query_binding(
+        info::check_field(grant_id)?,
+        request_nonce,
+        sql,
+        schema_version.as_deref(),
+    )
+}
+
 // ── wasm exports ─────────────────────────────────────────────────────────────
 //
 // Error messages are `CryptoError`'s, which carry no key material or data.
@@ -176,6 +206,21 @@ pub fn snapshot_manifest_info_js(
     version: &str,
 ) -> Result<Vec<u8>, JsError> {
     snapshot_manifest_info(tenant, connector, version).map_err(js_error)
+}
+
+#[wasm_bindgen(js_name = researchQueryInfo)]
+pub fn research_query_info_js(tenant: &str, grant_id: &str) -> Result<Vec<u8>, JsError> {
+    research_query_info(tenant, grant_id).map_err(js_error)
+}
+
+#[wasm_bindgen(js_name = researchQueryBinding)]
+pub fn research_query_binding_js(
+    grant_id: &str,
+    request_nonce: &[u8],
+    sql: &str,
+    schema_version: Option<String>,
+) -> Result<String, JsError> {
+    research_query_binding(grant_id, request_nonce, sql, schema_version).map_err(js_error)
 }
 
 #[wasm_bindgen(js_name = researchResultInfo)]

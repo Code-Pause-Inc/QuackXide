@@ -31,6 +31,7 @@ const infoBuilders: Record<string, (...fields: string[]) => Promise<Uint8Array>>
   connector_object: (t, c, o) => envelopeInfo.connectorObject(t!, c!, o!),
   snapshot_manifest: (t, c, v) => envelopeInfo.snapshotManifest(t!, c!, v!),
   research_result: (t, q) => envelopeInfo.researchResult(t!, q!),
+  research_query: (t, g) => envelopeInfo.researchQuery(t!, g!),
 };
 
 beforeAll(async () => {
@@ -51,6 +52,28 @@ describe("info strings", () => {
     await expect(envelopeInfo.researchResult("t", field)).rejects.toThrow(
       "invalid envelope info field",
     );
+  });
+});
+
+describe("query bindings", () => {
+  it.each(vectors.query_bindings)(
+    "schema_version $schema_version matches the shared vector",
+    async ({ grant_id, request_nonce_b64, sql, schema_version, query }) => {
+      const nonce = new Uint8Array(fromB64(request_nonce_b64));
+      expect(
+        await envelopeInfo.researchQueryBinding(grant_id, nonce, sql, schema_version ?? undefined),
+      ).toBe(query);
+    },
+  );
+
+  it("refuses an empty schema version and a short nonce", async () => {
+    const nonce = new Uint8Array(32);
+    await expect(envelopeInfo.researchQueryBinding("g", nonce, "q", "")).rejects.toThrow(
+      "invalid envelope info field",
+    );
+    await expect(
+      envelopeInfo.researchQueryBinding("g", nonce.slice(1), "q", undefined),
+    ).rejects.toThrow("invalid envelope info field");
   });
 });
 

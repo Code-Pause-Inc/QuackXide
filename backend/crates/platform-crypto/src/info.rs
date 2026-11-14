@@ -12,6 +12,10 @@
 
 use std::fmt::Display;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use sha2::{Digest, Sha256};
+
 use crate::{CryptoError, EnvelopeSuite};
 
 const SEPARATOR: char = '|';
@@ -69,8 +73,8 @@ pub fn steward_upload(
     .into_bytes()
 }
 
-/// A query result sealed to a researcher. P55 fixes the identifiers that
-/// fill the fields.
+/// A query result sealed to a researcher: `{query}` is
+/// [`research_query_binding`] of the request it answers (ADR 0010).
 pub fn research_result(
     suite: EnvelopeSuite,
     researcher_tenant: impl Display,
@@ -81,6 +85,50 @@ pub fn research_result(
         version(suite)
     )
     .into_bytes()
+}
+
+/// A research query sealed to the enclave's request key (ADR 0010 "Sealed
+/// request"): `{tenant}` is the session's tenant, `{grant_id}` the grant the
+/// query runs under, sent in the clear beside the frame.
+pub fn research_query(
+    suite: EnvelopeSuite,
+    tenant: impl Display,
+    grant_id: impl Display,
+) -> Vec<u8> {
+    format!("research-query-{}|{tenant}|{grant_id}", version(suite)).into_bytes()
+}
+
+const QUERY_BINDING_TAG: &[u8] = b"research-query-binding-v1";
+
+/// The `{query}` field of [`research_result`]: base64url, without padding,
+/// of SHA-256 over the tag and, each after its `u32` big-endian length, the
+/// grant id, the request nonce, SHA-256 of the SQL text and the result
+/// schema version (ADR 0010). An absent schema version is the empty field,
+/// so a present one must not be empty.
+pub fn research_query_binding(
+    grant_id: &str,
+    request_nonce: &[u8; 32],
+    sql: &str,
+    schema_version: Option<&str>,
+) -> Result<String, CryptoError> {
+    if schema_version == Some("") {
+        return Err(CryptoError::InvalidInfoField);
+    }
+    let sql_digest = Sha256::digest(sql.as_bytes());
+    let fields: [&[u8]; 4] = [
+        grant_id.as_bytes(),
+        request_nonce,
+        &sql_digest,
+        schema_version.unwrap_or("").as_bytes(),
+    ];
+    let mut hasher = Sha256::new();
+    hasher.update(QUERY_BINDING_TAG);
+    for field in fields {
+        let len = u32::try_from(field.len()).map_err(|_| CryptoError::InvalidInfoField)?;
+        hasher.update(len.to_be_bytes());
+        hasher.update(field);
+    }
+    Ok(URL_SAFE_NO_PAD.encode(hasher.finalize()))
 }
 
 /// Refuse a field that is empty or contains the separator.
@@ -115,6 +163,34 @@ mod tests {
             b"steward-upload-v2|t|d|o"
         );
         assert_eq!(research_result(Hpk2, "t", "q"), b"research-result-v2|t|q");
+        assert_eq!(research_query(Hpk1, "t", "g"), b"research-query-v1|t|g");
+        assert_eq!(research_query(Hpk2, "t", "g"), b"research-query-v2|t|g");
+    }
+
+    const GRANT: &str = "11111111-2222-4333-8444-555555555555";
+    const SQL: &str = "SELECT condition, COUNT(*) AS n FROM upload_cohorts GROUP BY condition";
+
+    #[test]
+    fn query_binding_is_pinned() {
+        // ADR 0010's layout, computed independently of this code.
+        let nonce = [0x66; 32];
+        assert_eq!(
+            research_query_binding(GRANT, &nonce, SQL, Some("1")).expect("binding"),
+            "GrChwe4FHyeJ7D4VAW7eTPWLBvh7qmVyNwuTnbO_y9I"
+        );
+        assert_eq!(
+            research_query_binding(GRANT, &nonce, SQL, None).expect("binding"),
+            "RrAaM53KoifkboFugVTgwANY9D0l8ewR2MERgev1yOo"
+        );
+    }
+
+    #[test]
+    fn an_empty_schema_version_is_refused() {
+        // It would bind the same as an absent one.
+        assert!(matches!(
+            research_query_binding(GRANT, &[0x66; 32], SQL, Some("")),
+            Err(CryptoError::InvalidInfoField)
+        ));
     }
 
     #[test]
