@@ -1,7 +1,7 @@
 # 0012. Steward dataset upload
 
-* Status: Proposed
-* Date: 2026-11-08
+* Status: Accepted
+* Date: 2026-11-13
 
 ## Context
 
@@ -225,6 +225,9 @@ not what the API stores.
 | Current record unreadable | 502 | failed, `record_unreadable` |
 | Storage failure | 503 or 502 | failed, `storage` |
 
+An upload outside the upload namespace is 404 rather than 403, since the
+steward holds no upload dataset by that name.
+
 The stored object is audited `ok`, and the commit and pruning are audited
 `committed` and `pruned`, as connector snapshots are under
 `connector.sync`. Details carry identifiers and fixed reasons only, never
@@ -305,16 +308,11 @@ APIs and features are built (no `with_context` streams, no `seekable`, no
 
 ## Open questions
 
-1. 0009 to 0011 are taken on `main` and no open branch uses 0012, so
-   this record uses 0012. The maintainer reserves numbers and may renumber
-   it.
-2. Are 64 MiB as the default and 512 MiB as the ceiling acceptable until
+1. Are 64 MiB as the default and 512 MiB as the ceiling acceptable until
    P34 and P40 measure the browser seal and upload?
-3. Should the declared schema move into the sealed manifest when manifests
+2. Should the declared schema move into the sealed manifest when manifests
    move to the data key, leaving only a digest in plaintext?
-4. 404 or 403 for an upload outside the upload namespace? 404 is chosen,
-   since the steward holds no upload dataset by that name.
-5. The schema lock depends on P42. A dataset keeps its first upload's
+3. The schema lock depends on P42. A dataset keeps its first upload's
    schema, so a wrong first schema, or the concurrent first uploads that
    "Holds" accepts, can be fixed only by deleting the dataset (P42).
    `docs/V1_PLAN.md` lists P42 as a v1.1 candidate; if it slips, such a
