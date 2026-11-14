@@ -1,6 +1,7 @@
 //! Audit-coverage contract: every security-relevant flow (key enrollment,
 //! TEE attestation, provisioning, data access including misses and denials,
-//! the research catalog) emits its SECURITY_AUDIT_EVENT record.
+//! the research catalog, research grants and budgets) emits its
+//! SECURITY_AUDIT_EVENT record.
 
 mod common;
 
@@ -11,6 +12,7 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::query::{ConnectorQueryService, DevKeyProvider};
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
@@ -54,8 +56,9 @@ fn token_for(tenant: TenantId) -> String {
     common::token_for(SECRET, tenant)
 }
 
-/// Full app: vault + jwt + provisioning + a query service with sealed
-/// QuickBooks fixture data for `tenant`.
+/// Full app: vault + jwt + provisioning + research access + a query
+/// service with sealed QuickBooks fixture data for `tenant`, who can also
+/// grant research access to it.
 async fn full_app(tenant: TenantId, zk: ZkMode) -> Router {
     full_app_with_attestation(tenant, zk, dev_attestation(), false).await
 }
@@ -69,6 +72,13 @@ async fn full_app_with_attestation(
 ) -> Router {
     let keypair = TenantKeypair::generate();
     let vault = synced_vault(tenant, &keypair, 1).await;
+    let config = Arc::new(common::config_with_mor_secret(PADDLE_SECRET));
+    // The configured `k` and default budget, as the binary wires them.
+    let research = Arc::new(ResearchService::from_config(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        &config.research,
+    ));
 
     let query = ConnectorQueryService::new(
         vault.clone(),
@@ -79,14 +89,16 @@ async fn full_app_with_attestation(
             max_concurrent_queries: 4,
         },
         require_attestation,
-    );
+    )
+    .with_research(research.clone());
     let provisioning = ProvisioningService::new(
         Arc::new(InMemoryTenantRegistry::new(default_connector_slugs())),
         vault.clone(),
     );
 
     build_app(AppState {
-        config: Arc::new(common::config_with_mor_secret(PADDLE_SECRET)),
+        config,
+        research: Some(research),
         query: Some(Arc::new(query)),
         provisioning: Some(Arc::new(provisioning)),
         ..app_state(SECRET, vault)
@@ -938,6 +950,234 @@ fn assert_event(capture: &AuditCapture, kind: &str, outcome: &str, detail: &str)
             .any(|e| e.audit_kind == kind && e.outcome == outcome && e.detail == detail),
         "no {kind} {outcome} event {detail:?} in {events:?}"
     );
+}
+
+/// As [`assert_event`], for an event about `tenant`.
+fn assert_tenant_event(
+    capture: &AuditCapture,
+    kind: &str,
+    outcome: &str,
+    tenant: TenantId,
+    detail: &str,
+) {
+    let events = capture.events();
+    let tenant = tenant.to_string();
+    assert!(
+        events.iter().any(|e| e.audit_kind == kind
+            && e.outcome == outcome
+            && e.tenant_id == tenant
+            && e.detail == detail),
+        "no {kind} {outcome} event for {tenant} {detail:?} in {events:?}"
+    );
+}
+
+/// The number of `kind` events with this outcome.
+fn count_outcome(capture: &AuditCapture, kind: &str, outcome: &str) -> usize {
+    capture
+        .events()
+        .iter()
+        .filter(|e| e.audit_kind == kind && e.outcome == outcome)
+        .count()
+}
+
+#[tokio::test]
+async fn research_grants_and_budgets_are_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = full_app(steward, ZkMode::Disabled).await;
+    let stoken = token_for(steward);
+    let rtoken = token_for(researcher);
+    let query = format!(
+        r#"{{"steward_tenant":"{steward}","connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}}"#
+    );
+
+    // No grant yet: refused before the attestation gate runs. (Building the
+    // app ran a connector sync, which passed a gate of its own.)
+    let gates = capture.count("tee.attestation");
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &query).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        capture.count("tee.attestation"),
+        gates,
+        "{:?}",
+        capture.events()
+    );
+
+    // A one-query grant: the query spends it, and the next is refused.
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &stoken,
+        &format!(
+            r#"{{"researcher_tenant":"{researcher}","connector":"quickbooks","query_budget":1}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let (status, body) = post(&app, "/api/v1/research/query", &rtoken, &query).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &query).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The steward tops the grant up, then revokes it.
+    let budget = format!("/api/v1/grants/{grant_id}/budget");
+    let (status, _) = post(&app, &budget, &stoken, r#"{"additional":2}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Grant and revoke share kind and outcome; the detail tells them apart.
+    assert_tenant_event(
+        &capture,
+        "auth.decision",
+        "denied",
+        researcher,
+        &format!("no active grant for steward={steward} connector=quickbooks"),
+    );
+    assert_tenant_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        steward,
+        &format!("granted researcher={researcher} connector=quickbooks budget_limit=1"),
+    );
+    assert_tenant_event(
+        &capture,
+        "research.budget",
+        "denied",
+        researcher,
+        &format!("exhausted steward={steward} connector=quickbooks limit=1 spent=1"),
+    );
+    assert_tenant_event(
+        &capture,
+        "research.budget",
+        "ok",
+        steward,
+        &format!("top_up grant={grant_id} added=2 limit=3"),
+    );
+    assert_tenant_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        steward,
+        &format!("revoked grant={grant_id}"),
+    );
+}
+
+#[tokio::test]
+async fn refused_grant_id_requests_are_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let outsider = TenantId::generate();
+    let app = full_app(steward, ZkMode::Disabled).await;
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"quickbooks"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+    let unknown_id = TenantId::generate().to_string();
+    // A path segment that is not an id; it must not reach the stream.
+    let not_an_id = "flu-cohort.csv";
+
+    // Each probe: the caller, the grant id it sends, the id the record
+    // shows, and whether a budget read is refused too (the grant's
+    // researcher may read its budget). Revoke and top-up always are.
+    let probes = [
+        (outsider, unknown_id.as_str(), unknown_id.as_str(), true),
+        (outsider, grant_id.as_str(), grant_id.as_str(), true),
+        (outsider, not_an_id, "malformed", true),
+        (researcher, grant_id.as_str(), grant_id.as_str(), false),
+    ];
+    for (who, sent, shown, reads) in probes {
+        let token = token_for(who);
+        let refused =
+            |action: &str| format!("{action} refused grant={shown} reason=unknown_or_foreign");
+        let (status, _) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v1/grants/{sent}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let budget = format!("/api/v1/grants/{sent}/budget");
+        let (status, _) = post(&app, &budget, &token, r#"{"additional":5}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_tenant_event(
+            &capture,
+            "tenant.provisioned",
+            "denied",
+            who,
+            &refused("revoke"),
+        );
+        assert_tenant_event(
+            &capture,
+            "research.budget",
+            "denied",
+            who,
+            &refused("top_up"),
+        );
+        if reads {
+            let (status, _) = call(&app, "GET", &budget, &token, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_tenant_event(&capture, "research.budget", "denied", who, &refused("read"));
+        }
+    }
+
+    // One event per refusal, and none of them revoked or topped up anything.
+    assert_eq!(count_outcome(&capture, "tenant.provisioned", "denied"), 4);
+    assert_eq!(count_outcome(&capture, "research.budget", "denied"), 7);
+    assert_eq!(count_outcome(&capture, "research.budget", "ok"), 0);
+    let events = capture.events();
+    assert!(
+        events.iter().all(|e| !e.detail.starts_with("revoked ")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().all(|e| !e.detail.contains("flu-cohort")),
+        "{events:?}"
+    );
+
+    // Input refused with 400 before any lookup reads only the request and
+    // is not audited: a malformed steward id or slug, a grant to oneself,
+    // and a zero top-up.
+    let stoken = token_for(steward);
+    let malformed = [
+        (
+            "/api/v1/research/query".to_owned(),
+            token_for(researcher),
+            r#"{"steward_tenant":"not-a-tenant","connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_owned(),
+        ),
+        (
+            "/api/v1/grants".to_owned(),
+            stoken.clone(),
+            format!(r#"{{"researcher_tenant":"{researcher}","connector":"Quick Books"}}"#),
+        ),
+        (
+            "/api/v1/grants".to_owned(),
+            stoken.clone(),
+            format!(r#"{{"researcher_tenant":"{steward}","connector":"quickbooks"}}"#),
+        ),
+        (
+            format!("/api/v1/grants/{grant_id}/budget"),
+            stoken,
+            r#"{"additional":0}"#.to_owned(),
+        ),
+    ];
+    for (uri, token, body) in malformed {
+        let (status, _) = post(&app, &uri, &token, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+    }
+    assert_eq!(capture.events(), events);
 }
 
 #[tokio::test]

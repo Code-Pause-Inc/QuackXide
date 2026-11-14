@@ -66,12 +66,15 @@ pub enum AuditKind {
     KeyEnrollment,
     KeyRelease,
     TeeAttestation,
+    /// Tenant provisioning and status, connector toggles, and research
+    /// grants: created, revoked, and refused revokes.
     TenantProvisioned,
     DataAccess,
     ConnectorSync,
     QueryExecuted,
     AuthDecision,
-    /// Query-budget top-ups, exhaustion refusals, and ledger anomalies.
+    /// Query-budget top-ups, exhaustion refusals, refused top-ups and
+    /// budget reads, and ledger anomalies.
     ResearchBudget,
     /// Listings published/withdrawn and access requests filed/resolved.
     /// Identifiers only, never titles or notes.

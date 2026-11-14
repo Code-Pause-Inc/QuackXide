@@ -371,7 +371,7 @@ upload; the **researcher** may run aggregate queries but never read rows.
 
 ```
 Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
-                 grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403
+                 grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403 + audit
                  attestation gate
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
@@ -419,10 +419,21 @@ Three enforcement layers at one choke point, all in code:
   re-granting cannot reset it. The `cost` parameter is the seam for a
   sensitivity-scaled or privacy-loss (ε) accountant.
 
-Grants (`platform_tenancy::GrantRegistry`) are steward-scoped and revocable
-by the granting steward only. Revoked, unknown, and foreign grants return the
-same response, so nothing leaks existence. Budget standing is visible to the
-grant's parties only; top-up is steward-only. Metering rides the
+Grants (`platform_tenancy::GrantRegistry`) are steward-scoped, revocable by
+the granting steward only, and do not expire. A grant covers one dataset of
+one steward: another steward's dataset of the same slug, or another of the
+steward's datasets, is refused as if there were no grant. That refusal
+(403, an `auth.decision` denial) comes before the attestation gate and the
+budget charge, and is byte-identical whether the grant never existed or was
+revoked and whether the steward and dataset exist, so it leaks nothing
+about existence. A malformed steward id or slug is refused with 400 first,
+from the request alone. Budget standing is visible to the grant's parties
+only; revoke and top-up are steward-only. `DELETE /api/v1/grants/{id}`,
+`GET /api/v1/grants/{id}/budget` and `POST /api/v1/grants/{id}/budget`
+answer a grant id that is unknown and one the caller may not act on with
+the same 404 body, each audited as a denial. A steward's revoked grant
+stays its own: revoking it again succeeds, and its budget can still be read
+and topped up, which does not restore access. Metering rides the
 `engine.query` event and doubles as the billing meter.
 
 Catalog, access requests, grants and budgets need no key material. They
@@ -585,13 +596,24 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
-| `tenant.provisioned` | Provisioning, suspension, connector toggles, grants |
+| `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
 | `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
 | `engine.query` | Every confidential query, with metering fields |
-| `auth.decision` | Every rejected token, admin denial, signature rejection |
-| `research.budget` | Budget top-ups and exhaustion refusals |
+| `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
+| `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+
+Grant events stay under `tenant.provisioned` rather than a `research.grant`
+kind of their own: a grant is the steward provisioning access to its own
+tenant's data, and keeping them there keeps the audit vocabulary
+(`AuditKind`) fixed. Their details tell them apart (`granted …`,
+`revoked …`, `revoke refused …`). Budget actions on a grant are
+`research.budget`, and a research query's grant check is an
+`auth.decision`. A refused revoke, top-up or budget read records the
+caller's tenant and the grant id, or `grant=malformed` when the path
+segment is not an id, with `reason=unknown_or_foreign`: like the 404, it
+does not say whether the grant exists.
 
 Rules, enforced by the capture tests:
 
@@ -599,16 +621,23 @@ Rules, enforced by the capture tests:
    or SQL text, including on failure paths.
 2. Denials and misses are events too: rejected tokens, refused attestations,
    rejected webhook signatures, malformed enrollment keys, budget
-   exhaustions, and 404 reads (cross-tenant probe visibility) all appear in
-   the stream.
+   exhaustions, research queries without a grant, refused grant revokes,
+   top-ups and budget reads, and 404 reads (cross-tenant probe visibility)
+   all appear in the stream. On the grant and research-query routes, input
+   refused with 400 before any lookup (a malformed tenant id or slug, a
+   zero top-up, a grant to oneself) is not audited: the check reads only
+   the request and the caller's own tenant id.
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
    provisioning, steward uploads (ok, committed, pruned, denied),
-   connector snapshot commit and prune, and the research catalog (ok +
+   connector snapshot commit and prune, the research catalog (ok +
    denied): publish and its refusal, request, approval and its retry, deny,
-   and the refused retry and deny.
+   and the refused retry and deny, and research grants and budgets (ok +
+   denied): grant, revoke, the query refused without a grant (before the
+   attestation gate), top-up, exhaustion, and refused revokes, top-ups and
+   budget reads of unknown, foreign and malformed grant ids.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on

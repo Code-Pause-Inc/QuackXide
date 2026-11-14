@@ -209,7 +209,8 @@ impl ResearchService {
 
     /// Steward-only budget top-up. Non-stewards — including the grant's own
     /// researcher — get the same "not found" as an unknown id: allocation
-    /// control mirrors the revoke discipline (no existence oracle).
+    /// control mirrors the revoke discipline (no existence oracle). Either
+    /// refusal is audited as `denied`.
     pub async fn top_up_budget(
         &self,
         steward: TenantId,
@@ -224,6 +225,12 @@ impl ResearchService {
             .into_iter()
             .any(|g| g.grant_id == grant_id && g.steward_tenant == steward);
         if !owns {
+            security_audit_event(
+                AuditKind::ResearchBudget,
+                Some(steward),
+                "denied",
+                &grant_refusal("top_up", grant_id),
+            );
             return Err(ApiError::NotFound);
         }
         let budget = self
@@ -244,7 +251,8 @@ impl ResearchService {
     }
 
     /// Budget standing — visible only to the grant's parties (steward or
-    /// researcher); anyone else gets the same "not found" as an unknown id.
+    /// researcher); anyone else gets the same "not found" as an unknown id,
+    /// and either refusal is audited as `denied`.
     pub async fn budget_state(&self, caller: TenantId, grant_id: &str) -> Result<Value, ApiError> {
         let is_party = self
             .grants
@@ -254,6 +262,12 @@ impl ResearchService {
             .into_iter()
             .any(|g| g.grant_id == grant_id);
         if !is_party {
+            security_audit_event(
+                AuditKind::ResearchBudget,
+                Some(caller),
+                "denied",
+                &grant_refusal("read", grant_id),
+            );
             return Err(ApiError::NotFound);
         }
         let budget = self
@@ -265,13 +279,25 @@ impl ResearchService {
         budget_json(&budget)
     }
 
+    /// Revoke one of the steward's grants; revoking a revoked grant succeeds
+    /// again. Anyone else — including the grant's own researcher — gets the
+    /// same "not found" as an unknown id, and either refusal is audited as
+    /// `denied`.
     pub async fn revoke_grant(&self, steward: TenantId, grant_id: &str) -> Result<Value, ApiError> {
         let revoked = self
             .grants
             .revoke(steward, grant_id)
             .await
-            .map_err(|_| ApiError::Backend)?
-            .ok_or(ApiError::NotFound)?;
+            .map_err(|_| ApiError::Backend)?;
+        let Some(revoked) = revoked else {
+            security_audit_event(
+                AuditKind::TenantProvisioned,
+                Some(steward),
+                "denied",
+                &grant_refusal("revoke", grant_id),
+            );
+            return Err(ApiError::NotFound);
+        };
         security_audit_event(
             AuditKind::TenantProvisioned,
             Some(steward),
@@ -624,6 +650,27 @@ fn budget_json(budget: &BudgetState) -> Result<Value, ApiError> {
     Ok(value)
 }
 
+/// The audit detail of a refused revoke, top-up or budget read. The grant
+/// is unknown or the caller may not act on it; the caller gets the same 404
+/// for both, and the registry does not tell them apart.
+fn grant_refusal(action: &str, grant_id: &str) -> String {
+    format!(
+        "{action} refused grant={} reason=unknown_or_foreign",
+        audited_grant_id(grant_id)
+    )
+}
+
+/// A caller-supplied grant id as an audit record shows it: the id itself if
+/// it has the form registry ids take (`platform_tenancy` mints them as
+/// canonical UUIDs), otherwise `malformed`, so arbitrary path text never
+/// reaches the audit stream.
+fn audited_grant_id(grant_id: &str) -> &str {
+    let canonical = grant_id
+        .parse::<TenantId>()
+        .is_ok_and(|id| id.to_string() == grant_id);
+    if canonical { grant_id } else { "malformed" }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 fn require_text(value: &str, max: usize, what: &'static str) -> Result<(), ApiError> {
@@ -737,4 +784,37 @@ pub(crate) async fn deny_access_request(
             .resolve_access_request(steward, &request_id, false, None)
             .await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_details_show_only_canonical_grant_ids() {
+        let id = "8d0e2f6a-3b1c-4d5e-9f70-a1b2c3d4e5f6";
+        assert_eq!(
+            grant_refusal("revoke", id),
+            format!("revoke refused grant={id} reason=unknown_or_foreign")
+        );
+        // Other spellings of a UUID name no grant, since grant ids are
+        // compared as strings, and anything else is not an id at all.
+        let braced = format!("{{{id}}}");
+        let simple = id.replace('-', "");
+        let upper = id.to_uppercase();
+        for raw in [
+            braced.as_str(),
+            simple.as_str(),
+            upper.as_str(),
+            "",
+            "flu-cohort.csv",
+            "SELECT * FROM health",
+        ] {
+            assert_eq!(
+                grant_refusal("read", raw),
+                "read refused grant=malformed reason=unknown_or_foreign",
+                "{raw:?}"
+            );
+        }
+    }
 }
