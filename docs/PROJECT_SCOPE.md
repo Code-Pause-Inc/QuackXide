@@ -47,7 +47,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Grant check | **Harden** | `GrantRegistry`, steward-scoped, revocable, no existence oracle. |
 | Attestation | **Build** | Verification of Google's Confidential Space attestation token on Intel TDX (ADR 0004). The provider currently refuses (fails closed). |
 | Key release | **Build** | Production `EnclaveKeyProvider`: Cloud KMS unwraps each dataset's data key only for the attested workload (ADR 0004). Query endpoints return 503 until wired; the path is proven by `DevKeyProvider` and `query-demo`. |
-| Query | **Harden** | DataFusion inside `QueryScope`, plaintext zeroized after use. |
+| Query | **Harden** | DataFusion inside `QueryScope`, plaintext zeroized after use; per-query time, memory, input, decode and result limits, and nothing spilled to disk. |
 | Disclosure control | **Harden** | Plan gate, genuine-count check, `MinCountThreshold`, budget ledger. |
 | Result | **Harden** | Aggregates, suppressed-row count, and remaining budget. |
 | Encrypted results | **Build** | Results sealed to the researcher's key inside the enclave and opened only in the researcher's browser. They currently leave as JSON over TLS. |

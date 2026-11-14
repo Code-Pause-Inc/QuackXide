@@ -22,7 +22,7 @@ use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
 };
 use platform_telemetry::capture::AuditCapture;
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -101,6 +101,7 @@ fn app(setup: Setup) -> (Router, Arc<TestVault>) {
             EngineSettings {
                 zk: ZkMode::Enabled,
                 max_concurrent_queries: 4,
+                limits: QueryLimits::default(),
             },
             required,
         ))

@@ -160,6 +160,19 @@ impl TenantPaths {
         VaultPath(format!("tenants/{tenant}/connectors/{connector}/snapshots"))
     }
 
+    /// Every object stored at one snapshot `version`, whether or not its
+    /// manifest lists it (a query sizes its input from this before any key
+    /// is released).
+    pub fn connector_snapshot_prefix(
+        tenant: TenantId,
+        connector: &ConnectorSlug,
+        version: &SnapshotVersion,
+    ) -> VaultPath {
+        VaultPath(format!(
+            "tenants/{tenant}/connectors/{connector}/snapshots/{version}"
+        ))
+    }
+
     /// The sealed manifest that commits a snapshot, written last.
     pub fn connector_manifest(
         tenant: TenantId,
@@ -983,6 +996,36 @@ mod tests {
             .await
             .expect("usage");
         assert_eq!(empty, StorageUsage::default());
+    }
+
+    #[tokio::test]
+    async fn one_snapshot_version_is_sized_alone() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let slug = ConnectorSlug::new("quickbooks").expect("slug");
+        let version_2: SnapshotVersion = "00000000000000000002-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("version");
+        for (version, bytes) in [
+            (version_1(), &b"0123456789"[..]),
+            (version_1(), &b"abc"[..]),
+            (version_2.clone(), &b"not this one"[..]),
+        ] {
+            let object = ObjectId::generate();
+            let path = TenantPaths::connector_snapshot_object(tenant_a(), &slug, &version, object);
+            vault
+                .put(&path, Bytes::copy_from_slice(bytes))
+                .await
+                .expect("put");
+        }
+        let prefix = TenantPaths::connector_snapshot_prefix(tenant_a(), &slug, &version_1());
+        assert!(
+            prefix
+                .as_str()
+                .starts_with(TenantPaths::connector_snapshots_prefix(tenant_a(), &slug).as_str())
+        );
+        let usage = vault.usage(&prefix).await.expect("usage");
+        assert_eq!(usage.object_count, 2);
+        assert_eq!(usage.total_bytes, 13);
     }
 
     #[tokio::test]

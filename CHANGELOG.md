@@ -233,6 +233,28 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* Per-query resource limits (ADR 0013, proposed; P52;
+  `platform_core::QueryLimits`, read by `platform-config`; each bounded,
+  and an invalid value refuses startup).
+  A query's scope runs in a fixed memory pool (`QUERY_MEMORY_MIB`) with
+  DataFusion's disk manager disabled, so a sort or aggregation that runs
+  out of memory fails instead of spilling decrypted rows to disk. A query
+  waits at most `QUERY_SLOT_WAIT_SECS` for a plaintext slot (503 with
+  `Retry-After`, distinct from the unwired 503) and holds plaintext within
+  `QUERY_TIMEOUT_SECS` (503). Before any key is released, the snapshot's
+  stored objects must fit `QUERY_MAX_INPUT_OBJECTS` and `DATASET_MAX_MIB`,
+  checked again while decrypting, and a manifest over 16 KiB fails closed
+  (502). Every Parquet footer must fit `QUERY_MAX_DECODED_ROWS` and
+  `QUERY_MAX_DECODED_MIB` before anything is decoded, and a result over
+  `QUERY_MAX_RESULT_ROWS` or `QUERY_MAX_RESULT_MIB` is refused, never
+  truncated. Size limits answer 422 and memory exhaustion is no longer
+  reported as the caller's SQL error (400). Each refusal is an
+  `engine.query` "denied" event naming the limit. A research query is
+  charged before all of them, so each costs a unit (P54 decides the
+  order). The slot is released and the decrypted blobs zeroized on every
+  way out, including the time limit, cancellation and a panic.
+  `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
+  the settings from configuration.
 * A revoke, top-up or budget read of a grant that is unknown or not the
   caller's is audited as `denied`: `tenant.provisioned` for a revoke and
   `research.budget` for the others, with the caller's tenant and the grant

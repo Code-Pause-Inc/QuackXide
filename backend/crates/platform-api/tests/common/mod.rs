@@ -36,7 +36,7 @@ use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
 };
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use sha2::Sha256;
 use tower::ServiceExt;
 
@@ -301,6 +301,7 @@ pub async fn research_app(
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         research.clone(),
         attestation,
@@ -463,6 +464,7 @@ pub fn upload_research_app(
         EngineSettings {
             zk: ZkMode::Enabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         research.clone(),
         dev_attestation(),
