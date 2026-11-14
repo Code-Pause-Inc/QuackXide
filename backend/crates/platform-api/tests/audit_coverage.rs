@@ -1327,6 +1327,68 @@ fn object_bytes(body: &[u8]) -> usize {
 }
 
 #[tokio::test]
+async fn dataset_listing_is_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = build_app(app_state(SECRET, vault.clone()));
+    let token = token_for(steward);
+    let cap = platform_api::MAX_LISTED_OBJECTS;
+    let version = common::next_version(None);
+
+    // Listings of no dataset, one, and one more than the cap.
+    let mut statuses = Vec::new();
+    for held in [0, 1, cap + 1] {
+        for i in 0..held {
+            let dataset = ConnectorSlug::new(&format!("upload_{i}")).expect("slug");
+            vault
+                .put(
+                    &TenantPaths::connector_manifest(steward, &dataset, &version),
+                    Bytes::from_static(b"sealed"),
+                )
+                .await
+                .expect("put");
+        }
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/api/v1/datasets",
+            &[bearer(&token)],
+            Vec::new(),
+        )
+        .await;
+        statuses.push(status);
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::UNPROCESSABLE_ENTITY
+        ]
+    );
+    for count in [0, 1] {
+        assert_tenant_event(
+            &capture,
+            "data.access",
+            "ok",
+            steward,
+            &format!("list_datasets count={count}"),
+        );
+    }
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        &format!(
+            "list_datasets datasets={} objects=0 exceeds cap={cap}",
+            cap + 1
+        ),
+    );
+}
+
+#[tokio::test]
 async fn connector_snapshot_commit_and_prune_are_audited() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();

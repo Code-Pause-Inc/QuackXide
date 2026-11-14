@@ -59,7 +59,9 @@ key that opens the data.
    non-extractable keys, AES-256-GCM). A steward uploads a research
    dataset as Parquet sealed in the browser to the steward's HPKE key
    (`PUT /api/v1/datasets/{dataset}`); each upload replaces the dataset's
-   snapshot, and its size is capped by `DATASET_MAX_MIB`. Connector
+   snapshot, and its size is capped by `DATASET_MAX_MIB`.
+   `GET /api/v1/datasets` lists the steward's stored datasets as
+   ciphertext: object ids and sizes, suite and upload time. Connector
    pipelines sync external sources into attested enclave memory, shape
    them into Parquet, and seal them to the tenant's HPKE key before
    anything persists.
@@ -181,13 +183,16 @@ sides of `RESEARCH_MIN_COHORT_SIZE`) as a steward's `health` dataset,
 publishes its catalog listing, and prints a token for the steward and one
 for a researcher.
 
-Terminal 2: put the two tokens in variables, then run the researcher's
-access request, the steward's approval and the researcher's query:
+Terminal 2: put the two tokens in variables, list the steward's datasets
+as stored (the `health` snapshot's version, object ids, ciphertext size,
+suite and write time), then run the researcher's access request, the
+steward's approval and the researcher's query:
 
 ```sh
 S_TOKEN='<steward token>'
 R_TOKEN='<researcher token>'
 API=http://127.0.0.1:8080
+curl -s "$API/api/v1/datasets" -H "Authorization: Bearer $S_TOKEN"
 CATALOG=$(curl -s "$API/api/v1/catalog" -H "Authorization: Bearer $R_TOKEN")
 LISTING=$(echo "$CATALOG" | sed -E 's/.*"listing_id":"([^"]+)".*/\1/')
 STEWARD=$(echo "$CATALOG" | sed -E 's/.*"steward_tenant":"([^"]+)".*/\1/')

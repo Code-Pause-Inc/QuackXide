@@ -211,6 +211,12 @@ impl TenantPaths {
         VaultPath(format!("tenants/{tenant}/connectors/{connector}"))
     }
 
+    /// Every research dataset of one tenant, connectors' and uploads' alike
+    /// (the steward's dataset listing).
+    pub fn connectors_root(tenant: TenantId) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/connectors"))
+    }
+
     /// Control-plane provisioning marker. Lives outside the tenant's data
     /// prefix, so it never counts toward usage and no tenant-scoped
     /// operation reaches it.
@@ -279,6 +285,19 @@ impl TenantPaths {
             .strip_suffix(".json")?
             .parse()
             .ok()
+    }
+
+    /// The dataset a path under [`connectors_root`](Self::connectors_root)
+    /// belongs to; `None` if the path is outside it or its dataset segment
+    /// is not a slug.
+    pub fn connector_of(tenant: TenantId, path: &VaultPath) -> Option<ConnectorSlug> {
+        let root = Self::connectors_root(tenant);
+        let (connector, _) = path
+            .as_str()
+            .strip_prefix(root.as_str())?
+            .strip_prefix('/')?
+            .split_once('/')?;
+        ConnectorSlug::new(connector).ok()
     }
 }
 
@@ -764,6 +783,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_dataset_path_names_its_dataset_and_tenant() {
+        let slug = ConnectorSlug::new("upload_cohorts").expect("valid slug");
+        let root = TenantPaths::connectors_root(tenant_a());
+        for path in [
+            TenantPaths::connector_snapshot_object(tenant_a(), &slug, &version_1(), object_1()),
+            TenantPaths::connector_record(tenant_a(), &slug, &version_1()),
+            TenantPaths::connector_manifest(tenant_a(), &slug, &version_1()),
+        ] {
+            assert!(path.as_str().starts_with(&format!("{root}/")), "{path}");
+            assert_eq!(
+                TenantPaths::connector_of(tenant_a(), &path),
+                Some(slug.clone()),
+                "{path}"
+            );
+            assert_eq!(TenantPaths::connector_of(tenant_b(), &path), None, "{path}");
+        }
+        let a = tenant_a();
+        for outside in [
+            TenantPaths::connectors_root(a),
+            TenantPaths::connector_prefix(a, &slug),
+            TenantPaths::drive_manifest(a, object_1()),
+            TenantPaths::tenant_enrollment(a),
+            VaultPath(format!(
+                "tenants/{a}/connectors/Upload_Cohorts/records/x.json"
+            )),
+            VaultPath(format!("tenants/{a}/connectors//records/x.json")),
+            VaultPath(format!("tenants/{a}/connectorsx/{slug}/records/x.json")),
+        ] {
+            assert_eq!(TenantPaths::connector_of(a, &outside), None, "{outside}");
+        }
+    }
+
     fn upload_record() -> SnapshotRecord {
         use platform_core::{ColumnType, DeclaredColumn};
         SnapshotRecord {
@@ -1055,6 +1107,28 @@ mod tests {
             .expect("list b");
         assert_eq!(b_list.len(), 1);
         assert_eq!(b_list[0], b_path);
+
+        // So is a tenant's dataset listing.
+        let slug = ConnectorSlug::new("upload_cohorts").expect("slug");
+        for tenant in [tenant_a(), tenant_b()] {
+            let record = TenantPaths::connector_record(tenant, &slug, &version_1());
+            vault
+                .put(&record, Bytes::from_static(b"{}"))
+                .await
+                .expect("put record");
+        }
+        let a_datasets = vault
+            .list(&TenantPaths::connectors_root(tenant_a()))
+            .await
+            .expect("list a datasets");
+        assert_eq!(
+            a_datasets,
+            vec![TenantPaths::connector_record(
+                tenant_a(),
+                &slug,
+                &version_1()
+            )]
+        );
     }
 
     /// A fresh directory for one test; the caller removes it.

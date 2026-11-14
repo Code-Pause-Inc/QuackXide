@@ -93,12 +93,13 @@ pub struct ManifestBody {
     pub created_at_iso: String,
 }
 
-/// Most drive objects one listing returns. With more, the listing is
-/// refused rather than cut short: v1 has no pagination, and a partial list
-/// would look like missing files.
+/// Most entries one listing returns: drive objects, or research datasets
+/// and, across them, the objects of their current snapshots. With more, the
+/// listing is refused rather than cut short: v1 has no pagination, and a
+/// partial list would look like missing files.
 pub const MAX_LISTED_OBJECTS: usize = 1000;
-/// Manifest reads one listing runs at a time.
-const LIST_READ_CONCURRENCY: usize = 16;
+/// Reads one listing runs at a time: drive manifests, or dataset records.
+pub(crate) const LIST_READ_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Serialize)]
 struct ListEntry {
@@ -137,7 +138,8 @@ pub enum ApiError {
     /// Research query refused: the grant's query budget is spent. The
     /// steward can restore access with a top-up.
     BudgetExhausted,
-    /// The drive holds more than [`MAX_LISTED_OBJECTS`] objects (422).
+    /// A listing would return more than [`MAX_LISTED_OBJECTS`] drive
+    /// objects, datasets, or dataset objects (422).
     ListTooLarge,
     /// A dataset upload over the dataset size limit (413).
     PayloadTooLarge,
@@ -471,9 +473,11 @@ fn routes(state: AppState) -> Router {
         )
         .layer(tenant_auth());
 
-    // Steward uploads need only the vault and the configuration, so they
-    // work where research queries are not configured.
+    // Steward uploads and the dataset listing need only the vault and the
+    // configuration, so they work where research queries are not
+    // configured.
     let datasets = Router::new()
+        .route("/", get(datasets::list_datasets))
         .route("/{dataset}", put(datasets::put_dataset))
         .layer(DefaultBodyLimit::max(datasets::body_limit(&state.config)))
         .layer(tenant_auth());

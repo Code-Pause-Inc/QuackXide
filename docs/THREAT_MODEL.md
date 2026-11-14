@@ -218,8 +218,11 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   delete the newest manifest so queries read an older one, and can rewrite
   the plaintext record, which makes queries fail but opens nothing. For
   uploads the API cannot check that the browser-sealed manifest lists what
-  it stored; a manifest that names a missing object fails closed. Closing
-  this needs an enclave signing key bound to attestation.
+  it stored; a manifest that names a missing object fails closed. The
+  steward's dataset listing (`GET /api/v1/datasets`) reports storage as
+  it finds it, so it shows a forged snapshot, a rollback or a rewritten
+  record's suite as the current state. Closing this needs an enclave
+  signing key bound to attestation.
 * **The key project's administrator.** Whoever administers the KMS key
   project can add an image digest to the release policy, and that image
   can then decrypt. This is the maintainer; changes are audited (P77),

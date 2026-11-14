@@ -208,10 +208,23 @@ header: version, obj, row cap,
   a suite this build does not read (502).
 * **Catalog registration.** A steward can publish a listing only for a
   dataset it holds, one with a committed snapshot ("Research access").
+* **Listing.** `GET /api/v1/datasets` lists every dataset the caller's
+  tenant holds, connectors' and uploads' alike: exactly the ones it may
+  publish (`platform_connectors::snapshot::held_datasets` decides "holds"
+  with the same function as `holds`). Each entry describes the current
+  snapshot only, from storage and the plaintext record, opening nothing:
+  its version and write time, the ids, count and total ciphertext bytes
+  of the objects stored at that version, and the suite the record names
+  (`null` if the record is missing, malformed or names a suite this build
+  does not read). Superseded snapshots and uploads that have not
+  committed are not counted. More than 1000 datasets
+  (`MAX_LISTED_OBJECTS`), or objects across them, is refused with 422
+  rather than listed in part, and a storage failure is an error (503 or
+  502), never an empty list. Each listing is a `data.access` event.
 
-The route needs only the vault and the configuration, so it works where
-the query service is not configured. The browser half (sealing and the
-upload form) is not built yet (P40).
+Both routes need only the vault and the configuration, so they work
+where the query service is not configured. The browser half (sealing and
+the upload form) is not built yet (P40).
 
 The operator can see the tenant id, the dataset name, the object id, the
 snapshot versions and their times, ciphertext lengths, the suite, and the
@@ -495,7 +508,8 @@ publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
-its tenant (`platform_connectors::snapshot::holds`). Researchers file
+its tenant (`platform_connectors::snapshot::holds`), so the steward's
+dataset listing (section 2) shows exactly what it can publish. Researchers file
 access requests (idempotent while pending); approval mints the grant through the same code path as a direct
 grant. The approval is recorded first, with its query budget, so a failure
 partway leaves an approved request without a usable grant, never a grant
@@ -675,7 +689,8 @@ Rules, enforced by the capture tests:
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
    query refusals by each kind of resource limit (denied), provisioning,
-   steward uploads (ok, committed, pruned, denied),
+   steward uploads (ok, committed, pruned, denied), the dataset listing
+   (ok + denied over its cap),
    connector snapshot commit and prune, the research catalog (ok +
    denied): publish and its refusal, request, approval and its retry, deny,
    and the refused retry and deny, and research grants and budgets (ok +
