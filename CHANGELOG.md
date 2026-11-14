@@ -233,6 +233,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* A revoke, top-up or budget read of a grant that is unknown or not the
+  caller's is audited as `denied`: `tenant.provisioned` for a revoke and
+  `research.budget` for the others, with the caller's tenant and the grant
+  id (`grant=malformed` when the path segment is not an id). The 404 is
+  unchanged and the same in both cases. Grant events stay under
+  `tenant.provisioned` (`docs/ARCHITECTURE.md`), and `audit_coverage.rs`
+  now covers grants and budgets.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is
