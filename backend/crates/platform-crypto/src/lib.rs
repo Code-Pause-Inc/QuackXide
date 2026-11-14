@@ -426,6 +426,12 @@ impl TenantPublicKey {
             PublicKeyInner::Hpk2(pk) => pk.to_bytes().to_vec(),
         }
     }
+
+    /// The suite magic, then the raw key: how a bound key names its suite
+    /// (ADR 0010 "Binding v2", `request-key`).
+    pub fn to_framed(&self) -> Vec<u8> {
+        [&self.suite().magic()[..], &self.to_raw()].concat()
+    }
 }
 
 impl std::fmt::Debug for TenantPublicKey {
@@ -1072,6 +1078,17 @@ mod tests {
         let mut relabelled = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"").expect("seal");
         relabelled[..4].copy_from_slice(b"HPK2");
         assert!(check_envelope_frame(&relabelled).is_err());
+    }
+
+    #[test]
+    fn a_framed_public_key_is_its_magic_then_its_raw_bytes() {
+        for suite in SUITES {
+            let key = TenantKeypair::generate(suite).public_key();
+            assert_eq!(
+                key.to_framed(),
+                [&suite.magic()[..], &key.to_raw()].concat()
+            );
+        }
     }
 
     #[test]

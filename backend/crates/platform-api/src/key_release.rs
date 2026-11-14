@@ -54,7 +54,7 @@ impl EnclaveIdentity {
         let public = request.public_key();
         let verifying = signing.verifying_keys();
         let binding = EnclaveKeyBinding {
-            request_key: [&public.suite().magic()[..], &public.to_raw()].concat(),
+            request_key: public.to_framed(),
             signing_ed25519: verifying.ed25519_bytes(),
             signing_ml_dsa_65: verifying.ml_dsa_65_bytes(),
             kms_public_key: Vec::new(),
@@ -248,7 +248,7 @@ mod tests {
         let identity = EnclaveIdentity::generate();
         let key = identity.request_public_key();
         assert_eq!(key.suite(), EnvelopeSuite::CURRENT);
-        let framed = [&key.suite().magic()[..], &key.to_raw()].concat();
+        let framed = key.to_framed();
         assert_eq!(identity.binding().request_key, framed);
     }
 

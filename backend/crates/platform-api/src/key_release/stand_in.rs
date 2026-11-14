@@ -364,7 +364,7 @@ impl KeyReleaseRelyingParty {
 
         // Recompute the binding the token's nonces must carry.
         let expected_binding = EnclaveKeyBinding {
-            request_key: [&request_key.suite().magic()[..], &request_key.to_raw()].concat(),
+            request_key: request_key.to_framed(),
             signing_ed25519: signing_keys.ed25519_bytes(),
             signing_ml_dsa_65: signing_keys.ml_dsa_65_bytes(),
             kms_public_key: Vec::new(),
