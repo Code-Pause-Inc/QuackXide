@@ -160,6 +160,19 @@ impl TenantPaths {
         VaultPath(format!("tenants/{tenant}/connectors/{connector}/snapshots"))
     }
 
+    /// Every object stored at one snapshot `version`, whether or not its
+    /// manifest lists it (a query sizes its input from this before any key
+    /// is released).
+    pub fn connector_snapshot_prefix(
+        tenant: TenantId,
+        connector: &ConnectorSlug,
+        version: &SnapshotVersion,
+    ) -> VaultPath {
+        VaultPath(format!(
+            "tenants/{tenant}/connectors/{connector}/snapshots/{version}"
+        ))
+    }
+
     /// The sealed manifest that commits a snapshot, written last.
     pub fn connector_manifest(
         tenant: TenantId,
@@ -196,6 +209,12 @@ impl TenantPaths {
     /// Prefix of all objects for one tenant-connector pair (query listing).
     pub fn connector_prefix(tenant: TenantId, connector: &ConnectorSlug) -> VaultPath {
         VaultPath(format!("tenants/{tenant}/connectors/{connector}"))
+    }
+
+    /// Every research dataset of one tenant, connectors' and uploads' alike
+    /// (the steward's dataset listing).
+    pub fn connectors_root(tenant: TenantId) -> VaultPath {
+        VaultPath(format!("tenants/{tenant}/connectors"))
     }
 
     /// Control-plane provisioning marker. Lives outside the tenant's data
@@ -266,6 +285,19 @@ impl TenantPaths {
             .strip_suffix(".json")?
             .parse()
             .ok()
+    }
+
+    /// The dataset a path under [`connectors_root`](Self::connectors_root)
+    /// belongs to; `None` if the path is outside it or its dataset segment
+    /// is not a slug.
+    pub fn connector_of(tenant: TenantId, path: &VaultPath) -> Option<ConnectorSlug> {
+        let root = Self::connectors_root(tenant);
+        let (connector, _) = path
+            .as_str()
+            .strip_prefix(root.as_str())?
+            .strip_prefix('/')?
+            .split_once('/')?;
+        ConnectorSlug::new(connector).ok()
     }
 }
 
@@ -751,6 +783,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_dataset_path_names_its_dataset_and_tenant() {
+        let slug = ConnectorSlug::new("upload_cohorts").expect("valid slug");
+        let root = TenantPaths::connectors_root(tenant_a());
+        for path in [
+            TenantPaths::connector_snapshot_object(tenant_a(), &slug, &version_1(), object_1()),
+            TenantPaths::connector_record(tenant_a(), &slug, &version_1()),
+            TenantPaths::connector_manifest(tenant_a(), &slug, &version_1()),
+        ] {
+            assert!(path.as_str().starts_with(&format!("{root}/")), "{path}");
+            assert_eq!(
+                TenantPaths::connector_of(tenant_a(), &path),
+                Some(slug.clone()),
+                "{path}"
+            );
+            assert_eq!(TenantPaths::connector_of(tenant_b(), &path), None, "{path}");
+        }
+        let a = tenant_a();
+        for outside in [
+            TenantPaths::connectors_root(a),
+            TenantPaths::connector_prefix(a, &slug),
+            TenantPaths::drive_manifest(a, object_1()),
+            TenantPaths::tenant_enrollment(a),
+            VaultPath(format!(
+                "tenants/{a}/connectors/Upload_Cohorts/records/x.json"
+            )),
+            VaultPath(format!("tenants/{a}/connectors//records/x.json")),
+            VaultPath(format!("tenants/{a}/connectorsx/{slug}/records/x.json")),
+        ] {
+            assert_eq!(TenantPaths::connector_of(a, &outside), None, "{outside}");
+        }
+    }
+
     fn upload_record() -> SnapshotRecord {
         use platform_core::{ColumnType, DeclaredColumn};
         SnapshotRecord {
@@ -986,6 +1051,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_snapshot_version_is_sized_alone() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let slug = ConnectorSlug::new("quickbooks").expect("slug");
+        let version_2: SnapshotVersion = "00000000000000000002-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("version");
+        for (version, bytes) in [
+            (version_1(), &b"0123456789"[..]),
+            (version_1(), &b"abc"[..]),
+            (version_2.clone(), &b"not this one"[..]),
+        ] {
+            let object = ObjectId::generate();
+            let path = TenantPaths::connector_snapshot_object(tenant_a(), &slug, &version, object);
+            vault
+                .put(&path, Bytes::copy_from_slice(bytes))
+                .await
+                .expect("put");
+        }
+        let prefix = TenantPaths::connector_snapshot_prefix(tenant_a(), &slug, &version_1());
+        assert!(
+            prefix
+                .as_str()
+                .starts_with(TenantPaths::connector_snapshots_prefix(tenant_a(), &slug).as_str())
+        );
+        let usage = vault.usage(&prefix).await.expect("usage");
+        assert_eq!(usage.object_count, 2);
+        assert_eq!(usage.total_bytes, 13);
+    }
+
+    #[tokio::test]
     async fn listing_is_isolated_per_tenant_prefix() {
         let vault = ObjectStoreVault::new_in_memory();
         let a_path = TenantPaths::drive_manifest(tenant_a(), object_1());
@@ -1012,6 +1107,28 @@ mod tests {
             .expect("list b");
         assert_eq!(b_list.len(), 1);
         assert_eq!(b_list[0], b_path);
+
+        // So is a tenant's dataset listing.
+        let slug = ConnectorSlug::new("upload_cohorts").expect("slug");
+        for tenant in [tenant_a(), tenant_b()] {
+            let record = TenantPaths::connector_record(tenant, &slug, &version_1());
+            vault
+                .put(&record, Bytes::from_static(b"{}"))
+                .await
+                .expect("put record");
+        }
+        let a_datasets = vault
+            .list(&TenantPaths::connectors_root(tenant_a()))
+            .await
+            .expect("list a datasets");
+        assert_eq!(
+            a_datasets,
+            vec![TenantPaths::connector_record(
+                tenant_a(),
+                &slug,
+                &version_1()
+            )]
+        );
     }
 
     /// A fresh directory for one test; the caller removes it.

@@ -21,7 +21,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
-use platform_core::{ConnectorSlug, ObjectId, SecretString, TenantId};
+use platform_core::{ConnectorSlug, ObjectId, QueryLimit, SecretString, TenantId};
 use platform_storage::{StorageError, TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
@@ -93,12 +93,13 @@ pub struct ManifestBody {
     pub created_at_iso: String,
 }
 
-/// Most drive objects one listing returns. With more, the listing is
-/// refused rather than cut short: v1 has no pagination, and a partial list
-/// would look like missing files.
+/// Most entries one listing returns: drive objects, or research datasets
+/// and, across them, the objects of their current snapshots. With more, the
+/// listing is refused rather than cut short: v1 has no pagination, and a
+/// partial list would look like missing files.
 pub const MAX_LISTED_OBJECTS: usize = 1000;
-/// Manifest reads one listing runs at a time.
-const LIST_READ_CONCURRENCY: usize = 16;
+/// Reads one listing runs at a time: drive manifests, or dataset records.
+pub(crate) const LIST_READ_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Serialize)]
 struct ListEntry {
@@ -137,7 +138,8 @@ pub enum ApiError {
     /// Research query refused: the grant's query budget is spent. The
     /// steward can restore access with a top-up.
     BudgetExhausted,
-    /// The drive holds more than [`MAX_LISTED_OBJECTS`] objects (422).
+    /// A listing would return more than [`MAX_LISTED_OBJECTS`] drive
+    /// objects, datasets, or dataset objects (422).
     ListTooLarge,
     /// A dataset upload over the dataset size limit (413).
     PayloadTooLarge,
@@ -153,11 +155,19 @@ pub enum ApiError {
     /// The decrypted dataset does not match the schema or row cap its
     /// steward declared, so the query does not run (502).
     DatasetMismatch,
+    /// A query exceeded one of its resource limits (`QueryLimits`): no
+    /// free plaintext slot within the wait (503 with `Retry-After`), the
+    /// time limit (503), or a size limit on its input, decoding, memory or
+    /// result (422). Never reported as the caller's SQL error.
+    QueryLimit(QueryLimit),
 }
 
 /// `Retry-After` on a transient storage failure. The storage client has
 /// already retried before the error reached the API.
 pub const STORAGE_RETRY_AFTER_SECS: u32 = 5;
+
+/// `Retry-After` when no plaintext slot came free within the wait.
+pub const QUERY_BUSY_RETRY_AFTER_SECS: u32 = 5;
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
@@ -195,7 +205,41 @@ impl ApiError {
             ApiError::SchemaMismatch => "schema_mismatch",
             ApiError::StaleSnapshot => "stale_snapshot",
             ApiError::DatasetMismatch => "dataset_mismatch",
+            ApiError::QueryLimit(QueryLimit::SlotWait) => "query_busy",
+            ApiError::QueryLimit(QueryLimit::Time) => "query_timed_out",
+            ApiError::QueryLimit(_) => "query_limit",
         }
+    }
+}
+
+/// Status and fixed message of a resource-limit refusal.
+fn query_limit_response(limit: QueryLimit) -> (StatusCode, &'static str) {
+    use StatusCode as S;
+    match limit {
+        QueryLimit::SlotWait => (
+            S::SERVICE_UNAVAILABLE,
+            "confidential query capacity is busy; retry later",
+        ),
+        QueryLimit::Time => (S::SERVICE_UNAVAILABLE, "query exceeded its time limit"),
+        QueryLimit::InputBytes => (
+            S::UNPROCESSABLE_ENTITY,
+            "dataset exceeds the query input size limit",
+        ),
+        QueryLimit::InputObjects => (
+            S::UNPROCESSABLE_ENTITY,
+            "dataset exceeds the query input object limit",
+        ),
+        QueryLimit::DecodedRows => (
+            S::UNPROCESSABLE_ENTITY,
+            "dataset exceeds the query decoded row limit",
+        ),
+        QueryLimit::DecodedBytes => (
+            S::UNPROCESSABLE_ENTITY,
+            "dataset exceeds the query decoded size limit",
+        ),
+        QueryLimit::Memory => (S::UNPROCESSABLE_ENTITY, "query exceeds its memory limit"),
+        QueryLimit::ResultRows => (S::UNPROCESSABLE_ENTITY, "result exceeds the row limit"),
+        QueryLimit::ResultBytes => (S::UNPROCESSABLE_ENTITY, "result exceeds the size limit"),
     }
 }
 
@@ -262,16 +306,19 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_GATEWAY,
                 "stored dataset does not match its declared schema or row cap",
             ),
+            ApiError::QueryLimit(limit) => query_limit_response(limit),
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
-        if matches!(kind, "storage_unavailable") {
+        let retry_after = match kind {
+            "storage_unavailable" => Some(STORAGE_RETRY_AFTER_SECS),
+            "query_busy" => Some(QUERY_BUSY_RETRY_AFTER_SECS),
+            _ => None,
+        };
+        if let Some(secs) = retry_after {
             response.headers_mut().insert(
                 header::RETRY_AFTER,
-                STORAGE_RETRY_AFTER_SECS
-                    .to_string()
-                    .parse()
-                    .expect("digits"),
+                secs.to_string().parse().expect("digits"),
             );
         }
         if matches!(status, StatusCode::UNAUTHORIZED) {
@@ -426,9 +473,11 @@ fn routes(state: AppState) -> Router {
         )
         .layer(tenant_auth());
 
-    // Steward uploads need only the vault and the configuration, so they
-    // work where research queries are not configured.
+    // Steward uploads and the dataset listing need only the vault and the
+    // configuration, so they work where research queries are not
+    // configured.
     let datasets = Router::new()
+        .route("/", get(datasets::list_datasets))
         .route("/{dataset}", put(datasets::put_dataset))
         .layer(DefaultBodyLimit::max(datasets::body_limit(&state.config)))
         .layer(tenant_auth());

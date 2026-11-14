@@ -1,6 +1,8 @@
 //! DEV ONLY (feature `dev`): the research wiring shared by the `devstack`
-//! server and the API integration tests, so the two cannot drift apart, and
-//! the checks a dev-only server runs before it starts.
+//! server and the API integration tests, so the two cannot drift apart; the
+//! steward upload sealing shared by the `seal-upload` tool and the tests,
+//! which seals as the browser does; and the checks a dev-only server runs
+//! before it starts.
 //!
 //! Nothing here is confidential. The vault is in memory, tenant keys are held
 //! in process memory, and the grant, budget and catalog registries are in
@@ -14,11 +16,15 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use platform_config::PlatformConfig;
 use platform_connectors::pipeline::PipelineError;
-use platform_connectors::snapshot::SnapshotWriter;
-use platform_core::{ConnectorSlug, SnapshotVersion, TenantId};
-use platform_crypto::TenantKeypair;
+use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_info, object_info};
+use platform_connectors::upload::{UploadHeader, encode_upload_body};
+use platform_core::{
+    ConnectorSlug, DeclaredColumn, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
+};
+use platform_crypto::{TenantKeypair, TenantPublicKey, hpke_seal_to_tenant};
 use platform_enclave::AttestationProvider;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
@@ -26,6 +32,8 @@ use platform_enclave::simulated_token::{
 use platform_enclave::token::ReleasePolicy;
 use platform_storage::{ObjectStoreVault, VaultStore};
 use quackxide_engine::EngineSettings;
+use synth_data::{SchemaName, Spec};
+use zeroize::Zeroizing;
 
 use crate::key_release::{
     AttestedKeyProvider, EnclaveIdentity, InProcessKeyReleaseClient, KeyReleaseRelyingParty,
@@ -165,6 +173,100 @@ impl Default for DevResearchStack {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a steward's browser sends to upload one dataset
+/// (`PUT /api/v1/datasets/{dataset}`, ADR 0012): the body, and the version
+/// and object id it bound into the sealed manifest and object.
+#[derive(Debug, Clone)]
+pub struct SealedUpload {
+    pub version: SnapshotVersion,
+    pub object: ObjectId,
+    pub body: Vec<u8>,
+}
+
+/// Seals `parquet` and a manifest listing it to `key`, as the steward's
+/// browser does for `steward`'s upload of `dataset` at `version`, and frames
+/// them with a header declaring `schema` and `row_cap`. The object id is
+/// drawn here, as the browser draws it. Needs only the public key.
+pub fn seal_upload(
+    steward: TenantId,
+    key: &TenantPublicKey,
+    dataset: &ConnectorSlug,
+    version: SnapshotVersion,
+    parquet: &[u8],
+    schema: DeclaredSchema,
+    row_cap: u64,
+) -> anyhow::Result<SealedUpload> {
+    let object = ObjectId::generate();
+    let sealed = hpke_seal_to_tenant(key, &object_info(&steward, dataset, &object), parquet)?;
+    let manifest = serde_json::to_vec(&SnapshotManifest {
+        version: version.clone(),
+        objects: vec![object],
+    })?;
+    let manifest =
+        hpke_seal_to_tenant(key, &manifest_info(&steward, dataset, &version), &manifest)?;
+    let header = UploadHeader {
+        version: version.clone(),
+        object,
+        row_cap,
+        schema,
+    };
+    let body = encode_upload_body(&header, &manifest, &sealed)?;
+    Ok(SealedUpload {
+        version,
+        object,
+        body,
+    })
+}
+
+/// Seeds the cohort [`seal_cohort_upload`] seals, so every run uploads the
+/// same rows.
+const UPLOAD_COHORT_SEED: u64 = 7;
+
+/// A seeded synthetic cohort (`synth-data`'s `cohort` schema, with
+/// `synth_data::cohort::min_rows(k)` rows built around the threshold `k`, so
+/// groups fall on both sides of it), sealed by [`seal_upload`] as `steward`'s
+/// upload of `dataset` at the current time. The header declares the
+/// cohort's columns and its row count. This is the body `seal-upload` writes
+/// for `scripts/test-simulated-tee.sh`.
+pub fn seal_cohort_upload(
+    steward: TenantId,
+    key: &TenantPublicKey,
+    dataset: &ConnectorSlug,
+    k: usize,
+) -> anyhow::Result<SealedUpload> {
+    let rows = synth_data::cohort::min_rows(k);
+    let spec = Spec::new(SchemaName::Cohort, UPLOAD_COHORT_SEED, rows).with_k(k);
+    let parquet = Zeroizing::new(synth_data::parquet_bytes(&spec)?);
+    seal_upload(
+        steward,
+        key,
+        dataset,
+        SnapshotVersion::generate(),
+        &parquet,
+        declared_schema(SchemaName::Cohort)?,
+        u64::try_from(rows)?,
+    )
+}
+
+/// The schema a steward declares for a table of `schema`: each column's name
+/// and type family, in order.
+fn declared_schema(schema: SchemaName) -> anyhow::Result<DeclaredSchema> {
+    let columns = schema
+        .arrow_schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            let column_type = quackxide_engine::column_type_of(field.data_type())
+                .with_context(|| format!("column {} has no declared type family", field.name()))?;
+            Ok(DeclaredColumn {
+                name: field.name().clone(),
+                column_type,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(DeclaredSchema::new(columns)?)
 }
 
 /// Why a dev-only server refuses to start.

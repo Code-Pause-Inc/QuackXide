@@ -148,6 +148,19 @@ pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
     })
 }
 
+/// The query service's engine settings from `config`: the ZK default
+/// (`FEATURE_ZK_ENABLED`), the plaintext-slot count
+/// (`QUERY_MAX_CONCURRENT`) and the per-query limits (`QUERY_*`, with
+/// `DATASET_MAX_MIB` as the input cap). Every query service built from
+/// configuration takes its settings from here.
+pub fn engine_settings(config: &PlatformConfig) -> quackxide_engine::EngineSettings {
+    quackxide_engine::EngineSettings {
+        zk: config.features.zk,
+        max_concurrent_queries: config.enclave.query_max_concurrent,
+        limits: config.enclave.query_limits,
+    }
+}
+
 /// DEV ONLY: the query service on the simulated TEE's key-release stand-in
 /// at `url`, running research queries through `research`.
 #[cfg(feature = "dev")]
@@ -185,10 +198,7 @@ fn key_release_query_service(
         vault.clone(),
         keys,
         attestation,
-        quackxide_engine::EngineSettings {
-            zk: config.features.zk,
-            max_concurrent_queries: config.enclave.query_max_concurrent,
-        },
+        engine_settings(config),
         config.features.tee_attestation_required,
     )
     .with_enclave_identity(identity)

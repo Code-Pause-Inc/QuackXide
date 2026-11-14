@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # DEV ONLY. Images for the local simulated TEE stack
 # (docker-compose.simulated-tee.yml): platform-api, the key-release
-# stand-in for Cloud KMS and the simulated attestation service, built with
-# the `dev` feature. Never deploy them;
+# stand-in for Cloud KMS, the simulated attestation service and the
+# steward's browser stand-in that seals uploads, built with the `dev`
+# feature. Never deploy them;
 # the production workload image is P49's, in deploy/ (ADR 0004).
 
 # cargo-chef builds the dependencies in their own layer, keyed on the
@@ -27,10 +28,12 @@ RUN cargo build --release --locked -p platform-api --features dev \
         --bin platform-api \
         --bin key-release \
         --bin query-demo \
+        --bin seal-upload \
         --bin sim-attestation \
     && strip target/release/platform-api \
              target/release/key-release \
              target/release/query-demo \
+             target/release/seal-upload \
              target/release/sim-attestation
 
 # ── Target 1: simulated enclave workload (platform-api) ─────────────────────
@@ -79,3 +82,17 @@ COPY --from=builder /workspace/backend/target/release/sim-attestation /usr/local
 USER 65532:65532
 EXPOSE 8070
 ENTRYPOINT ["/usr/local/bin/sim-attestation"]
+
+# ── Target 4: the steward's browser, sealing an upload body (run on demand) ─
+FROM debian:bookworm-slim AS seal-upload
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --shell /usr/sbin/nologin --no-create-home nonroot
+
+COPY --from=builder /workspace/backend/target/release/seal-upload /usr/local/bin/seal-upload
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/seal-upload"]

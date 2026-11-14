@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use platform_core::{SecretString, ZkMode};
+use platform_core::{QueryLimits, SecretString, ZkMode};
 use zeroize::Zeroizing;
 
 /// Neutral fallback used until an operator sets `APP_PUBLIC_NAME`.
@@ -37,6 +37,10 @@ pub const DEFAULT_DATASET_MAX_MIB: u64 = 64;
 /// memory, and a query holds the decrypted dataset beside its ciphertext.
 pub const MAX_DATASET_MAX_MIB: u64 = 512;
 const MIB: u64 = 1024 * 1024;
+
+/// Largest `QUERY_MAX_INPUT_OBJECTS` accepted. A sealed manifest listing
+/// this many objects stays under the upload route's manifest bound.
+pub const MAX_QUERY_MAX_INPUT_OBJECTS: u64 = 256;
 
 /// Deployment mode, from `APP_ENV` (ADR 0009). Unset or any value other
 /// than `development` means production: development paths must be asked
@@ -119,6 +123,16 @@ pub struct EnclaveConfig {
     /// `QUERY_MAX_CONCURRENT` — maximum concurrent queries holding decrypted
     /// plaintext in enclave RAM (`1..=64`, default `4`).
     pub query_max_concurrent: usize,
+    /// Per-query resource limits, each bounded, defaults from
+    /// `QueryLimits::default`: `QUERY_SLOT_WAIT_SECS` (`0..=120`, default
+    /// `10`), `QUERY_TIMEOUT_SECS` (`1..=600`, `60`), `QUERY_MEMORY_MIB`
+    /// (`1..=16384`, `256`), `QUERY_MAX_INPUT_OBJECTS` (`1..=256`, `64`),
+    /// `QUERY_MAX_DECODED_ROWS` (`1..=1000000000`, `10000000`),
+    /// `QUERY_MAX_DECODED_MIB` (`1..=65536`, `1024`), `QUERY_MAX_RESULT_ROWS`
+    /// (`1..=1000000`, `10000`) and `QUERY_MAX_RESULT_MIB` (`1..=256`, `4`).
+    /// The cap on decrypted input is `DATASET_MAX_MIB`, the largest upload
+    /// (ADR 0012).
+    pub query_limits: QueryLimits,
     /// `SIM_ATTESTATION_URL` — the simulated attestation service. Dev only;
     /// `platform_enclave::provider_for` reads the same key.
     pub sim_attestation_url: Option<String>,
@@ -178,7 +192,8 @@ pub struct ResearchConfig {
 pub struct DatasetConfig {
     /// `DATASET_MAX_MIB` (1..=512, default 64), in bytes here: the largest
     /// dataset a steward may upload, counted in sealed (ciphertext) bytes.
-    /// The upload route refuses anything larger with 413.
+    /// The upload route refuses anything larger with 413, and a query
+    /// decrypts no more than this (`QueryLimits::max_input_bytes`).
     pub max_bytes: u64,
 }
 
@@ -516,6 +531,7 @@ impl PlatformConfig {
         let enclave = EnclaveConfig {
             key_release_url: get_nonempty(&get, "KEY_RELEASE_URL"),
             query_max_concurrent: raw_max_concurrent as usize,
+            query_limits: query_limits(&get, &datasets)?,
             sim_attestation_url: get_nonempty(&get, "SIM_ATTESTATION_URL"),
         };
 
@@ -541,6 +557,51 @@ impl PlatformConfig {
             features,
         })
     }
+}
+
+/// The per-query limits (`EnclaveConfig::query_limits`). Each key is bounded
+/// and defaults to `QueryLimits::default`; the decrypted-input cap is the
+/// upload limit, so every dataset an upload stores can be queried.
+fn query_limits(
+    get: &impl Fn(&str) -> Option<String>,
+    datasets: &DatasetConfig,
+) -> Result<QueryLimits, ConfigError> {
+    let defaults = QueryLimits::default();
+    let secs = |key, default: Duration, range| {
+        parse_bounded(get, key, default.as_secs(), range).map(Duration::from_secs)
+    };
+    let mib =
+        |key, default: u64, range| parse_bounded(get, key, default / MIB, range).map(|v| v * MIB);
+    Ok(QueryLimits {
+        slot_wait: secs("QUERY_SLOT_WAIT_SECS", defaults.slot_wait, 0..=120)?,
+        timeout: secs("QUERY_TIMEOUT_SECS", defaults.timeout, 1..=600)?,
+        memory_bytes: mib("QUERY_MEMORY_MIB", defaults.memory_bytes, 1..=16_384)?,
+        max_input_bytes: datasets.max_bytes,
+        max_input_objects: parse_bounded(
+            get,
+            "QUERY_MAX_INPUT_OBJECTS",
+            defaults.max_input_objects,
+            1..=MAX_QUERY_MAX_INPUT_OBJECTS,
+        )?,
+        max_decoded_rows: parse_bounded(
+            get,
+            "QUERY_MAX_DECODED_ROWS",
+            defaults.max_decoded_rows,
+            1..=1_000_000_000,
+        )?,
+        max_decoded_bytes: mib(
+            "QUERY_MAX_DECODED_MIB",
+            defaults.max_decoded_bytes,
+            1..=65_536,
+        )?,
+        max_result_rows: parse_bounded(
+            get,
+            "QUERY_MAX_RESULT_ROWS",
+            defaults.max_result_rows,
+            1..=1_000_000,
+        )?,
+        max_result_bytes: mib("QUERY_MAX_RESULT_MIB", defaults.max_result_bytes, 1..=256)?,
+    })
 }
 
 fn get_or(get: &impl Fn(&str) -> Option<String>, key: &str, default: &str) -> String {
@@ -909,6 +970,79 @@ mod tests {
                     })
                 ),
                 "DATASET_MAX_MIB={invalid} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn query_limits_default_to_the_core_defaults_and_the_upload_limit() {
+        let cfg = PlatformConfig::from_source(source(&[])).expect("defaults");
+        assert_eq!(cfg.enclave.query_limits, QueryLimits::default());
+        assert_eq!(
+            cfg.enclave.query_limits.max_input_bytes,
+            cfg.datasets.max_bytes
+        );
+
+        // The input cap follows the upload limit: no upload is unqueryable.
+        let cfg =
+            PlatformConfig::from_source(source(&[("DATASET_MAX_MIB", "200")])).expect("in range");
+        assert_eq!(cfg.enclave.query_limits.max_input_bytes, 200 * MIB);
+    }
+
+    #[test]
+    fn query_limits_are_read_and_bounded_and_fail_closed() {
+        let cfg = PlatformConfig::from_source(source(&[
+            ("QUERY_SLOT_WAIT_SECS", "0"),
+            ("QUERY_TIMEOUT_SECS", "600"),
+            ("QUERY_MEMORY_MIB", "1"),
+            ("QUERY_MAX_INPUT_OBJECTS", "256"),
+            ("QUERY_MAX_DECODED_ROWS", "1000"),
+            ("QUERY_MAX_DECODED_MIB", "2"),
+            ("QUERY_MAX_RESULT_ROWS", "50"),
+            ("QUERY_MAX_RESULT_MIB", "3"),
+        ]))
+        .expect("valid limits");
+        assert_eq!(
+            cfg.enclave.query_limits,
+            QueryLimits {
+                slot_wait: Duration::ZERO,
+                timeout: Duration::from_secs(600),
+                memory_bytes: MIB,
+                max_input_bytes: DEFAULT_DATASET_MAX_MIB * MIB,
+                max_input_objects: 256,
+                max_decoded_rows: 1000,
+                max_decoded_bytes: 2 * MIB,
+                max_result_rows: 50,
+                max_result_bytes: 3 * MIB,
+            }
+        );
+
+        for (key, value) in [
+            ("QUERY_SLOT_WAIT_SECS", "121"),
+            ("QUERY_SLOT_WAIT_SECS", "-1"),
+            ("QUERY_TIMEOUT_SECS", "0"),
+            ("QUERY_TIMEOUT_SECS", "601"),
+            ("QUERY_TIMEOUT_SECS", "1m"),
+            ("QUERY_MEMORY_MIB", "0"),
+            ("QUERY_MEMORY_MIB", "16385"),
+            ("QUERY_MAX_INPUT_OBJECTS", "0"),
+            ("QUERY_MAX_INPUT_OBJECTS", "257"),
+            ("QUERY_MAX_DECODED_ROWS", "0"),
+            ("QUERY_MAX_DECODED_ROWS", "1000000001"),
+            ("QUERY_MAX_DECODED_MIB", "0"),
+            ("QUERY_MAX_DECODED_MIB", "65537"),
+            ("QUERY_MAX_RESULT_ROWS", "0"),
+            ("QUERY_MAX_RESULT_ROWS", "1000001"),
+            ("QUERY_MAX_RESULT_MIB", "0"),
+            ("QUERY_MAX_RESULT_MIB", "257"),
+            ("QUERY_MAX_RESULT_MIB", "lots"),
+        ] {
+            assert!(
+                matches!(
+                    PlatformConfig::from_source(source(&[(key, value)])),
+                    Err(ConfigError::Invalid { key: k, .. }) if k == key
+                ),
+                "{key}={value} must be refused"
             );
         }
     }

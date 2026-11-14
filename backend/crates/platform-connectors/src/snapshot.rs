@@ -15,18 +15,25 @@
 //! wrote a dataset follows from its slug ([`DatasetKind`]), and fixes the
 //! `info` string its objects open under ([`object_info`]).
 //!
+//! Readers find the current snapshot from manifest paths alone, without
+//! opening anything: [`holds`] for one dataset and [`held_datasets`] for
+//! every dataset of a tenant decide it with one function, and
+//! [`recorded_suite`] reads a snapshot's plaintext record.
+//!
 //! The manifest is sealed to the tenant and bound to tenant, dataset and
 //! version, so it cannot be moved between them. HPKE seals to a public key,
 //! so this binds but does not authenticate: an operator holding the
 //! tenant's public key can still forge a whole snapshot, as with any
 //! connector object (`docs/THREAT_MODEL.md`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use platform_core::{ConnectorSlug, DatasetKind, ObjectId, SnapshotVersion, TenantId};
 use platform_crypto::{EnvelopeSuite, TenantPublicKey, hpke_seal_to_tenant};
-use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
+use platform_storage::{
+    SnapshotRecord, StorageError, TenantPaths, VaultEntry, VaultPath, VaultStore,
+};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +67,24 @@ pub fn object_info(tenant: &TenantId, slug: &ConnectorSlug, object: &ObjectId) -
     }
 }
 
+/// The newest committed snapshot of `tenant`'s `slug` among `paths`: the
+/// newest version with a manifest there, and that manifest's path. Paths
+/// that are not one of its manifests are ignored. [`newest_manifest`], and
+/// through it [`holds`], and [`held_datasets`] all decide with this, so the
+/// dataset listing and "holds" cannot disagree.
+fn newest_committed<'a>(
+    tenant: TenantId,
+    slug: &ConnectorSlug,
+    paths: impl IntoIterator<Item = &'a VaultPath>,
+) -> Option<(SnapshotVersion, &'a VaultPath)> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            TenantPaths::connector_manifest_version(tenant, slug, path).map(|v| (v, path))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+}
+
 /// The newest committed snapshot of `tenant`'s `slug`: its version and the
 /// path of its manifest, found from the manifest paths alone (nothing is
 /// opened). `None` if no snapshot was ever committed.
@@ -71,24 +96,112 @@ pub async fn newest_manifest(
     let manifests = vault
         .list(&TenantPaths::connector_manifests_prefix(tenant, slug))
         .await?;
-    Ok(manifests
-        .into_iter()
-        .filter_map(|path| {
-            TenantPaths::connector_manifest_version(tenant, slug, &path).map(|v| (v, path))
-        })
-        .max_by(|a, b| a.0.cmp(&b.0)))
+    Ok(newest_committed(tenant, slug, &manifests).map(|(version, path)| (version, path.clone())))
 }
 
 /// Whether `tenant` holds the dataset `slug`: it has a committed snapshot.
 /// This is the one definition of "holds" (publishing a listing refuses a
-/// dataset the steward does not hold). A storage failure is an error, never
-/// `false`.
+/// dataset the steward does not hold, and [`held_datasets`] lists exactly
+/// the datasets held). A storage failure is an error, never `false`.
 pub async fn holds(
     vault: &dyn VaultStore,
     tenant: TenantId,
     slug: &ConnectorSlug,
 ) -> Result<bool, StorageError> {
     Ok(newest_manifest(vault, tenant, slug).await?.is_some())
+}
+
+/// One object stored under a dataset's current snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub object: ObjectId,
+    /// Its size as stored: the sealed envelope's length.
+    pub ciphertext_bytes: u64,
+}
+
+/// A dataset its tenant holds, as storage describes it: nothing is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldDataset {
+    pub slug: ConnectorSlug,
+    /// The current snapshot: the newest committed one.
+    pub version: SnapshotVersion,
+    /// The objects stored at the current snapshot's version, by id. The
+    /// manifest is sealed, so these are the objects stored there, not the
+    /// ones it lists. The commit's pruning makes them the same, except for
+    /// an object stored at the version after the commit or one whose
+    /// deletion failed (both unlisted), or a listed object that is missing,
+    /// on which queries fail closed (ADR 0012). Objects of superseded
+    /// snapshots and of writes not yet committed are left out.
+    pub objects: Vec<StoredObject>,
+}
+
+/// Every dataset `tenant` holds, connectors' and uploads' alike, by slug,
+/// from one listing of the tenant's datasets (nothing is opened). A dataset
+/// is here exactly when [`holds`] is true for it: both decide with the same
+/// function on the same manifest paths. A storage failure is an error,
+/// never an empty list.
+pub async fn held_datasets(
+    vault: &dyn VaultStore,
+    tenant: TenantId,
+) -> Result<Vec<HeldDataset>, StorageError> {
+    let mut by_dataset: HashMap<ConnectorSlug, Vec<VaultEntry>> = HashMap::new();
+    for entry in vault
+        .list_entries(&TenantPaths::connectors_root(tenant))
+        .await?
+    {
+        if let Some(slug) = TenantPaths::connector_of(tenant, &entry.path) {
+            by_dataset.entry(slug).or_default().push(entry);
+        }
+    }
+    let mut held: Vec<HeldDataset> = by_dataset
+        .into_iter()
+        .filter_map(|(slug, entries)| {
+            let (version, _) =
+                newest_committed(tenant, &slug, entries.iter().map(|entry| &entry.path))?;
+            let mut objects: Vec<StoredObject> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let (at, object) =
+                        TenantPaths::connector_snapshot_object_parts(tenant, &slug, &entry.path)?;
+                    (at == version).then_some(StoredObject {
+                        object,
+                        ciphertext_bytes: entry.size,
+                    })
+                })
+                .collect();
+            objects.sort_by_key(|stored| stored.object);
+            Some(HeldDataset {
+                slug,
+                version,
+                objects,
+            })
+        })
+        .collect();
+    held.sort_by(|a, b| a.slug.as_str().cmp(b.slug.as_str()));
+    Ok(held)
+}
+
+/// The envelope suite that the record of `tenant`'s snapshot `version` of
+/// `slug` names, if that record is valid (ADR 0012): stored, well formed,
+/// written for this snapshot, and naming a suite this build reads. `None`
+/// otherwise, as a query would refuse the snapshot. Reads only the record;
+/// a storage failure is an error.
+pub async fn recorded_suite(
+    vault: &dyn VaultStore,
+    tenant: TenantId,
+    slug: &ConnectorSlug,
+    version: &SnapshotVersion,
+) -> Result<Option<EnvelopeSuite>, StorageError> {
+    match vault
+        .get(&TenantPaths::connector_record(tenant, slug, version))
+        .await
+    {
+        Ok(bytes) => Ok(SnapshotRecord::parse(&bytes, version)
+            .ok()
+            .and_then(|record| EnvelopeSuite::from_id(&record.suite).ok())),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Writes one connector snapshot. Nothing it writes is visible to queries
@@ -465,6 +578,183 @@ mod tests {
         let record = SnapshotRecord::parse(&record, &version).expect("parse");
         assert_eq!(record.suite, "HPK1");
         assert_eq!((record.row_cap, record.schema), (None, None));
+    }
+
+    /// The datasets [`held_datasets`] lists, by slug.
+    async fn listed(vault: &dyn VaultStore, tenant: TenantId) -> Vec<String> {
+        held_datasets(vault, tenant)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|held| held.slug.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn held_datasets_lists_exactly_the_datasets_held() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let keypair = TenantKeypair::generate();
+        let key = keypair.public_key();
+        let tenant = TenantId::generate();
+        assert!(listed(&vault, tenant).await.is_empty());
+
+        // A committed snapshot of two objects.
+        let health = slug("health");
+        let mut writer = SnapshotWriter::begin(&vault, tenant, &key, health.clone());
+        let rows = writer.put("rows", b"parquet").await.expect("put");
+        let more = writer.put("more", b"more parquet").await.expect("put");
+        let version = writer.commit().await.expect("commit");
+        // Objects and a record without a manifest: a write that stopped.
+        let stopped = slug("upload_stopped");
+        let stopped_version = SnapshotVersion::generate();
+        vault
+            .put(
+                &TenantPaths::connector_snapshot_object(
+                    tenant,
+                    &stopped,
+                    &stopped_version,
+                    ObjectId::generate(),
+                ),
+                Bytes::from_static(b"sealed"),
+            )
+            .await
+            .expect("put");
+        let record = SnapshotRecord {
+            version: stopped_version.clone(),
+            suite: EnvelopeSuite::CURRENT.id().to_owned(),
+            row_cap: None,
+            schema: None,
+        };
+        vault
+            .put(
+                &TenantPaths::connector_record(tenant, &stopped, &stopped_version),
+                record.to_bytes(),
+            )
+            .await
+            .expect("put");
+
+        let held = held_datasets(&vault, tenant).await.expect("list");
+        let mut expected = vec![
+            StoredObject {
+                object: rows.object,
+                ciphertext_bytes: rows.ciphertext_bytes as u64,
+            },
+            StoredObject {
+                object: more.object,
+                ciphertext_bytes: more.ciphertext_bytes as u64,
+            },
+        ];
+        expected.sort_by_key(|stored| stored.object);
+        assert_eq!(
+            held,
+            vec![HeldDataset {
+                slug: health.clone(),
+                version,
+                objects: expected,
+            }]
+        );
+        for dataset in [&health, &stopped, &slug("never")] {
+            assert_eq!(
+                holds(&vault, tenant, dataset).await.expect("holds"),
+                held.iter().any(|held| held.slug == *dataset),
+                "{dataset}"
+            );
+        }
+        assert!(
+            listed(&vault, TenantId::generate()).await.is_empty(),
+            "another tenant holds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_datasets_describe_only_the_current_snapshot() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let keypair = TenantKeypair::generate();
+        let key = keypair.public_key();
+        let tenant = TenantId::generate();
+        let health = slug("health");
+        let mut current = None;
+        for _ in 0..2 {
+            let mut writer = SnapshotWriter::begin(&vault, tenant, &key, health.clone());
+            let written = writer.put("rows", b"parquet").await.expect("put");
+            current = Some((writer.commit().await.expect("commit"), written));
+        }
+        let (version, written) = current.expect("committed");
+        // An object a failed prune left at a superseded version, and one a
+        // newer write stored before stopping.
+        let superseded: SnapshotVersion = "00000000000000000001-0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("version");
+        for at in [superseded, SnapshotVersion::generate()] {
+            vault
+                .put(
+                    &TenantPaths::connector_snapshot_object(
+                        tenant,
+                        &health,
+                        &at,
+                        ObjectId::generate(),
+                    ),
+                    Bytes::from_static(b"not counted"),
+                )
+                .await
+                .expect("put");
+        }
+
+        let held = held_datasets(&vault, tenant).await.expect("list");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].version, version);
+        assert_eq!(
+            held[0].objects,
+            vec![StoredObject {
+                object: written.object,
+                ciphertext_bytes: written.ciphertext_bytes as u64,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_suite_reads_only_a_valid_record() {
+        let vault = ObjectStoreVault::new_in_memory();
+        let keypair = TenantKeypair::generate();
+        let key = keypair.public_key();
+        let tenant = TenantId::generate();
+        let health = slug("health");
+        let mut writer = SnapshotWriter::begin(&vault, tenant, &key, health.clone());
+        writer.put("rows", b"parquet").await.expect("put");
+        let version = writer.commit().await.expect("commit");
+        assert_eq!(
+            recorded_suite(&vault, tenant, &health, &version)
+                .await
+                .expect("read"),
+            Some(EnvelopeSuite::Hpk1)
+        );
+
+        // A record that is malformed, written for another snapshot, or names
+        // a suite this build does not read names no suite.
+        let path = TenantPaths::connector_record(tenant, &health, &version);
+        let other = SnapshotVersion::generate();
+        for stored in [
+            Bytes::from_static(b"not json"),
+            Bytes::from(format!(r#"{{"version":"{other}","suite":"HPK1"}}"#)),
+            Bytes::from(format!(r#"{{"version":"{version}","suite":"HPK9"}}"#)),
+        ] {
+            vault.put(&path, stored.clone()).await.expect("put");
+            assert_eq!(
+                recorded_suite(&vault, tenant, &health, &version)
+                    .await
+                    .expect("read"),
+                None,
+                "{stored:?}"
+            );
+        }
+        // Nor does a missing one.
+        vault.delete(&path).await.expect("delete");
+        assert_eq!(
+            recorded_suite(&vault, tenant, &health, &version)
+                .await
+                .expect("read"),
+            None
+        );
     }
 
     #[tokio::test]
