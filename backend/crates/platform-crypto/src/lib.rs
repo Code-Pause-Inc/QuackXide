@@ -418,13 +418,9 @@ impl TenantKeypair {
     }
 }
 
-impl Drop for TenantKeypair {
-    fn drop(&mut self) {
-        if let Ok(zero_sk) = KemPrivateKey::from_bytes(&[0u8; X25519_PUBLIC_KEY_BYTES]) {
-            self.private_key = zero_sk;
-        }
-    }
-}
+// hpke's X25519 private key is an `x25519_dalek::StaticSecret`, which wipes
+// itself on drop (see `x25519_secrets_zeroize_on_drop`).
+impl ZeroizeOnDrop for TenantKeypair {}
 
 #[cfg(test)]
 mod tests {
@@ -639,6 +635,25 @@ mod tests {
     #[test]
     fn tenant_public_key_rejects_bad_raw() {
         assert!(TenantPublicKey::from_raw(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn x25519_secrets_zeroize_on_drop() {
+        // `TenantKeypair: ZeroizeOnDrop` rests on this. hpke's X25519
+        // private keys and DH results are these types. x25519-dalek 2 gives
+        // them `Zeroize` and a `Drop` that zeroizes (`#[zeroize(drop)]`,
+        // which adds no `ZeroizeOnDrop` marker) only with its `zeroize`
+        // feature; without it they have no drop glue at all.
+        fn assert_zeroize<T: zeroize::Zeroize>() {}
+        assert_zeroize::<x25519_dalek::StaticSecret>();
+        assert_zeroize::<x25519_dalek::SharedSecret>();
+        const {
+            assert!(std::mem::needs_drop::<x25519_dalek::StaticSecret>());
+            assert!(std::mem::needs_drop::<x25519_dalek::SharedSecret>());
+            // hpke's own key type, so this fails if hpke ever uses an
+            // x25519-dalek without the feature.
+            assert!(std::mem::needs_drop::<KemPrivateKey>());
+        };
     }
 
     mod props {
