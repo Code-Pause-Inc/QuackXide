@@ -1,14 +1,18 @@
 name: bench
 
-# Report only: shared runners are too noisy to gate on, so nothing here
-# fails on the numbers, and this is not a required check. docs/BENCHMARKS.md
-# describes the method and the recorded baseline.
+# On pull requests, benchmarks the base commit and then the head in one job,
+# on one runner, and fails when a benchmark is significantly more than 10 %
+# slower (scripts/bench-compare.sh). Shared runners vary between runs, so
+# numbers are only compared within the job. Not a required check.
+# docs/BENCHMARKS.md describes the method, the recorded numbers and targets.
 
 on:
   pull_request:
     paths:
       - "backend/**"
       - ".github/workflows/bench.yml"
+      - "scripts/bench-compare.sh"
+      - "scripts/bench-targets.sh"
   workflow_dispatch:
 
 permissions:
@@ -23,32 +27,81 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
-      - name: HPKE envelope benchmarks
-        working-directory: backend
+      - name: Runner
         run: |
-          set -o pipefail
           # In the log as well as the summary, so the machine can be read back with `gh run view --log`.
           { lscpu | grep -E '^(Model name|CPU\(s\)):'; rustc -V; } | tee "$RUNNER_TEMP/machine.txt"
-          cargo bench -p platform-crypto --bench hpke --locked -- --noplot | tee "$RUNNER_TEMP/bench.txt"
+          # Only this run's comparisons may be judged, never a cached one.
+          rm -rf backend/target/criterion
+      - name: Benchmarks at the base commit
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # One target dir: the head build is incremental, and both runs'
+          # results land in one target/criterion.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/backend/target
+        run: |
+          set -o pipefail
+          git worktree add "$RUNNER_TEMP/base" "$BASE_SHA"
+          cd "$RUNNER_TEMP/base/backend"
+          targets="$("$GITHUB_WORKSPACE/scripts/bench-targets.sh")"
+          read -r -a benches <<<"$targets"
+          cargo bench --locked "${benches[@]}" -- --noplot --save-baseline base | tee "$RUNNER_TEMP/base.txt"
+      - name: Benchmarks at the head
+        working-directory: backend
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -o pipefail
+          compare=()
+          if [[ "$EVENT" == pull_request ]]; then compare=(--baseline-lenient base); fi
+          # Cargo decides freshness by mtime, and this checkout predates the
+          # base build in the shared target dir: without this it reuses base's code.
+          git ls-files -z | xargs -0 touch
+          targets="$(../scripts/bench-targets.sh)"
+          read -r -a benches <<<"$targets"
+          cargo bench --locked "${benches[@]}" -- --noplot "${compare[@]}" | tee "$RUNNER_TEMP/bench.txt"
+      - name: Compare with the base commit
+        if: github.event_name == 'pull_request'
+        run: |
+          status=0
+          scripts/bench-compare.sh backend/target/criterion 0.10 > "$RUNNER_TEMP/compare.md" || status=$?
+          cat "$RUNNER_TEMP/compare.md"
           {
-            echo "## HPKE envelope benchmarks"
+            echo "## Benchmarks: head against base"
             echo
-            echo "Reference numbers from a shared GitHub-hosted runner; they vary between runs and never gate."
+            echo "A benchmark regresses when its whole 95 % interval is more than 10 % slower."
+            echo
+            cat "$RUNNER_TEMP/compare.md"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Raw output
+        if: always()
+        run: |
+          {
+            echo "## Benchmark output"
+            echo
+            echo "Numbers from a shared GitHub-hosted runner; compare only within one run."
             echo
             echo '```'
             cat "$RUNNER_TEMP/machine.txt"
             echo '```'
             echo
             echo '```'
-            cat "$RUNNER_TEMP/bench.txt"
+            cat "$RUNNER_TEMP/bench.txt" 2>/dev/null || echo "(no head run)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
         with:
           name: criterion
           path: backend/target/criterion
+          if-no-files-found: ignore
