@@ -6,7 +6,7 @@
 //! from its grant, and an exhausted grant refuses until the steward tops it
 //! up. The same ledger is the billing meter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -46,9 +46,10 @@ pub enum BudgetError {
 pub trait BudgetLedger: Send + Sync {
     /// Open a grant's entry with an initial allocation. Insert-if-absent, so
     /// re-granting (which reuses the grant id) never resets spend; only
-    /// [`top_up`] raises the allocation.
+    /// [`top_up`] and [`top_up_once`] raise the allocation.
     ///
     /// [`top_up`]: BudgetLedger::top_up
+    /// [`top_up_once`]: BudgetLedger::top_up_once
     async fn open(&self, grant_id: &str, limit: u64) -> Result<BudgetState, TenancyError>;
 
     /// Atomically consume `cost` units. Refuses without partial spend when
@@ -59,6 +60,20 @@ pub trait BudgetLedger: Send + Sync {
     /// overflow, cannot lower.
     async fn top_up(&self, grant_id: &str, additional: u64) -> Result<BudgetState, BudgetError>;
 
+    /// [`top_up`] at most once per `key` (an access request id): a repeat
+    /// with the same key returns the standing unchanged, so a retried
+    /// approval cannot add its budget twice. The key check, the top-up and
+    /// recording the key must be one atomic step, and a durable backend must
+    /// persist the applied keys with the allocation.
+    ///
+    /// [`top_up`]: BudgetLedger::top_up
+    async fn top_up_once(
+        &self,
+        grant_id: &str,
+        key: &str,
+        additional: u64,
+    ) -> Result<BudgetState, BudgetError>;
+
     /// Current standing, if an entry exists.
     async fn state(&self, grant_id: &str) -> Result<Option<BudgetState>, TenancyError>;
 }
@@ -67,11 +82,17 @@ pub trait BudgetLedger: Send + Sync {
 /// conditional update.
 #[derive(Default)]
 pub struct InMemoryBudgetLedger {
-    by_grant: Mutex<HashMap<String, BudgetState>>,
+    by_grant: Mutex<HashMap<String, Entry>>,
+}
+
+struct Entry {
+    state: BudgetState,
+    /// Keys whose [`BudgetLedger::top_up_once`] has been applied.
+    applied: HashSet<String>,
 }
 
 impl InMemoryBudgetLedger {
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, BudgetState>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
         self.by_grant.lock().expect("budget lock")
     }
 }
@@ -80,19 +101,23 @@ impl InMemoryBudgetLedger {
 impl BudgetLedger for InMemoryBudgetLedger {
     async fn open(&self, grant_id: &str, limit: u64) -> Result<BudgetState, TenancyError> {
         let mut ledger = self.lock();
-        let entry = ledger
-            .entry(grant_id.to_owned())
-            .or_insert_with(|| BudgetState {
+        let entry = ledger.entry(grant_id.to_owned()).or_insert_with(|| Entry {
+            state: BudgetState {
                 grant_id: grant_id.to_owned(),
                 limit,
                 spent: 0,
-            });
-        Ok(entry.clone())
+            },
+            applied: HashSet::new(),
+        });
+        Ok(entry.state.clone())
     }
 
     async fn charge(&self, grant_id: &str, cost: u64) -> Result<BudgetState, BudgetError> {
         let mut ledger = self.lock();
-        let entry = ledger.get_mut(grant_id).ok_or(BudgetError::UnknownGrant)?;
+        let entry = &mut ledger
+            .get_mut(grant_id)
+            .ok_or(BudgetError::UnknownGrant)?
+            .state;
         if entry.remaining() < cost {
             return Err(BudgetError::Exhausted(entry.clone()));
         }
@@ -102,19 +127,64 @@ impl BudgetLedger for InMemoryBudgetLedger {
 
     async fn top_up(&self, grant_id: &str, additional: u64) -> Result<BudgetState, BudgetError> {
         let mut ledger = self.lock();
-        let entry = ledger.get_mut(grant_id).ok_or(BudgetError::UnknownGrant)?;
+        let entry = &mut ledger
+            .get_mut(grant_id)
+            .ok_or(BudgetError::UnknownGrant)?
+            .state;
         entry.limit = entry.limit.saturating_add(additional);
         Ok(entry.clone())
     }
 
+    async fn top_up_once(
+        &self,
+        grant_id: &str,
+        key: &str,
+        additional: u64,
+    ) -> Result<BudgetState, BudgetError> {
+        let mut ledger = self.lock();
+        let entry = ledger.get_mut(grant_id).ok_or(BudgetError::UnknownGrant)?;
+        if entry.applied.insert(key.to_owned()) {
+            entry.state.limit = entry.state.limit.saturating_add(additional);
+        }
+        Ok(entry.state.clone())
+    }
+
     async fn state(&self, grant_id: &str) -> Result<Option<BudgetState>, TenancyError> {
-        Ok(self.lock().get(grant_id).cloned())
+        Ok(self.lock().get(grant_id).map(|entry| entry.state.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn top_up_once_applies_each_key_once() {
+        let ledger = InMemoryBudgetLedger::default();
+        ledger.open("g1", 2).await.expect("open");
+        ledger.charge("g1", 2).await.expect("spend");
+
+        let after = ledger
+            .top_up_once("g1", "request-2", 3)
+            .await
+            .expect("top up");
+        assert_eq!((after.limit, after.spent, after.remaining()), (5, 2, 3));
+        // The same key again is a no-op; another key adds.
+        let again = ledger
+            .top_up_once("g1", "request-2", 3)
+            .await
+            .expect("again");
+        assert_eq!(again.limit, 5);
+        let other = ledger
+            .top_up_once("g1", "request-3", 1)
+            .await
+            .expect("other");
+        assert_eq!(other.limit, 6);
+        assert!(matches!(
+            ledger.top_up_once("missing", "request-2", 1).await,
+            Err(BudgetError::UnknownGrant)
+        ));
+    }
 
     #[tokio::test]
     async fn charge_decrements_until_exhausted() {

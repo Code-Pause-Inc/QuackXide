@@ -442,15 +442,21 @@ included budget, prices in integer cents — is the steward's opt-in to
 discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`). Researchers file
-access requests (idempotent while pending); approval mints the grant through the same code path as a direct
-grant. The approval is recorded first, with its query budget, so a failure
+access requests (idempotent while pending); approval mints the grant
+through the same code path as a direct grant, and adds its query budget
+to the grant once, keyed by the request: a follow-up request tops up a
+grant that already exists (spend is kept), and a retry adds nothing. A
+pending request whose listing has been unpublished can be denied but not
+approved (404, `denied` event). The approval is recorded first, with its
+query budget, so a failure
 partway leaves an approved request without a usable grant, never a grant
 behind a pending or denied one, and the steward's retry re-runs the
 idempotent grant and budget steps with the approved budget; a retry cannot
 change it. A retry never undoes a revoke: while the steward's grant to that
 researcher for that connector is revoked, the retry is refused (404) with a
 `denied` event, and only an explicit re-grant or a new request restores
-access. Denied is terminal. `research.catalog` events carry identifiers
+access. A retry is also refused once the grant was revoked after the
+approval, even if it has since been re-granted. Denied is terminal. `research.catalog` events carry identifiers
 only.
 
 **Residual risk:** overlapping-query differencing. See
