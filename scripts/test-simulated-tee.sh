@@ -190,10 +190,16 @@ echo "    ${OBJECT_COUNT} tenant objects stored: $((OBJECT_COUNT - RECORD_COUNT)
 TOKEN=$(mint_jwt "${TENANT_ID}")
 
 echo "==> [5/7] Verifying the attestation token and the confidential query happy path..."
-NONCE_B64=$(openssl rand -base64 32)
-ATTEST_RESP=$(curl -fsS -G "http://127.0.0.1:8080/api/v1/attestation" --data-urlencode "nonce_b64=${NONCE_B64}")
+ATTEST_NONCE=$(openssl rand 32 | b64url)
+ATTEST_RESP=$(curl -fsS -G "http://127.0.0.1:8080/api/v1/attestation" --data-urlencode "nonce=${ATTEST_NONCE}")
 if ! printf '%s' "${ATTEST_RESP}" | grep -q '"token":"ey'; then
   echo "ERROR: expected a token in /api/v1/attestation response: ${ATTEST_RESP}" >&2
+  exit 1
+fi
+# No token without the caller's own nonce (ADR 0010).
+ATTEST_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080/api/v1/attestation")
+if [[ "${ATTEST_STATUS}" != "400" ]]; then
+  echo "ERROR: /api/v1/attestation without a nonce returned ${ATTEST_STATUS}, not 400" >&2
   exit 1
 fi
 

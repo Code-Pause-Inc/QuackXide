@@ -18,10 +18,12 @@ uses [Semantic Versioning](https://semver.org/).
   `ReportDataBinding` with labelled, length-prefixed values. The enclave's
   key set (`EnclaveIdentity`) is an `HPK2` request key, whose private half
   now exists in every build, and a result-signing key, with a `key_id`.
-  `GET /api/v1/attestation` returns ADR 0010's evidence bundle, and the
-  key-release stand-in checks binding v2 and refuses a request key that is
-  not `HPK2`. The sealed-query wire types are defined; nothing routes to
-  them yet. ADR 0005 and ADR 0010 are accepted.
+  `GET /api/v1/attestation` takes the caller's nonce as `?nonce=` (32
+  bytes, base64url; 400 when missing or malformed, instead of a nonce the
+  server chose) and returns ADR 0010's evidence bundle, and the key-release
+  stand-in checks binding v2 and refuses a request key that is not `HPK2`
+  (audited as `crypto.suite_refused`). The sealed-query wire types are
+  defined; nothing routes to them yet. ADR 0005 and ADR 0010 are accepted.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot

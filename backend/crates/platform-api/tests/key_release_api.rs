@@ -257,11 +257,12 @@ async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity
         provisioning: None,
     });
 
-    let nonce = [0u8; 32];
+    // Bytes whose base64url uses `-` and `_` (ADR 0010: `?nonce=`, base64url).
+    let nonce = [0xfb; 32];
     let (status, body) = send(
         &app,
         "GET",
-        &format!("/api/v1/attestation?nonce_b64={}", B64.encode(nonce)),
+        &format!("/api/v1/attestation?nonce={}", B64URL.encode(nonce)),
         &[],
         Vec::new(),
     )
@@ -296,11 +297,19 @@ async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity
         .verify(&bundle.token, &expected)
         .expect("bundle token must verify");
 
-    for bad in ["not-valid-base64!!!".to_owned(), B64.encode([1u8; 16])] {
+    // A missing nonce, the old parameter, standard base64, and the wrong
+    // length are each refused: no token on a nonce the caller did not choose.
+    for query in [
+        String::new(),
+        format!("?nonce_b64={}", B64URL.encode(nonce)),
+        format!("?nonce={}", B64.encode(nonce)),
+        format!("?nonce={}", B64URL.encode([1u8; 16])),
+        "?nonce=not-valid-base64!!!".to_owned(),
+    ] {
         let (status, _) = send(
             &app,
             "GET",
-            &format!("/api/v1/attestation?nonce_b64={bad}"),
+            &format!("/api/v1/attestation{query}"),
             &[],
             Vec::new(),
         )
@@ -511,7 +520,7 @@ async fn an_hpk1_request_key_is_refused() {
     // refuses it.
     let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
     let binding = platform_enclave::EnclaveKeyBinding {
-        request_key: [&hpk1.suite().magic()[..], &hpk1.to_raw()].concat(),
+        request_key: hpk1.to_framed(),
         ..identity.binding().clone()
     };
     let nonce: [u8; 32] = B64
