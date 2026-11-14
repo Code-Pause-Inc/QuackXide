@@ -239,6 +239,19 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* Tenant envelopes use the hybrid post-quantum suite `HPK2` (ADR 0007, P35,
+  #187): HPKE with X-Wing (X25519 + ML-KEM-768), HKDF-SHA256 and
+  AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
+  Enrollment and snapshot records name the key's suite, and the upload
+  route accepts a complete frame of either suite, which opens only under a
+  key of the same suite. Every key loader takes a suite
+  policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
+  with a `crypto.suite_refused` audit event; development still accepts
+  them until the browser moves to `HPK2` (P36). Private keys are exported
+  as `magic || key`; the key-release stand-in imports only `HPK2` tenant
+  keys, and the enclave accepts only `HPK2` released keys.
+  X-Wing known-answer tests against `@noble/post-quantum` and frames sealed
+  by `hpke-js` pin interoperability. ADR 0007 is accepted.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is

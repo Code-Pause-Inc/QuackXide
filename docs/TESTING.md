@@ -130,6 +130,11 @@ which fails when the file and its generator disagree; regenerate with
 wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
 enrollment cases through the enrollment route and the badly framed
 envelopes through the upload route.
+`hpk2-kem.json` (X-Wing known-answer values from `@noble/post-quantum`) and
+`hpk2-js-sealed.json` (`HPK2` frames sealed by `hpke-js`, plus negatives)
+come from implementations other than ours (ADR 0007); regenerate them with
+`node scripts/hpk2-vectors.mjs` from `frontend/`, and
+`backend/crates/platform-crypto/tests/hpk2_vectors.rs` checks them.
 
 ### Fuzz targets
 

@@ -74,7 +74,8 @@ dotenvy = "0.15"
 # ── cryptography (server side holds public-key / index material ONLY —
 #     drive master keys are browser-generated and never exist here) ──────────
 aes-gcm = "0.10"
-hpke = { version = "0.12", features = ["alloc", "x25519"] }
+# ADR 0007 pins 0.14.1 exactly; its x-wing and ml-kem are pinned in Cargo.lock.
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "aes", "hkdfsha2"] }
 hmac = "0.12"
 # SHA-1 only for TOTP (RFC 6238 HMAC): virtually every authenticator app
 # (Google/Microsoft/Authy/1Password) hardcodes SHA-1 regardless of what an
@@ -95,9 +96,9 @@ rand = "0.8"
 # The browser build of the envelope code (`envelope-wasm`). `scripts/build-wasm.sh`
 # refuses a `wasm-bindgen` CLI whose version differs from this one.
 wasm-bindgen = "=0.2.126"
-# `rand` 0.8's `OsRng` uses getrandom 0.2; on wasm32 it needs the JavaScript
-# backend (`crypto.getRandomValues`).
-getrandom = { version = "0.2", features = ["js"] }
+# `hpke` 0.14 draws randomness through getrandom 0.4; on wasm32 it needs the
+# JavaScript backend (`crypto.getRandomValues`). Only `envelope-wasm` uses it.
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 # ── auth + storage backends ─────────────────────────────────────────────────
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
@@ -120,6 +121,10 @@ datafusion = "55"                                                 # arrow/parque
 # Benchmarks only (docs/BENCHMARKS.md). No plotters or rayon; runs pass --noplot.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1"
+# X-Wing known-answer tests (ADR 0007); the same version hpke 0.14.1 uses.
+x-wing = "=0.1.1"
+# The RNG traits `hpke` 0.14 takes, for tests that pass a seeded RNG.
+rand_core = "0.10"
 # Seeded RNG for synth-data. synth-data uses rand_chacha's own rand_core
 # re-export, so this need not match `rand` above.
 rand_chacha = "0.10"

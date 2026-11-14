@@ -50,8 +50,8 @@ export interface ChunkRecord {
   readonly data: ArrayBuffer;
 }
 
-/** X25519 keypair for HPKE; matches the backend's DHKEM(X25519, HKDF-SHA256)
- *  suite (platform-crypto::TenantKem). */
+/** X25519 keypair for HPKE; matches the backend's `HPK1` suite,
+ *  DHKEM(X25519, HKDF-SHA256), accepted in development until P36. */
 export interface HpkeKeypairHandle {
   readonly privateKey: CryptoKey;
   readonly publicKeyRaw: ArrayBuffer;

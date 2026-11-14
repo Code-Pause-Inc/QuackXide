@@ -18,6 +18,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@hpke/core": "1.9.0",
+    "@hpke/hybridkem-x-wing": "0.7.0",
+    "@noble/post-quantum": "0.7.1",
     "@tailwindcss/vite": "^4.3.5",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/jest-dom": "^7.0.1",

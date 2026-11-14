@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let (parquet, rows) = synthetic_cohort(min_cohort)?;
 
     // The steward's key stays in this process: dev only, not zero-trust.
-    let steward_keypair = TenantKeypair::generate();
+    let steward_keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let mut stack = DevResearchStack::new();
     stack
         .commit_snapshot(steward, steward_keypair, &connector, "cohort", &parquet)
@@ -244,7 +244,7 @@ mod tests {
         let steward = TenantId::generate();
         let researcher = TenantId::generate();
 
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
         let mut stack = DevResearchStack::new();
         stack
             .commit_snapshot(steward, keypair, &connector, "cohort", &parquet)

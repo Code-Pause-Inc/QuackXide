@@ -20,9 +20,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use envelope_wasm::{
     connector_object_info, research_result_info, snapshot_manifest_info, steward_upload_info,
 };
-use platform_crypto::{TenantKeypair, hpke_seal_to_tenant_with_rng};
-use rand::SeedableRng;
+use platform_crypto::{EnvelopeSuite, TenantKeypair, hpke_seal_to_tenant_with_rng};
 use rand::rngs::StdRng;
+use rand::{RngCore as _, SeedableRng};
 use serde_json::{Value, json};
 
 const RNG_SEED: [u8; 32] = *b"envelope vectors, test-only seed";
@@ -35,6 +35,29 @@ const DATASET: &str = "00000000-dddd-4ddd-8ddd-000000000001";
 const OBJECT: &str = "00000000-aaaa-4bbb-8ccc-000000000001";
 const PLAINTEXT: &str = "synthetic cohort rows: site-a,42\nsite-b,17\n";
 
+/// rand 0.8's `StdRng` behind the `rand_core` 0.10 traits `hpke` 0.14 takes,
+/// so the committed vectors keep the ephemeral keys they were generated with.
+struct Rng08(StdRng);
+
+impl rand_core::TryRng for Rng08 {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.0.next_u32())
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.next_u64())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.fill_bytes(dst);
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for Rng08 {}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/envelope")
 }
@@ -44,7 +67,7 @@ fn recipient(name: &str) -> TenantKeypair {
         .iter()
         .find(|(n, _)| *n == name)
         .expect("known recipient");
-    TenantKeypair::derive(seed.as_bytes())
+    TenantKeypair::derive(EnvelopeSuite::Hpk1, seed.as_bytes())
 }
 
 fn utf8(bytes: Vec<u8>) -> String {
@@ -52,7 +75,7 @@ fn utf8(bytes: Vec<u8>) -> String {
 }
 
 fn generate() -> Value {
-    let mut rng = StdRng::from_seed(RNG_SEED);
+    let mut rng = Rng08(StdRng::from_seed(RNG_SEED));
     let a = recipient("a");
     let b = recipient("b");
     let a_raw = a.public_key().to_raw();
@@ -90,7 +113,7 @@ fn generate() -> Value {
 
     let upload_info = steward_upload_info(TENANT, DATASET, OBJECT).unwrap();
     let other_info = steward_upload_info(TENANT, DATASET, DATASET).unwrap();
-    let seal = |to: &TenantKeypair, rng: &mut StdRng| {
+    let seal = |to: &TenantKeypair, rng: &mut Rng08| {
         hpke_seal_to_tenant_with_rng(&to.public_key(), &upload_info, PLAINTEXT.as_bytes(), rng)
             .expect("seal")
     };
@@ -135,7 +158,7 @@ fn generate() -> Value {
             "wrong frame magic",
             &upload_info,
             &relabelled,
-            Some("invalid envelope framing")
+            Some("envelope suite does not match the key")
         ),
         entry(
             "truncated frame",
@@ -203,7 +226,10 @@ fn recipients_derive_from_their_published_seeds() {
         .as_array()
         .expect("recipients")
     {
-        let derived = TenantKeypair::derive(r["seed_utf8"].as_str().expect("seed").as_bytes());
+        let derived = TenantKeypair::derive(
+            EnvelopeSuite::Hpk1,
+            r["seed_utf8"].as_str().expect("seed").as_bytes(),
+        );
         assert_eq!(B64.encode(derived.public_key().to_raw()), r["public_b64"]);
     }
 }
@@ -248,7 +274,12 @@ fn info_vectors_match_and_refused_fields_are_refused() {
         .map(|v| v.as_str().expect("field"))
         .collect();
     assert_eq!(
-        utf8(platform_crypto::info::connector_object(f[0], f[1], f[2])),
+        utf8(platform_crypto::info::connector_object(
+            EnvelopeSuite::Hpk1,
+            f[0],
+            f[1],
+            f[2]
+        )),
         connector["info"]
     );
 }

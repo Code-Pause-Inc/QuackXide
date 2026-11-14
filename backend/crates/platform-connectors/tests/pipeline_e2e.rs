@@ -27,7 +27,7 @@ fn dev_pipeline(vault: Arc<dyn VaultStore>) -> EnclavePipeline {
 #[tokio::test]
 async fn full_confidential_sync_round_trip() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let tenant = TenantId::generate();
 
     let job = SyncJob {
@@ -73,7 +73,7 @@ async fn full_confidential_sync_round_trip() {
         .expect("get record");
     let record = platform_storage::SnapshotRecord::parse(&record, &report.snapshot)
         .expect("snapshot record");
-    assert_eq!(record.suite, "HPK1");
+    assert_eq!(record.suite, keypair.suite().id());
     assert_eq!(
         (record.row_cap, record.schema),
         (None, None),
@@ -90,7 +90,10 @@ async fn full_confidential_sync_round_trip() {
         .await
         .expect("get manifest");
     let manifest = keypair
-        .open_envelope(&manifest_info(&tenant, &slug, &report.snapshot), &manifest)
+        .open_envelope(
+            &manifest_info(keypair.suite(), &tenant, &slug, &report.snapshot),
+            &manifest,
+        )
         .expect("tenant can open the manifest");
     let manifest: SnapshotManifest =
         serde_json::from_slice(manifest.expose()).expect("manifest json");
@@ -107,7 +110,7 @@ async fn full_confidential_sync_round_trip() {
         .await
         .expect("get ciphertext");
 
-    let info = envelope_info(&tenant, &slug, &written.object);
+    let info = envelope_info(keypair.suite(), &tenant, &slug, &written.object);
     let parquet = keypair
         .open_envelope(&info, &envelope)
         .expect("tenant can open the envelope");
@@ -136,7 +139,7 @@ async fn full_confidential_sync_round_trip() {
 #[tokio::test]
 async fn scheduler_tick_runs_all_jobs_and_isolates_results() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let tenant = TenantId::generate();
 
     let jobs = vec![
@@ -199,7 +202,7 @@ impl ConnectorSource for GatedSource {
 #[tokio::test]
 async fn stopping_the_scheduler_finishes_the_sync_in_flight_and_starts_no_more() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let tenant = TenantId::generate();
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -258,7 +261,7 @@ async fn stopping_the_scheduler_finishes_the_sync_in_flight_and_starts_no_more()
 async fn required_attestation_fails_closed_without_hardware() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let pipeline = EnclavePipeline::new(Arc::new(SnpAttestation::new()), vault.clone(), true);
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
 
     let job = SyncJob {
         tenant: TenantId::generate(),
@@ -281,7 +284,7 @@ async fn dev_evidence_cannot_satisfy_required_attestation() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let pipeline =
         EnclavePipeline::new(Arc::new(DevAttestation::allow_insecure_dev()), vault, true);
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
 
     let job = SyncJob {
         tenant: TenantId::generate(),
@@ -310,7 +313,7 @@ impl platform_enclave::AttestationProvider for RejectingAttestation {
 async fn rejected_provider_refuses_sync_even_when_not_required() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let pipeline = EnclavePipeline::new(Arc::new(RejectingAttestation), vault.clone(), false);
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let job = SyncJob {
         tenant: TenantId::generate(),
         tenant_public_key: keypair.public_key(),
@@ -351,7 +354,8 @@ async fn sync_with(
     let pipeline = EnclavePipeline::new(provider, vault, require_attestation);
     let job = SyncJob {
         tenant: TenantId::generate(),
-        tenant_public_key: TenantKeypair::generate().public_key(),
+        tenant_public_key: TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT)
+            .public_key(),
         source: Arc::new(FixtureSource::quickbooks_demo().expect("fixture")),
     };
     pipeline.run_sync(&job).await.map(|_| ())
@@ -417,7 +421,7 @@ async fn simulated_token_cannot_satisfy_required_attestation() {
 #[tokio::test]
 async fn envelopes_are_bound_to_their_object() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let tenant = TenantId::generate();
 
     let job = SyncJob {
@@ -441,12 +445,17 @@ async fn envelopes_are_bound_to_their_object() {
         ))
         .await
         .expect("get");
-    let wrong_info = envelope_info(&tenant, &slug, &platform_core::ObjectId::generate());
+    let wrong_info = envelope_info(
+        keypair.suite(),
+        &tenant,
+        &slug,
+        &platform_core::ObjectId::generate(),
+    );
     assert!(
         keypair.open_envelope(&wrong_info, &envelope).is_err(),
         "envelope replayed under another object id must not open"
     );
 
-    let right_info = envelope_info(&tenant, &slug, &written.object);
+    let right_info = envelope_info(keypair.suite(), &tenant, &slug, &written.object);
     assert!(keypair.open_envelope(&right_info, &envelope).is_ok());
 }

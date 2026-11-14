@@ -19,8 +19,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
+use hpke::rand_core::CryptoRng;
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
-use rand::{CryptoRng, RngCore};
 #[cfg(feature = "server")]
 use sha2::Sha256;
 use std::io::{self, Write};
@@ -39,9 +39,12 @@ pub const GCM_NONCE_BYTES: usize = 12;
 pub const GCM_TAG_BYTES: usize = 16;
 pub const BLIND_INDEX_BYTES: usize = 16;
 
-/// HPKE KEM for tenant envelopes. Together with [`TenantKdf`] and
-/// [`TenantAead`] this pins the wire suite for every producer and consumer.
-pub type TenantKem = hpke::kem::X25519HkdfSha256;
+/// HPKE KEM of the current suite ([`EnvelopeSuite::CURRENT`], `HPK2`).
+/// Together with [`TenantKdf`] and [`TenantAead`] this pins the wire suite
+/// for every producer and consumer.
+pub type TenantKem = hpke::kem::XWing;
+/// HPKE KEM of the `HPK1` suite, accepted only in development until P36.
+type Hpk1Kem = hpke::kem::X25519HkdfSha256;
 type TenantKdf = HkdfSha256;
 type TenantAead = AesGcm256;
 
@@ -60,6 +63,12 @@ pub enum CryptoError {
     SealFailed,
     #[error("open failed (ciphertext rejected)")]
     OpenFailed,
+    /// The suite policy does not accept this key's or envelope's suite.
+    #[error("envelope suite not accepted")]
+    SuiteRefused,
+    /// The envelope's suite is not the suite of the key opening it.
+    #[error("envelope suite does not match the key")]
+    SuiteMismatch,
 }
 
 /// Heap bytes wiped on drop, with a redacted `Debug`. Use for every transient
@@ -211,26 +220,28 @@ pub fn blind_index(index_key: &[u8], value: &[u8]) -> [u8; BLIND_INDEX_BYTES] {
 // context travels in HPKE `info` ([`info`]), so an envelope replayed under
 // another object fails to open.
 
-pub const HPKE_ENVELOPE_MAGIC: [u8; 4] = *b"HPK1";
-pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
-const MAGIC_BYTES: usize = HPKE_ENVELOPE_MAGIC.len();
-const ENCAPPED_KEY_BYTES: usize = 32;
+const MAGIC_BYTES: usize = 4;
 
 /// An envelope suite, named on the wire by its frame magic. Readers choose
 /// the suite from the magic and refuse any magic they do not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopeSuite {
     /// `HPK1`: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
+    /// Development only, until the browser moves to `HPK2` (P36).
     Hpk1,
+    /// `HPK2`: X-Wing (draft-connolly-cfrg-xwing-kem-06), HKDF-SHA256,
+    /// AES-256-GCM (ADR 0007).
+    Hpk2,
 }
 
 impl EnvelopeSuite {
-    /// The suite new envelopes are sealed with.
-    pub const CURRENT: Self = Self::Hpk1;
+    /// The suite new keys and envelopes use.
+    pub const CURRENT: Self = Self::Hpk2;
 
     pub fn magic(self) -> [u8; MAGIC_BYTES] {
         match self {
-            Self::Hpk1 => HPKE_ENVELOPE_MAGIC,
+            Self::Hpk1 => *b"HPK1",
+            Self::Hpk2 => *b"HPK2",
         }
     }
 
@@ -239,6 +250,7 @@ impl EnvelopeSuite {
     pub fn id(self) -> &'static str {
         match self {
             Self::Hpk1 => "HPK1",
+            Self::Hpk2 => "HPK2",
         }
     }
 
@@ -246,6 +258,7 @@ impl EnvelopeSuite {
     pub fn from_id(id: &str) -> Result<Self, CryptoError> {
         match id {
             "HPK1" => Ok(Self::Hpk1),
+            "HPK2" => Ok(Self::Hpk2),
             _ => Err(CryptoError::InvalidEnvelope),
         }
     }
@@ -253,17 +266,93 @@ impl EnvelopeSuite {
     /// The shortest complete frame: magic, encapsulated key and AEAD tag
     /// (an empty plaintext).
     pub fn min_frame_bytes(self) -> usize {
-        match self {
-            Self::Hpk1 => MAGIC_BYTES + ENCAPPED_KEY_BYTES + GCM_TAG_BYTES,
+        MAGIC_BYTES + self.encapped_len() + GCM_TAG_BYTES
+    }
+
+    /// The suite a framed envelope or private key declares. Unknown magic is
+    /// refused. This reads only the magic; [`check_envelope_frame`] also
+    /// checks length.
+    pub fn of_envelope(envelope: &[u8]) -> Result<Self, CryptoError> {
+        match envelope.get(..MAGIC_BYTES) {
+            Some(b"HPK1") => Ok(Self::Hpk1),
+            Some(b"HPK2") => Ok(Self::Hpk2),
+            _ => Err(CryptoError::InvalidEnvelope),
         }
     }
 
-    /// The suite a framed envelope declares. Unknown magic is refused. This
-    /// reads only the magic; [`check_envelope_frame`] also checks length.
-    pub fn of_envelope(envelope: &[u8]) -> Result<Self, CryptoError> {
-        match envelope.get(..MAGIC_BYTES) {
-            Some(magic) if magic == HPKE_ENVELOPE_MAGIC => Ok(Self::Hpk1),
-            _ => Err(CryptoError::InvalidEnvelope),
+    /// The name an enrollment record stores for the suite.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Hpk1 => "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM",
+            Self::Hpk2 => "X-Wing+HKDF-SHA256+AES-256-GCM",
+        }
+    }
+
+    pub fn public_key_len(self) -> usize {
+        match self {
+            Self::Hpk1 => 32,
+            Self::Hpk2 => 1216,
+        }
+    }
+
+    pub fn encapped_len(self) -> usize {
+        match self {
+            Self::Hpk1 => 32,
+            Self::Hpk2 => 1120,
+        }
+    }
+
+    /// The suite whose public keys have this length; the only suite signal a
+    /// raw public key carries.
+    fn of_public_key_len(len: usize) -> Option<Self> {
+        [Self::Hpk1, Self::Hpk2]
+            .into_iter()
+            .find(|suite| suite.public_key_len() == len)
+    }
+}
+
+/// The suites a deployment accepts when it loads a key. Every key loader
+/// takes one, so no caller can load a key without deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuitePolicy {
+    hpk1: bool,
+    hpk2: bool,
+}
+
+impl SuitePolicy {
+    /// Production (ADR 0009's default): `HPK2` only.
+    pub const PRODUCTION: Self = Self {
+        hpk1: false,
+        hpk2: true,
+    };
+    /// Development: also `HPK1`, so the browser works until P36.
+    pub const DEVELOPMENT: Self = Self {
+        hpk1: true,
+        hpk2: true,
+    };
+    /// The browser build until P36: `HPK1` only.
+    pub const HPK1_ONLY: Self = Self {
+        hpk1: true,
+        hpk2: false,
+    };
+
+    pub fn for_env(production: bool) -> Self {
+        if production {
+            Self::PRODUCTION
+        } else {
+            Self::DEVELOPMENT
+        }
+    }
+
+    pub fn check(self, suite: EnvelopeSuite) -> Result<(), CryptoError> {
+        let accepted = match suite {
+            EnvelopeSuite::Hpk1 => self.hpk1,
+            EnvelopeSuite::Hpk2 => self.hpk2,
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err(CryptoError::SuiteRefused)
         }
     }
 }
@@ -281,147 +370,293 @@ pub fn check_envelope_frame(envelope: &[u8]) -> Result<EnvelopeSuite, CryptoErro
     Ok(suite)
 }
 
-type KemPublicKey = <TenantKem as KemTrait>::PublicKey;
-type KemPrivateKey = <TenantKem as KemTrait>::PrivateKey;
-type KemEncappedKey = <TenantKem as KemTrait>::EncappedKey;
-
-/// A tenant's HPKE public key — raw X25519 bytes enrolled from the browser.
 #[derive(Clone)]
-pub struct TenantPublicKey(KemPublicKey);
+enum PublicKeyInner {
+    Hpk1(<Hpk1Kem as KemTrait>::PublicKey),
+    // Boxed: an X-Wing public key is about 1.6 KB in memory.
+    Hpk2(Box<<TenantKem as KemTrait>::PublicKey>),
+}
+
+/// A tenant's HPKE public key, raw bytes as enrolled.
+#[derive(Clone)]
+pub struct TenantPublicKey(PublicKeyInner);
 
 impl TenantPublicKey {
-    pub fn from_raw(raw: &[u8]) -> Result<Self, CryptoError> {
-        KemPublicKey::from_bytes(raw)
-            .map(Self)
-            .map_err(|_| CryptoError::InvalidPublicKey)
+    /// Parse a raw public key. Its length names the suite (32 bytes `HPK1`,
+    /// 1216 bytes `HPK2`); `policy` decides whether that suite is accepted.
+    pub fn from_raw(raw: &[u8], policy: SuitePolicy) -> Result<Self, CryptoError> {
+        let suite =
+            EnvelopeSuite::of_public_key_len(raw.len()).ok_or(CryptoError::InvalidPublicKey)?;
+        policy.check(suite)?;
+        let inner = match suite {
+            EnvelopeSuite::Hpk1 => Deserializable::from_bytes(raw).map(PublicKeyInner::Hpk1),
+            EnvelopeSuite::Hpk2 => {
+                Deserializable::from_bytes(raw).map(|pk| PublicKeyInner::Hpk2(Box::new(pk)))
+            }
+        };
+        inner.map(Self).map_err(|_| CryptoError::InvalidPublicKey)
+    }
+
+    pub fn suite(&self) -> EnvelopeSuite {
+        match self.0 {
+            PublicKeyInner::Hpk1(_) => EnvelopeSuite::Hpk1,
+            PublicKeyInner::Hpk2(_) => EnvelopeSuite::Hpk2,
+        }
     }
 
     pub fn to_raw(&self) -> Vec<u8> {
-        self.0.to_bytes().to_vec()
+        match &self.0 {
+            PublicKeyInner::Hpk1(pk) => pk.to_bytes().to_vec(),
+            PublicKeyInner::Hpk2(pk) => pk.to_bytes().to_vec(),
+        }
     }
 }
 
 impl std::fmt::Debug for TenantPublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TenantPublicKey(x25519)")
+        write!(f, "TenantPublicKey({:?})", self.suite())
     }
 }
 
-/// Envelope-seal `plaintext` to a tenant public key. Returns the framed
-/// envelope (`HPK1 || encapped_key || ciphertext`) ready for the vault.
+/// Envelope-seal `plaintext` to a tenant public key, in the key's suite.
+/// Returns the framed envelope (`magic || encapped_key || ciphertext`).
 pub fn hpke_seal_to_tenant(
     recipient: &TenantPublicKey,
     info: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    hpke_seal_to_tenant_with_rng(recipient, info, plaintext, &mut rand::rngs::OsRng)
+    fn seal<K: KemTrait>(
+        suite: EnvelopeSuite,
+        pk: &K::PublicKey,
+        info: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, K>(
+            &OpModeS::Base,
+            pk,
+            info,
+            plaintext,
+            b"",
+        )
+        .map_err(|_| CryptoError::SealFailed)?;
+        Ok(frame(suite, &encapped.to_bytes(), &ciphertext))
+    }
+    match &recipient.0 {
+        PublicKeyInner::Hpk1(pk) => seal::<Hpk1Kem>(EnvelopeSuite::Hpk1, pk, info, plaintext),
+        PublicKeyInner::Hpk2(pk) => seal::<TenantKem>(EnvelopeSuite::Hpk2, pk, info, plaintext),
+    }
 }
 
 /// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
 /// committed test-vector generator passes a seeded RNG; everything else
 /// calls [`hpke_seal_to_tenant`].
-pub fn hpke_seal_to_tenant_with_rng<R: CryptoRng + RngCore>(
+pub fn hpke_seal_to_tenant_with_rng(
     recipient: &TenantPublicKey,
     info: &[u8],
     plaintext: &[u8],
-    rng: &mut R,
+    rng: &mut impl CryptoRng,
 ) -> Result<Vec<u8>, CryptoError> {
-    let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, TenantKem, _>(
-        &OpModeS::Base,
-        &recipient.0,
-        info,
-        plaintext,
-        b"",
-        rng,
-    )
-    .map_err(|_| CryptoError::SealFailed)?;
-
-    let mut envelope = Vec::with_capacity(MAGIC_BYTES + ENCAPPED_KEY_BYTES + ciphertext.len());
-    envelope.extend_from_slice(&EnvelopeSuite::CURRENT.magic());
-    envelope.extend_from_slice(&encapped.to_bytes());
-    envelope.extend_from_slice(&ciphertext);
-    Ok(envelope)
-}
-
-fn parse_envelope(envelope: &[u8]) -> Result<(&[u8], &[u8]), CryptoError> {
-    match check_envelope_frame(envelope)? {
-        EnvelopeSuite::Hpk1 => Ok(envelope[MAGIC_BYTES..].split_at(ENCAPPED_KEY_BYTES)),
+    fn seal<K: KemTrait>(
+        suite: EnvelopeSuite,
+        pk: &K::PublicKey,
+        info: &[u8],
+        plaintext: &[u8],
+        rng: &mut impl CryptoRng,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let (encapped, ciphertext) = hpke::single_shot_seal_with_rng::<TenantAead, TenantKdf, K>(
+            &OpModeS::Base,
+            pk,
+            info,
+            plaintext,
+            b"",
+            rng,
+        )
+        .map_err(|_| CryptoError::SealFailed)?;
+        Ok(frame(suite, &encapped.to_bytes(), &ciphertext))
+    }
+    match &recipient.0 {
+        PublicKeyInner::Hpk1(pk) => seal::<Hpk1Kem>(EnvelopeSuite::Hpk1, pk, info, plaintext, rng),
+        PublicKeyInner::Hpk2(pk) => {
+            seal::<TenantKem>(EnvelopeSuite::Hpk2, pk, info, plaintext, rng)
+        }
     }
 }
 
-/// Test/dev-only tenant keypair. Production tenant private keys are
-/// generated non-extractable in the browser and never exist server-side.
-pub struct TenantKeypair {
-    private_key: KemPrivateKey,
-    public_key: KemPublicKey,
+fn frame(suite: EnvelopeSuite, encapped: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut envelope = Vec::with_capacity(MAGIC_BYTES + encapped.len() + ciphertext.len());
+    envelope.extend_from_slice(&suite.magic());
+    envelope.extend_from_slice(encapped);
+    envelope.extend_from_slice(ciphertext);
+    envelope
 }
 
+enum KeypairInner {
+    Hpk1 {
+        private_key: <Hpk1Kem as KemTrait>::PrivateKey,
+        public_key: <Hpk1Kem as KemTrait>::PublicKey,
+    },
+    // Boxed for the same reason as `PublicKeyInner::Hpk2`.
+    Hpk2(Box<Hpk2Keypair>),
+}
+
+struct Hpk2Keypair {
+    private_key: <TenantKem as KemTrait>::PrivateKey,
+    public_key: <TenantKem as KemTrait>::PublicKey,
+}
+
+/// Test/dev-only tenant keypair. Both suites' private keys zeroize on drop
+/// (`x25519-dalek` and `x-wing`).
+pub struct TenantKeypair(KeypairInner);
+
 impl TenantKeypair {
-    pub fn generate() -> Self {
-        let (private_key, public_key) = TenantKem::gen_keypair(&mut rand::rngs::OsRng);
-        Self {
-            private_key,
-            public_key,
-        }
+    pub fn generate(suite: EnvelopeSuite) -> Self {
+        Self(match suite {
+            EnvelopeSuite::Hpk1 => {
+                let (private_key, public_key) = Hpk1Kem::gen_keypair();
+                KeypairInner::Hpk1 {
+                    private_key,
+                    public_key,
+                }
+            }
+            EnvelopeSuite::Hpk2 => {
+                let (private_key, public_key) = TenantKem::gen_keypair();
+                KeypairInner::Hpk2(Box::new(Hpk2Keypair {
+                    private_key,
+                    public_key,
+                }))
+            }
+        })
     }
 
     /// RFC 9180 `DeriveKeyPair` from input keying material. Used only for
     /// the test-only recipients of the committed vectors, whose seeds are
     /// public.
-    pub fn derive(ikm: &[u8]) -> Self {
-        let (private_key, public_key) = TenantKem::derive_keypair(ikm);
-        Self {
-            private_key,
-            public_key,
+    pub fn derive(suite: EnvelopeSuite, ikm: &[u8]) -> Self {
+        Self(match suite {
+            EnvelopeSuite::Hpk1 => {
+                let (private_key, public_key) = Hpk1Kem::derive_keypair(ikm);
+                KeypairInner::Hpk1 {
+                    private_key,
+                    public_key,
+                }
+            }
+            EnvelopeSuite::Hpk2 => {
+                let (private_key, public_key) = TenantKem::derive_keypair(ikm);
+                KeypairInner::Hpk2(Box::new(Hpk2Keypair {
+                    private_key,
+                    public_key,
+                }))
+            }
+        })
+    }
+
+    pub fn suite(&self) -> EnvelopeSuite {
+        match self.0 {
+            KeypairInner::Hpk1 { .. } => EnvelopeSuite::Hpk1,
+            KeypairInner::Hpk2(_) => EnvelopeSuite::Hpk2,
         }
     }
 
     pub fn public_key(&self) -> TenantPublicKey {
-        TenantPublicKey(self.public_key.clone())
-    }
-
-    /// Export the raw 32-byte X25519 private scalar into a zeroize-on-drop
-    /// container (used by the key-release service to HPKE-wrap a released key
-    /// to an attested enclave's ephemeral public key).
-    pub fn to_private_key_bytes(&self) -> SecretBytes {
-        SecretBytes::new(self.private_key.to_bytes().to_vec())
-    }
-
-    /// Reconstruct a keypair inside enclave RAM from unwrapped private-key
-    /// bytes.
-    pub fn from_private_key_bytes(raw: &[u8]) -> Result<Self, CryptoError> {
-        let private_key =
-            KemPrivateKey::from_bytes(raw).map_err(|_| CryptoError::InvalidKeyLength)?;
-        let public_key = TenantKem::sk_to_pk(&private_key);
-        Ok(Self {
-            private_key,
-            public_key,
+        TenantPublicKey(match &self.0 {
+            KeypairInner::Hpk1 { public_key, .. } => PublicKeyInner::Hpk1(public_key.clone()),
+            KeypairInner::Hpk2(kp) => PublicKeyInner::Hpk2(Box::new(kp.public_key.clone())),
         })
     }
 
-    /// Open a framed envelope. Fails on tamper, wrong recipient, or a
-    /// mismatched `info` binding.
-    pub fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, CryptoError> {
-        let (encapped_raw, ciphertext) = parse_envelope(envelope)?;
-        let encapped =
-            KemEncappedKey::from_bytes(encapped_raw).map_err(|_| CryptoError::InvalidEnvelope)?;
-        hpke::single_shot_open::<TenantAead, TenantKdf, TenantKem>(
-            &OpModeR::Base,
-            &self.private_key,
-            &encapped,
-            info,
-            ciphertext,
-            b"",
-        )
-        .map(SecretBytes::new)
-        .map_err(|_| CryptoError::OpenFailed)
+    /// Export the private key as `magic || raw key` (an X25519 scalar or an
+    /// X-Wing seed, both 32 bytes, so the magic is what names the suite),
+    /// zeroized on drop. The key-release service HPKE-wraps this to an
+    /// attested enclave's public key.
+    pub fn to_private_key_bytes(&self) -> SecretBytes {
+        // Both suites' private keys are 32 bytes; each temporary copy is
+        // wiped before it is dropped.
+        let mut framed = Vec::with_capacity(MAGIC_BYTES + 32);
+        framed.extend_from_slice(&self.suite().magic());
+        match &self.0 {
+            KeypairInner::Hpk1 { private_key, .. } => {
+                let mut raw = private_key.to_bytes();
+                framed.extend_from_slice(&raw);
+                raw.as_mut_slice().zeroize();
+            }
+            KeypairInner::Hpk2(kp) => {
+                let mut raw = kp.private_key.to_bytes();
+                framed.extend_from_slice(&raw);
+                raw.as_mut_slice().zeroize();
+            }
+        }
+        SecretBytes::new(framed)
     }
-}
 
-impl Drop for TenantKeypair {
-    fn drop(&mut self) {
-        if let Ok(zero_sk) = KemPrivateKey::from_bytes(&[0u8; X25519_PUBLIC_KEY_BYTES]) {
-            self.private_key = zero_sk;
+    /// Reconstruct a keypair from [`Self::to_private_key_bytes`] output.
+    /// Unframed or unknown-magic input is refused; `policy` decides whether
+    /// the named suite is accepted.
+    pub fn from_private_key_bytes(framed: &[u8], policy: SuitePolicy) -> Result<Self, CryptoError> {
+        let suite =
+            EnvelopeSuite::of_envelope(framed).map_err(|_| CryptoError::InvalidKeyLength)?;
+        policy.check(suite)?;
+        let raw = &framed[MAGIC_BYTES..];
+        let inner = match suite {
+            EnvelopeSuite::Hpk1 => {
+                let private_key = <Hpk1Kem as KemTrait>::PrivateKey::from_bytes(raw)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let public_key = Hpk1Kem::sk_to_pk(&private_key);
+                KeypairInner::Hpk1 {
+                    private_key,
+                    public_key,
+                }
+            }
+            EnvelopeSuite::Hpk2 => {
+                let private_key = <TenantKem as KemTrait>::PrivateKey::from_bytes(raw)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?;
+                let public_key = TenantKem::sk_to_pk(&private_key);
+                KeypairInner::Hpk2(Box::new(Hpk2Keypair {
+                    private_key,
+                    public_key,
+                }))
+            }
+        };
+        Ok(Self(inner))
+    }
+
+    /// Open a framed envelope of this key's suite. Fails on a frame of
+    /// another suite, tamper, wrong recipient, or a mismatched `info`.
+    pub fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, CryptoError> {
+        fn open<K: KemTrait>(
+            sk: &K::PrivateKey,
+            encapped: &[u8],
+            info: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<SecretBytes, CryptoError> {
+            let encapped =
+                K::EncappedKey::from_bytes(encapped).map_err(|_| CryptoError::InvalidEnvelope)?;
+            hpke::single_shot_open::<TenantAead, TenantKdf, K>(
+                &OpModeR::Base,
+                sk,
+                &encapped,
+                info,
+                ciphertext,
+                b"",
+            )
+            .map(SecretBytes::new)
+            .map_err(|_| CryptoError::OpenFailed)
+        }
+
+        let suite = EnvelopeSuite::of_envelope(envelope)?;
+        if suite != self.suite() {
+            return Err(CryptoError::SuiteMismatch);
+        }
+        if envelope.len() < suite.min_frame_bytes() {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+        let (encapped, ciphertext) = envelope[MAGIC_BYTES..].split_at(suite.encapped_len());
+        match &self.0 {
+            KeypairInner::Hpk1 { private_key, .. } => {
+                open::<Hpk1Kem>(private_key, encapped, info, ciphertext)
+            }
+            KeypairInner::Hpk2(kp) => {
+                open::<TenantKem>(&kp.private_key, encapped, info, ciphertext)
+            }
         }
     }
 }
@@ -503,109 +738,253 @@ mod tests {
         assert_eq!(writer.into_secret().expose(), expected.as_slice());
     }
 
+    const SUITES: [EnvelopeSuite; 2] = [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2];
+
     #[test]
     fn hpke_envelope_round_trips() {
-        let keypair = TenantKeypair::generate();
-        let envelope = hpke_seal_to_tenant(&keypair.public_key(), b"info|a|b", b"parquet bytes")
-            .expect("seal");
-        assert_eq!(&envelope[..4], b"HPK1");
-        let opened = keypair.open_envelope(b"info|a|b", &envelope).expect("open");
-        assert_eq!(opened.expose(), b"parquet bytes");
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            let envelope =
+                hpke_seal_to_tenant(&keypair.public_key(), b"info|a|b", b"parquet bytes")
+                    .expect("seal");
+            assert_eq!(&envelope[..4], &suite.magic());
+            let opened = keypair.open_envelope(b"info|a|b", &envelope).expect("open");
+            assert_eq!(opened.expose(), b"parquet bytes");
+        }
+    }
+
+    #[test]
+    fn hpk2_is_current() {
+        assert_eq!(EnvelopeSuite::CURRENT, EnvelopeSuite::Hpk2);
+        assert_eq!(EnvelopeSuite::Hpk2.magic(), *b"HPK2");
+        assert_eq!(EnvelopeSuite::Hpk1.magic(), *b"HPK1");
     }
 
     #[test]
     fn hpke_envelope_rejects_wrong_info_binding() {
-        let keypair = TenantKeypair::generate();
-        let envelope =
-            hpke_seal_to_tenant(&keypair.public_key(), b"tenant|obj-1", b"data").expect("seal");
-        assert!(matches!(
-            keypair.open_envelope(b"tenant|obj-2", &envelope),
-            Err(CryptoError::OpenFailed)
-        ));
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            let envelope =
+                hpke_seal_to_tenant(&keypair.public_key(), b"tenant|obj-1", b"data").expect("seal");
+            assert!(matches!(
+                keypair.open_envelope(b"tenant|obj-2", &envelope),
+                Err(CryptoError::OpenFailed)
+            ));
+        }
     }
 
     #[test]
     fn hpke_envelope_rejects_wrong_recipient_and_tamper() {
-        let alice = TenantKeypair::generate();
-        let mallory = TenantKeypair::generate();
-        let mut envelope =
-            hpke_seal_to_tenant(&alice.public_key(), b"info", b"data").expect("seal");
-
-        assert!(matches!(
-            mallory.open_envelope(b"info", &envelope),
-            Err(CryptoError::OpenFailed)
-        ));
-
-        let last = envelope.len() - 1;
-        envelope[last] ^= 0xFF;
-        assert!(matches!(
-            alice.open_envelope(b"info", &envelope),
-            Err(CryptoError::OpenFailed)
-        ));
+        for suite in SUITES {
+            let alice = TenantKeypair::generate(suite);
+            let mallory = TenantKeypair::generate(suite);
+            let mut envelope =
+                hpke_seal_to_tenant(&alice.public_key(), b"info", b"data").expect("seal");
+            assert!(matches!(
+                mallory.open_envelope(b"info", &envelope),
+                Err(CryptoError::OpenFailed)
+            ));
+            let last = envelope.len() - 1;
+            envelope[last] ^= 0xFF;
+            assert!(matches!(
+                alice.open_envelope(b"info", &envelope),
+                Err(CryptoError::OpenFailed)
+            ));
+        }
     }
 
     #[test]
     fn hpke_envelope_rejects_bad_framing() {
-        let keypair = TenantKeypair::generate();
-        assert!(matches!(
-            keypair.open_envelope(b"info", b"XXXXtooshort"),
-            Err(CryptoError::InvalidEnvelope)
-        ));
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            for bad in [&b"XXXXtooshort"[..], b"HPK1short", b"HPK2short", b""] {
+                assert!(keypair.open_envelope(b"info", bad).is_err(), "{bad:?}");
+            }
+        }
     }
 
     #[test]
-    fn hpk1_envelope_overhead_is_52_bytes() {
-        // Magic (4) + encapsulated X25519 key (32) + AES-GCM tag (16).
-        // docs/BENCHMARKS.md records this size.
-        let recipient = TenantKeypair::generate().public_key();
-        for len in [0usize, 32, 4096] {
-            let envelope = hpke_seal_to_tenant(&recipient, b"size", &vec![0u8; len]).expect("seal");
-            assert_eq!(envelope.len(), len + 52);
+    fn envelope_overhead_per_suite() {
+        // Magic (4) + encapsulated key (X25519 32, X-Wing 1120) + AES-GCM tag (16).
+        // docs/BENCHMARKS.md records these sizes.
+        for (suite, overhead) in [(EnvelopeSuite::Hpk1, 52), (EnvelopeSuite::Hpk2, 1140)] {
+            let recipient = TenantKeypair::generate(suite).public_key();
+            for len in [0usize, 32, 4096] {
+                let envelope =
+                    hpke_seal_to_tenant(&recipient, b"size", &vec![0u8; len]).expect("seal");
+                assert_eq!(envelope.len(), len + overhead, "{suite:?}");
+            }
         }
     }
 
     #[test]
     fn envelope_suite_comes_from_the_frame_magic() {
-        let keypair = TenantKeypair::generate();
-        let envelope = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"x").expect("seal");
-        assert_eq!(
-            EnvelopeSuite::of_envelope(&envelope).expect("suite"),
-            EnvelopeSuite::Hpk1
-        );
-        assert_eq!(EnvelopeSuite::CURRENT.magic(), *b"HPK1");
-        for unknown in [&b"HPK2"[..], b"hpk1", b"HPK", b""] {
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            let envelope = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"x").expect("seal");
+            assert_eq!(EnvelopeSuite::of_envelope(&envelope).expect("suite"), suite);
+        }
+        for unknown in [&b"HPK3"[..], b"hpk1", b"hpk2", b"HPK", b""] {
             assert!(matches!(
                 EnvelopeSuite::of_envelope(unknown),
                 Err(CryptoError::InvalidEnvelope)
             ));
         }
-        let mut relabelled = envelope.clone();
-        relabelled[..4].copy_from_slice(b"HPK2");
+    }
+
+    #[test]
+    fn open_refuses_other_suite_frame() {
+        let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+        let hpk2 = TenantKeypair::generate(EnvelopeSuite::Hpk2);
+        let to_hpk1 = hpke_seal_to_tenant(&hpk1.public_key(), b"i", b"x").expect("seal");
+        let to_hpk2 = hpke_seal_to_tenant(&hpk2.public_key(), b"i", b"x").expect("seal");
         assert!(matches!(
-            keypair.open_envelope(b"i", &relabelled),
-            Err(CryptoError::InvalidEnvelope)
+            hpk2.open_envelope(b"i", &to_hpk1),
+            Err(CryptoError::SuiteMismatch)
         ));
+        assert!(matches!(
+            hpk1.open_envelope(b"i", &to_hpk2),
+            Err(CryptoError::SuiteMismatch)
+        ));
+        // A relabelled frame is refused, not reinterpreted under the other suite.
+        let mut relabelled = to_hpk1.clone();
+        relabelled[..4].copy_from_slice(b"HPK2");
+        assert!(hpk1.open_envelope(b"i", &relabelled).is_err());
+        assert!(hpk2.open_envelope(b"i", &relabelled).is_err());
+    }
+
+    #[test]
+    fn from_raw_accepts_only_suite_lengths() {
+        for suite in SUITES {
+            let raw = TenantKeypair::generate(suite).public_key().to_raw();
+            assert_eq!(raw.len(), suite.public_key_len());
+            let parsed = TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT).expect("raw");
+            assert_eq!(parsed.suite(), suite);
+        }
+        assert_eq!(EnvelopeSuite::Hpk1.public_key_len(), 32);
+        assert_eq!(EnvelopeSuite::Hpk2.public_key_len(), 1216);
+        for len in [0usize, 31, 33, 1215, 1217, 2432] {
+            assert!(matches!(
+                TenantPublicKey::from_raw(&vec![7u8; len], SuitePolicy::DEVELOPMENT),
+                Err(CryptoError::InvalidPublicKey)
+            ));
+        }
+    }
+
+    #[test]
+    fn production_policy_refuses_hpk1() {
+        let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+        let hpk2 = TenantKeypair::generate(EnvelopeSuite::Hpk2);
+        let hpk1_raw = hpk1.public_key().to_raw();
+        let hpk2_raw = hpk2.public_key().to_raw();
+        assert!(matches!(
+            TenantPublicKey::from_raw(&hpk1_raw, SuitePolicy::PRODUCTION),
+            Err(CryptoError::SuiteRefused)
+        ));
+        assert!(matches!(
+            TenantKeypair::from_private_key_bytes(
+                hpk1.to_private_key_bytes().expose(),
+                SuitePolicy::PRODUCTION
+            ),
+            Err(CryptoError::SuiteRefused)
+        ));
+        assert!(TenantPublicKey::from_raw(&hpk2_raw, SuitePolicy::PRODUCTION).is_ok());
+        assert!(matches!(
+            TenantPublicKey::from_raw(&hpk2_raw, SuitePolicy::HPK1_ONLY),
+            Err(CryptoError::SuiteRefused)
+        ));
+        assert!(TenantPublicKey::from_raw(&hpk1_raw, SuitePolicy::HPK1_ONLY).is_ok());
+        assert_eq!(SuitePolicy::for_env(true), SuitePolicy::PRODUCTION);
+        assert_eq!(SuitePolicy::for_env(false), SuitePolicy::DEVELOPMENT);
+    }
+
+    #[test]
+    fn private_keys_are_framed() {
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            let framed = keypair.to_private_key_bytes();
+            assert_eq!(&framed.expose()[..4], &suite.magic());
+            assert_eq!(framed.expose().len(), 36);
+            let restored =
+                TenantKeypair::from_private_key_bytes(framed.expose(), SuitePolicy::DEVELOPMENT)
+                    .expect("framed key");
+            assert_eq!(restored.suite(), suite);
+            assert_eq!(
+                restored.public_key().to_raw(),
+                keypair.public_key().to_raw()
+            );
+            for bad in [
+                &framed.expose()[4..],
+                &[b"HPK3".as_slice(), &framed.expose()[4..]].concat()[..],
+            ] {
+                assert!(matches!(
+                    TenantKeypair::from_private_key_bytes(bad, SuitePolicy::DEVELOPMENT),
+                    Err(CryptoError::InvalidKeyLength)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn info_kind_follows_suite() {
+        use EnvelopeSuite::{Hpk1, Hpk2};
+        type Builder = fn(EnvelopeSuite) -> Vec<u8>;
+        let cases: [(Builder, &str); 4] = [
+            (
+                |s| info::connector_object(s, "t", "c", "o"),
+                "tenant-envelope",
+            ),
+            (
+                |s| info::snapshot_manifest(s, "t", "c", "v"),
+                "tenant-snapshot-manifest",
+            ),
+            (|s| info::steward_upload(s, "t", "d", "o"), "steward-upload"),
+            (|s| info::research_result(s, "t", "q"), "research-result"),
+        ];
+        for (build, kind) in cases {
+            assert!(
+                build(Hpk1).starts_with(format!("{kind}-v1|").as_bytes()),
+                "{kind}"
+            );
+            assert!(
+                build(Hpk2).starts_with(format!("{kind}-v2|").as_bytes()),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn suite_names() {
+        assert_eq!(
+            EnvelopeSuite::Hpk1.name(),
+            "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM"
+        );
+        assert_eq!(EnvelopeSuite::Hpk2.name(), "X-Wing+HKDF-SHA256+AES-256-GCM");
     }
 
     #[test]
     fn frame_check_refuses_unknown_magic_and_truncated_frames() {
-        let keypair = TenantKeypair::generate();
-        let empty = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"").expect("seal");
-        assert_eq!(empty.len(), EnvelopeSuite::Hpk1.min_frame_bytes());
-        assert_eq!(
-            check_envelope_frame(&empty).expect("complete frame"),
-            EnvelopeSuite::Hpk1
-        );
-        // A known magic alone does not make a frame: the committed
-        // "truncated frame" vector is 20 bytes starting `HPK1`.
-        for short in [&empty[..4], &empty[..20], &empty[..empty.len() - 1]] {
-            assert!(EnvelopeSuite::of_envelope(short).is_ok());
-            assert!(matches!(
-                check_envelope_frame(short),
-                Err(CryptoError::InvalidEnvelope)
-            ));
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            let empty = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"").expect("seal");
+            assert_eq!(empty.len(), suite.min_frame_bytes());
+            assert_eq!(check_envelope_frame(&empty).expect("complete frame"), suite);
+            // A known magic alone does not make a frame: the committed
+            // "truncated frame" vector is 20 bytes starting `HPK1`.
+            for short in [&empty[..4], &empty[..20], &empty[..empty.len() - 1]] {
+                assert!(EnvelopeSuite::of_envelope(short).is_ok());
+                assert!(matches!(
+                    check_envelope_frame(short),
+                    Err(CryptoError::InvalidEnvelope)
+                ));
+            }
+            let mut unknown = empty.clone();
+            unknown[..4].copy_from_slice(b"HPK9");
+            assert!(check_envelope_frame(&unknown).is_err());
         }
-        let mut relabelled = empty.clone();
+        // An HPK1 frame relabelled HPK2 is too short to be one.
+        let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+        let mut relabelled = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"").expect("seal");
         relabelled[..4].copy_from_slice(b"HPK2");
         assert!(check_envelope_frame(&relabelled).is_err());
     }
@@ -613,43 +992,49 @@ mod tests {
     #[test]
     fn suite_ids_are_stable_and_round_trip() {
         assert_eq!(EnvelopeSuite::Hpk1.id(), "HPK1");
-        assert_eq!(
-            EnvelopeSuite::from_id(EnvelopeSuite::CURRENT.id()).expect("known"),
-            EnvelopeSuite::CURRENT
-        );
-        for unknown in ["", "hpk1", "HPK2", "HPK1 "] {
+        assert_eq!(EnvelopeSuite::Hpk2.id(), "HPK2");
+        for suite in SUITES {
+            assert_eq!(suite.id().as_bytes(), suite.magic());
+            assert_eq!(EnvelopeSuite::from_id(suite.id()).expect("known"), suite);
+        }
+        for unknown in ["", "hpk1", "HPK3", "HPK1 "] {
             assert!(EnvelopeSuite::from_id(unknown).is_err(), "{unknown:?}");
         }
     }
 
     #[test]
     fn derived_keypairs_are_deterministic_and_seed_separated() {
-        let a1 = TenantKeypair::derive(b"seed a").public_key().to_raw();
-        let a2 = TenantKeypair::derive(b"seed a").public_key().to_raw();
-        let b = TenantKeypair::derive(b"seed b").public_key().to_raw();
-        assert_eq!(a1, a2);
-        assert_ne!(a1, b);
+        for suite in SUITES {
+            let a1 = TenantKeypair::derive(suite, b"seed a")
+                .public_key()
+                .to_raw();
+            let a2 = TenantKeypair::derive(suite, b"seed a")
+                .public_key()
+                .to_raw();
+            let b = TenantKeypair::derive(suite, b"seed b")
+                .public_key()
+                .to_raw();
+            assert_eq!(a1, a2);
+            assert_ne!(a1, b);
+        }
     }
 
     #[test]
     fn tenant_public_key_raw_round_trip() {
-        let keypair = TenantKeypair::generate();
-        let raw = keypair.public_key().to_raw();
-        assert_eq!(raw.len(), X25519_PUBLIC_KEY_BYTES);
-        let restored = TenantPublicKey::from_raw(&raw).expect("valid raw key");
-        let envelope = hpke_seal_to_tenant(&restored, b"i", b"x").expect("seal");
-        assert_eq!(
-            keypair
-                .open_envelope(b"i", &envelope)
-                .expect("open")
-                .expose(),
-            b"x"
-        );
-    }
-
-    #[test]
-    fn tenant_public_key_rejects_bad_raw() {
-        assert!(TenantPublicKey::from_raw(&[0u8; 5]).is_err());
+        for suite in SUITES {
+            let keypair = TenantKeypair::generate(suite);
+            let raw = keypair.public_key().to_raw();
+            let restored =
+                TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT).expect("valid raw key");
+            let envelope = hpke_seal_to_tenant(&restored, b"i", b"x").expect("seal");
+            assert_eq!(
+                keypair
+                    .open_envelope(b"i", &envelope)
+                    .expect("open")
+                    .expose(),
+                b"x"
+            );
+        }
     }
 
     mod props {
@@ -657,7 +1042,8 @@ mod tests {
         use proptest::prelude::*;
         use std::sync::LazyLock;
 
-        static KEYPAIR: LazyLock<TenantKeypair> = LazyLock::new(TenantKeypair::generate);
+        static KEYPAIR: LazyLock<TenantKeypair> =
+            LazyLock::new(|| TenantKeypair::generate(EnvelopeSuite::CURRENT));
 
         fn bytes(max: usize) -> impl Strategy<Value = Vec<u8>> {
             prop::collection::vec(any::<u8>(), 0..max)
@@ -678,7 +1064,7 @@ mod tests {
                 framed: bool,
             ) {
                 let envelope = if framed {
-                    [&HPKE_ENVELOPE_MAGIC[..], &envelope].concat()
+                    [&EnvelopeSuite::CURRENT.magic()[..], &envelope].concat()
                 } else {
                     envelope
                 };
@@ -722,9 +1108,12 @@ mod tests {
 
         proptest! {
             #[test]
-            fn arbitrary_public_keys_never_panic(raw in bytes(64)) {
-                let parsed = TenantPublicKey::from_raw(&raw);
-                prop_assert_eq!(parsed.is_ok(), raw.len() == X25519_PUBLIC_KEY_BYTES);
+            fn arbitrary_public_keys_never_panic(raw in bytes(1300)) {
+                let parsed = TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT);
+                prop_assert!(parsed.is_err() || raw.len() == 32 || raw.len() == 1216);
+                if raw.len() == 32 {
+                    prop_assert!(parsed.is_ok());
+                }
             }
 
             #[cfg(feature = "server")]

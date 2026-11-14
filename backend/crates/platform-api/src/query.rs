@@ -23,7 +23,7 @@ use platform_connectors::snapshot::{
     SnapshotManifest, manifest_info, newest_manifest, object_info,
 };
 use platform_core::{ConnectorSlug, DatasetKind, DeclaredSchema, TenantId};
-use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair};
+use platform_crypto::{CryptoError, EnvelopeSuite, SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
@@ -87,6 +87,33 @@ pub trait EnclaveKeyProvider: Send + Sync {
     }
 }
 
+/// Open `envelope` with `tenant`'s `keypair`. A frame of another suite than
+/// the key's is audited as `crypto.suite_refused` before the generic error.
+pub(crate) fn open_tenant_envelope(
+    keypair: &TenantKeypair,
+    tenant: TenantId,
+    info: &[u8],
+    envelope: &[u8],
+) -> Result<SecretBytes, ApiError> {
+    keypair.open_envelope(info, envelope).map_err(|e| {
+        if matches!(e, CryptoError::SuiteMismatch) {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(tenant),
+                "denied",
+                "refused an envelope whose suite does not match the tenant key",
+            );
+        }
+        ApiError::Backend
+    })
+}
+
+/// The suite a stored envelope names, which picks its `info` version; the
+/// open then refuses a suite other than the key's.
+fn suite_of(envelope: &[u8]) -> Result<EnvelopeSuite, ApiError> {
+    EnvelopeSuite::of_envelope(envelope).map_err(|_| ApiError::Backend)
+}
+
 /// DEV ONLY: holds one tenant keypair in process memory, which defeats the
 /// zero-trust boundary. For local development and tests.
 pub struct DevKeyProvider {
@@ -114,9 +141,7 @@ impl EnclaveKeyProvider for DevKeyProvider {
         if tenant != self.tenant {
             return Err(ApiError::Backend);
         }
-        self.keypair
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        open_tenant_envelope(&self.keypair, tenant, info, envelope)
     }
 }
 
@@ -145,11 +170,8 @@ impl EnclaveKeyProvider for MultiTenantDevKeyProvider {
         info: &[u8],
         envelope: &[u8],
     ) -> Result<SecretBytes, ApiError> {
-        self.keys
-            .get(&tenant)
-            .ok_or(ApiError::Backend)?
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        let keypair = self.keys.get(&tenant).ok_or(ApiError::Backend)?;
+        open_tenant_envelope(keypair, tenant, info, envelope)
     }
 }
 
@@ -424,7 +446,7 @@ impl ConnectorQueryService {
 
         let key_session = self.keys.begin_query_session(owner).await?;
         let envelope = self.snapshot_part(owner, &path).await?;
-        let info = manifest_info(&owner, dataset, &version);
+        let info = manifest_info(suite_of(&envelope)?, &owner, dataset, &version);
         let plaintext = key_session.open_envelope(&info, &envelope).await?;
         let manifest = serde_json::from_slice::<SnapshotManifest>(plaintext.expose())
             .ok()
@@ -444,7 +466,7 @@ impl ConnectorQueryService {
         for object in &manifest.objects {
             let path = TenantPaths::connector_snapshot_object(owner, dataset, &version, *object);
             let envelope = self.snapshot_part(owner, &path).await?;
-            let info = object_info(&owner, dataset, object);
+            let info = object_info(suite_of(&envelope)?, &owner, dataset, object);
             let plaintext = key_session.open_envelope(&info, &envelope).await?;
             blobs.push(plaintext);
         }

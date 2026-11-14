@@ -76,6 +76,9 @@ pub enum AuditKind {
     /// Listings published/withdrawn and access requests filed/resolved.
     /// Identifiers only, never titles or notes.
     ResearchCatalog,
+    /// A key or envelope whose suite the deployment does not accept (for
+    /// example `HPK1` in production), or whose suite does not match the key.
+    SuiteRefused,
 }
 
 impl AuditKind {
@@ -92,6 +95,7 @@ impl AuditKind {
             AuditKind::AuthDecision => "auth.decision",
             AuditKind::ResearchBudget => "research.budget",
             AuditKind::ResearchCatalog => "research.catalog",
+            AuditKind::SuiteRefused => "crypto.suite_refused",
         }
     }
 }

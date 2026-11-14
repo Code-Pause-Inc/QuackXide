@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use platform_core::{ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
-use platform_crypto::TenantPublicKey;
+use platform_crypto::{EnvelopeSuite, TenantPublicKey};
 use platform_enclave::{AttestationProvider, EnclaveError, TeePlatform, fresh_nonce};
 use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
@@ -58,10 +58,15 @@ pub struct SyncReport {
     pub written: Vec<WrittenObject>,
 }
 
-/// HPKE `info` binding for a connector object
+/// HPKE `info` binding for a connector object sealed under `suite`
 /// ([`platform_crypto::info::connector_object`]).
-pub fn envelope_info(tenant: &TenantId, slug: &ConnectorSlug, object: &ObjectId) -> Vec<u8> {
-    platform_crypto::info::connector_object(tenant, slug, object)
+pub fn envelope_info(
+    suite: EnvelopeSuite,
+    tenant: &TenantId,
+    slug: &ConnectorSlug,
+    object: &ObjectId,
+) -> Vec<u8> {
+    platform_crypto::info::connector_object(suite, tenant, slug, object)
 }
 
 pub struct EnclavePipeline {

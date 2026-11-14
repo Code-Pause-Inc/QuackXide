@@ -1,6 +1,8 @@
 //! HPKE `info` strings: the binding context every envelope is sealed under.
 //!
 //! Each string is a kind with a version, then its fields, joined with `|`.
+//! The version follows the envelope suite (`-v1` for `HPK1`, `-v2` for
+//! `HPK2`, ADR 0007), so every builder takes the suite it seals under.
 //! They are defined only here and pinned by the committed vectors
 //! (`fixtures/envelope/`), so the enclave and the browser cannot drift.
 //!
@@ -10,26 +12,43 @@
 
 use std::fmt::Display;
 
-use crate::CryptoError;
+use crate::{CryptoError, EnvelopeSuite};
 
 const SEPARATOR: char = '|';
 
+fn version(suite: EnvelopeSuite) -> &'static str {
+    match suite {
+        EnvelopeSuite::Hpk1 => "v1",
+        EnvelopeSuite::Hpk2 => "v2",
+    }
+}
+
 /// A connector object written by an enclave pipeline.
 pub fn connector_object(
+    suite: EnvelopeSuite,
     tenant: impl Display,
     connector: impl Display,
     object: impl Display,
 ) -> Vec<u8> {
-    format!("tenant-envelope-v1|{tenant}|{connector}|{object}").into_bytes()
+    format!(
+        "tenant-envelope-{}|{tenant}|{connector}|{object}",
+        version(suite)
+    )
+    .into_bytes()
 }
 
 /// A connector snapshot manifest (ADR 0003).
 pub fn snapshot_manifest(
+    suite: EnvelopeSuite,
     tenant: impl Display,
     connector: impl Display,
     version: impl Display,
 ) -> Vec<u8> {
-    format!("tenant-snapshot-manifest-v1|{tenant}|{connector}|{version}").into_bytes()
+    format!(
+        "tenant-snapshot-manifest-{}|{tenant}|{connector}|{version}",
+        self::version(suite)
+    )
+    .into_bytes()
 }
 
 /// An object of a dataset a steward uploads from the browser (ADR 0012):
@@ -38,17 +57,30 @@ pub fn snapshot_manifest(
 /// browser chose before sealing. The snapshot's manifest uses
 /// [`snapshot_manifest`] with the same slug.
 pub fn steward_upload(
+    suite: EnvelopeSuite,
     tenant: impl Display,
     dataset: impl Display,
     object: impl Display,
 ) -> Vec<u8> {
-    format!("steward-upload-v1|{tenant}|{dataset}|{object}").into_bytes()
+    format!(
+        "steward-upload-{}|{tenant}|{dataset}|{object}",
+        version(suite)
+    )
+    .into_bytes()
 }
 
 /// A query result sealed to a researcher. P55 fixes the identifiers that
 /// fill the fields.
-pub fn research_result(researcher_tenant: impl Display, query: impl Display) -> Vec<u8> {
-    format!("research-result-v1|{researcher_tenant}|{query}").into_bytes()
+pub fn research_result(
+    suite: EnvelopeSuite,
+    researcher_tenant: impl Display,
+    query: impl Display,
+) -> Vec<u8> {
+    format!(
+        "research-result-{}|{researcher_tenant}|{query}",
+        version(suite)
+    )
+    .into_bytes()
 }
 
 /// Refuse a field that is empty or contains the separator.
@@ -65,13 +97,24 @@ mod tests {
 
     #[test]
     fn strings_have_the_pinned_layout() {
-        assert_eq!(connector_object("t", "c", "o"), b"tenant-envelope-v1|t|c|o");
+        use EnvelopeSuite::{Hpk1, Hpk2};
         assert_eq!(
-            snapshot_manifest("t", "c", "v"),
-            b"tenant-snapshot-manifest-v1|t|c|v"
+            connector_object(Hpk1, "t", "c", "o"),
+            b"tenant-envelope-v1|t|c|o"
         );
-        assert_eq!(steward_upload("t", "d", "o"), b"steward-upload-v1|t|d|o");
-        assert_eq!(research_result("t", "q"), b"research-result-v1|t|q");
+        assert_eq!(
+            connector_object(Hpk2, "t", "c", "o"),
+            b"tenant-envelope-v2|t|c|o"
+        );
+        assert_eq!(
+            snapshot_manifest(Hpk2, "t", "c", "v"),
+            b"tenant-snapshot-manifest-v2|t|c|v"
+        );
+        assert_eq!(
+            steward_upload(Hpk2, "t", "d", "o"),
+            b"steward-upload-v2|t|d|o"
+        );
+        assert_eq!(research_result(Hpk2, "t", "q"), b"research-result-v2|t|q");
     }
 
     #[test]

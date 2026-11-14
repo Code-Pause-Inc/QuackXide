@@ -34,7 +34,7 @@ use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
 use platform_connectors::snapshot::SnapshotWriter;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
-use platform_crypto::{TenantKeypair, TenantPublicKey};
+use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
 use platform_enclave::AttestationProvider;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
@@ -195,7 +195,7 @@ async fn release_with(
 
 fn enrolled(rp: &KeyReleaseRelyingParty) -> TenantId {
     let tenant = TenantId::generate();
-    rp.insert_tenant_key(tenant, &TenantKeypair::generate());
+    rp.insert_tenant_key(tenant, &TenantKeypair::generate(EnvelopeSuite::Hpk2));
     tenant
 }
 
@@ -303,7 +303,7 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let steward_key = TenantKeypair::generate();
+    let steward_key = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
 
     // Seal a 3-object snapshot so we can prove key release happens ONCE per query,
     // not 1 (manifest) + 3 (objects) = 4 times.
@@ -609,7 +609,7 @@ async fn refusal_bodies_carry_no_token_text() {
 #[tokio::test]
 async fn enroll_returns_the_public_key() {
     let rp = static_rp();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk2);
     let body = serde_json::json!({
         "tenant_id": TenantId::generate().to_string(),
         "private_key_b64": B64.encode(keypair.to_private_key_bytes().expose()),
@@ -627,9 +627,63 @@ async fn enroll_returns_the_public_key() {
     let public = B64
         .decode(parsed["public_key_b64"].as_str().unwrap())
         .unwrap();
+    assert_eq!(public.len(), 1216);
     assert_eq!(
-        TenantPublicKey::from_raw(&public).unwrap().to_raw(),
+        TenantPublicKey::from_raw(&public, SuitePolicy::PRODUCTION)
+            .unwrap()
+            .to_raw(),
         keypair.public_key().to_raw()
+    );
+}
+
+#[tokio::test]
+async fn stand_in_refuses_hpk1_and_unframed_tenant_keys() {
+    // The stand-in imports only HPK2 tenant keys, whatever APP_ENV says.
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let rp = static_rp();
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).to_private_key_bytes();
+    let hpk2 = TenantKeypair::generate(EnvelopeSuite::Hpk2).to_private_key_bytes();
+    for refused in [hpk1.expose(), &hpk2.expose()[4..]] {
+        let body = serde_json::json!({
+            "tenant_id": TenantId::generate().to_string(),
+            "private_key_b64": B64.encode(refused),
+        });
+        let (status, _) = send(
+            &rp.clone().router(),
+            "PUT",
+            "/v1/keys",
+            &[json_header()],
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // The HPK1 key is a suite refusal; the unframed one is malformed.
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn released_hpk1_key_is_refused_and_audited() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let rp = static_rp();
+    let tenant = TenantId::generate();
+    // Bypasses /v1/keys, which would refuse it: the enclave must refuse too.
+    rp.insert_tenant_key(tenant, &TenantKeypair::generate(EnvelopeSuite::Hpk1));
+    let key_provider = AttestedKeyProvider::new(
+        Arc::new(EnclaveIdentity::generate()),
+        provider(SimulatedClaims::default()),
+        Arc::new(InProcessKeyReleaseClient(rp.clone())),
+    );
+    use platform_api::query::EnclaveKeyProvider as _;
+    assert!(key_provider.begin_query_session(tenant).await.is_err());
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
     );
 }
 
@@ -715,7 +769,7 @@ async fn query_still_answers_503_when_the_stand_in_refuses() {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let attestation = provider(SimulatedClaims::default());
     let tenant = TenantId::generate();
-    let public_key = TenantKeypair::generate().public_key();
+    let public_key = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT).public_key();
     let mut snapshot = SnapshotWriter::begin(
         &*vault,
         tenant,
