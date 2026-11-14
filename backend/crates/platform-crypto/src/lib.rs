@@ -27,6 +27,12 @@ use std::io::{self, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod info;
+pub mod signature;
+pub use signature::{
+    ED25519_PUBLIC_KEY_BYTES, ED25519_SIGNATURE_BYTES, ML_DSA_65_PUBLIC_KEY_BYTES,
+    ML_DSA_65_SIGNATURE_BYTES, ResultSignature, ResultSigningKey, ResultVerifyingKeys,
+    result_signature_message,
+};
 #[cfg(feature = "server")]
 mod totp;
 #[cfg(feature = "server")]
@@ -70,6 +76,9 @@ pub enum CryptoError {
     /// The envelope's suite is not the suite of the key opening it.
     #[error("envelope suite does not match the key")]
     SuiteMismatch,
+    /// A result signature did not verify under both schemes.
+    #[error("signature rejected")]
+    SignatureInvalid,
 }
 
 /// Heap bytes wiped on drop, with a redacted `Debug`. Use for every transient
