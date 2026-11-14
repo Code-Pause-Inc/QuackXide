@@ -1,21 +1,25 @@
 //! Audit-coverage contract: every security-relevant flow (key enrollment,
 //! TEE attestation, provisioning, data access including misses and denials,
-//! the research catalog) emits its SECURITY_AUDIT_EVENT record.
+//! the research catalog, research grants and budgets, and queries refused
+//! by a resource limit) emits its SECURITY_AUDIT_EVENT record.
 
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
-use platform_api::query::{ConnectorQueryService, DevKeyProvider};
-use platform_api::{AppState, build_app};
+use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
+use platform_api::research::{ResearchService, ResearchStores};
+use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
-use platform_crypto::TenantKeypair;
+use platform_crypto::{SecretBytes, TenantKeypair};
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
@@ -24,7 +28,7 @@ use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
 
@@ -54,8 +58,9 @@ fn token_for(tenant: TenantId) -> String {
     common::token_for(SECRET, tenant)
 }
 
-/// Full app: vault + jwt + provisioning + a query service with sealed
-/// QuickBooks fixture data for `tenant`.
+/// Full app: vault + jwt + provisioning + research access + a query
+/// service with sealed QuickBooks fixture data for `tenant`, who can also
+/// grant research access to it.
 async fn full_app(tenant: TenantId, zk: ZkMode) -> Router {
     full_app_with_attestation(tenant, zk, dev_attestation(), false).await
 }
@@ -69,6 +74,13 @@ async fn full_app_with_attestation(
 ) -> Router {
     let keypair = TenantKeypair::generate();
     let vault = synced_vault(tenant, &keypair, 1).await;
+    let config = Arc::new(common::config_with_mor_secret(PADDLE_SECRET));
+    // The configured `k` and default budget, as the binary wires them.
+    let research = Arc::new(ResearchService::from_config(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        &config.research,
+    ));
 
     let query = ConnectorQueryService::new(
         vault.clone(),
@@ -77,16 +89,19 @@ async fn full_app_with_attestation(
         EngineSettings {
             zk,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         require_attestation,
-    );
+    )
+    .with_research(research.clone());
     let provisioning = ProvisioningService::new(
         Arc::new(InMemoryTenantRegistry::new(default_connector_slugs())),
         vault.clone(),
     );
 
     build_app(AppState {
-        config: Arc::new(common::config_with_mor_secret(PADDLE_SECRET)),
+        config,
+        research: Some(research),
         query: Some(Arc::new(query)),
         provisioning: Some(Arc::new(provisioning)),
         ..app_state(SECRET, vault)
@@ -513,6 +528,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );
@@ -553,6 +569,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );
@@ -940,6 +957,234 @@ fn assert_event(capture: &AuditCapture, kind: &str, outcome: &str, detail: &str)
     );
 }
 
+/// As [`assert_event`], for an event about `tenant`.
+fn assert_tenant_event(
+    capture: &AuditCapture,
+    kind: &str,
+    outcome: &str,
+    tenant: TenantId,
+    detail: &str,
+) {
+    let events = capture.events();
+    let tenant = tenant.to_string();
+    assert!(
+        events.iter().any(|e| e.audit_kind == kind
+            && e.outcome == outcome
+            && e.tenant_id == tenant
+            && e.detail == detail),
+        "no {kind} {outcome} event for {tenant} {detail:?} in {events:?}"
+    );
+}
+
+/// The number of `kind` events with this outcome.
+fn count_outcome(capture: &AuditCapture, kind: &str, outcome: &str) -> usize {
+    capture
+        .events()
+        .iter()
+        .filter(|e| e.audit_kind == kind && e.outcome == outcome)
+        .count()
+}
+
+#[tokio::test]
+async fn research_grants_and_budgets_are_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = full_app(steward, ZkMode::Disabled).await;
+    let stoken = token_for(steward);
+    let rtoken = token_for(researcher);
+    let query = format!(
+        r#"{{"steward_tenant":"{steward}","connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}}"#
+    );
+
+    // No grant yet: refused before the attestation gate runs. (Building the
+    // app ran a connector sync, which passed a gate of its own.)
+    let gates = capture.count("tee.attestation");
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &query).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        capture.count("tee.attestation"),
+        gates,
+        "{:?}",
+        capture.events()
+    );
+
+    // A one-query grant: the query spends it, and the next is refused.
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &stoken,
+        &format!(
+            r#"{{"researcher_tenant":"{researcher}","connector":"quickbooks","query_budget":1}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let (status, body) = post(&app, "/api/v1/research/query", &rtoken, &query).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &query).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The steward tops the grant up, then revokes it.
+    let budget = format!("/api/v1/grants/{grant_id}/budget");
+    let (status, _) = post(&app, &budget, &stoken, r#"{"additional":2}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Grant and revoke share kind and outcome; the detail tells them apart.
+    assert_tenant_event(
+        &capture,
+        "auth.decision",
+        "denied",
+        researcher,
+        &format!("no active grant for steward={steward} connector=quickbooks"),
+    );
+    assert_tenant_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        steward,
+        &format!("granted researcher={researcher} connector=quickbooks budget_limit=1"),
+    );
+    assert_tenant_event(
+        &capture,
+        "research.budget",
+        "denied",
+        researcher,
+        &format!("exhausted steward={steward} connector=quickbooks limit=1 spent=1"),
+    );
+    assert_tenant_event(
+        &capture,
+        "research.budget",
+        "ok",
+        steward,
+        &format!("top_up grant={grant_id} added=2 limit=3"),
+    );
+    assert_tenant_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        steward,
+        &format!("revoked grant={grant_id}"),
+    );
+}
+
+#[tokio::test]
+async fn refused_grant_id_requests_are_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let outsider = TenantId::generate();
+    let app = full_app(steward, ZkMode::Disabled).await;
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"quickbooks"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+    let unknown_id = TenantId::generate().to_string();
+    // A path segment that is not an id; it must not reach the stream.
+    let not_an_id = "flu-cohort.csv";
+
+    // Each probe: the caller, the grant id it sends, the id the record
+    // shows, and whether a budget read is refused too (the grant's
+    // researcher may read its budget). Revoke and top-up always are.
+    let probes = [
+        (outsider, unknown_id.as_str(), unknown_id.as_str(), true),
+        (outsider, grant_id.as_str(), grant_id.as_str(), true),
+        (outsider, not_an_id, "malformed", true),
+        (researcher, grant_id.as_str(), grant_id.as_str(), false),
+    ];
+    for (who, sent, shown, reads) in probes {
+        let token = token_for(who);
+        let refused =
+            |action: &str| format!("{action} refused grant={shown} reason=unknown_or_foreign");
+        let (status, _) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v1/grants/{sent}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let budget = format!("/api/v1/grants/{sent}/budget");
+        let (status, _) = post(&app, &budget, &token, r#"{"additional":5}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_tenant_event(
+            &capture,
+            "tenant.provisioned",
+            "denied",
+            who,
+            &refused("revoke"),
+        );
+        assert_tenant_event(
+            &capture,
+            "research.budget",
+            "denied",
+            who,
+            &refused("top_up"),
+        );
+        if reads {
+            let (status, _) = call(&app, "GET", &budget, &token, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_tenant_event(&capture, "research.budget", "denied", who, &refused("read"));
+        }
+    }
+
+    // One event per refusal, and none of them revoked or topped up anything.
+    assert_eq!(count_outcome(&capture, "tenant.provisioned", "denied"), 4);
+    assert_eq!(count_outcome(&capture, "research.budget", "denied"), 7);
+    assert_eq!(count_outcome(&capture, "research.budget", "ok"), 0);
+    let events = capture.events();
+    assert!(
+        events.iter().all(|e| !e.detail.starts_with("revoked ")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().all(|e| !e.detail.contains("flu-cohort")),
+        "{events:?}"
+    );
+
+    // Input refused with 400 before any lookup reads only the request and
+    // is not audited: a malformed steward id or slug, a grant to oneself,
+    // and a zero top-up.
+    let stoken = token_for(steward);
+    let malformed = [
+        (
+            "/api/v1/research/query".to_owned(),
+            token_for(researcher),
+            r#"{"steward_tenant":"not-a-tenant","connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#.to_owned(),
+        ),
+        (
+            "/api/v1/grants".to_owned(),
+            stoken.clone(),
+            format!(r#"{{"researcher_tenant":"{researcher}","connector":"Quick Books"}}"#),
+        ),
+        (
+            "/api/v1/grants".to_owned(),
+            stoken.clone(),
+            format!(r#"{{"researcher_tenant":"{steward}","connector":"quickbooks"}}"#),
+        ),
+        (
+            format!("/api/v1/grants/{grant_id}/budget"),
+            stoken,
+            r#"{"additional":0}"#.to_owned(),
+        ),
+    ];
+    for (uri, token, body) in malformed {
+        let (status, _) = post(&app, &uri, &token, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+    }
+    assert_eq!(capture.events(), events);
+}
+
 #[tokio::test]
 async fn dataset_upload_is_audited() {
     let capture = AuditCapture::install();
@@ -1082,6 +1327,68 @@ fn object_bytes(body: &[u8]) -> usize {
 }
 
 #[tokio::test]
+async fn dataset_listing_is_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = build_app(app_state(SECRET, vault.clone()));
+    let token = token_for(steward);
+    let cap = platform_api::MAX_LISTED_OBJECTS;
+    let version = common::next_version(None);
+
+    // Listings of no dataset, one, and one more than the cap.
+    let mut statuses = Vec::new();
+    for held in [0, 1, cap + 1] {
+        for i in 0..held {
+            let dataset = ConnectorSlug::new(&format!("upload_{i}")).expect("slug");
+            vault
+                .put(
+                    &TenantPaths::connector_manifest(steward, &dataset, &version),
+                    Bytes::from_static(b"sealed"),
+                )
+                .await
+                .expect("put");
+        }
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/api/v1/datasets",
+            &[bearer(&token)],
+            Vec::new(),
+        )
+        .await;
+        statuses.push(status);
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::UNPROCESSABLE_ENTITY
+        ]
+    );
+    for count in [0, 1] {
+        assert_tenant_event(
+            &capture,
+            "data.access",
+            "ok",
+            steward,
+            &format!("list_datasets count={count}"),
+        );
+    }
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        &format!(
+            "list_datasets datasets={} objects=0 exceeds cap={cap}",
+            cap + 1
+        ),
+    );
+}
+
+#[tokio::test]
 async fn connector_snapshot_commit_and_prune_are_audited() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
@@ -1114,4 +1421,160 @@ async fn production_mode_refusal_is_audited_without_values() {
         !format!("{events:?}").contains("audit-refusal-secret"),
         "{events:?}"
     );
+}
+
+/// Holds each key open for `hold` before the dev provider opens it.
+struct SlowKeys {
+    inner: DevKeyProvider,
+    hold: Duration,
+}
+
+#[async_trait]
+impl EnclaveKeyProvider for SlowKeys {
+    async fn open_envelope(
+        &self,
+        tenant: TenantId,
+        info: &[u8],
+        envelope: &[u8],
+    ) -> Result<SecretBytes, ApiError> {
+        tokio::time::sleep(self.hold).await;
+        self.inner.open_envelope(tenant, info, envelope).await
+    }
+}
+
+/// A query service (ZK off) over one QuickBooks sync for `tenant`, with
+/// `limits` and `max_concurrent_queries` slots, holding each key open for
+/// `hold`.
+async fn limited_query_service(
+    tenant: TenantId,
+    max_concurrent_queries: usize,
+    limits: QueryLimits,
+    hold: Duration,
+) -> ConnectorQueryService {
+    let keypair = TenantKeypair::generate();
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let keys = SlowKeys {
+        inner: DevKeyProvider::new(tenant, keypair),
+        hold,
+    };
+    ConnectorQueryService::new(
+        vault,
+        Arc::new(keys),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries,
+            limits,
+        },
+        false,
+    )
+}
+
+/// Every resource-limit refusal, wherever in the query it happens, is one
+/// `engine.query` denial naming the limit, with the caller's tenant and no
+/// SQL text. The paused clock runs the waits without real time.
+#[tokio::test(start_paused = true)]
+async fn resource_limit_refusals_are_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let sql = "SELECT currency, SUM(total) AS revenue FROM quickbooks GROUP BY currency";
+    // Each open is held this long: two outlast a one-second limit and fit
+    // the default time limit.
+    let hold = Duration::from_secs(20);
+    let defaults = QueryLimits::default();
+
+    // A result limit in the engine, then an input limit before key release.
+    for limits in [
+        QueryLimits {
+            max_result_rows: 1,
+            ..defaults
+        },
+        QueryLimits {
+            max_input_bytes: 1,
+            ..defaults
+        },
+    ] {
+        let service = limited_query_service(tenant, 4, limits, Duration::ZERO).await;
+        assert!(service.query(tenant, &connector, sql).await.is_err());
+    }
+    // The time limit, while a key opens.
+    let limits = QueryLimits {
+        timeout: Duration::from_secs(1),
+        ..defaults
+    };
+    let timed = limited_query_service(tenant, 1, limits, hold).await;
+    assert!(timed.query(tenant, &connector, sql).await.is_err());
+    // The wait for the only slot, which another query holds.
+    let limits = QueryLimits {
+        slot_wait: Duration::from_secs(1),
+        ..defaults
+    };
+    let busy = limited_query_service(tenant, 1, limits, hold).await;
+    let (first, second) = tokio::join!(busy.query(tenant, &connector, sql), async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        busy.query(tenant, &connector, sql).await
+    });
+    assert!(first.is_ok() && second.is_err());
+
+    // A research query refused after its charge.
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        Arc::new(ObjectStoreVault::new_in_memory()),
+        2,
+        100,
+    ));
+    assert!(
+        research
+            .grant(steward, researcher, &connector, Some(10))
+            .await
+            .is_ok()
+    );
+    let limits = QueryLimits {
+        max_result_rows: 0,
+        ..defaults
+    };
+    let service = limited_query_service(steward, 4, limits, Duration::ZERO)
+        .await
+        .with_research(research);
+    let research_sql = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency";
+    assert!(
+        service
+            .research_query(researcher, steward, &connector, research_sql)
+            .await
+            .is_err()
+    );
+
+    let events = capture.events();
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|e| e.audit_kind == "engine.query" && e.outcome == "denied")
+        .collect();
+    let details: Vec<&str> = denied.iter().map(|e| e.detail.as_str()).collect();
+    assert_eq!(
+        details,
+        [
+            "connector=quickbooks limit=result_rows zk=false".to_owned(),
+            "connector=quickbooks limit=input_bytes zk=false".to_owned(),
+            "connector=quickbooks limit=time zk=false".to_owned(),
+            "connector=quickbooks limit=slot_wait zk=false".to_owned(),
+            format!(
+                "research steward={steward} connector=quickbooks limit=result_rows \
+                 budget_remaining=9"
+            ),
+        ],
+        "{events:?}"
+    );
+    let tenants: Vec<String> = denied.iter().map(|e| e.tenant_id.clone()).collect();
+    let mut expected = vec![tenant.to_string(); 4];
+    expected.push(researcher.to_string());
+    assert_eq!(tenants, expected);
+    for event in &events {
+        assert!(
+            !event.detail.contains("SELECT") && !event.detail.contains("revenue"),
+            "{event:?}"
+        );
+    }
 }

@@ -208,10 +208,23 @@ header: version, obj, row cap,
   a suite this build does not read (502).
 * **Catalog registration.** A steward can publish a listing only for a
   dataset it holds, one with a committed snapshot ("Research access").
+* **Listing.** `GET /api/v1/datasets` lists every dataset the caller's
+  tenant holds, connectors' and uploads' alike: exactly the ones it may
+  publish (`platform_connectors::snapshot::held_datasets` decides "holds"
+  with the same function as `holds`). Each entry describes the current
+  snapshot only, from storage and the plaintext record, opening nothing:
+  its version and write time, the ids, count and total ciphertext bytes
+  of the objects stored at that version, and the suite the record names
+  (`null` if the record is missing, malformed or names a suite this build
+  does not read). Superseded snapshots and uploads that have not
+  committed are not counted. More than 1000 datasets
+  (`MAX_LISTED_OBJECTS`), or objects across them, is refused with 422
+  rather than listed in part, and a storage failure is an error (503 or
+  502), never an empty list. Each listing is a `data.access` event.
 
-The route needs only the vault and the configuration, so it works where
-the query service is not configured. The browser half (sealing and the
-upload form) is not built yet (P40).
+Both routes need only the vault and the configuration, so they work
+where the query service is not configured. The browser half (sealing and
+the upload form) is not built yet (P40).
 
 The operator can see the tenant id, the dataset name, the object id, the
 snapshot versions and their times, ciphertext lengths, the suite, and the
@@ -288,16 +301,22 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 ### 4. Query (zero-trust analytics)
 
 ```
-POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapshot
-   (JWT tenant)        (gate_execution)       tenants/{t}/connectors/{slug}/manifests/*
+POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none within the wait ⇒ 503)
+   (JWT tenant)        (gate_execution)       ── from here within the time limit (⇒ 503) ──
+                                              newest committed snapshot
+                                              tenants/{t}/connectors/{slug}/manifests/*
                                               its record (no record ⇒ 502)
+                                              its objects within the input limits? (no ⇒ 422)
                                               │
                           key released into enclave (EnclaveKeyProvider)
                           open HPKE envelopes (info by dataset kind) → Parquet in RAM
                           upload: schema and row cap as declared? (no ⇒ 502)
+                          footers within the decode limits? (no ⇒ 422)
                                               │
                           QueryScope: DataFusion SQL over decrypted frames
+                          fixed memory pool, no disk (pool exhausted ⇒ 422)
                           ZkMode::Enabled → plan allowlist + cohort threshold
+                          result within its row and byte limits? (no ⇒ 422)
                           zeroize blobs; Drop releases Arrow frames
                                               │
                                         JSON result rows
@@ -313,9 +332,42 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   the MemTables built from decrypted Parquet; `Drop` deregisters them and
   releases the Arrow frames. Decrypted Parquet bytes live in zeroizing
   buffers and are wiped on every exit path, including errors.
-* **Bounded plaintext.** `max_concurrent_queries` caps how many queries
-  hold decrypted data at once; further queries wait for a slot, and a limit
-  of zero refuses with 503.
+* **Bounded plaintext.** `max_concurrent_queries` (`QUERY_MAX_CONCURRENT`)
+  caps how many queries hold decrypted data at once, and a limit of zero
+  refuses with 503. A query waits at most `QUERY_SLOT_WAIT_SECS` for a slot,
+  then gets 503 with `Retry-After`, a refusal distinct from the 503 of a
+  query service that is not wired. From taking its slot through
+  decryption, decoding, execution and serialization it runs within
+  `QUERY_TIMEOUT_SECS`; on expiry the work is dropped and the query gets
+  503. However a query ends (a result, an error, the time limit, the caller
+  going away, or a panic unwinding, which the release profile does), the
+  decrypted blobs are zeroized and the slot is released.
+* **Resource limits** ([ADR 0013](adr/0013-per-query-resource-limits.md)).
+  `platform_core::QueryLimits`, read by `platform-config`, where each value
+  is bounded and an invalid one refuses startup (`backend/.env.example`
+  lists them). Before any key is released,
+  the objects stored at the snapshot's version must fit
+  `QUERY_MAX_INPUT_OBJECTS` and, in ciphertext bytes, `DATASET_MAX_MIB`, the
+  upload limit, so every stored upload stays queryable; a sealed manifest
+  over the upload route's 16 KiB bound fails closed (502). Both input
+  limits are checked again on what the manifest lists, cumulatively, before
+  each object is opened. `QueryScope` reads every Parquet footer before it
+  decodes anything: the rows and uncompressed bytes they report must fit
+  `QUERY_MAX_DECODED_ROWS` and `QUERY_MAX_DECODED_MIB`, since DataFusion's
+  memory pool does not track the decoded table, and decoded rows are counted
+  again. Decoding is synchronous, so these limits also bound the one stretch
+  the time limit cannot interrupt. A footer's uncompressed sizes understate
+  columns that dictionary or run-length encoding shrinks, so the decoded
+  table can take more memory than `QUERY_MAX_DECODED_MIB`; the row limit
+  holds regardless. Operators run in a pool of `QUERY_MEMORY_MIB` with
+  DataFusion's disk manager disabled, so a sort or aggregation that runs out
+  fails the query instead of spilling decrypted rows to a temporary file. A
+  result with more rows than `QUERY_MAX_RESULT_ROWS` after disclosure
+  control, or more JSON than `QUERY_MAX_RESULT_MIB`, is refused, never
+  truncated. Each size limit is refused with 422 and a message of its own,
+  never the 400 of SQL that cannot run, and each limit refusal is an
+  `engine.query` "denied" event naming the limit. A research query is
+  charged before all of them (see "Rate level" below).
 * **The snapshot as written.** Before any key is released, the query reads
   the newest snapshot's plaintext record; a snapshot without a valid one
   fails closed (502), as does a manifest that lists a missing object.
@@ -371,9 +423,10 @@ upload; the **researcher** may run aggregate queries but never read rows.
 
 ```
 Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
-                 grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403
+                 grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403 + audit
                  attestation gate
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
+                 slot, time and size limits as in Query (charged)  ──no──▶ 503 / 422 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
                  QueryScope, ZkMode FORCED Enabled:
                      plan gate: aggregate-only (no row egress)
@@ -414,15 +467,29 @@ Three enforcement layers at one choke point, all in code:
 * **Rate level** (`platform_tenancy::BudgetLedger`): each research query
   spends one unit of the grant's budget, charged after the attestation gate
   (infrastructure failures never cost the researcher) and before execution,
-  with no refunds — probing the plan gate costs budget. Exhaustion returns
-  429 with a `research.budget` event. Spend is monotonic per grant id;
-  re-granting cannot reset it. The `cost` parameter is the seam for a
-  sensitivity-scaled or privacy-loss (ε) accountant.
+  with no refunds — probing the plan gate costs budget. A refusal by a
+  resource limit, including no plaintext slot within the wait, also comes
+  after the charge and costs the unit; P54 decides whether that order
+  stays. Exhaustion returns 429 with a `research.budget` event. Spend is
+  monotonic per grant id; re-granting cannot reset it. The `cost`
+  parameter is the seam for a sensitivity-scaled or privacy-loss (ε)
+  accountant.
 
-Grants (`platform_tenancy::GrantRegistry`) are steward-scoped and revocable
-by the granting steward only. Revoked, unknown, and foreign grants return the
-same response, so nothing leaks existence. Budget standing is visible to the
-grant's parties only; top-up is steward-only. Metering rides the
+Grants (`platform_tenancy::GrantRegistry`) are steward-scoped, revocable by
+the granting steward only, and do not expire. A grant covers one dataset of
+one steward: another steward's dataset of the same slug, or another of the
+steward's datasets, is refused as if there were no grant. That refusal
+(403, an `auth.decision` denial) comes before the attestation gate and the
+budget charge, and is byte-identical whether the grant never existed or was
+revoked and whether the steward and dataset exist, so it leaks nothing
+about existence. A malformed steward id or slug is refused with 400 first,
+from the request alone. Budget standing is visible to the grant's parties
+only; revoke and top-up are steward-only. `DELETE /api/v1/grants/{id}`,
+`GET /api/v1/grants/{id}/budget` and `POST /api/v1/grants/{id}/budget`
+answer a grant id that is unknown and one the caller may not act on with
+the same 404 body, each audited as a denial. A steward's revoked grant
+stays its own: revoking it again succeeds, and its budget can still be read
+and topped up, which does not restore access. Metering rides the
 `engine.query` event and doubles as the billing meter.
 
 Catalog, access requests, grants and budgets need no key material. They
@@ -441,7 +508,8 @@ publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
-its tenant (`platform_connectors::snapshot::holds`). Researchers file
+its tenant (`platform_connectors::snapshot::holds`), so the steward's
+dataset listing (section 2) shows exactly what it can publish. Researchers file
 access requests (idempotent while pending); approval mints the grant through the same code path as a direct
 grant. The approval is recorded first, with its query budget, so a failure
 partway leaves an approved request without a usable grant, never a grant
@@ -585,13 +653,24 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
-| `tenant.provisioned` | Provisioning, suspension, connector toggles, grants |
+| `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
 | `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
-| `engine.query` | Every confidential query, with metering fields |
-| `auth.decision` | Every rejected token, admin denial, signature rejection |
-| `research.budget` | Budget top-ups and exhaustion refusals |
+| `engine.query` | Every confidential query, with metering fields, and each refusal by a resource limit ("denied", with `limit=<name>`) |
+| `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
+| `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+
+Grant events stay under `tenant.provisioned` rather than a `research.grant`
+kind of their own: a grant is the steward provisioning access to its own
+tenant's data, and keeping them there keeps the audit vocabulary
+(`AuditKind`) fixed. Their details tell them apart (`granted …`,
+`revoked …`, `revoke refused …`). Budget actions on a grant are
+`research.budget`, and a research query's grant check is an
+`auth.decision`. A refused revoke, top-up or budget read records the
+caller's tenant and the grant id, or `grant=malformed` when the path
+segment is not an id, with `reason=unknown_or_foreign`: like the 404, it
+does not say whether the grant exists.
 
 Rules, enforced by the capture tests:
 
@@ -599,16 +678,25 @@ Rules, enforced by the capture tests:
    or SQL text, including on failure paths.
 2. Denials and misses are events too: rejected tokens, refused attestations,
    rejected webhook signatures, malformed enrollment keys, budget
-   exhaustions, and 404 reads (cross-tenant probe visibility) all appear in
-   the stream.
+   exhaustions, research queries without a grant, refused grant revokes,
+   top-ups and budget reads, and 404 reads (cross-tenant probe visibility)
+   all appear in the stream. On the grant and research-query routes, input
+   refused with 400 before any lookup (a malformed tenant id or slug, a
+   zero top-up, a grant to oneself) is not audited: the check reads only
+   the request and the caller's own tenant id.
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
    enrollment (ok + denied), query attestation + execution (ok + failed),
-   provisioning, steward uploads (ok, committed, pruned, denied),
-   connector snapshot commit and prune, and the research catalog (ok +
+   query refusals by each kind of resource limit (denied), provisioning,
+   steward uploads (ok, committed, pruned, denied), the dataset listing
+   (ok + denied over its cap),
+   connector snapshot commit and prune, the research catalog (ok +
    denied): publish and its refusal, request, approval and its retry, deny,
-   and the refused retry and deny.
+   and the refused retry and deny, and research grants and budgets (ok +
+   denied): grant, revoke, the query refused without a grant (before the
+   attestation gate), top-up, exhaustion, and refused revokes, top-ups and
+   budget reads of unknown, foreign and malformed grant ids.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on
