@@ -35,13 +35,12 @@ use std::sync::Arc;
 use anyhow::{Context as _, anyhow};
 use platform_api::dev::{self, DevResearchStack};
 use platform_api::research::{PublishListingRequest, ResearchService, ResearchStores};
-use platform_api::{AppState, build_apps};
+use platform_api::{AppState, build_apps, wiring};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
 use platform_core::{ConnectorSlug, TenantId};
 use platform_crypto::TenantKeypair;
 use platform_telemetry::{AuditKind, security_audit_event};
-use quackxide_engine::EngineSettings;
 use synth_data::{SchemaName, Spec};
 use zeroize::Zeroizing;
 
@@ -92,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         vault.clone(),
         &config.research,
     ));
-    let service = stack.query_service(engine_settings(&config), research.clone());
+    let service = stack.query_service(wiring::engine_settings(&config), research.clone());
     let listing_id = publish_listing_for(&research, steward, &connector).await?;
 
     let steward_token = dev_token(secret, &config, steward, "dev-steward")?;
@@ -159,14 +158,6 @@ fn warn_insecure() {
         "dev_insecure",
         "devstack booting: insecure, development only",
     );
-}
-
-/// Engine settings from the configuration, as `platform-api` uses them.
-fn engine_settings(config: &PlatformConfig) -> EngineSettings {
-    EngineSettings {
-        zk: config.features.zk,
-        max_concurrent_queries: config.enclave.query_max_concurrent,
-    }
 }
 
 /// A seeded synthetic cohort built around `min_cohort`, with groups on both
@@ -255,7 +246,7 @@ mod tests {
             stack.vault(),
             &config.research,
         ));
-        let service = stack.query_service(engine_settings(&config), research.clone());
+        let service = stack.query_service(wiring::engine_settings(&config), research.clone());
 
         let granted = research.grant(steward, researcher, &connector, None).await;
         assert!(granted.is_ok(), "grant refused");

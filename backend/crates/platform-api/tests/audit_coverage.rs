@@ -1,23 +1,25 @@
 //! Audit-coverage contract: every security-relevant flow (key enrollment,
 //! TEE attestation, provisioning, data access including misses and denials,
-//! the research catalog, research grants and budgets) emits its
-//! SECURITY_AUDIT_EVENT record.
+//! the research catalog, research grants and budgets, and queries refused
+//! by a resource limit) emits its SECURITY_AUDIT_EVENT record.
 
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
-use platform_api::query::{ConnectorQueryService, DevKeyProvider};
+use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
 use platform_api::research::{ResearchService, ResearchStores};
-use platform_api::{AppState, build_app};
+use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
-use platform_crypto::TenantKeypair;
+use platform_crypto::{SecretBytes, TenantKeypair};
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
@@ -26,7 +28,7 @@ use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
 
@@ -87,6 +89,7 @@ async fn full_app_with_attestation(
         EngineSettings {
             zk,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         require_attestation,
     )
@@ -525,6 +528,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );
@@ -565,6 +569,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );
@@ -1354,4 +1359,160 @@ async fn production_mode_refusal_is_audited_without_values() {
         !format!("{events:?}").contains("audit-refusal-secret"),
         "{events:?}"
     );
+}
+
+/// Holds each key open for `hold` before the dev provider opens it.
+struct SlowKeys {
+    inner: DevKeyProvider,
+    hold: Duration,
+}
+
+#[async_trait]
+impl EnclaveKeyProvider for SlowKeys {
+    async fn open_envelope(
+        &self,
+        tenant: TenantId,
+        info: &[u8],
+        envelope: &[u8],
+    ) -> Result<SecretBytes, ApiError> {
+        tokio::time::sleep(self.hold).await;
+        self.inner.open_envelope(tenant, info, envelope).await
+    }
+}
+
+/// A query service (ZK off) over one QuickBooks sync for `tenant`, with
+/// `limits` and `max_concurrent_queries` slots, holding each key open for
+/// `hold`.
+async fn limited_query_service(
+    tenant: TenantId,
+    max_concurrent_queries: usize,
+    limits: QueryLimits,
+    hold: Duration,
+) -> ConnectorQueryService {
+    let keypair = TenantKeypair::generate();
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let keys = SlowKeys {
+        inner: DevKeyProvider::new(tenant, keypair),
+        hold,
+    };
+    ConnectorQueryService::new(
+        vault,
+        Arc::new(keys),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries,
+            limits,
+        },
+        false,
+    )
+}
+
+/// Every resource-limit refusal, wherever in the query it happens, is one
+/// `engine.query` denial naming the limit, with the caller's tenant and no
+/// SQL text. The paused clock runs the waits without real time.
+#[tokio::test(start_paused = true)]
+async fn resource_limit_refusals_are_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let sql = "SELECT currency, SUM(total) AS revenue FROM quickbooks GROUP BY currency";
+    // Each open is held this long: two outlast a one-second limit and fit
+    // the default time limit.
+    let hold = Duration::from_secs(20);
+    let defaults = QueryLimits::default();
+
+    // A result limit in the engine, then an input limit before key release.
+    for limits in [
+        QueryLimits {
+            max_result_rows: 1,
+            ..defaults
+        },
+        QueryLimits {
+            max_input_bytes: 1,
+            ..defaults
+        },
+    ] {
+        let service = limited_query_service(tenant, 4, limits, Duration::ZERO).await;
+        assert!(service.query(tenant, &connector, sql).await.is_err());
+    }
+    // The time limit, while a key opens.
+    let limits = QueryLimits {
+        timeout: Duration::from_secs(1),
+        ..defaults
+    };
+    let timed = limited_query_service(tenant, 1, limits, hold).await;
+    assert!(timed.query(tenant, &connector, sql).await.is_err());
+    // The wait for the only slot, which another query holds.
+    let limits = QueryLimits {
+        slot_wait: Duration::from_secs(1),
+        ..defaults
+    };
+    let busy = limited_query_service(tenant, 1, limits, hold).await;
+    let (first, second) = tokio::join!(busy.query(tenant, &connector, sql), async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        busy.query(tenant, &connector, sql).await
+    });
+    assert!(first.is_ok() && second.is_err());
+
+    // A research query refused after its charge.
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        Arc::new(ObjectStoreVault::new_in_memory()),
+        2,
+        100,
+    ));
+    assert!(
+        research
+            .grant(steward, researcher, &connector, Some(10))
+            .await
+            .is_ok()
+    );
+    let limits = QueryLimits {
+        max_result_rows: 0,
+        ..defaults
+    };
+    let service = limited_query_service(steward, 4, limits, Duration::ZERO)
+        .await
+        .with_research(research);
+    let research_sql = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency";
+    assert!(
+        service
+            .research_query(researcher, steward, &connector, research_sql)
+            .await
+            .is_err()
+    );
+
+    let events = capture.events();
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|e| e.audit_kind == "engine.query" && e.outcome == "denied")
+        .collect();
+    let details: Vec<&str> = denied.iter().map(|e| e.detail.as_str()).collect();
+    assert_eq!(
+        details,
+        [
+            "connector=quickbooks limit=result_rows zk=false".to_owned(),
+            "connector=quickbooks limit=input_bytes zk=false".to_owned(),
+            "connector=quickbooks limit=time zk=false".to_owned(),
+            "connector=quickbooks limit=slot_wait zk=false".to_owned(),
+            format!(
+                "research steward={steward} connector=quickbooks limit=result_rows \
+                 budget_remaining=9"
+            ),
+        ],
+        "{events:?}"
+    );
+    let tenants: Vec<String> = denied.iter().map(|e| e.tenant_id.clone()).collect();
+    let mut expected = vec![tenant.to_string(); 4];
+    expected.push(researcher.to_string());
+    assert_eq!(tenants, expected);
+    for event in &events {
+        assert!(
+            !event.detail.contains("SELECT") && !event.detail.contains("revenue"),
+            "{event:?}"
+        );
+    }
 }

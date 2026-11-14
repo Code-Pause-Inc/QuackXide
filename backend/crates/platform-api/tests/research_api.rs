@@ -28,7 +28,7 @@ use platform_tenancy::{
     BudgetError, BudgetLedger, BudgetState, DatasetGrant, GrantOutcome, GrantRegistry,
     InMemoryBudgetLedger, InMemoryGrantRegistry, TenancyError,
 };
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 use common::{call, dev_attestation, post};
 
@@ -948,6 +948,7 @@ async fn research_app_with_stores(
     let settings = EngineSettings {
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     };
     let research = Arc::new(ResearchService::new(stores, vault.clone(), 5, 100));
     let service = stack.query_service(settings, research.clone());

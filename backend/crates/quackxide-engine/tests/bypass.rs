@@ -27,7 +27,7 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use platform_core::ZkMode;
-use quackxide_engine::{EngineSettings, MinCountThreshold, QueryError, QueryScope};
+use quackxide_engine::{EngineSettings, MinCountThreshold, QueryError, QueryLimits, QueryScope};
 use serde_json::Value;
 
 const K: i64 = 5;
@@ -534,6 +534,7 @@ fn ungated_scope() -> QueryScope {
     let mut scope = QueryScope::new(EngineSettings {
         zk: ZkMode::Disabled,
         max_concurrent_queries: 1,
+        limits: QueryLimits::default(),
     });
     let ids = StringArray::from_iter_values(ROWS.iter().map(|r| r.0));
     let depts = StringArray::from_iter_values(ROWS.iter().map(|r| r.1));
@@ -553,6 +554,7 @@ fn text_scope() -> QueryScope {
     let mut scope = QueryScope::new(EngineSettings {
         zk: ZkMode::Enabled,
         max_concurrent_queries: 1,
+        limits: QueryLimits::default(),
     });
     let depts = || ROWS.iter().map(|r| r.1);
     let utf8 = StringArray::from_iter_values(depts());
@@ -573,6 +575,7 @@ fn scope(k: Option<i64>) -> QueryScope {
     let mut scope = QueryScope::new(EngineSettings {
         zk: ZkMode::Enabled,
         max_concurrent_queries: 1,
+        limits: QueryLimits::default(),
     });
     let ids = StringArray::from_iter_values(ROWS.iter().map(|r| r.0));
     let depts = StringArray::from_iter_values(ROWS.iter().map(|r| r.1));

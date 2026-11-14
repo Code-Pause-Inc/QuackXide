@@ -21,7 +21,7 @@ use platform_enclave::simulated_token::{
 };
 use platform_enclave::token::ReleasePolicy;
 use platform_storage::{ObjectStoreVault, VaultStore};
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     )

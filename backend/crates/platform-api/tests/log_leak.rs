@@ -26,7 +26,7 @@ use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use tracing_subscriber::util::SubscriberInitExt;
 
 use common::{app_state, bearer, json_header, post, send, token_for};
@@ -142,6 +142,7 @@ async fn research_app(steward: TenantId) -> Router {
     let settings = EngineSettings {
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     };
     let research = Arc::new(ResearchService::new(
         ResearchStores::in_memory(),

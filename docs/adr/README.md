@@ -44,3 +44,4 @@ What becomes easier or harder, and what must now be true.
 * [0010. Sealed research queries and results](0010-sealed-research-queries-and-results.md)
 * [0011. Refuse expressions that can fail at runtime in the disclosure gate](0011-refuse-expressions-that-can-fail-at-runtime.md)
 * [0012. Steward dataset upload](0012-steward-dataset-upload.md)
+* [0013. Per-query resource limits](0013-per-query-resource-limits.md)
