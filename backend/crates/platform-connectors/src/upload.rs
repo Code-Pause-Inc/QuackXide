@@ -243,7 +243,8 @@ pub enum UploadCommitError {
     #[error("snapshot version is ahead of the server clock")]
     VersionAhead,
     /// The dataset's current snapshot is this version or newer, or another
-    /// write committed this version first.
+    /// write took this version first: it committed it, or stored another
+    /// record for it.
     #[error("a snapshot at or after this version is already committed")]
     StaleVersion,
     /// The declared schema differs from the current snapshot's.
@@ -286,9 +287,12 @@ pub struct UploadReport {
 /// new snapshot does not list is pruned, including an object that an earlier
 /// attempt at the same version left. The first upload creates the dataset.
 /// A later one must carry a newer version and the schema already recorded.
-/// A version commits once, so an upload that another write beat to its
-/// version is stale. A failure before the manifest is written leaves the
-/// current snapshot as it was.
+/// A version keeps the first record stored for it and commits once, so an
+/// upload is stale if another write committed its version first, or stored
+/// a record for it that differs from the upload's. A retry of an attempt
+/// that stopped before its manifest declares the same record and goes
+/// through. A failure before the manifest is written leaves the current
+/// snapshot as it was.
 pub async fn commit_upload(
     vault: &dyn VaultStore,
     tenant: TenantId,
@@ -363,7 +367,7 @@ pub async fn commit_upload(
     };
     match commit_snapshot(vault, tenant, dataset, &record, manifest, &[object_id]).await {
         Ok(()) => {}
-        // Another write committed this version after the check above.
+        // Another write took this version after the check above.
         Err(StorageError::AlreadyExists) => return Err(UploadCommitError::StaleVersion),
         Err(err) => return Err(err.into()),
     }
@@ -483,6 +487,18 @@ mod tests {
         ) -> Result<UploadReport, UploadCommitError> {
             let parsed = parse_upload_body(body.into(), MAX).expect("parse");
             commit_upload(vault, self.tenant, &self.dataset, parsed, SystemTime::now()).await
+        }
+    }
+
+    /// The record that committing `body` stores.
+    fn record_of(body: &[u8]) -> SnapshotRecord {
+        let UploadBody { header, suite, .. } =
+            parse_upload_body(Bytes::copy_from_slice(body), MAX).expect("parse");
+        SnapshotRecord {
+            version: header.version,
+            suite: suite.id().to_owned(),
+            row_cap: Some(header.row_cap),
+            schema: Some(header.schema),
         }
     }
 
@@ -819,8 +835,9 @@ mod tests {
         let fixture = Fixture::new();
         let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
         let version = version_at(-1_000);
-        // An attempt at `version` stored its object and stopped before its
-        // manifest, and a newer upload is in progress.
+        let body = fixture.body(&version, cohort_schema(), b"rows");
+        // An attempt at `version` stored its object and record and stopped
+        // before its manifest, and a newer upload is in progress.
         let left =
             TenantPaths::connector_snapshot_object(tenant, dataset, &version, ObjectId::generate());
         let newer = TenantPaths::connector_snapshot_object(
@@ -835,12 +852,17 @@ mod tests {
                 .await
                 .expect("put");
         }
-
-        // The retry seals its object under a new id and commits `version`.
-        let report = fixture
-            .commit(&vault, fixture.body(&version, cohort_schema(), b"rows"))
+        vault
+            .put(
+                &TenantPaths::connector_record(tenant, dataset, &version),
+                record_of(&body).to_bytes(),
+            )
             .await
-            .expect("retry");
+            .expect("put record");
+
+        // The retry declares the same record, seals its object under a new
+        // id, and commits `version`.
+        let report = fixture.commit(&vault, body).await.expect("retry");
         let mut expected = vec![
             TenantPaths::connector_snapshot_object(tenant, dataset, &version, report.object),
             TenantPaths::connector_record(tenant, dataset, &version),
@@ -854,17 +876,17 @@ mod tests {
         assert_eq!(stored(&vault, tenant).await, expected);
     }
 
-    /// A vault in which another write commits a snapshot (`theirs`: its
-    /// object and manifest) just before the first create-only write through
-    /// it lands, as a concurrent upload at the same version would.
-    struct CommittedFirst {
+    /// A vault in which another write stores `theirs` just before the first
+    /// create-only write through it lands, as a concurrent upload at the
+    /// same version would.
+    struct TheirsFirst {
         inner: ObjectStoreVault,
-        theirs: [(VaultPath, Bytes); 2],
+        theirs: Vec<(VaultPath, Bytes)>,
         raced: AtomicBool,
     }
 
     #[async_trait::async_trait]
-    impl VaultStore for CommittedFirst {
+    impl VaultStore for TheirsFirst {
         async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
             self.inner.put(path, ciphertext).await
         }
@@ -902,21 +924,25 @@ mod tests {
         let fixture = Fixture::new();
         let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
         let version = version_at(0);
+        let body = fixture.body(&version, cohort_schema(), b"rows");
+        // The other write declared the same record, so this one gets as far
+        // as its manifest.
         let their_object =
             TenantPaths::connector_snapshot_object(tenant, dataset, &version, ObjectId::generate());
         let manifest = TenantPaths::connector_manifest(tenant, dataset, &version);
-        let vault = CommittedFirst {
+        let vault = TheirsFirst {
             inner: ObjectStoreVault::new_in_memory(),
-            theirs: [
+            theirs: vec![
                 (their_object.clone(), Bytes::from_static(b"their object")),
+                (
+                    TenantPaths::connector_record(tenant, dataset, &version),
+                    record_of(&body).to_bytes(),
+                ),
                 (manifest.clone(), Bytes::from_static(b"their manifest")),
             ],
             raced: AtomicBool::new(false),
         };
-        let err = fixture
-            .commit(&vault, fixture.body(&version, cohort_schema(), b"rows"))
-            .await
-            .expect_err("stale");
+        let err = fixture.commit(&vault, body).await.expect_err("stale");
         assert!(matches!(err, UploadCommitError::StaleVersion), "{err:?}");
         // The other write's snapshot stands, and none of it was pruned.
         assert_eq!(
@@ -927,6 +953,37 @@ mod tests {
             vault.get(&their_object).await.expect("object"),
             Bytes::from_static(b"their object")
         );
+    }
+
+    #[tokio::test]
+    async fn a_version_another_write_recorded_differently_is_stale() {
+        let fixture = Fixture::new();
+        let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
+        let version = version_at(0);
+        let body = fixture.body(&version, cohort_schema(), b"rows");
+        // The other write, not yet at its manifest, declared another row cap
+        // at the same version.
+        let ours = record_of(&body);
+        let theirs = SnapshotRecord {
+            row_cap: ours.row_cap.map(|cap| cap + 1),
+            ..ours
+        };
+        let record = TenantPaths::connector_record(tenant, dataset, &version);
+        let vault = TheirsFirst {
+            inner: ObjectStoreVault::new_in_memory(),
+            theirs: vec![(record.clone(), theirs.to_bytes())],
+            raced: AtomicBool::new(false),
+        };
+        let err = fixture.commit(&vault, body).await.expect_err("stale");
+        assert!(matches!(err, UploadCommitError::StaleVersion), "{err:?}");
+        // Their record stands, and this upload stopped before its manifest.
+        assert_eq!(vault.get(&record).await.expect("record"), theirs.to_bytes());
+        assert!(matches!(
+            vault
+                .get(&TenantPaths::connector_manifest(tenant, dataset, &version))
+                .await,
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[tokio::test]
