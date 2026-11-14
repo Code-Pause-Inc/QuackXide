@@ -85,6 +85,7 @@ Every security decision, including denials, is written to a
 | `docs/PROJECT_SCOPE.md` | Release scope and definition of done |
 | `docs/V1_PLAN.md` | v1.0 plan: work items, order, and the issues they map to |
 | `docs/DATA_POLICY.md` | Synthetic and public data only |
+| `docs/BENCHMARKS.md` | Benchmarks: method, baselines and how to compare |
 | `docs/SIMULATED_TEE_GCP_GUIDE.md` | The simulated TEE and its production counterparts (Confidential Space on TDX, Cloud KMS) |
 | `docs/adr/` | Architecture decision records |
 

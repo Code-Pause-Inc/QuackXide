@@ -1,0 +1,54 @@
+name: bench
+
+# Report only: shared runners are too noisy to gate on, so nothing here
+# fails on the numbers, and this is not a required check. docs/BENCHMARKS.md
+# describes the method and the recorded baseline.
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+      - name: HPKE envelope benchmarks
+        working-directory: backend
+        run: |
+          set -o pipefail
+          # In the log as well as the summary, so the machine can be read back with `gh run view --log`.
+          { lscpu | grep -E '^(Model name|CPU\(s\)):'; rustc -V; } | tee "$RUNNER_TEMP/machine.txt"
+          cargo bench -p platform-crypto --bench hpke --locked -- --noplot | tee "$RUNNER_TEMP/bench.txt"
+          {
+            echo "## HPKE envelope benchmarks"
+            echo
+            echo "Reference numbers from a shared GitHub-hosted runner; they vary between runs and never gate."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/machine.txt"
+            echo '```'
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/bench.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: criterion
+          path: backend/target/criterion
