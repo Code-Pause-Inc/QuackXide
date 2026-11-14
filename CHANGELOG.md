@@ -233,6 +233,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* X25519 private keys and Diffie-Hellman results are zeroized on drop.
+  `hpke` holds them in `x25519-dalek` types, which wipe themselves only
+  with that crate's `zeroize` feature, and nothing turned it on, so every
+  `TenantKeypair` (the key-release stand-in's per-query sessions, the dev
+  key providers, `EnclaveIdentity`'s HPKE key) and each envelope's
+  ephemeral key, in the enclave and in the browser's envelope module, was
+  freed without being wiped. `platform-crypto` turns the feature on, and
+  `TenantKeypair` implements `ZeroizeOnDrop`.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is
