@@ -39,6 +39,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
+          # Each pull request's entry would be readable by that pull request
+          # only, and would evict the required jobs' caches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
