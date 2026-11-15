@@ -37,12 +37,13 @@ uses [Semantic Versioning](https://semver.org/).
   The `browser` workflow runs Chromium on every pull request and Chromium,
   Firefox and WebKit on `main` and nightly.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
-  `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
-  4 MiB, and a unit test pins the 52-byte envelope overhead. `cargo test`
-  runs each benchmark once, so `scripts/check.sh` fails on a broken one. The
-  `bench` workflow runs them on pull requests that touch `backend/` or
-  `rust-toolchain.toml` and reports only. `docs/BENCHMARKS.md` records the
-  method and the baseline the hybrid suite (#187) is compared against.
+  key generation and envelope seal and open for `HPK1` and `HPK2` at 32 B,
+  4 KiB and 4 MiB, and a unit test pins each suite's envelope overhead
+  (52 and 1140 bytes). `cargo test` runs each benchmark once, so
+  `scripts/check.sh` fails on a broken one. The `bench` workflow runs them
+  on pull requests that touch `backend/` or `rust-toolchain.toml` and
+  reports only. `docs/BENCHMARKS.md` records the method and both suites'
+  numbers from one run.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
