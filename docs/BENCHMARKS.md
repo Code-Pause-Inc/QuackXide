@@ -79,8 +79,12 @@ overheads.
 Criterion's estimate, both suites from one run:
 [run 43391725261](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43391725261)
 of #228's HPK2 change, on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC
-7763, 4 CPUs, `rustc 1.94.1`. The numbers hold until the benchmarked code
-changes; later runs of the same code differ only by runner noise.
+7763, 4 CPUs, `rustc 1.94.1`, hpke 0.14.1, x-wing 0.1.1, ml-kem 0.3.4,
+x25519-dalek 3.0.0, curve25519-dalek 5.0.0 and aes-gcm 0.11.1 (hpke's;
+0.10.3 is `aead_seal`'s). Crate upgrades move these numbers, so the
+workflow prints these versions with the machine. The numbers hold until
+the benchmarked code changes; later runs of the same code differ only by
+runner noise.
 
 | Benchmark | Payload | `HPK1` time | `HPK2` time | `HPK1` throughput | `HPK2` throughput |
 | --- | --- | --- | --- | --- | --- |
