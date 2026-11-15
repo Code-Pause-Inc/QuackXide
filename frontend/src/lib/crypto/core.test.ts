@@ -12,11 +12,11 @@ import {
   encryptManifest,
   encryptPayload,
   generateFileKey,
-  generateHpkeKeypair,
   generateMasterKey,
-  isX25519Supported,
+  generateSeedKey,
   keyFingerprint,
   manifestAad,
+  privateKeyAad,
   unwrapFileKey,
   wrapFileKey,
 } from "./core";
@@ -148,30 +148,29 @@ describe("encrypted manifest", () => {
   });
 });
 
-const x25519 = await isX25519Supported();
-
-describe.runIf(x25519)("HPKE X25519 enrollment keys", () => {
-  it("keeps the private key non-extractable and exports a 32-byte public key", async () => {
-    const pair = await generateHpkeKeypair();
-    expect(pair.privateKey.extractable).toBe(false);
-    expect(pair.publicKeyRaw.byteLength).toBe(32);
-    await expect(crypto.subtle.exportKey("raw", pair.privateKey)).rejects.toThrow();
+describe("seed key and private-key AAD", () => {
+  it("keeps the seed key non-extractable and limited to encrypt and decrypt", async () => {
+    const key = await generateSeedKey();
+    expect(key.extractable).toBe(false);
+    expect([...key.usages].sort()).toEqual(["decrypt", "encrypt"]);
+    await expect(crypto.subtle.exportKey("raw", key)).rejects.toThrow();
   });
 
-  it("produces distinct keypairs with stable fingerprints", async () => {
-    const a = await generateHpkeKeypair();
-    const b = await generateHpkeKeypair();
-    const fpA1 = await keyFingerprint(a.publicKeyRaw);
-    const fpA2 = await keyFingerprint(a.publicKeyRaw);
-    const fpB = await keyFingerprint(b.publicKeyRaw);
-    expect(fpA1).toBe(fpA2);
-    expect(fpA1).not.toBe(fpB);
-    expect(fpA1).toMatch(/^[0-9a-f]{4}(-[0-9a-f]{4}){3}$/);
+  it("binds the tenant and the full public-key digest", async () => {
+    const publicKey = new Uint8Array(32).fill(7).buffer;
+    const aad = new TextDecoder().decode(await privateKeyAad(TENANT, publicKey));
+    expect(aad).toMatch(new RegExp(`^x25519-key-v1\\|${TENANT}\\|[0-9a-f]{64}$`));
+    const other = new TextDecoder().decode(
+      await privateKeyAad(TENANT, new Uint8Array(32).fill(8).buffer),
+    );
+    expect(other).not.toBe(aad);
   });
-});
 
-describe.runIf(!x25519)("HPKE X25519 unsupported environment", () => {
-  it("reports unsupported instead of failing", () => {
-    expect(x25519).toBe(false);
+  it("gives distinct public keys distinct, stable fingerprints", async () => {
+    const a = new Uint8Array(32).fill(1).buffer;
+    const b = new Uint8Array(32).fill(2).buffer;
+    expect(await keyFingerprint(a)).toBe(await keyFingerprint(a));
+    expect(await keyFingerprint(a)).not.toBe(await keyFingerprint(b));
+    expect(await keyFingerprint(a)).toMatch(/^[0-9a-f]{4}(-[0-9a-f]{4}){3}$/);
   });
 });
