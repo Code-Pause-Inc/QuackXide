@@ -62,7 +62,7 @@ jobs:
           BROWSERS: ${{ matrix.browser }}
         run: npm run test:browser
       # Report only: browser timings and the wasm module's size (#185).
-      # Runs even when the tests failed (WebKit until #200), on every event.
+      # Runs even when the tests failed, on every event.
       - name: Browser timings in ${{ matrix.browser }}
         if: ${{ !cancelled() }}
         continue-on-error: true
