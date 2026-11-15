@@ -1,12 +1,13 @@
 // The crypto worker, Web Crypto keys and IndexedDB persistence in real
 // browsers (vitest `browser` project, `npm run test:browser`). Nothing is
 // mocked: the module worker and the local vault run as they do in the app,
-// and the worker loads the wasm envelope module (nothing here seals with
-// it). No backend is involved.
+// and the worker loads the wasm envelope module to create the device's HPKE
+// key (nothing here seals or opens with it). No backend is involved.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { LocalVault } from "../vault/localVault";
+import { decryptPayload, privateKeyAad } from "./core";
 import { loadDeviceKeys } from "./keystore";
 import { DriveWorkerClient } from "./workerClient";
 
@@ -28,13 +29,15 @@ function deleteDatabase(name: string): Promise<void> {
   });
 }
 
-async function canGenerateX25519(): Promise<boolean> {
-  try {
-    await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+/** Whether `needle` occurs anywhere in `haystack`. */
+function contains(haystack: Uint8Array, needle: Uint8Array): boolean {
+  outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
     return true;
-  } catch {
-    return false;
   }
+  return false;
 }
 
 beforeEach(async () => {
@@ -52,19 +55,30 @@ describe("crypto worker in a real browser", () => {
     const init = await client().init();
     expect(init.created).toBe(true);
     expect(init.tenantId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    // A device HPKE key exists exactly where the browser can make one.
-    expect(init.hpkePublicKeyB64 !== null).toBe(await canGenerateX25519());
+    // The envelope module loads in every supported browser, so the device
+    // always gets an HPKE key.
+    expect(init.hpkeKeyAvailable).toBe(true);
+    expect(init.hpkePublicKeyB64).not.toBeNull();
   });
 
-  it("keeps the drive KEK non-extractable", async () => {
-    await client().init();
+  it("keeps the KEK non-extractable and the HPKE private key sealed", async () => {
+    const init = await client().init();
     const keys = await loadDeviceKeys();
     expect(keys).not.toBeNull();
     expect(keys!.kek.extractable).toBe(false);
     await expect(crypto.subtle.exportKey("raw", keys!.kek)).rejects.toThrow();
-    if (keys!.hpkePrivateKey instanceof CryptoKey) {
-      expect(keys!.hpkePrivateKey.extractable).toBe(false);
-    }
+
+    // ADR 0007: IndexedDB holds the private key only encrypted, under a
+    // seed key that cannot be exported, bound to the tenant and public key.
+    const hpke = keys!.hpke!;
+    expect(hpke.seedKey.extractable).toBe(false);
+    expect([...hpke.seedKey.usages].sort()).toEqual(["decrypt", "encrypt"]);
+    await expect(crypto.subtle.exportKey("raw", hpke.seedKey)).rejects.toThrow();
+    const aad = await privateKeyAad(init.tenantId, hpke.publicKeyRaw);
+    const raw = await decryptPayload(hpke.seedKey, aad, hpke.sealedPrivateKey);
+    expect(raw.byteLength).toBe(32); // a raw X25519 private key (HPK1)
+    const otherTenant = await privateKeyAad(crypto.randomUUID(), hpke.publicKeyRaw);
+    await expect(decryptPayload(hpke.seedKey, otherTenant, hpke.sealedPrivateKey)).rejects.toThrow();
   });
 
   it("restores the same keys after a reload", async () => {
@@ -76,6 +90,7 @@ describe("crypto worker in a real browser", () => {
     const after = await client().init();
     expect(after.created).toBe(false);
     expect(after.tenantId).toBe(before.tenantId);
+    expect(after.fingerprint).not.toBeNull();
     expect(after.fingerprint).toBe(before.fingerprint);
   });
 
@@ -86,19 +101,18 @@ describe("crypto worker in a real browser", () => {
     crypto.getRandomValues(bytes);
 
     const uploaded = await drive.upload(new File([bytes], "a.bin"));
-    // The vault holds ciphertext: the stored chunk is not the plaintext.
+    // The vault holds ciphertext: no 1 KiB window of the plaintext appears in
+    // the stored chunk, so a prefixed nonce or header would not hide it.
     const stored = await new LocalVault().getChunk(uploaded.objectId, 0);
     expect(stored).not.toBeNull();
-    expect(new Uint8Array(stored!.data)).not.toEqual(bytes);
+    const data = new Uint8Array(stored!.data);
+    for (const offset of [0, 32 * 1024, bytes.length - 1024]) {
+      expect(contains(data, bytes.subarray(offset, offset + 1024))).toBe(false);
+    }
     const listed = await drive.list();
     expect(listed.map((f) => f.objectId)).toContain(uploaded.objectId);
 
     const { blob } = await drive.download(uploaded.objectId);
     expect(new Uint8Array(await blob.arrayBuffer())).toEqual(bytes);
-  });
-
-  it("reports X25519 support truthfully", async () => {
-    const init = await client().init();
-    expect(init.x25519Supported).toBe(await canGenerateX25519());
   });
 });
