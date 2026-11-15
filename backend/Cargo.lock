@@ -3130,6 +3130,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "thiserror",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -4903,6 +4904,7 @@ checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
 dependencies = [
  "curve25519-dalek",
  "rand_core 0.6.4",
+ "zeroize",
 ]
 
 [[package]]

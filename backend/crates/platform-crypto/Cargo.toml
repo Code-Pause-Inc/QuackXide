@@ -24,6 +24,10 @@ hmac = { workspace = true, optional = true }
 rand.workspace = true
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Only turns on x25519-dalek's `zeroize` feature, which hpke 0.12 leaves off,
+# so hpke's X25519 private keys and DH results wipe themselves on drop. Keep
+# it on the major version hpke uses; `x25519_secrets_zeroize_on_drop` checks.
+x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 zeroize.workspace = true
 thiserror.workspace = true
 
