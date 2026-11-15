@@ -18,8 +18,9 @@ cargo bench -p platform-crypto --bench hpke --locked -- --noplot
 ```
 
 The benchmarks use [criterion](https://docs.rs/criterion) and live in
-`backend/crates/platform-crypto/benches/`. `scripts/check.sh` compiles them
-(`cargo check` and `clippy` with `--all-targets`) but does not run them.
+`backend/crates/platform-crypto/benches/`. The bench target sets
+`test = true`, so `cargo test` in `scripts/check.sh` runs each benchmark
+once, untimed: a failed seal or open, or the suite check, fails it.
 
 ## Method
 
@@ -35,9 +36,11 @@ The benchmarks use [criterion](https://docs.rs/criterion) and live in
   it returns. Every timed seal and open must succeed, and the `hpk1` IDs
   refuse to run on any other suite.
 * The `bench` workflow (`.github/workflows/bench.yml`) runs these on pull
-  requests that touch `backend/`, and on demand, and writes the output to
-  the job summary. Shared GitHub-hosted runners vary from run to run, so the
-  numbers are a reference and never fail a pull request.
+  requests that touch `backend/` or `rust-toolchain.toml`, and on demand,
+  and writes the output to the job summary. Shared GitHub-hosted runners
+  vary from run to run, so the numbers are a reference and never fail a
+  pull request. On pushes to `main` it only builds them, to save the build
+  cache that pull requests restore; pull requests save none of their own.
 
 ## Comparing a change
 
@@ -71,7 +74,9 @@ tag. The unit test `hpk1_envelope_overhead_is_52_bytes` in
 **Times.** Criterion's estimate from
 [run 43373874498](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43373874498)
 on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC 9V45, 4 CPUs,
-`rustc 1.94.1`.
+`rustc 1.94.1`, hpke 0.12.0, aes-gcm 0.10.3, x25519-dalek 2.0.1 and
+curve25519-dalek 4.1.3. Crate upgrades move these numbers, so the workflow
+prints these versions with the machine.
 
 | Benchmark | Payload | Time | Throughput |
 | --- | --- | --- | --- |

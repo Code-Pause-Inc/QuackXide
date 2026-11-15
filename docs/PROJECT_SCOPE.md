@@ -58,7 +58,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | --- | --- | --- |
 | Durable registries | **Build** | Tenant, grant, budget, and catalog registries are in-memory behind traits; add durable backends without touching call sites. |
 | Deployment | **Build** | Reproducible deployment of `platform-api`, with the query engine in-process, as a Confidential Space workload on an attested Intel TDX Confidential VM, with TLS terminating inside the VM and the frontend served from the same origin (ADR 0005). |
-| Benchmarks | **Build** | None exist. Measure query latency, encryption throughput, and enclave overhead against synthetic datasets, and track them for regressions. |
+| Benchmarks | **Build** | `HPK1` envelope keygen, seal and open benchmarks exist, reported in CI but not gated (`docs/BENCHMARKS.md`). Still to build: query latency against synthetic datasets, browser encryption throughput, enclave overhead, and regression tracking. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
 | DataFusion upgrade | **Built** | DataFusion 55, Arrow/Parquet 59, and `object_store` 0.13 ([ADR 0008](adr/0008-datafusion-55-upgrade.md)); `thrift`, `paste`, and `rustls-pemfile` advisories cleared; disclosure allowlist and `tests/bypass.rs` verified. |
 | Dominance rule | **Build** | Suppress `MIN`/`MAX` (and sums) dominated by a single individual, closing the extreme-value residual in `docs/THREAT_MODEL.md`. |
