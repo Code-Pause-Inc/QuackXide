@@ -86,10 +86,8 @@ ENTRYPOINT ["/usr/local/bin/sim-attestation"]
 # ── Target 4: the steward's browser, sealing an upload body (run on demand) ─
 FROM debian:bookworm-slim AS seal-upload
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 65532 nonroot \
+# It runs with no network, so it needs no CA certificates.
+RUN groupadd --gid 65532 nonroot \
     && useradd --uid 65532 --gid 65532 --shell /usr/sbin/nologin --no-create-home nonroot
 
 COPY --from=builder /workspace/backend/target/release/seal-upload /usr/local/bin/seal-upload

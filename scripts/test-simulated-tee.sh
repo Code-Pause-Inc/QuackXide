@@ -22,19 +22,21 @@ JWT_SECRET="simulated-tee-local-jwt-secret-32b!!"
 DATASET="upload_cohort"
 MIN_COHORT=2
 
-WORK_DIR=$(mktemp -d)
-UPLOAD_BODY="${WORK_DIR}/upload.body"
-VAULT_COPY="${WORK_DIR}/vault"
-
 cleanup() {
   local status=$?
   if [[ ${status} -ne 0 ]]; then
     docker compose -f "${COMPOSE_FILE}" logs --tail 20 >&2 || true
   fi
   docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
-  rm -rf "${WORK_DIR}"
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    rm -rf "${WORK_DIR}"
+  fi
 }
 trap cleanup EXIT
+
+WORK_DIR=$(mktemp -d)
+UPLOAD_BODY="${WORK_DIR}/upload.body"
+VAULT_COPY="${WORK_DIR}/vault"
 
 b64url() {
   openssl base64 -e -A | tr '+/' '-_' | tr -d '='
@@ -222,14 +224,13 @@ while IFS= read -r -d '' object; do
     exit 1
   fi
 done < <(find "${TENANT_DATA}" -type f -print0)
-# A cohort cell value (every email is at cohort.example), and the magic
-# bytes of a plaintext Parquet file.
-for plaintext in "@cohort.example" "PAR1"; do
-  if grep -rlF -- "${plaintext}" "${TENANT_DATA}" >&2; then
-    echo "ERROR: plaintext \"${plaintext}\" stored in the vault (files above)" >&2
-    exit 1
-  fi
-done
+# The magic bytes that open and close every Parquet file, whatever its
+# compression. (A cell value would be found only while the Parquet is
+# uncompressed.)
+if grep -rlF -- "PAR1" "${TENANT_DATA}" >&2; then
+  echo "ERROR: plaintext Parquet stored in the vault (files above)" >&2
+  exit 1
+fi
 echo "    ${OBJECT_COUNT} tenant objects stored: $((OBJECT_COUNT - RECORD_COUNT)) HPK1 envelopes and ${RECORD_COUNT} snapshot records holding only their suite and what the steward declared, none with plaintext data."
 
 echo "==> [6/8] Verifying the attestation token and the confidential query happy path..."
