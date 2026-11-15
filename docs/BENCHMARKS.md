@@ -40,7 +40,8 @@ once, untimed: a failed seal or open, or the suite check, fails it.
   and writes the output to the job summary. Shared GitHub-hosted runners
   vary from run to run, so the numbers are a reference and never fail a
   pull request. On pushes to `main` it only builds them, to save the build
-  cache that pull requests restore; pull requests save none of their own.
+  cache that pull requests restore. Only that run saves a cache, so no
+  saved cache holds benchmark results.
 
 ## Comparing a change
 

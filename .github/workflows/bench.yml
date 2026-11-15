@@ -37,8 +37,9 @@ jobs:
         with:
           workspaces: backend
           # Each pull request's entry would be readable by that pull request
-          # only, and would evict the required jobs' caches.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # only, and would evict the required jobs' caches. Only the
+          # build-only push run saves, so no saved cache holds bench results.
+          save-if: ${{ github.event_name == 'push' }}
       - name: Build the benchmarks for the cache
         if: github.event_name == 'push'
         working-directory: backend
