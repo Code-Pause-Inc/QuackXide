@@ -60,9 +60,10 @@ pub trait BudgetLedger: Send + Sync {
     /// overflow, cannot lower.
     async fn top_up(&self, grant_id: &str, additional: u64) -> Result<BudgetState, BudgetError>;
 
-    /// [`top_up`] at most once per `key` (an access request id): a repeat
-    /// with the same key returns the standing unchanged, so a retried
-    /// approval cannot add its budget twice. The key check, the top-up and
+    /// [`top_up`] at most once per `key` (an access request id, or a
+    /// re-grant's revoke time): a repeat with the same key returns the
+    /// standing unchanged, so a retried approval or re-grant cannot add its
+    /// budget twice. The key check, the top-up and
     /// recording the key must be one atomic step, and a durable backend must
     /// persist the applied keys with the allocation.
     ///

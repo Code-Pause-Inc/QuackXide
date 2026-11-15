@@ -209,6 +209,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* `POST /api/v1/grants` no longer drops its `query_budget` when the grant
+  exists: for an active grant it is refused with 409 and audited (the
+  steward tops the budget up instead), and for a revoked grant it adds the
+  new budget once per revoke, then re-activates the grant, so a retry after
+  a failure completes it. Direct grants and approvals are serialized, so
+  two at once cannot drop a budget, and revoking an already-revoked grant
+  changes nothing (#235).
 * A follow-up access request's approval adds its query budget to the
   existing grant instead of being dropped, and a retry of the same
   approval adds nothing (`BudgetLedger::top_up_once`). A retry of an

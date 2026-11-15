@@ -867,6 +867,11 @@ async fn research_catalog_is_audited() {
     let (status, _) = post(&app, &deny, &stoken, "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // A direct grant of the now-active grant is refused.
+    let regrant = format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#);
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &regrant).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
     // A retry that names a different budget is refused.
     let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":7}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -942,6 +947,14 @@ async fn research_catalog_is_audited() {
         &capture,
         "denied",
         &format!("approve refused request={last_id} researcher={researcher} reason=unpublished"),
+    );
+    assert_event(
+        &capture,
+        "tenant.provisioned",
+        "denied",
+        &format!(
+            "grant refused researcher={researcher} connector=health grant={grant_id} reason=already_granted"
+        ),
     );
 }
 

@@ -431,9 +431,18 @@ Three enforcement layers at one choke point, all in code:
 
 Grants (`platform_tenancy::GrantRegistry`) are steward-scoped and revocable
 by the granting steward only. Revoked, unknown, and foreign grants return the
-same response, so nothing leaks existence. Budget standing is visible to the
-grant's parties only; top-up is steward-only. Metering rides the
-`engine.query` event and doubles as the billing meter.
+same response, so nothing leaks existence, and revoking a revoked grant
+changes nothing. `POST /api/v1/grants` for an active grant that already has
+a budget is refused with 409 (a `tenant.provisioned` `denied` event); the
+steward raises its budget with `POST /api/v1/grants/{grant_id}/budget`
+instead. For a revoked grant it adds
+the new budget once per revoke, then re-activates the grant, so a retry after
+a failure completes it without adding twice. Direct grants and approvals
+take one lock while they create and fund a grant, because the grant and its
+budget live in two stores; that holds in one process, and several instances
+need conditional writes in the durable stores (P61). Budget standing is
+visible to the grant's parties only; top-up is steward-only. Metering rides
+the `engine.query` event and doubles as the billing meter.
 
 Catalog, access requests, grants and budgets need no key material. They
 live in `research::ResearchService` (`AppState::research`), which

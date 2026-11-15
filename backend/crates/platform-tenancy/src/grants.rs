@@ -87,7 +87,10 @@ pub trait GrantRegistry: Send + Sync {
     /// Revoke by id; only the grant's steward may revoke. Sets
     /// `revoked_at_iso`, which `create` keeps on re-activation. A durable
     /// backend must persist it: approval retries refuse based on it, and a
-    /// lost value lets a stale retry add budget to a newer grant.
+    /// lost value lets a stale retry add budget to a newer grant. Revoking a
+    /// revoked grant changes nothing, and a later revoke must record a
+    /// different time, since a re-grant's budget is added once per revoke
+    /// time.
     async fn revoke(
         &self,
         steward: TenantId,
@@ -202,6 +205,11 @@ impl GrantRegistry for InMemoryGrantRegistry {
         grant_id: &str,
     ) -> Result<Option<DatasetGrant>, TenancyError> {
         match self.lock().get_mut(grant_id) {
+            // Revoking a revoked grant changes nothing, so its revoke time
+            // stays the one a re-grant keys its budget on.
+            Some(grant) if grant.steward_tenant == steward && grant.revoked => {
+                Ok(Some(grant.clone()))
+            }
             Some(grant) if grant.steward_tenant == steward => {
                 let now = now_iso();
                 grant.revoked = true;
@@ -254,6 +262,22 @@ mod tests {
             .unwrap();
         assert!(!again.revoked);
         assert_eq!(again.revoked_at_iso.as_deref(), Some(revoked_at.as_str()));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_revoked_grant_changes_nothing() {
+        let registry = InMemoryGrantRegistry::default();
+        let steward = TenantId::generate();
+        let grant = registry
+            .create(steward, TenantId::generate(), "health")
+            .await
+            .unwrap();
+        let first = registry.revoke(steward, &grant.grant_id).await.unwrap();
+        let second = registry.revoke(steward, &grant.grant_id).await.unwrap();
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(second.revoked);
+        assert_eq!(second.revoked_at_iso, first.revoked_at_iso);
+        assert_eq!(second.updated_at_iso, first.updated_at_iso);
     }
 
     #[tokio::test]
