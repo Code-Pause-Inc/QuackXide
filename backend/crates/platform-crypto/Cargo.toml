@@ -34,3 +34,5 @@ proptest.workspace = true
 [[bench]]
 name = "hpke"
 harness = false
+# `cargo test` runs each benchmark once, so its checks gate check.sh.
+test = true
