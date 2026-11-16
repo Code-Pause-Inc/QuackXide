@@ -36,6 +36,13 @@ uses [Semantic Versioning](https://semver.org/).
   browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
   The `browser` workflow runs Chromium on every pull request and Chromium,
   Firefox and WebKit on `main` and nightly.
+* Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
+  `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
+  4 MiB, and a unit test pins the 52-byte envelope overhead. `cargo test`
+  runs each benchmark once, so `scripts/check.sh` fails on a broken one. The
+  `bench` workflow runs them on pull requests that touch `backend/` or
+  `rust-toolchain.toml` and reports only. `docs/BENCHMARKS.md` records the
+  method and the baseline the hybrid suite (#187) is compared against.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
@@ -252,6 +259,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* X25519 private keys and Diffie-Hellman results are zeroized on drop.
+  `hpke` holds them in `x25519-dalek` types, which wipe themselves only
+  with that crate's `zeroize` feature, and nothing turned it on, so every
+  `TenantKeypair` (the key-release stand-in's per-query sessions, the dev
+  key providers, `EnclaveIdentity`'s HPKE key) and each envelope's
+  ephemeral key, in the enclave and in the browser's envelope module, was
+  freed without being wiped. `platform-crypto` turns the feature on, and
+  `TenantKeypair` implements `ZeroizeOnDrop`.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is
