@@ -19,6 +19,12 @@ EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
 fail() { echo "FAIL: $1"; exit 1; }
 
+# GIT_ATTR_SOURCE needs git 2.41 or later; older git silently ignores it.
+v="$(git version)"
+IFS=. read -r major minor _ <<<"${v#git version }"
+(( major > 2 || (major == 2 && minor >= 41) )) \
+    || fail "git 2.41 or later is needed (GIT_ATTR_SOURCE); this is $v"
+
 # scan <repo>: only HEAD's history, so other branches' allowlists never
 # apply. Merges are diffed against their first parent, so a conflict
 # resolution is scanned too.
