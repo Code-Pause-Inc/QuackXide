@@ -26,6 +26,9 @@ pub struct DatasetGrant {
     /// connector's or an upload's (`upload_…`, ADR 0012).
     pub connector: String,
     pub revoked: bool,
+    /// When the grant was last revoked. Kept on re-activation, so an
+    /// approval retry can tell a revoke that came after its approval.
+    pub revoked_at_iso: Option<String>,
     pub created_at_iso: String,
     pub updated_at_iso: String,
 }
@@ -81,7 +84,10 @@ pub trait GrantRegistry: Send + Sync {
         connector: &str,
     ) -> Result<Option<DatasetGrant>, TenancyError>;
 
-    /// Revoke by id; only the grant's steward may revoke.
+    /// Revoke by id; only the grant's steward may revoke. Sets
+    /// `revoked_at_iso`, which `create` keeps on re-activation. A durable
+    /// backend must persist it: approval retries refuse based on it, and a
+    /// lost value lets a stale retry add budget to a newer grant.
     async fn revoke(
         &self,
         steward: TenantId,
@@ -114,6 +120,7 @@ impl DatasetGrant {
             researcher_tenant: researcher,
             connector: connector.to_owned(),
             revoked: false,
+            revoked_at_iso: None,
             created_at_iso: now.clone(),
             updated_at_iso: now,
         }
@@ -196,8 +203,10 @@ impl GrantRegistry for InMemoryGrantRegistry {
     ) -> Result<Option<DatasetGrant>, TenancyError> {
         match self.lock().get_mut(grant_id) {
             Some(grant) if grant.steward_tenant == steward => {
+                let now = now_iso();
                 grant.revoked = true;
-                grant.updated_at_iso = now_iso();
+                grant.revoked_at_iso = Some(now.clone());
+                grant.updated_at_iso = now;
                 Ok(Some(grant.clone()))
             }
             // Unknown and someone else's grant are indistinguishable: no
@@ -221,6 +230,31 @@ impl GrantRegistry for InMemoryGrantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn revoke_time_survives_reactivation() {
+        let registry = InMemoryGrantRegistry::default();
+        let steward = TenantId::generate();
+        let researcher = TenantId::generate();
+        let grant = registry
+            .create(steward, researcher, "health")
+            .await
+            .unwrap();
+        assert_eq!(grant.revoked_at_iso, None);
+
+        let revoked = registry
+            .revoke(steward, &grant.grant_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let revoked_at = revoked.revoked_at_iso.expect("revoke records its time");
+        let again = registry
+            .create(steward, researcher, "health")
+            .await
+            .unwrap();
+        assert!(!again.revoked);
+        assert_eq!(again.revoked_at_iso.as_deref(), Some(revoked_at.as_str()));
+    }
 
     #[tokio::test]
     async fn create_find_revoke_lifecycle() {
