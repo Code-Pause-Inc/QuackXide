@@ -193,6 +193,40 @@ async fn x25519_enrollment_is_refused_in_production_and_audited() {
         "{:?}",
         capture.events()
     );
+    // Monitoring on `crypto.key_enrollment` sees the refusal too.
+    assert_tenant_event(
+        &capture,
+        "crypto.key_enrollment",
+        "denied",
+        tenant,
+        "refused enrollment key of a suite this deployment does not accept",
+    );
+}
+
+#[tokio::test]
+async fn an_enrollment_key_that_is_not_base64_is_refused_and_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let app = build_app(common::app_state(
+        SECRET,
+        Arc::new(ObjectStoreVault::new_in_memory()),
+    ));
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token_for(tenant)), json_header()],
+        br#"{"hpke_public_key_b64":"not base64!"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_tenant_event(
+        &capture,
+        "crypto.key_enrollment",
+        "denied",
+        tenant,
+        "rejected enrollment key that is not valid base64",
+    );
 }
 
 #[tokio::test]

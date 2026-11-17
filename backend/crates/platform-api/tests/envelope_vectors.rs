@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use platform_api::build_app;
 use platform_core::TenantId;
 use platform_storage::ObjectStoreVault;
+use platform_telemetry::capture::AuditCapture;
 
 use common::{bearer, json_header, send};
 
@@ -19,6 +20,14 @@ const SECRET: &str = "integration-test-secret";
 
 #[tokio::test]
 async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
+    let capture = AuditCapture::install();
+    let denied = || {
+        capture
+            .events()
+            .iter()
+            .filter(|e| e.audit_kind == "crypto.key_enrollment" && e.outcome == "denied")
+            .count()
+    };
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../fixtures/envelope/hpk1.json"
@@ -36,6 +45,7 @@ async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
 
     for case in vectors["enrollment"].as_array().expect("enrollment cases") {
         let body = serde_json::json!({ "hpke_public_key_b64": case["public_b64"] });
+        let before = denied();
         let (status, _) = send(
             &app,
             "PUT",
@@ -50,6 +60,9 @@ async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
             StatusCode::BAD_REQUEST
         };
         assert_eq!(status, expected, "{}", case["name"]);
+        // Every refused key is audited, whatever the reason.
+        let refused = usize::from(case["valid"] != true);
+        assert_eq!(denied() - before, refused, "audit: {}", case["name"]);
 
         let (status, _) = send(
             &production,
@@ -63,6 +76,12 @@ async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
             status,
             StatusCode::BAD_REQUEST,
             "production: {}",
+            case["name"]
+        );
+        assert_eq!(
+            denied() - before - refused,
+            1,
+            "production audit: {}",
             case["name"]
         );
     }

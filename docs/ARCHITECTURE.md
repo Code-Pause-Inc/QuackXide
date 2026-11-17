@@ -626,7 +626,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `audit_kind` | Emitted on |
 | --- | --- |
 | `service.start` | API or connector-worker boot |
-| `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
+| `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied; every refusal, a suite refusal included, is a denial) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
@@ -636,7 +636,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
-| `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope whose suite does not match its key |
+| `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope or upload whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
 kind of their own: a grant is the steward provisioning access to its own

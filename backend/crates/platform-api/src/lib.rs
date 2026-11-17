@@ -1046,15 +1046,27 @@ async fn put_enrollment(
     Json(body): Json<EnrollmentBody>,
 ) -> Result<StatusCode, ApiError> {
     let public_key_b64 = body.hpke_public_key_b64.trim();
-    let raw = B64
-        .decode(public_key_b64)
-        .map_err(|_| ApiError::BadRequest("invalid base64 public key"))?;
+    let Ok(raw) = B64.decode(public_key_b64) else {
+        security_audit_event(
+            AuditKind::KeyEnrollment,
+            Some(tenant),
+            "denied",
+            "rejected enrollment key that is not valid base64",
+        );
+        return Err(ApiError::BadRequest("invalid base64 public key"));
+    };
     let policy = platform_crypto::SuitePolicy::for_env(state.config.env.is_production());
     let key = match platform_crypto::TenantPublicKey::from_raw(&raw, policy) {
         Ok(key) => key,
         Err(platform_crypto::CryptoError::SuiteRefused) => {
             security_audit_event(
                 AuditKind::SuiteRefused,
+                Some(tenant),
+                "denied",
+                "refused enrollment key of a suite this deployment does not accept",
+            );
+            security_audit_event(
+                AuditKind::KeyEnrollment,
                 Some(tenant),
                 "denied",
                 "refused enrollment key of a suite this deployment does not accept",
