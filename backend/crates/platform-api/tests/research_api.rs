@@ -2,10 +2,12 @@
 //! aggregate access to a sealed dataset, seeded directly or uploaded
 //! through the steward upload route; the researcher runs
 //! disclosure-controlled queries (small cohorts suppressed); ungranted and
-//! revoked access is refused; row-level egress is blocked; an approval
-//! that fails part-way converges when the steward retries it; and a retry
-//! never re-activates a grant the steward has revoked, even when the revoke
-//! lands while the retry runs.
+//! revoked access, and access to another steward's or connector's dataset,
+//! is refused with the same 403 whether or not the dataset exists; unknown
+//! and foreign grant ids get the same 404; re-granting never resets spend;
+//! row-level egress is blocked; an approval that fails part-way converges
+//! when the steward retries it; and a retry never re-activates a grant the
+//! steward has revoked, even when the revoke lands while the retry runs.
 mod common;
 
 use std::sync::Arc;
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use platform_api::dev::DevResearchStack;
 use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
@@ -506,6 +508,273 @@ async fn cannot_grant_to_self() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// ── What a grant covers, and refusals that reveal nothing ──
+
+/// A whole response — status, headers and body — so two refusals can be
+/// compared byte for byte.
+type RawResponse = (StatusCode, HeaderMap, String);
+
+/// An authenticated JSON request, answered as a [`RawResponse`].
+async fn raw_call(app: &Router, method: &str, uri: &str, token: &str, body: &str) -> RawResponse {
+    let (status, headers, bytes) = common::send_with_headers(
+        app,
+        method,
+        uri,
+        &[common::bearer(token), common::json_header()],
+        body.as_bytes().to_vec(),
+    )
+    .await;
+    (
+        status,
+        headers,
+        String::from_utf8(bytes).expect("utf-8 body"),
+    )
+}
+
+/// `researcher`'s count query over `steward`'s dataset `connector`, both as
+/// sent, answered as a [`RawResponse`].
+async fn raw_research_query(
+    app: &Router,
+    researcher: TenantId,
+    steward: &str,
+    connector: &str,
+) -> RawResponse {
+    let body = serde_json::json!({
+        "steward_tenant": steward,
+        "connector": connector,
+        "sql": format!("SELECT COUNT(*) AS n FROM {connector}"),
+    });
+    raw_call(
+        app,
+        "POST",
+        "/api/v1/research/query",
+        &token_for(researcher),
+        &body.to_string(),
+    )
+    .await
+}
+
+/// Grants `researcher` the steward's `health` dataset; returns the grant id.
+async fn grant_health(app: &Router, steward: TenantId, researcher: TenantId) -> String {
+    let (status, grant) = post(
+        app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    grant["grant_id"].as_str().expect("grant id").to_owned()
+}
+
+/// A grant covers one dataset of one steward: any other is refused exactly
+/// as if the researcher held no grant. The grant check runs before the
+/// budget charge and any data access, so neither refused dataset needs
+/// data, and neither refusal costs budget.
+#[tokio::test]
+async fn queries_outside_the_granted_dataset_are_forbidden() {
+    let steward = TenantId::generate();
+    let other_steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let grant_id = grant_health(&app, steward, researcher).await;
+    let (status, body) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    let ungranted =
+        raw_research_query(&app, TenantId::generate(), &steward.to_string(), "health").await;
+    assert_eq!(ungranted.0, StatusCode::FORBIDDEN, "{}", ungranted.2);
+
+    // Another steward's dataset under the same slug, and another of this
+    // steward's datasets.
+    for (owner, connector) in [(other_steward, "health"), (steward, "billing")] {
+        let refused = raw_research_query(&app, researcher, &owner.to_string(), connector).await;
+        assert_eq!(refused, ungranted, "{owner}/{connector}");
+    }
+
+    let (status, budget) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/grants/{grant_id}/budget"),
+        &token_for(researcher),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(budget["spent"], 1, "budget: {budget}");
+}
+
+/// The 403 is the same, byte for byte, for an existing ungranted dataset,
+/// a revoked grant, and a steward or dataset that does not exist, so it
+/// reveals nothing about what exists. Malformed ids are refused with 400
+/// before the grant check: that depends only on the request.
+#[tokio::test]
+async fn nonexistent_or_revoked_dataset_gets_the_same_refusal_as_an_ungranted_one() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let revoked_researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let revoked_id = grant_health(&app, steward, revoked_researcher).await;
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/v1/grants/{revoked_id}"),
+        &token_for(steward),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let steward = steward.to_string();
+    let nobody = TenantId::generate().to_string();
+
+    let ungranted = raw_research_query(&app, researcher, &steward, "health").await;
+    assert_eq!(ungranted.0, StatusCode::FORBIDDEN, "{}", ungranted.2);
+    for (who, owner, connector) in [
+        (revoked_researcher, steward.as_str(), "health"),
+        (researcher, nobody.as_str(), "health"),
+        (researcher, steward.as_str(), "billing"),
+        (researcher, steward.as_str(), "upload_cohorts"),
+        (researcher, nobody.as_str(), "billing"),
+    ] {
+        let refused = raw_research_query(&app, who, owner, connector).await;
+        assert_eq!(refused, ungranted, "{owner}/{connector}");
+    }
+
+    for (owner, connector, error) in [
+        ("not-a-tenant", "health", "invalid steward tenant id"),
+        (steward.as_str(), "Health!", "invalid connector slug"),
+    ] {
+        let (status, _, body) = raw_research_query(&app, researcher, owner, connector).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{owner}/{connector}");
+        assert_eq!(body, format!(r#"{{"error":"{error}"}}"#));
+    }
+}
+
+/// `DELETE /api/v1/grants/{id}` and both budget routes answer a grant id
+/// that does not exist and one the caller may not act on with the same
+/// 404, byte for byte, and the refusals change nothing.
+#[tokio::test]
+async fn unknown_and_foreign_grant_ids_get_the_same_404() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let outsider = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let grant_id = grant_health(&app, steward, researcher).await;
+    let unknown_id = TenantId::generate().to_string();
+
+    // Per route: the callers refused the existing grant. Its researcher may
+    // read its budget, but not revoke it or top it up.
+    let routes: [(&str, &str, &str, &[TenantId]); 3] = [
+        ("DELETE", "", "", &[researcher, outsider]),
+        ("GET", "/budget", "", &[outsider]),
+        (
+            "POST",
+            "/budget",
+            r#"{"additional":5}"#,
+            &[researcher, outsider],
+        ),
+    ];
+    for (method, suffix, body, refused) in routes {
+        let unknown_uri = format!("/api/v1/grants/{unknown_id}{suffix}");
+        let unknown = raw_call(&app, method, &unknown_uri, &token_for(steward), body).await;
+        assert_eq!(unknown.0, StatusCode::NOT_FOUND, "{method} {unknown_uri}");
+        let outsider_unknown =
+            raw_call(&app, method, &unknown_uri, &token_for(outsider), body).await;
+        assert_eq!(outsider_unknown, unknown, "{method} {unknown_uri}");
+
+        let foreign_uri = format!("/api/v1/grants/{grant_id}{suffix}");
+        for who in refused {
+            let foreign = raw_call(&app, method, &foreign_uri, &token_for(*who), body).await;
+            assert_eq!(foreign, unknown, "{method} {foreign_uri} as {who}");
+        }
+    }
+
+    // The grant is still active, with its allocation untouched.
+    let (status, budget) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/grants/{grant_id}/budget"),
+        &token_for(steward),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(budget["limit"], 100, "budget: {budget}");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A steward's revoked grant is still its own: revoking it again succeeds,
+/// and its budget can still be read and topped up. None of that restores
+/// access.
+#[tokio::test]
+async fn revoked_grant_still_answers_its_steward() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let grant_id = grant_health(&app, steward, researcher).await;
+
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    for _ in 0..2 {
+        let (status, revoked) = call(&app, "DELETE", &revoke, &stoken, None).await;
+        assert_eq!(status, StatusCode::OK, "revoke: {revoked}");
+        assert_eq!(revoked["grant_id"], grant_id.as_str());
+        assert_eq!(revoked["revoked"], true);
+    }
+
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+    let (status, budget) = call(&app, "GET", &budget_uri, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK, "budget: {budget}");
+    assert_eq!(budget["limit"], 100);
+    let (status, topped) = post(&app, &budget_uri, &stoken, r#"{"additional":5}"#).await;
+    assert_eq!(status, StatusCode::OK, "top up: {topped}");
+    assert_eq!(topped["limit"], 105);
+    let (status, _) = call(&app, "GET", &budget_uri, &token_for(researcher), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Revoking and re-granting reuses the grant id, and with it the budget
+/// already spent: the re-grant's `query_budget` is ignored.
+#[tokio::test]
+async fn cannot_reset_budget_spend_by_regranting() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let grant = |budget: u64| {
+        format!(
+            r#"{{"researcher_tenant":"{researcher}","connector":"health","query_budget":{budget}}}"#
+        )
+    };
+
+    let (status, granted) = post(&app, "/api/v1/grants", &stoken, &grant(2)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {granted}");
+    let grant_id = granted["grant_id"].as_str().expect("grant id");
+    let (status, body) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(body["budget_remaining"], 1);
+
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, regranted) = post(&app, "/api/v1/grants", &stoken, &grant(100)).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regranted}");
+    assert_eq!(regranted["grant_id"], grant_id);
+    assert_eq!(regranted["revoked"], false);
+    assert_eq!(regranted["budget"]["limit"], 2, "re-grant: {regranted}");
+    assert_eq!(regranted["budget"]["spent"], 1, "re-grant: {regranted}");
+
+    let (status, body) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(body["budget_remaining"], 0);
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
 // ── Approval after a partial failure ──
 
 /// Fails the first call and passes every later one. The error is
