@@ -5,6 +5,7 @@
 # line (`-p <package> --bench <target> ...`). Run from backend/.
 # `--benches` would also run each library's test harness, which refuses
 # criterion's flags. Needs jq.
+# (Same-code calibration run for #233; not for merging.)
 # =============================================================================
 set -euo pipefail
 targets="$(cargo metadata --no-deps --format-version 1 --locked |
