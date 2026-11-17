@@ -216,12 +216,18 @@ uses [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 * `POST /api/v1/grants` no longer drops its `query_budget` when the grant
-  exists: for an active grant it is refused with 409 and audited (the
-  steward tops the budget up instead), and for a revoked grant it adds the
-  new budget once per revoke, then re-activates the grant, so a retry after
-  a failure completes it. Direct grants and approvals are serialized, so
-  two at once cannot drop a budget, and revoking an already-revoked grant
-  changes nothing (#235).
+  exists. An active grant that already has a budget is refused with 409
+  and audited; the body says to raise the budget with
+  `POST /api/v1/grants/{grant_id}/budget`. A revoked grant is re-activated
+  first and then gets the new budget on top of its old one; if that
+  funding fails the grant stays active with its old budget and a retry is
+  refused, so nothing is added twice or dropped. Every top-up of an
+  existing budget on a grant path (a re-grant or a follow-up approval)
+  emits `research.budget`. A grant with no budget entry (a failed approval)
+  is funded by the next direct grant. `BudgetLedger::top_up_once` now
+  creates a missing entry in the same step, so a failed approval leaves no
+  placeholder. Direct grants, approvals and revokes are serialized, so two
+  at once cannot drop a budget and a revoke cannot land mid-grant (#235).
 * A follow-up access request's approval adds its query budget to the
   existing grant instead of being dropped, and a retry of the same
   approval adds nothing (`BudgetLedger::top_up_once`). A retry of an

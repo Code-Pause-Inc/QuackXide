@@ -442,9 +442,21 @@ only; revoke and top-up are steward-only. `DELETE /api/v1/grants/{id}`,
 `GET /api/v1/grants/{id}/budget` and `POST /api/v1/grants/{id}/budget`
 answer a grant id that is unknown and one the caller may not act on with
 the same 404 body, each audited as a denial. A steward's revoked grant
-stays its own: revoking it again succeeds, and its budget can still be read
-and topped up, which does not restore access. Metering rides the
-`engine.query` event and doubles as the billing meter.
+stays its own: revoking it again succeeds and records the later time, and its
+budget can still be read and topped up, which does not restore access.
+`POST /api/v1/grants` for an active grant that already has a budget is
+refused with 409 (a `tenant.provisioned` `denied` event) and a body that
+points to `POST /api/v1/grants/{grant_id}/budget`, where the steward raises
+the budget. A grant with no budget yet (a failed approval left it so) is
+funded. A revoked grant is re-activated first and then gets the new budget
+on top of its old one; if that funding fails, the grant stays active with
+its old budget and a retry is refused like any direct grant of an active grant, so
+nothing is added twice or dropped. Every top-up of an existing budget emits
+a `research.budget` event. Direct grants, approvals and revokes take one
+lock, because a grant and its budget live in two stores; that holds in one
+process, and several instances need conditional writes in the durable stores
+(P61, P62). Metering rides the `engine.query` event and doubles as the
+billing meter.
 
 Catalog, access requests, grants and budgets need no key material. They
 live in `research::ResearchService` (`AppState::research`), which
@@ -464,9 +476,11 @@ discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`). Researchers file
 access requests (idempotent while pending); approval mints the grant
-through the same code path as a direct grant, and adds its query budget
-to the grant once, keyed by the request: a follow-up request tops up a
-grant that already exists (spend is kept), and a retry adds nothing. A
+(re-activating a revoked one, which a direct grant does the same way) and
+adds its query budget to it once, keyed by the request: a follow-up request
+tops up a grant that already exists (spend is kept), and a retry adds
+nothing. The budget write creates the entry if there is none, so a failure
+leaves no placeholder entry. A
 pending request whose listing has been unpublished can be denied but not
 approved (404, `denied` event). The approval is recorded first, with its
 query budget, so a failure

@@ -60,10 +60,11 @@ pub trait BudgetLedger: Send + Sync {
     /// overflow, cannot lower.
     async fn top_up(&self, grant_id: &str, additional: u64) -> Result<BudgetState, BudgetError>;
 
-    /// [`top_up`] at most once per `key` (an access request id, or a
-    /// re-grant's revoke time): a repeat with the same key returns the
-    /// standing unchanged, so a retried approval or re-grant cannot add its
-    /// budget twice. The key check, the top-up and
+    /// [`top_up`] at most once per `key` (an access request id): a repeat
+    /// with the same key returns the standing unchanged, so a retried
+    /// approval cannot add its budget twice. With no entry yet, it creates
+    /// one whose limit is `additional`, so a failed call leaves no
+    /// placeholder entry behind. The key check, the insert or top-up and
     /// recording the key must be one atomic step, and a durable backend must
     /// persist the applied keys with the allocation.
     ///
@@ -92,6 +93,19 @@ struct Entry {
     applied: HashSet<String>,
 }
 
+impl Entry {
+    fn new(grant_id: &str, limit: u64) -> Self {
+        Self {
+            state: BudgetState {
+                grant_id: grant_id.to_owned(),
+                limit,
+                spent: 0,
+            },
+            applied: HashSet::new(),
+        }
+    }
+}
+
 impl InMemoryBudgetLedger {
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
         self.by_grant.lock().expect("budget lock")
@@ -102,14 +116,9 @@ impl InMemoryBudgetLedger {
 impl BudgetLedger for InMemoryBudgetLedger {
     async fn open(&self, grant_id: &str, limit: u64) -> Result<BudgetState, TenancyError> {
         let mut ledger = self.lock();
-        let entry = ledger.entry(grant_id.to_owned()).or_insert_with(|| Entry {
-            state: BudgetState {
-                grant_id: grant_id.to_owned(),
-                limit,
-                spent: 0,
-            },
-            applied: HashSet::new(),
-        });
+        let entry = ledger
+            .entry(grant_id.to_owned())
+            .or_insert_with(|| Entry::new(grant_id, limit));
         Ok(entry.state.clone())
     }
 
@@ -143,7 +152,9 @@ impl BudgetLedger for InMemoryBudgetLedger {
         additional: u64,
     ) -> Result<BudgetState, BudgetError> {
         let mut ledger = self.lock();
-        let entry = ledger.get_mut(grant_id).ok_or(BudgetError::UnknownGrant)?;
+        let entry = ledger
+            .entry(grant_id.to_owned())
+            .or_insert_with(|| Entry::new(grant_id, 0));
         if entry.applied.insert(key.to_owned()) {
             entry.state.limit = entry.state.limit.saturating_add(additional);
         }
@@ -181,10 +192,26 @@ mod tests {
             .await
             .expect("other");
         assert_eq!(other.limit, 6);
-        assert!(matches!(
-            ledger.top_up_once("missing", "request-2", 1).await,
-            Err(BudgetError::UnknownGrant)
-        ));
+    }
+
+    #[tokio::test]
+    async fn top_up_once_creates_a_missing_entry_once() {
+        let ledger = InMemoryBudgetLedger::default();
+        let made = ledger
+            .top_up_once("g1", "request-1", 4)
+            .await
+            .expect("create");
+        assert_eq!((made.limit, made.spent), (4, 0));
+        let again = ledger
+            .top_up_once("g1", "request-1", 4)
+            .await
+            .expect("again");
+        assert_eq!(again.limit, 4);
+        let other = ledger
+            .top_up_once("g1", "request-2", 1)
+            .await
+            .expect("other");
+        assert_eq!(other.limit, 5);
     }
 
     #[tokio::test]
