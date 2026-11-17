@@ -372,7 +372,10 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
   key into a zeroize-on-drop `TenantKeypair` for the duration of that
   query. The relying party checks the token with the production verifier
-  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query,
+  (`platform_enclave::token`) against the `sim-attestation` key set, and
+  accepts only the enclave audience: the public evidence token
+  (`GET /api/v1/attestation`) carries the browser audience, so a caller who
+  fetched it cannot open key release. When `KEY_RELEASE_URL` is unset, the query,
   research-query and attestation endpoints fail closed with 503; research
   access (below) does not need key release. That relying party is the development and
   simulation stand-in (ADR 0004): it and its clients compile only with the
@@ -667,7 +670,8 @@ Rules, enforced by the capture tests:
    all appear in the stream. On the grant and research-query routes, input
    refused with 400 before any lookup (a malformed tenant id or slug, a
    zero top-up, a grant to oneself) is not audited: the check reads only
-   the request and the caller's own tenant id.
+   the request and the caller's own tenant id. The same holds for a
+   malformed attestation nonce on the unauthenticated attestation route.
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key

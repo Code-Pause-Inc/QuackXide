@@ -23,7 +23,10 @@ uses [Semantic Versioning](https://semver.org/).
   server chose) and returns ADR 0010's evidence bundle, and the key-release
   stand-in checks binding v2 and refuses a request key that is not `HPK2`
   (audited as `crypto.suite_refused`). The sealed-query wire types are
-  defined; nothing routes to them yet. ADR 0005 and ADR 0010 are accepted.
+  defined; nothing routes to them yet. The public evidence token carries
+  the audience `urn:platform:browser-attestation`, which key release
+  refuses, so a caller who fetches it cannot open key release.
+  ADR 0005 and ADR 0010 are accepted.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
