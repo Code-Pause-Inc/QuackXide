@@ -30,6 +30,12 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser tests (#223 stage A). A vitest `browser` project runs the module
+  crypto worker, Web Crypto keys, the sealed HPKE device key, IndexedDB
+  persistence across a worker restart and a drive round trip in real
+  browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
+  The `browser` workflow runs Chromium on every pull request and Chromium,
+  Firefox and WebKit on `main` and nightly.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
   4 MiB, and a unit test pins the 52-byte envelope overhead. `cargo test`
