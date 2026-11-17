@@ -40,7 +40,8 @@ use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
 use platform_enclave::token::{
-    JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError, TokenVerifier, nonces_from_bytes,
+    BROWSER_ATTESTATION_AUDIENCE, JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError,
+    TokenVerifier, nonces_from_bytes,
 };
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::InMemoryTenantRegistry;
@@ -285,8 +286,13 @@ async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity
 
     // The token verifies against the signer's keys, bound to the caller's
     // nonce and the enclave's keys.
-    let verifier =
-        TokenVerifier::new(&signer().jwks(), SIM_ISSUER, SIMULATED_AUDIENCE, policy()).unwrap();
+    let verifier = TokenVerifier::new(
+        &signer().jwks(),
+        SIM_ISSUER,
+        BROWSER_ATTESTATION_AUDIENCE,
+        policy(),
+    )
+    .unwrap();
     // The second nonce is the binding digest, which is the key id.
     let expected = nonces_from_bytes(&identity.binding().report_data(&nonce)).unwrap();
     assert_eq!(
@@ -501,6 +507,69 @@ async fn a_swapped_signing_key_is_refused() {
             Err(platform_api::ApiError::Forbidden)
         ));
     }
+    assert_eq!(rp.release_count(), 0);
+    assert!(
+        capture.contains("crypto.key_release", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+/// The public evidence token (`GET /api/v1/attestation`) carries the browser
+/// audience, so a caller who fetched it cannot present it to key release.
+#[tokio::test]
+async fn a_public_attestation_token_does_not_open_key_release() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = Arc::new(EnclaveIdentity::generate());
+    let attestation = provider(SimulatedClaims::default());
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let key_provider = Arc::new(AttestedKeyProvider::new(
+        identity.clone(),
+        attestation.clone(),
+        Arc::new(InProcessKeyReleaseClient(rp.clone())),
+    ));
+    let query = ConnectorQueryService::new(
+        vault.clone(),
+        key_provider,
+        attestation,
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+        },
+        false,
+    )
+    .with_enclave_identity(identity.clone());
+    let app = build_app(AppState {
+        config: Arc::new(PlatformConfig::from_source(|_| None).expect("config")),
+        vault,
+        jwt: Some(Arc::new(JwtVerifier::hs256(SECRET, ISS, AUD))),
+        research: None,
+        query: Some(Arc::new(query)),
+        provisioning: None,
+    });
+
+    // The attacker takes a live key-release challenge and has the public
+    // route bind its nonce.
+    let challenge = rp.issue_challenge();
+    let nonce = B64.decode(&challenge.nonce_b64).unwrap();
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/attestation?nonce={}", B64URL.encode(nonce)),
+        &[],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let bundle: AttestationBundle = serde_json::from_slice(&body).expect("json");
+
+    let req = request(tenant, &identity, &challenge.nonce_b64, bundle.token);
+    assert!(matches!(
+        rp.release_key(&req).await,
+        Err(platform_api::ApiError::Forbidden)
+    ));
     assert_eq!(rp.release_count(), 0);
     assert!(
         capture.contains("crypto.key_release", "denied"),

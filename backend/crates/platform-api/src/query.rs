@@ -242,7 +242,7 @@ impl ConnectorQueryService {
         let report_data = self.identity.binding().report_data(&nonce);
         let evidence = self
             .attestation
-            .produce_evidence(&report_data)
+            .produce_browser_evidence(&report_data)
             .await
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
@@ -250,7 +250,7 @@ impl ConnectorQueryService {
             return Err(ApiError::AttestationUnavailable);
         }
         self.attestation
-            .verify_evidence(&evidence, &report_data)
+            .verify_browser_evidence(&evidence, &report_data)
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
         Ok(AttestationBundle::new(&self.identity, evidence.token))
