@@ -28,13 +28,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
 use bytes::Bytes;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::{DataFusionError, exec_err};
 use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::coop::CooperativeExec;
+use datafusion::physical_plan::execution_plan::SchedulingType;
+use datafusion::physical_plan::{ExecutionPlan, replace_children_if_necessary};
 use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
+use futures::StreamExt;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::ParquetMetaData;
@@ -168,9 +175,14 @@ pub struct QueryScope {
 
 impl QueryScope {
     pub fn new(settings: EngineSettings) -> Self {
-        let runtime = scope_runtime(&settings.limits);
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new())
+            .with_runtime_env(scope_runtime(&settings.limits))
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(YieldEveryBatch))
+            .build();
         Self {
-            ctx: SessionContext::new_with_config_rt(SessionConfig::new(), runtime),
+            ctx: SessionContext::new_with_state(state),
             settings,
             tables: Vec::new(),
             disclosure: None,
@@ -315,7 +327,13 @@ impl QueryScope {
     /// required, and results pass through it before egress. A result with
     /// more rows than [`QueryLimits::max_result_rows`] after disclosure
     /// control is refused, as is a query whose operators run out of the
-    /// scope's memory pool.
+    /// scope's memory pool. Without a disclosure policy the result is
+    /// refused as soon as it passes the row limit, and the plan stops.
+    ///
+    /// Dropping the returned future stops the plan at its next batch
+    /// boundary: every operator yields to the runtime as it produces batches
+    /// (`YieldEveryBatch`), so a time limit applied around this call is
+    /// enforced while the plan runs.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>, QueryError> {
         self.last_suppressed_rows.store(0, Ordering::Relaxed);
 
@@ -364,10 +382,26 @@ impl QueryScope {
             }
         };
 
-        let batches = df
-            .collect()
+        // The pool does not track rows collected for the result. Without a
+        // disclosure policy those rows are the result, so the query stops at
+        // the first row over the limit. A policy has to see the whole
+        // aggregate, whose groups the pool held while they were computed.
+        let max_rows = self.settings.limits.max_result_rows;
+        let mut stream = df
+            .execute_stream()
             .await
             .map_err(|err| datafusion_error(ExecutionStage::Execute, &err))?;
+        let mut batches = Vec::new();
+        let mut rows = 0u64;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|err| datafusion_error(ExecutionStage::Execute, &err))?;
+            rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+            if disclosure.is_none() && rows > max_rows {
+                return Err(QueryError::LimitExceeded(QueryLimit::ResultRows));
+            }
+            batches.push(batch);
+        }
+        drop(stream);
 
         let batches = match disclosure {
             None => batches,
@@ -380,7 +414,7 @@ impl QueryScope {
         };
         // Refused rather than cut short: a partial result would look whole.
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        if u64::try_from(rows).unwrap_or(u64::MAX) > self.settings.limits.max_result_rows {
+        if u64::try_from(rows).unwrap_or(u64::MAX) > max_rows {
             return Err(QueryError::LimitExceeded(QueryLimit::ResultRows));
         }
         Ok(batches)
@@ -565,6 +599,60 @@ fn footer_size(metadata: &ParquetMetaData) -> Result<(u64, u64), QueryError> {
     Ok((rows.max(file_rows), bytes))
 }
 
+/// Makes every operator yield to the runtime as it produces batches.
+///
+/// A time limit stops a query by dropping its future, which takes effect
+/// only when the plan returns to the runtime, and a plan's partitions run
+/// on tasks of their own that stop the same way. DataFusion consumes the
+/// task's cooperative budget only at scans and exchanges, so a join that
+/// reads each input once could otherwise run to the end with its time
+/// limit long past and its slot already released. Each batch any operator
+/// produces now consumes budget, so the plan stops at its next batch
+/// boundary.
+#[derive(Debug)]
+struct YieldEveryBatch;
+
+impl PhysicalOptimizerRule for YieldEveryBatch {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        cooperate(plan, false)
+    }
+
+    fn name(&self) -> &str {
+        "yield_every_batch"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Wraps `plan` and every operator below it in a [`CooperativeExec`],
+/// except operators that already consume budget themselves: each
+/// `CooperativeExec`, the operator directly under one (`wrapped`), and any
+/// that DataFusion reports as cooperative.
+fn cooperate(
+    plan: Arc<dyn ExecutionPlan>,
+    wrapped: bool,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let is_wrapper = plan.is::<CooperativeExec>();
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| cooperate(Arc::clone(child), is_wrapper))
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = replace_children_if_necessary(plan, children)?;
+    let cooperative = plan.properties().scheduling_type == SchedulingType::Cooperative;
+    Ok(if is_wrapper || wrapped || cooperative {
+        plan
+    } else {
+        Arc::new(CooperativeExec::new(plan))
+    })
+}
+
 /// Queries only: no DDL, DML, `COPY` or session statements.
 fn read_only() -> SQLOptions {
     SQLOptions::new()
@@ -595,8 +683,15 @@ impl ObjectStoreRegistry for NoObjectStores {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use arrow::array::Int64Array;
-    use arrow::datatypes::Field;
+    use arrow::datatypes::{Field, SchemaRef};
+    use datafusion::catalog::streaming::StreamingTable;
+    use datafusion::execution::memory_pool::MemoryLimit;
+    use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::streaming::PartitionStream;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
     use parquet::file::properties::WriterProperties;
@@ -766,6 +861,188 @@ mod tests {
             scope.register_parquet("t", &pages_wiped),
             Err(QueryError::Parquet(_))
         ));
+    }
+
+    /// A single partition of `batches` batches of `rows` rows each (`v`,
+    /// `Int64`), counting the batches it hands out.
+    #[derive(Debug)]
+    struct CountedBatches {
+        schema: SchemaRef,
+        batches: usize,
+        rows: i64,
+        produced: Arc<AtomicUsize>,
+    }
+
+    impl PartitionStream for CountedBatches {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let (schema, produced, rows) = (self.schema.clone(), self.produced.clone(), self.rows);
+            let batches = futures::stream::iter((0..self.batches).map(move |_| {
+                produced.fetch_add(1, Ordering::SeqCst);
+                let values = Arc::new(Int64Array::from_iter_values(0..rows));
+                Ok(RecordBatch::try_new(schema.clone(), vec![values])?)
+            }));
+            Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), batches))
+        }
+    }
+
+    /// Without a disclosure policy the collected rows are the result, and
+    /// the pool does not track them: the query stops reading at the first
+    /// row over the limit instead of collecting everything first.
+    #[tokio::test]
+    async fn an_ungated_result_stops_at_the_row_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let produced = Arc::new(AtomicUsize::new(0));
+        let source = CountedBatches {
+            schema: schema.clone(),
+            batches: 1_000,
+            rows: 100,
+            produced: produced.clone(),
+        };
+        let table = StreamingTable::try_new(schema, vec![Arc::new(source)]).expect("table");
+        let limits = QueryLimits {
+            max_result_rows: 250,
+            ..QueryLimits::default()
+        };
+        let scope = scope_with(ZkMode::Disabled, limits);
+        scope
+            .ctx
+            .register_table("t", Arc::new(table))
+            .expect("register");
+
+        let err = scope.sql("SELECT v FROM t").await.expect_err("over");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::ResultRows)),
+            "{err:?}"
+        );
+        // The third batch passes the limit.
+        assert_eq!(produced.load(Ordering::SeqCst), 3);
+    }
+
+    /// A time limit drops the query's future. A cross join reads each input
+    /// once and then works without reading again, so only
+    /// [`YieldEveryBatch`] makes it stop: the call returns at the limit, and
+    /// the tasks running its partitions stop too, releasing everything they
+    /// held in the pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_time_limit_stops_a_running_plan() {
+        let parquet = int_parquet(Int64Array::from_iter_values(0..80_000), None);
+        let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+        scope.register_parquet("t", &parquet).expect("register");
+        let pool = scope.ctx.runtime_env().memory_pool.clone();
+
+        // 6.4 billion pairs: about a minute of work on four threads.
+        let started = Instant::now();
+        let ran = tokio::time::timeout(
+            Duration::from_millis(500),
+            scope.sql("SELECT COUNT(*) AS n FROM t a CROSS JOIN t b WHERE a.v + b.v >= 0"),
+        )
+        .await;
+        assert!(ran.is_err(), "the plan finished within the limit");
+        let stopped = started.elapsed();
+        assert!(
+            stopped < Duration::from_secs(5),
+            "returned after {stopped:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.reserved() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "{} bytes still reserved: the plan is still running",
+                pool.reserved()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every operator in a scope's plan consumes budget as it produces
+    /// batches: each is a `CooperativeExec`, sits directly under one, or is
+    /// cooperative itself, and no wrapper wraps another.
+    #[tokio::test]
+    async fn every_operator_in_a_plan_yields() {
+        fn check(plan: &Arc<dyn ExecutionPlan>, wrapped: bool) {
+            let is_wrapper = plan.is::<CooperativeExec>();
+            assert!(!(is_wrapper && wrapped), "a wrapper wraps a wrapper");
+            let cooperative = plan.properties().scheduling_type == SchedulingType::Cooperative;
+            assert!(
+                is_wrapper || wrapped || cooperative,
+                "{} does not yield",
+                plan.name()
+            );
+            for child in plan.children() {
+                check(child, is_wrapper);
+            }
+        }
+
+        let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+        let parquet = int_parquet(Int64Array::from_iter_values(0..1_000), None);
+        scope.register_parquet("t", &parquet).expect("register");
+        let sql = "SELECT a.v % 7 AS g, COUNT(*) AS n FROM t a JOIN t b ON a.v = b.v \
+                   CROSS JOIN t c WHERE a.v + c.v >= 0 GROUP BY g ORDER BY g";
+        let plan = scope
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        check(&plan, false);
+    }
+
+    /// `SET` on a runtime key would give the scope a temporary directory or
+    /// a larger pool, so no-spill rests on refusing it. After the refusals
+    /// the runtime is as built: a sort that outgrows the pool fails with the
+    /// memory limit and writes nothing.
+    #[tokio::test]
+    async fn refused_runtime_settings_leave_the_scope_unable_to_spill() {
+        let dir = std::env::temp_dir().join(format!("qx-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let tight = QueryLimits {
+            memory_bytes: 64 * 1024,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope_with(ZkMode::Disabled, tight);
+        let parquet = int_parquet(Int64Array::from_iter_values(0..200_000), None);
+        scope.register_parquet("t", &parquet).expect("register");
+
+        for set in [
+            format!(
+                "SET datafusion.runtime.temp_directory = '{}'",
+                dir.display()
+            ),
+            "SET datafusion.runtime.max_temp_directory_size = '1G'".to_owned(),
+            "SET datafusion.runtime.memory_limit = '1G'".to_owned(),
+        ] {
+            let err = scope.sql(&set).await.expect_err(&set);
+            assert!(
+                matches!(err, QueryError::StatementNotAllowed),
+                "{set}: {err:?}"
+            );
+        }
+
+        let err = scope
+            .sql("SELECT v FROM t ORDER BY v DESC")
+            .await
+            .expect_err("outgrows the pool");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::Memory)),
+            "{err:?}"
+        );
+        let runtime = scope.ctx.runtime_env();
+        assert!(matches!(
+            runtime.memory_pool.memory_limit(),
+            MemoryLimit::Finite(bytes) if bytes == 64 * 1024
+        ));
+        assert!(!runtime.disk_manager.tmp_files_enabled());
+        assert_eq!(runtime.disk_manager.used_disk_space(), 0);
+        let written = std::fs::read_dir(&dir).expect("scratch dir").count();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(written, 0);
     }
 
     #[test]

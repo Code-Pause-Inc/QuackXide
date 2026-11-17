@@ -279,8 +279,15 @@ uses [Semantic Versioning](https://semver.org/).
   (502). Every Parquet footer must fit `QUERY_MAX_DECODED_ROWS` and
   `QUERY_MAX_DECODED_MIB` before anything is decoded, and a result over
   `QUERY_MAX_RESULT_ROWS` or `QUERY_MAX_RESULT_MIB` is refused, never
-  truncated. Size limits answer 422 and memory exhaustion is no longer
-  reported as the caller's SQL error (400). Each refusal is an
+  truncated; without a disclosure policy the result streams and the query
+  stops at the first row over the limit. Every operator yields to the
+  runtime as it produces a batch, so the time limit stops a running plan
+  and the tasks running its partitions. Startup is refused when
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, decoded
+  table, three copies of its input and two of its result) exceeds
+  `QUERY_TOTAL_MEMORY_MIB` (default 8192). Size limits answer 422 and
+  memory exhaustion is no longer reported as the caller's SQL error
+  (400). Each refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them, so each costs a unit (P54 decides the
   order). The slot is released and the decrypted blobs zeroized on every

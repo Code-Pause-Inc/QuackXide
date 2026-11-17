@@ -937,6 +937,9 @@ mod tests {
         assert_zeroize_on_drop::<DecryptedObjects>();
         // Each opened envelope, the manifest's included, until it is kept.
         assert_zeroize_on_drop::<SecretBytes>();
+        // The private key a query's key session or a dev key provider
+        // holds.
+        assert_zeroize_on_drop::<TenantKeypair>();
     }
 
     /// The input-object limit is reached before the manifest bound: a

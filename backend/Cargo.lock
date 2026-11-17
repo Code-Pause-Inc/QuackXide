@@ -3467,6 +3467,7 @@ dependencies = [
  "arrow",
  "bytes",
  "datafusion",
+ "futures",
  "object_store",
  "parquet",
  "platform-core",

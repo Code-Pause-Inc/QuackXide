@@ -336,13 +336,21 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   query service that is not wired. From taking its slot through
   decryption, decoding, execution and serialization it runs within
   `QUERY_TIMEOUT_SECS`; on expiry the work is dropped and the query gets
-  503. However a query ends (a result, an error, the time limit, the caller
-  going away, or a panic unwinding, which the release profile does), the
-  decrypted blobs are zeroized and the slot is released.
+  503. Every operator yields to the runtime as it produces a batch, so a
+  running plan stops at its next batch boundary, on the tasks running its
+  partitions too. One operator step between batches runs to its end first:
+  a nested-loop join compares a probe batch with its whole build side,
+  which the memory pool bounds. However a query ends (a result, an error,
+  the time limit, the caller going away, or a panic unwinding, which the
+  release profile does), the decrypted blobs are zeroized and the slot is
+  released.
 * **Resource limits** ([ADR 0013](adr/0013-per-query-resource-limits.md)).
   `platform_core::QueryLimits`, read by `platform-config`, where each value
   is bounded and an invalid one refuses startup (`backend/.env.example`
-  lists them). Before any key is released,
+  lists them). Together they must fit `QUERY_TOTAL_MEMORY_MIB`:
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, its
+  decoded table, three copies of its input and two of its result), or
+  startup is refused. Before any key is released,
   the objects stored at the snapshot's version must fit
   `QUERY_MAX_INPUT_OBJECTS` and, in ciphertext bytes, `DATASET_MAX_MIB`, the
   upload limit, so every stored upload stays queryable; a sealed manifest
@@ -361,7 +369,10 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   fails the query instead of spilling decrypted rows to a temporary file. A
   result with more rows than `QUERY_MAX_RESULT_ROWS` after disclosure
   control, or more JSON than `QUERY_MAX_RESULT_MIB`, is refused, never
-  truncated. Each size limit is refused with 422 and a message of its own,
+  truncated. The pool does not track the rows collected for a result, so
+  without a disclosure policy the result streams and the query stops at
+  the first row over the limit; with one, suppression sees the whole
+  aggregate, whose groups the pool held. Each size limit is refused with 422 and a message of its own,
   never the 400 of SQL that cannot run, and each limit refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them (see "Rate level" below).
