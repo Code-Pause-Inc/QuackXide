@@ -2,8 +2,8 @@
 //! browser-sealed upload is stored as the dataset's new snapshot and is
 //! queryable in the enclave; a re-upload replaces it; an upload that fails
 //! partway is never visible. Refusals: no or non-access token (401), a
-//! malformed body (422), a frame of a suite the deployment refuses (422),
-//! an oversized one (413), a declared schema that
+//! malformed body (422), a frame of a suite the deployment refuses or the
+//! enrolled key does not use (422), an oversized one (413), a declared schema that
 //! differs from the recorded one (422), a stale version (409), a dataset id
 //! outside the upload namespace (404), a storage outage (503), and data
 //! that does not match its declaration (502, in the enclave).
@@ -723,4 +723,46 @@ async fn development_accepts_an_hpk1_upload() {
     let sealed = cohorts_upload(tenant, &hpk1.public_key(), DATASET, None);
     let (status, body) = put_upload(&app, Some(&token_for(tenant)), DATASET, sealed.body).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn an_upload_in_another_suite_than_the_enrolled_key_is_refused() {
+    use platform_crypto::EnvelopeSuite::{Hpk1, Hpk2};
+
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    // Both suites pass the development policy; the enrolled key decides.
+    for (enrolled, sealed_as) in [(Hpk2, Hpk1), (Hpk1, Hpk2)] {
+        let tenant = TenantId::generate();
+        let token = token_for(tenant);
+        let enrolled_key = TenantKeypair::generate(enrolled).public_key();
+        assert_eq!(
+            common::enroll_key(&app, &token, &enrolled_key).await,
+            StatusCode::NO_CONTENT
+        );
+        let other = TenantKeypair::generate(sealed_as).public_key();
+        let sealed = cohorts_upload(tenant, &other, DATASET, None);
+        let (status, body) = put_upload(&app, Some(&token), DATASET, sealed.body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "upload suite does not match the enrolled key"
+        );
+        // Nothing was committed, so the previous snapshot is not pruned.
+        assert_eq!(snapshot_paths(&*vault, tenant).await, (0, 0, 0));
+
+        // The same suite as the enrolled key is stored.
+        let same = cohorts_upload(tenant, &enrolled_key, DATASET, None);
+        let (status, body) = put_upload(&app, Some(&token), DATASET, same.body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
 }

@@ -1455,3 +1455,37 @@ async fn production_mode_refusal_is_audited_without_values() {
         "{events:?}"
     );
 }
+
+#[tokio::test]
+async fn an_upload_in_another_suite_than_the_enrolled_key_is_audited() {
+    let capture = AuditCapture::install();
+    let mut state = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let steward = TenantId::generate();
+    let token = token_for(steward);
+    let enrolled = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    assert_eq!(
+        common::enroll_key(&app, &token, &enrolled).await,
+        StatusCode::NO_CONTENT
+    );
+    let other = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+    let sealed = common::cohorts_upload(steward, &other, "upload_cohorts", None);
+    let (status, _) = common::put_upload(&app, Some(&token), "upload_cohorts", sealed.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert_tenant_event(
+        &capture,
+        "crypto.suite_refused",
+        "denied",
+        steward,
+        "refused an upload sealed in a suite other than the enrolled key's",
+    );
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        "upload refused dataset=upload_cohorts reason=suite_mismatch",
+    );
+}
