@@ -878,6 +878,17 @@ async fn http_sim_attestation_service_serves_tokens_and_keys_end_to_end() {
         .verify_evidence(&evidence, &[3u8; 32])
         .unwrap();
 
+    // A browser token minted over HTTP carries the browser audience, so only
+    // the browser verifier accepts it.
+    let browser = gate_provider
+        .produce_browser_evidence(&[4u8; 32])
+        .await
+        .unwrap();
+    gate_provider
+        .verify_browser_evidence(&browser, &[4u8; 32])
+        .unwrap();
+    assert!(gate_provider.verify_evidence(&browser, &[4u8; 32]).is_err());
+
     server.abort();
 }
 

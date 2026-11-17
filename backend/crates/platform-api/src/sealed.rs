@@ -27,7 +27,8 @@ pub const MAX_SEALED_QUERY_PLAINTEXT_BYTES: usize = 64 * 1024;
 
 /// What `envelope` opens to inside the enclave. The SQL text is plaintext
 /// only here (ADR 0010): `Debug` redacts it, and it is wiped on drop, also
-/// when a later field fails to parse.
+/// when a later field fails to parse. Best-effort: serde_json's scratch copy
+/// of a string with JSON escapes is freed without wiping.
 #[derive(PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealedQueryPlaintext {

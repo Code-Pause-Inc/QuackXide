@@ -81,7 +81,9 @@ Any change to a bound value (a restart, a renewed TLS key) produces a new
 key set. Its `key_id` is the binding digest below, base64url-encoded.
 
 The opened request (including the SQL text) and the result payload before
-sealing are zeroized after use, like the query-result buffer today.
+sealing are zeroized after use, like the query-result buffer today. For the
+SQL this is best-effort: serde_json copies a string containing JSON escapes
+into a scratch buffer that it frees without wiping.
 
 ### Binding v2
 
@@ -287,7 +289,8 @@ identities.
 ### No downgrade
 
 The request key is hybrid (`HPK2`) from the first build, and so are the
-signatures. Once the browser seals with the hybrid suite (P36, #186),
+signatures. The browser's envelope module seals only `HPK1` until P36, so
+browser sealed queries wait on P36 as well as P85. Once the browser seals with the hybrid suite (P36, #186),
 every step refuses the classical one, as ADR 0007 requires for stored
 data: the browser refuses an evidence bundle whose request key is
 `HPK1`, and the enclave refuses an `HPK1` envelope and an X25519-only
