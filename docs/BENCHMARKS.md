@@ -77,8 +77,9 @@ overheads.
 ## Times
 
 Criterion's estimate, both suites from one run:
-[run 43391725261](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/43391725261)
-of #228's HPK2 change, on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC
+[run 44014510055](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/44014510055)
+of #228, with the server's X25519 basepoint table (`precomputed-tables`), on
+a GitHub-hosted `ubuntu-latest` runner: AMD EPYC
 7763, 4 CPUs, `rustc 1.94.1`, hpke 0.14.1, x-wing 0.1.1, ml-kem 0.3.4,
 x25519-dalek 3.0.0, curve25519-dalek 5.0.0 and aes-gcm 0.11.1 (hpke's;
 0.10.3 is `aead_seal`'s). Crate upgrades move these numbers, so the
@@ -88,13 +89,13 @@ runner noise.
 
 | Benchmark | Payload | `HPK1` time | `HPK2` time | `HPK1` throughput | `HPK2` throughput |
 | --- | --- | --- | --- | --- | --- |
-| `keygen` | | 33.2 µs | 121.3 µs | | |
-| `seal/32B` | 32 B | 125.6 µs | 189.7 µs | 249 KiB/s | 165 KiB/s |
-| `open/32B` | 32 B | 93.3 µs | 308.3 µs | 335 KiB/s | 101 KiB/s |
-| `seal/4KiB` | 4 KiB | 128.2 µs | 191.8 µs | 30.5 MiB/s | 20.4 MiB/s |
-| `open/4KiB` | 4 KiB | 95.9 µs | 310.8 µs | 40.7 MiB/s | 12.6 MiB/s |
-| `seal/4MiB` | 4 MiB | 5.63 ms | 5.71 ms | 711 MiB/s | 701 MiB/s |
-| `open/4MiB` | 4 MiB | 2.65 ms | 2.87 ms | 1.47 GiB/s | 1.36 GiB/s |
+| `keygen` | | 18.3 µs | 105.9 µs | | |
+| `seal/32B` | 32 B | 98.0 µs | 175.5 µs | 319 KiB/s | 178 KiB/s |
+| `open/32B` | 32 B | 79.5 µs | 294.4 µs | 393 KiB/s | 106 KiB/s |
+| `seal/4KiB` | 4 KiB | 99.9 µs | 177.4 µs | 39.1 MiB/s | 22.0 MiB/s |
+| `open/4KiB` | 4 KiB | 82.1 µs | 296.6 µs | 47.6 MiB/s | 13.2 MiB/s |
+| `seal/4MiB` | 4 MiB | 5.63 ms | 5.72 ms | 711 MiB/s | 699 MiB/s |
+| `open/4MiB` | 4 MiB | 2.64 ms | 2.86 ms | 1.48 GiB/s | 1.37 GiB/s |
 
 ## Targets and regression threshold
 
