@@ -1,9 +1,10 @@
 //! Steward dataset uploads (ADR 0012).
 //!
 //! A steward's browser seals a Parquet file to the steward's key, under
-//! `steward-upload-v1|{tenant}|{dataset}|{object}`, and a manifest listing
-//! it, under `tenant-snapshot-manifest-v1|{tenant}|{dataset}|{version}`, and
-//! sends both in one body with a plaintext header. The upload route holds no
+//! `steward-upload-v{n}|{tenant}|{dataset}|{object}`, and a manifest listing
+//! it, under `tenant-snapshot-manifest-v{n}|{tenant}|{dataset}|{version}`
+//! (`v1` for `HPK1`, `v2` for `HPK2`), and sends both in one body with a
+//! plaintext header. The upload route holds no
 //! key and opens neither; only a query does, inside the enclave. The route
 //! checks what it can (lengths, envelope frames, the header) and
 //! [`commit_upload`] stores the upload as a new snapshot of the dataset, so
@@ -556,9 +557,16 @@ mod tests {
         };
         let relabel = |envelope: &[u8]| {
             let mut out = envelope.to_vec();
-            out[..4].copy_from_slice(b"HPK2");
+            out[..4].copy_from_slice(b"HPK9");
             out
         };
+        // The same upload sealed under the other suite, for mixed-suite bodies.
+        let (_, manifest_hpk2, object_hpk2) =
+            parts(&Fixture::sealed_under(EnvelopeSuite::Hpk2).body(
+                &version_at(0),
+                cohort_schema(),
+                b"parquet bytes",
+            ));
         let object_id = header_json["object"].as_str().expect("id").to_owned();
 
         let cases: Vec<(&str, Vec<u8>, UploadError)> = vec![
@@ -692,6 +700,16 @@ mod tests {
             (
                 "object truncated",
                 frame(b"DSU1", &header, &manifest, &object[..20]),
+                UploadError::BadObject,
+            ),
+            (
+                "HPK1 manifest with an HPK2 object",
+                frame(b"DSU1", &header, &manifest, &object_hpk2),
+                UploadError::BadObject,
+            ),
+            (
+                "HPK2 manifest with an HPK1 object",
+                frame(b"DSU1", &header, &manifest_hpk2, &object),
                 UploadError::BadObject,
             ),
         ];
