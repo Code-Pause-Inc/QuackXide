@@ -294,6 +294,12 @@ uses [Semantic Versioning](https://semver.org/).
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
+* The secret scan reads every file's content whatever git attributes say:
+  `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
+  `.git/info/attributes`, a user's attributes file or a NUL byte from
+  hiding a credential, so the scan no longer needs git 2.41
+  (`GIT_ATTR_SOURCE`). Its selftest no longer reinitialises the repository
+  named by an exported `GIT_DIR`, as a git hook or `git rebase -x` sets.
 * A revoke, top-up or budget read of a grant that is unknown or not the
   caller's is audited as `denied`: `tenant.provisioned` for a revoke and
   `research.budget` for the others, with the caller's tenant and the grant
