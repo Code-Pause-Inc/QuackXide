@@ -171,6 +171,30 @@ async fn granted_researcher_queries_an_hpk1_dataset_uploaded_in_development() {
     researcher_queries_an_uploaded_dataset(EnvelopeSuite::Hpk1, common::development_config()).await;
 }
 
+/// Key release is `HPK2`-only: an `HPK1` key registered for it would make
+/// every query fail after charging its budget, so building the service fails.
+#[test]
+#[should_panic(expected = "key release is HPK2-only")]
+fn the_release_path_refuses_a_stack_holding_an_hpk1_key() {
+    let mut stack = DevResearchStack::new();
+    stack.register_key(
+        TenantId::generate(),
+        TenantKeypair::generate(EnvelopeSuite::Hpk1),
+    );
+    let vault = stack.vault();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault,
+        5,
+        100,
+    ));
+    let settings = EngineSettings {
+        zk: ZkMode::Disabled,
+        max_concurrent_queries: 4,
+    };
+    stack.query_service(settings, research);
+}
+
 #[tokio::test]
 async fn budget_exhausts_and_steward_top_up_restores_access() {
     let steward = TenantId::generate();

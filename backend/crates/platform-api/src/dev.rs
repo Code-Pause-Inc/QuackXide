@@ -18,7 +18,7 @@ use platform_config::PlatformConfig;
 use platform_connectors::pipeline::PipelineError;
 use platform_connectors::snapshot::SnapshotWriter;
 use platform_core::{ConnectorSlug, SnapshotVersion, TenantId};
-use platform_crypto::TenantKeypair;
+use platform_crypto::{EnvelopeSuite, TenantKeypair};
 use platform_enclave::AttestationProvider;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
@@ -99,6 +99,11 @@ impl DevResearchStack {
     /// `AppState::research` the same `Arc`), on the simulated TEE. Each query
     /// attests with a simulated token, and the in-process key-release
     /// stand-in releases the tenant's key only after that token verifies.
+    ///
+    /// Key release is `HPK2`-only, so a stack holding another suite's key
+    /// panics here instead of building a service whose every query would
+    /// be refused after charging its budget; use
+    /// [`Self::query_service_with_attestation`] for those keys.
     pub fn query_service(
         self,
         settings: EngineSettings,
@@ -121,6 +126,11 @@ impl DevResearchStack {
             policy,
         ));
         for (tenant, keypair) in &self.keys {
+            assert_eq!(
+                keypair.suite(),
+                EnvelopeSuite::Hpk2,
+                "key release is HPK2-only; use query_service_with_attestation for {tenant}'s key"
+            );
             relying_party.insert_tenant_key(*tenant, keypair);
         }
         let identity = Arc::new(EnclaveIdentity::generate());
