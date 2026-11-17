@@ -117,3 +117,36 @@ fn demo_tenant(config: &PlatformConfig) -> anyhow::Result<(TenantId, TenantPubli
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_config(env: &'static str, key_b64: String) -> PlatformConfig {
+        PlatformConfig::from_source(move |k| match k {
+            "APP_ENV" => Some(env.to_owned()),
+            "DEMO_TENANT_ID" => Some("6f2c8a2e-1111-4222-8333-444455556666".to_owned()),
+            "DEMO_TENANT_PUBLIC_KEY_B64" => Some(key_b64.clone()),
+            _ => None,
+        })
+        .expect("config loads")
+    }
+
+    fn key_b64(suite: EnvelopeSuite) -> String {
+        B64.encode(TenantKeypair::generate(suite).public_key().to_raw())
+    }
+
+    // `build` refuses any production demo tenant first (`enforce_production`,
+    // so no `crypto.suite_refused` event is reachable); this is the second
+    // guard, should a caller reach the loader.
+    #[test]
+    fn production_refuses_a_classical_demo_key_and_accepts_a_hybrid_one() {
+        let hpk1 = demo_config("production", key_b64(EnvelopeSuite::Hpk1));
+        let err = demo_tenant(&hpk1).expect_err("HPK1 refused").to_string();
+        assert!(err.contains("DEMO_TENANT_PUBLIC_KEY_B64"), "{err}");
+        let hpk2 = demo_config("production", key_b64(EnvelopeSuite::Hpk2));
+        assert!(demo_tenant(&hpk2).is_ok());
+        let development = demo_config("development", key_b64(EnvelopeSuite::Hpk1));
+        assert!(demo_tenant(&development).is_ok());
+    }
+}
