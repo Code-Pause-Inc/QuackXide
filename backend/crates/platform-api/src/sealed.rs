@@ -22,10 +22,13 @@ pub struct SealedQueryRequest {
     pub envelope: String,
 }
 
+/// Longest sealed query plaintext the enclave parses (ADR 0010).
+pub const MAX_SEALED_QUERY_PLAINTEXT_BYTES: usize = 64 * 1024;
+
 /// What `envelope` opens to inside the enclave. The SQL text is plaintext
 /// only here (ADR 0010): `Debug` redacts it, and it is wiped on drop, also
 /// when a later field fails to parse.
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealedQueryPlaintext {
     pub steward_tenant: String,
@@ -47,6 +50,15 @@ impl std::fmt::Debug for SealedQueryPlaintext {
 }
 
 impl SealedQueryPlaintext {
+    /// Parse the opened plaintext. Input over
+    /// [`MAX_SEALED_QUERY_PLAINTEXT_BYTES`] is a 400 before any parsing.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ApiError> {
+        if bytes.len() > MAX_SEALED_QUERY_PLAINTEXT_BYTES {
+            return Err(ApiError::BadRequest("sealed query is too large"));
+        }
+        serde_json::from_slice(bytes).map_err(|_| ApiError::BadRequest("sealed query is malformed"))
+    }
+
     /// The request nonce's 32 bytes; anything else is a 400.
     pub fn request_nonce_bytes(&self) -> Result<[u8; 32], ApiError> {
         URL_SAFE_NO_PAD
@@ -93,7 +105,14 @@ mod tests {
         let r: SealedQueryRequest = serde_json::from_value(request.clone()).expect("request");
         assert_eq!(serde_json::to_value(&r).unwrap(), request);
         let p: SealedQueryPlaintext = serde_json::from_value(plaintext.clone()).expect("plaintext");
-        assert_eq!(serde_json::to_value(&p).unwrap(), plaintext);
+        assert_eq!(p.steward_tenant, "s");
+        assert_eq!(p.connector, "upload_cohorts");
+        assert_eq!(p.sql.as_str(), "SELECT 1");
+        assert_eq!(p.request_nonce, "bm9uY2U");
+        assert_eq!(
+            p.recipient_key,
+            serde_json::from_value(recipient()).unwrap()
+        );
         let s: SealedQueryResponse = serde_json::from_value(response.clone()).expect("response");
         assert_eq!(serde_json::to_value(&s).unwrap(), response);
     }
@@ -129,6 +148,43 @@ mod tests {
         };
         let printed = format!("{plaintext:?}");
         assert!(!printed.contains("secret_column"), "{printed}");
+    }
+
+    /// A plaintext of exactly `len` bytes, padded through the SQL text.
+    fn plaintext_of_len(len: usize) -> Vec<u8> {
+        let with_sql = |sql: &str| {
+            json!({
+                "steward_tenant": "s", "connector": "c", "sql": sql,
+                "request_nonce": "n", "recipient_key": recipient(),
+            })
+            .to_string()
+        };
+        let base = with_sql("").len();
+        with_sql(&" ".repeat(len - base)).into_bytes()
+    }
+
+    #[test]
+    fn a_plaintext_over_the_cap_is_refused_before_parsing() {
+        let at_cap = plaintext_of_len(MAX_SEALED_QUERY_PLAINTEXT_BYTES);
+        assert_eq!(at_cap.len(), MAX_SEALED_QUERY_PLAINTEXT_BYTES);
+        assert!(SealedQueryPlaintext::parse(&at_cap).is_ok());
+
+        // Valid JSON, one byte over: only the cap refuses it.
+        let over = plaintext_of_len(MAX_SEALED_QUERY_PLAINTEXT_BYTES + 1);
+        assert!(matches!(
+            SealedQueryPlaintext::parse(&over),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn a_malformed_plaintext_is_a_bad_request() {
+        for bad in [&b"not json"[..], b"{}", b""] {
+            assert!(matches!(
+                SealedQueryPlaintext::parse(bad),
+                Err(ApiError::BadRequest(_))
+            ));
+        }
     }
 
     #[test]
