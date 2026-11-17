@@ -1523,3 +1523,36 @@ async fn an_upload_in_another_suite_than_the_enrolled_key_is_audited() {
         "upload refused dataset=upload_cohorts reason=suite_mismatch",
     );
 }
+
+#[tokio::test]
+async fn an_unreadable_enrollment_record_is_audited_on_upload() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let key = keypair.public_key();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(steward),
+            Bytes::from_static(b"not an enrollment record"),
+        )
+        .await
+        .expect("put");
+    let sealed = common::cohorts_upload(steward, &key, "upload_cohorts", None);
+    let (status, _) = common::put_upload(
+        &app,
+        Some(&token_for(steward)),
+        "upload_cohorts",
+        sealed.body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "failed",
+        steward,
+        "upload failed dataset=upload_cohorts reason=enrollment_unreadable",
+    );
+}

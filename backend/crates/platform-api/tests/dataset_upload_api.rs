@@ -744,24 +744,52 @@ async fn an_upload_in_another_suite_than_the_enrolled_key_is_refused() {
             common::enroll_key(&app, &token, &enrolled_key).await,
             StatusCode::NO_CONTENT
         );
+        // The same suite as the enrolled key is stored.
+        let first = cohorts_upload(tenant, &enrolled_key, DATASET, None);
+        let (status, body) = put_upload(&app, Some(&token), DATASET, first.body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
         let other = TenantKeypair::generate(sealed_as).public_key();
-        let sealed = cohorts_upload(tenant, &other, DATASET, None);
+        let sealed = cohorts_upload(tenant, &other, DATASET, Some(&first.version));
         let (status, body) = put_upload(&app, Some(&token), DATASET, sealed.body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(
             body["error"],
             "upload suite does not match the enrolled key"
         );
-        // Nothing was committed, so the previous snapshot is not pruned.
-        assert_eq!(snapshot_paths(&*vault, tenant).await, (0, 0, 0));
-
-        // The same suite as the enrolled key is stored.
-        let same = cohorts_upload(tenant, &enrolled_key, DATASET, None);
-        let (status, body) = put_upload(&app, Some(&token), DATASET, same.body).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        // Nothing was committed: the previous snapshot is not pruned.
+        assert_eq!(snapshot_paths(&*vault, tenant).await, (1, 1, 1));
     }
     assert!(
         capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_enrollment_record_fails_the_upload_closed() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let vault = in_memory();
+    let (app, steward) = app_over(vault.clone());
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(steward.tenant),
+            Bytes::from_static(b"not an enrollment record"),
+        )
+        .await
+        .expect("put");
+    let sealed = cohorts_upload(steward.tenant, &steward.key, DATASET, None);
+    let (status, body) = put_upload(&app, Some(&steward.token), DATASET, sealed.body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (0, 0, 0));
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "data.access"
+                && e.outcome == "failed"
+                && e.detail == "upload failed dataset=upload_cohorts reason=enrollment_unreadable"),
         "{:?}",
         capture.events()
     );

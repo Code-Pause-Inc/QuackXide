@@ -230,6 +230,7 @@ not what the API stores.
 | Declared schema unlike the recorded one | 422 | denied, `schema_mismatch` |
 | Version not newer than the current one, or another write committed it or recorded it differently first | 409 | denied, `stale_version` |
 | Current record unreadable | 502 | failed, `record_unreadable` |
+| Enrolled key record unreadable | 502 | failed, `enrollment_unreadable` |
 | Storage failure | 503 or 502 | failed, `storage` |
 
 An upload outside the upload namespace is 404 rather than 403, since the

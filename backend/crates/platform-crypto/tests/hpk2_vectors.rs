@@ -262,15 +262,12 @@ fn rust_sealed_vectors_are_current() {
         generated,
         "fixtures/envelope/hpk2-rust-sealed.json is stale; regenerate it (see this file's header)"
     );
-}
-
-#[test]
-fn rust_sealed_vectors_open_here() {
-    let vectors = fixture("hpk2-rust-sealed.json");
-    let envelopes = vectors["envelopes"].as_array().expect("envelopes");
+    // Opens the generated vectors, which the file equals, so a regeneration
+    // run cannot race the write.
+    let envelopes = generated["envelopes"].as_array().expect("envelopes");
     assert!(envelopes.len() >= 4);
     for e in envelopes {
-        let to = recipient(&vectors, text(e, "recipient"));
+        let to = recipient(&generated, text(e, "recipient"));
         let opened = to
             .open_envelope(&info_for(e), &bytes(e, "envelope_b64"))
             .expect("open");
