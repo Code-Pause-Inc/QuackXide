@@ -603,9 +603,11 @@ Migration rules:
 * The suite changes at the existing seams — `EnvelopeSuite` (add a suite
   and move `CURRENT`), the `JwtVerifier` construction site, the browser
   crypto core — with a new frame version alongside `HPK1`.
-* Every key loader takes a `SuitePolicy`. Tenant enrollment and the demo
-  tenant build it from `APP_ENV` (ADR 0009): production accepts only `HPK2`
-  keys, development also `HPK1`, so the browser works until P36. The
+* Every key loader takes a `SuitePolicy`, except the raw `hpk1_*` loaders:
+  they are the browser's `HPK1` path and go away with P36 (#186). Tenant
+  enrollment and the demo tenant build it from `APP_ENV` (ADR 0009):
+  production accepts only `HPK2` keys, development also `HPK1`, so the
+  browser works until P36. The
   key-release stand-in and released keys accept only `HPK2` in every mode;
   the browser build and the enclave's key-release key accept only `HPK1`
   until P36 and P85. A key opens only frames of its own suite. Refusals at

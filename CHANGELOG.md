@@ -264,6 +264,12 @@ uses [Semantic Versioning](https://semver.org/).
   refused with 400. Each status event is audited as `tenant.provisioned`:
   `ok` when applied, `denied` with `reason=stale` or `reason=canceled`
   when skipped, and `miss` for an unknown subscription.
+* Enrollment audits every refused key as `crypto.key_enrollment` denied: a
+  key of a suite the deployment refuses (also `crypto.suite_refused`) and a
+  key that is not valid base64, which emitted nothing.
+* `DevResearchStack::query_service` panics on a stack holding an `HPK1`
+  key, since key release is `HPK2`-only and every query would fail after
+  charging its budget; `query_service_with_attestation` still takes both.
 
 ### Security
 

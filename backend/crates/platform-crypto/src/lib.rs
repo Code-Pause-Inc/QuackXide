@@ -507,12 +507,12 @@ fn hpk1_keypair_from_raw(raw: &[u8]) -> Result<TenantKeypair, CryptoError> {
     }))
 }
 
-// The two `hpk1_*` loaders below take no `SuitePolicy`: they are the
-// browser's raw-key `HPK1` path (`envelope-wasm`), and go away with P36 (#186).
 /// The `HPK1` public key of a raw X25519 private key. The browser derives
 /// its enrollment key this way from the private key it generated
 /// (ADR 0007, "Browser private-key storage"). `HPK1` only until the browser
-/// moves to the hybrid suite (P36).
+/// moves to the hybrid suite (P36). Takes no `SuitePolicy`: this is the
+/// browser's raw-key `HPK1` path (`envelope-wasm`), which goes away with P36
+/// (#186).
 pub fn hpk1_public_key_from_private(raw: &[u8]) -> Result<TenantPublicKey, CryptoError> {
     Ok(hpk1_keypair_from_raw(raw)?.public_key())
 }
@@ -521,7 +521,8 @@ pub fn hpk1_public_key_from_private(raw: &[u8]) -> Result<TenantPublicKey, Crypt
 /// browser's open path: the crypto worker decrypts the device key just
 /// before the call and drops it when it returns. An `HPK2` frame is refused
 /// as a suite mismatch (P36 adds it). Fails on tamper, wrong recipient, a
-/// mismatched `info` binding or an unknown frame.
+/// mismatched `info` binding or an unknown frame. Takes no `SuitePolicy`, for
+/// the same reason as [`hpk1_public_key_from_private`].
 pub fn hpk1_open_with_private_key(
     private_key: &[u8],
     info: &[u8],
