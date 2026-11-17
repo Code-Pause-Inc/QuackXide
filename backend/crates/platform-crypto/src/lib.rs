@@ -19,7 +19,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
-use hpke::rand_core::CryptoRng;
+use hpke::rand_core::{CryptoRng, UnwrapErr};
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
 #[cfg(feature = "server")]
 use sha2::Sha256;
@@ -39,10 +39,11 @@ pub const GCM_NONCE_BYTES: usize = 12;
 pub const GCM_TAG_BYTES: usize = 16;
 pub const BLIND_INDEX_BYTES: usize = 16;
 
-/// HPKE KEM of the current suite ([`EnvelopeSuite::CURRENT`], `HPK2`).
-/// Together with [`TenantKdf`] and [`TenantAead`] this pins the wire suite
-/// for every producer and consumer.
-pub type TenantKem = hpke::kem::XWing;
+/// HPKE KEM of the `HPK2` suite. To change the current suite, change
+/// [`EnvelopeSuite::CURRENT`] and add a suite beside this one; this alias
+/// stays `HPK2`'s. Together with [`TenantKdf`] and [`TenantAead`] it pins the
+/// wire suite for every producer and consumer.
+type Hpk2Kem = hpke::kem::XWing;
 /// HPKE KEM of the `HPK1` suite, accepted only in development until P36.
 type Hpk1Kem = hpke::kem::X25519HkdfSha256;
 type TenantKdf = HkdfSha256;
@@ -332,11 +333,15 @@ impl SuitePolicy {
         hpk1: true,
         hpk2: true,
     };
-    /// The browser build until P36: `HPK1` only.
-    pub const HPK1_ONLY: Self = Self {
-        hpk1: true,
-        hpk2: false,
-    };
+
+    /// Exactly `suite`, in every mode: for a caller whose key or frame has
+    /// one fixed suite, so the policy follows that suite and not a mode.
+    pub const fn only(suite: EnvelopeSuite) -> Self {
+        Self {
+            hpk1: matches!(suite, EnvelopeSuite::Hpk1),
+            hpk2: matches!(suite, EnvelopeSuite::Hpk2),
+        }
+    }
 
     pub fn for_env(production: bool) -> Self {
         if production {
@@ -376,7 +381,7 @@ pub fn check_envelope_frame(envelope: &[u8]) -> Result<EnvelopeSuite, CryptoErro
 enum PublicKeyInner {
     Hpk1(<Hpk1Kem as KemTrait>::PublicKey),
     // Boxed: an X-Wing public key is about 1.6 KB in memory.
-    Hpk2(Box<<TenantKem as KemTrait>::PublicKey>),
+    Hpk2(Box<<Hpk2Kem as KemTrait>::PublicKey>),
 }
 
 /// A tenant's HPKE public key, raw bytes as enrolled.
@@ -421,37 +426,26 @@ impl std::fmt::Debug for TenantPublicKey {
 }
 
 /// Envelope-seal `plaintext` to a tenant public key, in the key's suite.
-/// Returns the framed envelope (`magic || encapped_key || ciphertext`).
+/// Returns the framed envelope (`magic || encapped_key || ciphertext`). The
+/// ephemeral key comes from the operating system's RNG, as in hpke's own
+/// `single_shot_seal`.
 pub fn hpke_seal_to_tenant(
     recipient: &TenantPublicKey,
     info: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    fn seal<K: KemTrait>(
-        suite: EnvelopeSuite,
-        pk: &K::PublicKey,
-        info: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        let (encapped, ciphertext) = hpke::single_shot_seal::<TenantAead, TenantKdf, K>(
-            &OpModeS::Base,
-            pk,
-            info,
-            plaintext,
-            b"",
-        )
-        .map_err(|_| CryptoError::SealFailed)?;
-        Ok(frame(suite, &encapped.to_bytes(), &ciphertext))
-    }
-    match &recipient.0 {
-        PublicKeyInner::Hpk1(pk) => seal::<Hpk1Kem>(EnvelopeSuite::Hpk1, pk, info, plaintext),
-        PublicKeyInner::Hpk2(pk) => seal::<TenantKem>(EnvelopeSuite::Hpk2, pk, info, plaintext),
-    }
+    hpke_seal_to_tenant_with_rng(
+        recipient,
+        info,
+        plaintext,
+        &mut UnwrapErr(getrandom::SysRng),
+    )
 }
 
-/// [`hpke_seal_to_tenant`] with the ephemeral key drawn from `rng`. Only the
-/// committed test-vector generator passes a seeded RNG; everything else
-/// calls [`hpke_seal_to_tenant`].
+/// The one seal path: [`hpke_seal_to_tenant`] with the ephemeral key drawn
+/// from `rng`. Only the committed test-vector generators pass a seeded RNG;
+/// everything else calls [`hpke_seal_to_tenant`], so the vectors pin the
+/// code production runs.
 pub fn hpke_seal_to_tenant_with_rng(
     recipient: &TenantPublicKey,
     info: &[u8],
@@ -478,9 +472,7 @@ pub fn hpke_seal_to_tenant_with_rng(
     }
     match &recipient.0 {
         PublicKeyInner::Hpk1(pk) => seal::<Hpk1Kem>(EnvelopeSuite::Hpk1, pk, info, plaintext, rng),
-        PublicKeyInner::Hpk2(pk) => {
-            seal::<TenantKem>(EnvelopeSuite::Hpk2, pk, info, plaintext, rng)
-        }
+        PublicKeyInner::Hpk2(pk) => seal::<Hpk2Kem>(EnvelopeSuite::Hpk2, pk, info, plaintext, rng),
     }
 }
 
@@ -515,6 +507,8 @@ fn hpk1_keypair_from_raw(raw: &[u8]) -> Result<TenantKeypair, CryptoError> {
     }))
 }
 
+// The two `hpk1_*` loaders below take no `SuitePolicy`: they are the
+// browser's raw-key `HPK1` path (`envelope-wasm`), and go away with P36 (#186).
 /// The `HPK1` public key of a raw X25519 private key. The browser derives
 /// its enrollment key this way from the private key it generated
 /// (ADR 0007, "Browser private-key storage"). `HPK1` only until the browser
@@ -537,8 +531,8 @@ pub fn hpk1_open_with_private_key(
 }
 
 struct Hpk2Keypair {
-    private_key: <TenantKem as KemTrait>::PrivateKey,
-    public_key: <TenantKem as KemTrait>::PublicKey,
+    private_key: <Hpk2Kem as KemTrait>::PrivateKey,
+    public_key: <Hpk2Kem as KemTrait>::PublicKey,
 }
 
 /// Test/dev-only tenant keypair. Both suites' private keys zeroize on drop
@@ -556,7 +550,7 @@ impl TenantKeypair {
                 }
             }
             EnvelopeSuite::Hpk2 => {
-                let (private_key, public_key) = TenantKem::gen_keypair();
+                let (private_key, public_key) = Hpk2Kem::gen_keypair();
                 KeypairInner::Hpk2(Box::new(Hpk2Keypair {
                     private_key,
                     public_key,
@@ -578,7 +572,7 @@ impl TenantKeypair {
                 }
             }
             EnvelopeSuite::Hpk2 => {
-                let (private_key, public_key) = TenantKem::derive_keypair(ikm);
+                let (private_key, public_key) = Hpk2Kem::derive_keypair(ikm);
                 KeypairInner::Hpk2(Box::new(Hpk2Keypair {
                     private_key,
                     public_key,
@@ -629,8 +623,7 @@ impl TenantKeypair {
     /// Unframed or unknown-magic input is refused; `policy` decides whether
     /// the named suite is accepted.
     pub fn from_private_key_bytes(framed: &[u8], policy: SuitePolicy) -> Result<Self, CryptoError> {
-        let suite =
-            EnvelopeSuite::of_envelope(framed).map_err(|_| CryptoError::InvalidKeyLength)?;
+        let suite = EnvelopeSuite::of_envelope(framed)?;
         policy.check(suite)?;
         let raw = &framed[MAGIC_BYTES..];
         let inner = match suite {
@@ -644,9 +637,9 @@ impl TenantKeypair {
                 }
             }
             EnvelopeSuite::Hpk2 => {
-                let private_key = <TenantKem as KemTrait>::PrivateKey::from_bytes(raw)
+                let private_key = <Hpk2Kem as KemTrait>::PrivateKey::from_bytes(raw)
                     .map_err(|_| CryptoError::InvalidKeyLength)?;
-                let public_key = TenantKem::sk_to_pk(&private_key);
+                let public_key = Hpk2Kem::sk_to_pk(&private_key);
                 KeypairInner::Hpk2(Box::new(Hpk2Keypair {
                     private_key,
                     public_key,
@@ -691,9 +684,7 @@ impl TenantKeypair {
             KeypairInner::Hpk1 { private_key, .. } => {
                 open::<Hpk1Kem>(private_key, encapped, info, ciphertext)
             }
-            KeypairInner::Hpk2(kp) => {
-                open::<TenantKem>(&kp.private_key, encapped, info, ciphertext)
-            }
+            KeypairInner::Hpk2(kp) => open::<Hpk2Kem>(&kp.private_key, encapped, info, ciphertext),
         }
     }
 }
@@ -915,6 +906,36 @@ mod tests {
     }
 
     #[test]
+    fn suites_have_distinct_public_key_lengths() {
+        // `of_public_key_len` names the suite from the length alone.
+        for (i, a) in SUITES.iter().enumerate() {
+            for b in &SUITES[i + 1..] {
+                assert_ne!(a.public_key_len(), b.public_key_len());
+            }
+            assert_eq!(
+                EnvelopeSuite::of_public_key_len(a.public_key_len()),
+                Some(*a)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_hybrid_public_key_is_refused() {
+        // The ML-KEM half has 12-bit coefficients that must be below 3329
+        // (FIPS 203's modulus check); 0xFFFF is not. Pins that
+        // `from_raw` validates the 1216 bytes, not only their length.
+        let mut raw = TenantKeypair::generate(EnvelopeSuite::Hpk2)
+            .public_key()
+            .to_raw();
+        assert!(TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT).is_ok());
+        raw[..2].copy_from_slice(&[0xFF, 0xFF]);
+        assert!(matches!(
+            TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT),
+            Err(CryptoError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
     fn production_policy_refuses_hpk1() {
         let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1);
         let hpk2 = TenantKeypair::generate(EnvelopeSuite::Hpk2);
@@ -933,10 +954,19 @@ mod tests {
         ));
         assert!(TenantPublicKey::from_raw(&hpk2_raw, SuitePolicy::PRODUCTION).is_ok());
         assert!(matches!(
-            TenantPublicKey::from_raw(&hpk2_raw, SuitePolicy::HPK1_ONLY),
+            TenantPublicKey::from_raw(&hpk2_raw, SuitePolicy::only(EnvelopeSuite::Hpk1)),
             Err(CryptoError::SuiteRefused)
         ));
-        assert!(TenantPublicKey::from_raw(&hpk1_raw, SuitePolicy::HPK1_ONLY).is_ok());
+        assert!(
+            TenantPublicKey::from_raw(&hpk1_raw, SuitePolicy::only(EnvelopeSuite::Hpk1)).is_ok()
+        );
+        assert!(matches!(
+            TenantPublicKey::from_raw(&hpk1_raw, SuitePolicy::only(EnvelopeSuite::Hpk2)),
+            Err(CryptoError::SuiteRefused)
+        ));
+        assert!(
+            TenantPublicKey::from_raw(&hpk2_raw, SuitePolicy::only(EnvelopeSuite::Hpk2)).is_ok()
+        );
         assert_eq!(SuitePolicy::for_env(true), SuitePolicy::PRODUCTION);
         assert_eq!(SuitePolicy::for_env(false), SuitePolicy::DEVELOPMENT);
     }
@@ -962,7 +992,7 @@ mod tests {
             ] {
                 assert!(matches!(
                     TenantKeypair::from_private_key_bytes(bad, SuitePolicy::DEVELOPMENT),
-                    Err(CryptoError::InvalidKeyLength)
+                    Err(CryptoError::InvalidEnvelope)
                 ));
             }
         }
@@ -1143,7 +1173,7 @@ mod tests {
         assert_zeroize_on_drop::<x_wing::DecapsulationKey>();
         const {
             assert!(std::mem::needs_drop::<<Hpk1Kem as KemTrait>::PrivateKey>());
-            assert!(std::mem::needs_drop::<<TenantKem as KemTrait>::PrivateKey>());
+            assert!(std::mem::needs_drop::<<Hpk2Kem as KemTrait>::PrivateKey>());
         };
     }
 
@@ -1152,65 +1182,105 @@ mod tests {
         use proptest::prelude::*;
         use std::sync::LazyLock;
 
-        static KEYPAIR: LazyLock<TenantKeypair> =
-            LazyLock::new(|| TenantKeypair::generate(EnvelopeSuite::CURRENT));
+        static KEYPAIRS: LazyLock<[TenantKeypair; 2]> =
+            LazyLock::new(|| SUITES.map(TenantKeypair::generate));
+
+        fn keypair(suite: EnvelopeSuite) -> &'static TenantKeypair {
+            &KEYPAIRS[SUITES.iter().position(|s| *s == suite).unwrap()]
+        }
+
+        fn suite() -> impl Strategy<Value = EnvelopeSuite> {
+            prop::sample::select(SUITES.to_vec())
+        }
 
         fn bytes(max: usize) -> impl Strategy<Value = Vec<u8>> {
             prop::collection::vec(any::<u8>(), 0..max)
         }
 
-        fn seal(info: &[u8], plaintext: &[u8]) -> Vec<u8> {
-            hpke_seal_to_tenant(&KEYPAIR.public_key(), info, plaintext).unwrap()
+        fn seal(suite: EnvelopeSuite, info: &[u8], plaintext: &[u8]) -> Vec<u8> {
+            hpke_seal_to_tenant(&keypair(suite).public_key(), info, plaintext).unwrap()
+        }
+
+        /// A suite and a frame of at least that suite's minimum length with
+        /// its magic, so opening it reaches decapsulation and the AEAD.
+        fn complete_frame() -> impl Strategy<Value = (EnvelopeSuite, Vec<u8>)> {
+            suite().prop_flat_map(|suite| {
+                let body = suite.min_frame_bytes() - MAGIC_BYTES;
+                (
+                    Just(suite),
+                    prop::collection::vec(any::<u8>(), body..body + 64)
+                        .prop_map(move |rest| [&suite.magic()[..], &rest].concat()),
+                )
+            })
         }
 
         proptest! {
-            // Debug-build X25519 is slow; each case costs several scalar mults.
             #![proptest_config(ProptestConfig::with_cases(32))]
 
             #[test]
             fn arbitrary_envelopes_never_open(
                 info in bytes(64),
+                suite in suite(),
                 envelope in bytes(512),
                 framed: bool,
             ) {
                 let envelope = if framed {
-                    [&EnvelopeSuite::CURRENT.magic()[..], &envelope].concat()
+                    [&suite.magic()[..], &envelope].concat()
                 } else {
                     envelope
                 };
-                prop_assert!(KEYPAIR.open_envelope(&info, &envelope).is_err());
+                prop_assert!(keypair(suite).open_envelope(&info, &envelope).is_err());
             }
 
             #[test]
-            fn envelope_round_trips(info in bytes(64), plaintext in bytes(2048)) {
-                let opened = KEYPAIR.open_envelope(&info, &seal(&info, &plaintext)).unwrap();
+            fn arbitrary_complete_frames_are_rejected_by_the_aead(
+                info in bytes(64),
+                (suite, envelope) in complete_frame(),
+            ) {
+                prop_assert!(matches!(
+                    keypair(suite).open_envelope(&info, &envelope),
+                    Err(CryptoError::OpenFailed)
+                ));
+            }
+
+            #[test]
+            fn envelope_round_trips(
+                info in bytes(64),
+                suite in suite(),
+                plaintext in bytes(2048),
+            ) {
+                let opened = keypair(suite)
+                    .open_envelope(&info, &seal(suite, &info, &plaintext))
+                    .unwrap();
                 prop_assert_eq!(opened.expose(), &plaintext[..]);
             }
 
             #[test]
             fn envelope_mutation_or_truncation_fails(
                 info in bytes(64),
+                suite in suite(),
                 plaintext in bytes(256),
                 pick: usize,
                 flip in 1..=u8::MAX,
             ) {
-                let envelope = seal(&info, &plaintext);
+                let envelope = seal(suite, &info, &plaintext);
                 let mut tampered = envelope.clone();
                 tampered[pick % envelope.len()] ^= flip;
-                prop_assert!(KEYPAIR.open_envelope(&info, &tampered).is_err());
+                prop_assert!(keypair(suite).open_envelope(&info, &tampered).is_err());
                 let truncated = &envelope[..pick % envelope.len()];
-                prop_assert!(KEYPAIR.open_envelope(&info, truncated).is_err());
+                prop_assert!(keypair(suite).open_envelope(&info, truncated).is_err());
             }
 
             #[test]
             fn envelope_with_other_info_fails(
                 info in bytes(64),
                 other in bytes(64),
+                suite in suite(),
                 plaintext in bytes(256),
             ) {
                 prop_assume!(info != other);
                 prop_assert!(matches!(
-                    KEYPAIR.open_envelope(&other, &seal(&info, &plaintext)),
+                    keypair(suite).open_envelope(&other, &seal(suite, &info, &plaintext)),
                     Err(CryptoError::OpenFailed)
                 ));
             }

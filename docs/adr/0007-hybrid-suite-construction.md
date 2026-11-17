@@ -70,7 +70,7 @@ repository:
 * **Rust:** `hpke` 0.14.1, pinned exactly, with features `alloc`,
   `getrandom`, `x25519`, `mlkem`, `aes` and `hkdfsha2`, and its
   `x-wing` and `ml-kem` dependencies pinned in `Cargo.lock`. The suite
-  stays behind the `TenantKem` alias.
+  stays behind `EnvelopeSuite` (`CURRENT` and each suite's KEM).
 * **Browser:** a wasm32 build of the same `hpke` code, in the wrapper
   crate P34 builds, called only from the crypto worker. One
   implementation serves both sides. `@noble/post-quantum` and `hpke-js`

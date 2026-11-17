@@ -34,7 +34,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use platform_core::TenantId;
 use platform_crypto::{
-    SecretBytes, SuitePolicy, TenantKeypair, TenantPublicKey, hpke_seal_to_tenant,
+    EnvelopeSuite, SecretBytes, SuitePolicy, TenantKeypair, TenantPublicKey, hpke_seal_to_tenant,
 };
 use platform_enclave::simulated_token::TokenSigner;
 use platform_enclave::token::{
@@ -322,12 +322,11 @@ impl KeyReleaseRelyingParty {
         })?;
         // The enclave key is X25519 until P85 (#176): see `EnclaveIdentity`.
         let enclave_hpke_pk =
-            TenantPublicKey::from_raw(&enclave_hpke_pk_raw, SuitePolicy::HPK1_ONLY).map_err(
-                |_| {
+            TenantPublicKey::from_raw(&enclave_hpke_pk_raw, SuitePolicy::only(EnvelopeSuite::Hpk1))
+                .map_err(|_| {
                     self.audit_denial(tenant, "invalid X25519 enclave HPKE public key");
                     ApiError::Forbidden
-                },
-            )?;
+                })?;
 
         let result_signing_pk = decode_32(&req.result_signing_public_key_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed result-signing public key");
@@ -448,7 +447,7 @@ impl KeyReleaseRelyingParty {
                             .decode(req.private_key_b64.trim())
                             .map_err(|_| ApiError::BadRequest("invalid base64 private key"))?;
                         // HPK2 only, in every mode: the e2e script is the only client.
-                        let kp = TenantKeypair::from_private_key_bytes(&raw, SuitePolicy::PRODUCTION)
+                        let kp = TenantKeypair::from_private_key_bytes(&raw, SuitePolicy::only(EnvelopeSuite::Hpk2))
                             .map_err(|e| {
                                 if matches!(e, platform_crypto::CryptoError::SuiteRefused) {
                                     security_audit_event(

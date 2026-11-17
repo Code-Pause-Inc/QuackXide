@@ -124,8 +124,8 @@ exist.
 | Forge signatures | Hybrid Ed25519 + ML-DSA-65, including platform tokens (ADR 0006, P37) | **To build** — current tokens use RS256 |
 | Silent downgrade to classical-only | Versioned framing (`HPK2`); every key loader takes a suite policy, and a key opens only frames of its own suite. Production refuses `HPK1` frames and X25519 keys with `crypto.suite_refused`; there is no migration mode (ADR 0007) | **Built** — development (`APP_ENV=development`) still accepts `HPK1` until P36 removes it; production is the default when `APP_ENV` is unset |
 
-The suite seams are `TenantKem`, the `JwtVerifier` construction site and
-the frame magic. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
+The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
+`JwtVerifier` construction site and the frame magic. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
 
 ## Out of scope
 

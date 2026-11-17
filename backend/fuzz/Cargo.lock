@@ -2085,6 +2085,7 @@ name = "platform-crypto"
 version = "0.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
+ "getrandom 0.4.3",
  "hmac 0.12.1",
  "hpke",
  "rand 0.8.8",

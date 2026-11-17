@@ -19,6 +19,8 @@ server = ["dep:aes-gcm", "dep:hmac", "dep:rand", "dep:sha1", "dep:sha2"]
 
 [dependencies]
 aes-gcm = { workspace = true, optional = true }
+# `sys_rng` is the OS RNG that `hpke_seal_to_tenant` draws from, as hpke does.
+getrandom = { version = "0.4", features = ["sys_rng"] }
 hpke.workspace = true
 hmac = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }

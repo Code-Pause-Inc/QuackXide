@@ -111,7 +111,7 @@ impl EnclaveIdentity {
             .map_err(|_| ApiError::AttestationUnavailable)?;
         TenantKeypair::from_private_key_bytes(
             raw_sk.expose(),
-            platform_crypto::SuitePolicy::PRODUCTION,
+            platform_crypto::SuitePolicy::only(EnvelopeSuite::Hpk2),
         )
         .map_err(|e| {
             if matches!(e, platform_crypto::CryptoError::SuiteRefused) {

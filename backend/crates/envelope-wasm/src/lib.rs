@@ -32,7 +32,7 @@ pub fn seal_envelope(
     info: &[u8],
     mut plaintext: Vec<u8>,
 ) -> Result<Vec<u8>, CryptoError> {
-    let sealed = TenantPublicKey::from_raw(recipient_public_key, SuitePolicy::HPK1_ONLY)
+    let sealed = TenantPublicKey::from_raw(recipient_public_key, SuitePolicy::only(SUITE))
         .and_then(|recipient| hpke_seal_to_tenant(&recipient, info, &plaintext));
     // The JavaScript caller keeps its own copy; this one is wasm memory that
     // is reused, never returned to the browser.
