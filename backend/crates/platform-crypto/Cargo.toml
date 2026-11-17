@@ -15,7 +15,14 @@ workspace = true
 default = ["server"]
 # AEAD sealing, blind indexes and TOTP. The browser build (`envelope-wasm`)
 # turns it off and gets only the HPKE envelopes and their `info` strings.
-server = ["dep:aes-gcm", "dep:hmac", "dep:rand", "dep:sha1", "dep:sha2"]
+server = [
+    "dep:aes-gcm",
+    "dep:hmac",
+    "dep:rand",
+    "dep:sha1",
+    "dep:sha2",
+    "dep:x25519-dalek",
+]
 
 [dependencies]
 aes-gcm = { workspace = true, optional = true }
@@ -26,6 +33,12 @@ hmac = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Not called: this only turns on curve25519-dalek's precomputed basepoint
+# table for the server's X25519 operations. hpke builds x25519-dalek without
+# default features, and nothing else on the server turned the table on once
+# hpke left x25519-dalek 2. The browser build (no `server` feature) keeps the
+# table out of the wasm module.
+x25519-dalek = { version = "3", optional = true, default-features = false, features = ["precomputed-tables"] }
 zeroize.workspace = true
 thiserror.workspace = true
 
