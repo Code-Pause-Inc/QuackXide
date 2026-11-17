@@ -72,13 +72,13 @@ pub struct ResearchService {
     /// Budget units allocated to a grant when the steward doesn't specify
     /// (`RESEARCH_DEFAULT_QUERY_BUDGET`).
     default_budget: u64,
-    /// Held by every path that creates, re-activates, funds or revokes a
-    /// grant (a direct grant, an approval and a revoke). Each reads the grant
+    /// Held by every path that creates, re-activates, funds, tops up or
+    /// revokes a grant (a direct grant, an approval, a top-up and a revoke). Each reads the grant
     /// and its budget and then writes both, in two stores, so concurrent
     /// paths must not interleave. One lock for every tenant, held across
     /// store calls, is fine at the rate stewards grant; it holds in one
     /// process only, and several instances need conditional writes in the
-    /// durable stores (P61).
+    /// durable stores (P62).
     minting: tokio::sync::Mutex<()>,
 }
 
@@ -239,13 +239,16 @@ impl ResearchService {
                         .open(id, units)
                         .await
                         .map_err(|_| ApiError::Backend)?,
-                    Some(_) => {
+                    Some(before) => {
                         let budget = self
                             .budgets
                             .top_up(id, units)
                             .await
                             .map_err(|_| ApiError::Backend)?;
-                        audit_top_up(steward, id, units, &budget);
+                        if budget.limit != before.limit {
+                            let added = budget.limit.saturating_sub(before.limit);
+                            audit_top_up(steward, id, added, &budget);
+                        }
                         budget
                     }
                 };
@@ -312,6 +315,9 @@ impl ResearchService {
         grant_id: &str,
         additional: u64,
     ) -> Result<Value, ApiError> {
+        // Serialised with the grant paths, whose audited top-up is the change
+        // in the limit, so a concurrent top-up is never counted as theirs.
+        let _minting = self.minting.lock().await;
         let owns = self
             .grants
             .list_for(steward)
@@ -371,8 +377,8 @@ impl ResearchService {
     /// same "not found" as an unknown id, and either refusal is audited as
     /// `denied`.
     pub async fn revoke_grant(&self, steward: TenantId, grant_id: &str) -> Result<Value, ApiError> {
-        // A grant path in flight finishes first, so it never reports a grant
-        // that a revoke already took away.
+        // A grant, approval or top-up in flight finishes first, so none of
+        // them reports a grant that a revoke already took away.
         let _minting = self.minting.lock().await;
         let revoked = self
             .grants
@@ -560,7 +566,8 @@ impl ResearchService {
     /// Approval marks the request Approved first, recording its query budget
     /// (the steward's override, else the listing's included budget) in the
     /// same step, then mints the grant and adds that budget to it once,
-    /// keyed by the request (see `fund`). If a later step fails, the request stays Approved
+    /// keyed by the request (see `fund_grant`). If a later step fails, the request
+    /// stays Approved
     /// without a usable grant (fail closed) and the steward retries:
     /// approving an already-Approved request re-runs every step after
     /// `resolve` (slug, grant and budget), all idempotent, so the retry
@@ -589,6 +596,9 @@ impl ResearchService {
         approve: bool,
         budget_override: Option<u64>,
     ) -> Result<Value, ApiError> {
+        // Held from the decision to the funded grant, so a revoke cannot land
+        // between recording the approval and re-activating the grant.
+        let minting = self.minting.lock().await;
         let (request, retry) = match self
             .catalog
             .resolve(steward, request_id, approve, budget_override)
@@ -671,7 +681,6 @@ impl ResearchService {
         let query_budget = request.approved_budget;
         // A first approval is a new decision, so it may re-activate a revoked
         // grant. A retry may not.
-        let minting = self.minting.lock().await;
         let grant = if retry {
             self.grant_on_retry(steward, &request, &connector, query_budget)
                 .await?

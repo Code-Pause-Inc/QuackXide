@@ -452,8 +452,8 @@ funded. A revoked grant is re-activated first and then gets the new budget
 on top of its old one; if that funding fails, the grant stays active with
 its old budget and a retry is refused like any direct grant of an active grant, so
 nothing is added twice or dropped. Every top-up of an existing budget emits
-a `research.budget` event. Direct grants, approvals and revokes take one
-lock, because a grant and its budget live in two stores; that holds in one
+a `research.budget` event. Direct grants, approvals, top-ups and revokes take
+one lock, because a grant and its budget live in two stores; that holds in one
 process, and several instances need conditional writes in the durable stores
 (P61, P62). Metering rides the `engine.query` event and doubles as the
 billing meter.

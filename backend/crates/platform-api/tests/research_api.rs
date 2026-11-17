@@ -926,6 +926,144 @@ async fn a_revoke_racing_a_grant_lands_after_it() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// The `research.budget` `ok` details captured so far.
+fn budget_events(capture: &platform_telemetry::capture::AuditCapture) -> Vec<String> {
+    capture
+        .events()
+        .iter()
+        .filter(|e| e.audit_kind == "research.budget" && e.outcome == "ok")
+        .map(|e| e.detail.clone())
+        .collect()
+}
+
+/// A ledger whose next `state` yields once armed (`yielded` false), plus an
+/// app over it with `researcher` holding a 28-unit grant, and a pending
+/// request of `researcher`. The yield is disarmed during setup.
+async fn app_with_a_grant_and_a_request(
+    steward: TenantId,
+    researcher: TenantId,
+    ledger: Arc<TestLedger>,
+) -> (Router, String, String) {
+    let stores = ResearchStores {
+        budgets: ledger,
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let stoken = token_for(steward);
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+    let request_id = pending_request(&app, steward, researcher).await;
+    (app, grant_id, request_id)
+}
+
+#[tokio::test]
+async fn a_revoke_queued_before_an_approval_lands_before_its_decision() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger {
+        fail_first_top_up_once: true,
+        yield_on_state: true,
+        yielded: AtomicBool::new(true),
+        ..TestLedger::default()
+    });
+    let (app, grant_id, request_id) =
+        app_with_a_grant_and_a_request(steward, researcher, ledger.clone()).await;
+    let stoken = token_for(steward);
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // A direct grant holds the lock (it yields in `state`), a revoke queues
+    // behind it, and then the approval arrives. The approval's decision
+    // must come after the revoke, so its retry is not "revoked since".
+    ledger.yielded.store(false, Ordering::SeqCst);
+    let direct = grant_body(researcher, 5);
+    let (_, revoked, approved) = tokio::join!(
+        post(&app, "/api/v1/grants", &stoken, &direct),
+        call(&app, "DELETE", &revoke, &stoken, None),
+        post(&app, &approve, &stoken, "{}"),
+    );
+    assert_eq!(revoked.0, StatusCode::OK);
+    assert_eq!(
+        approved.0,
+        StatusCode::BAD_GATEWAY,
+        "approve: {}",
+        approved.1
+    );
+    let (status, retry) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "retry: {retry}");
+    assert_eq!(retry["grant"]["revoked"], false);
+    assert_eq!(retry["grant"]["budget"]["limit"], 53, "{retry}");
+}
+
+#[tokio::test]
+async fn a_top_up_racing_a_follow_up_approval_is_not_counted_as_its_own() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger {
+        yield_on_state: true,
+        yielded: AtomicBool::new(true),
+        ..TestLedger::default()
+    });
+    let (app, grant_id, request_id) =
+        app_with_a_grant_and_a_request(steward, researcher, ledger.clone()).await;
+    let stoken = token_for(steward);
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+
+    // The approval yields after reading the budget; the steward's top-up
+    // arrives meanwhile.
+    ledger.yielded.store(false, Ordering::SeqCst);
+    let (approved, topped) = tokio::join!(
+        post(&app, &approve, &stoken, r#"{"query_budget":3}"#),
+        post(&app, &budget_uri, &stoken, r#"{"additional":100}"#),
+    );
+    assert_eq!(approved.0, StatusCode::OK, "approve: {}", approved.1);
+    assert_eq!(topped.0, StatusCode::OK, "top-up: {}", topped.1);
+    // A retry alongside another top-up adds nothing and audits nothing.
+    let (retry, topped) = tokio::join!(
+        post(&app, &approve, &stoken, "{}"),
+        post(&app, &budget_uri, &stoken, r#"{"additional":7}"#),
+    );
+    assert_eq!(retry.0, StatusCode::OK, "retry: {}", retry.1);
+    assert_eq!(topped.0, StatusCode::OK);
+    let mut events = budget_events(&capture);
+    events.sort();
+    let mut expected = vec![
+        format!("top_up grant={grant_id} added=100 limit=131"),
+        format!("top_up grant={grant_id} added=3 limit=31"),
+        format!("top_up grant={grant_id} added=7 limit=138"),
+    ];
+    expected.sort();
+    assert_eq!(events, expected);
+}
+
+#[tokio::test]
+async fn a_zero_budget_re_grant_audits_no_top_up() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate()).await;
+    let stoken = token_for(steward);
+    let (_, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/v1/grants/{grant_id}"),
+        &stoken,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, regrant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 0)).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regrant}");
+    assert_eq!(regrant["budget"]["limit"], 28, "{regrant}");
+    assert_eq!(budget_events(&capture), Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn a_failed_approval_leaves_no_budget_for_a_direct_grant_to_trip_over() {
     let steward = TenantId::generate();

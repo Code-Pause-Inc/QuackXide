@@ -226,8 +226,9 @@ uses [Semantic Versioning](https://semver.org/).
   emits `research.budget`. A grant with no budget entry (a failed approval)
   is funded by the next direct grant. `BudgetLedger::top_up_once` now
   creates a missing entry in the same step, so a failed approval leaves no
-  placeholder. Direct grants, approvals and revokes are serialized, so two
-  at once cannot drop a budget and a revoke cannot land mid-grant (#235).
+  placeholder. Direct grants, approvals (from recording the decision),
+  top-ups and revokes are serialized, so two at once cannot drop a budget
+  and a revoke cannot land mid-grant (#235).
 * A follow-up access request's approval adds its query budget to the
   existing grant instead of being dropped, and a retry of the same
   approval adds nothing (`BudgetLedger::top_up_once`). A retry of an
