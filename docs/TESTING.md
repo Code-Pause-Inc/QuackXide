@@ -134,21 +134,30 @@ The full browser lifecycle against the API is not covered yet; see
 
 ### Browser timings
 
-`npm run bench:browser` (from `frontend/`) times chunk encryption
-(`encryptPayload` at 4 KiB and 4 MiB) and the first, cold load of the wasm
-envelope module in real browsers (`src/lib/crypto/timings.browser.timing.ts`,
-which `npm run test:browser` leaves out). Vitest cannot run `bench` in
-browser mode, so each encryption timing is the median and nearest-rank p95
-per operation over 20 samples. Browsers coarsen `performance.now()` (to
-1 ms in Firefox and WebKit), so each sample is a batch of calls lasting at
-least 50 ms. The wasm first load is one sample per run, fetched from the
-Vite dev server, so it carries the clock's coarseness: repeated loads hit
-the module cache.
+`npm run bench:browser` (from `frontend/`) is a Vitest bench in the
+`browser` project (`src/lib/crypto/timings.browser.bench.ts`). It times
+chunk encryption (`encryptPayload` at 4 KiB and 4 MiB) and the wasm
+envelope module's cold start, the load plus the first seal, because V8
+compiles wasm functions on their first call. `BROWSERS=chromium,firefox,webkit`
+runs the other browsers, one after the other. `npm test` and
+`npm run test:browser` never run it: bench files have their own glob,
+`*.browser.bench.ts`, which only `vitest bench` reads.
 
-The numbers are report only. The `browser` workflow writes them, and the
+Browsers coarsen `performance.now()` (to 1 ms in Firefox and WebKit), so one
+call per sample would read as zero. Each sample is instead a batch of calls
+that lasts at least 50 ms, reported as its per-call mean, and the bench
+takes 64 samples. Vitest's bench reports p50 and p99 (tinybench has no p95)
+over those batch means, so a slow single call is averaged away; read them as
+the spread of the typical cost, not as per-call tail latency. The cold start
+is one sample per page, reported as one value. The timings run on the page's
+main thread, while the app does this work in the crypto worker.
+
+The numbers are report only. The `browser` workflow writes them from
+Vitest's JSON output, with the runner's CPU, the browser version and the
 module's raw and gzipped size, to each run's job summary: Chromium on pull
 requests, and Chromium, Firefox and WebKit on `main`, nightly and on demand.
-The step is marked failed, without failing the run, if no timings come out.
+The step fails, without failing the run, if the bench run fails or prints no
+results. Recorded numbers belong in `docs/BENCHMARKS.md`.
 
 ### Envelope vectors
 
