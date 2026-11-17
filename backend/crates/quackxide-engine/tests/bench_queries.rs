@@ -7,15 +7,14 @@ use platform_core::ZkMode;
 use quackxide_engine::{EngineSettings, MinCountThreshold, QueryScope};
 use synth_data::{SchemaName, Spec};
 
-const QUERIES: [&str; 2] = [
-    "SELECT region, COUNT(*) AS n FROM t GROUP BY region",
-    "SELECT bucket, COUNT(*) AS n FROM t WHERE flag GROUP BY bucket",
-];
+#[path = "../benches/common/mod.rs"]
+mod common;
+use common::QUERIES;
 
 #[tokio::test]
 async fn bench_queries_pass_the_disclosure_gate() {
     let parquet = synth_data::parquet_bytes(&Spec::new(SchemaName::Wide, 1, 10_000)).expect("wide");
-    for query in QUERIES {
+    for (_, query) in QUERIES {
         let mut scope = QueryScope::new(EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 1,

@@ -1,9 +1,11 @@
 name: bench
 
 # On pull requests, benchmarks the base commit and then the head in one job,
-# on one runner, and fails when a benchmark is significantly more than 10 %
-# slower (scripts/bench-compare.sh). Shared runners vary between runs, so
-# numbers are only compared within the job. Not a required check.
+# on one runner, and warns in the job summary when a benchmark is
+# significantly more than 10 % slower (scripts/bench-compare.sh). The job
+# fails only when the comparison itself cannot run. Shared runners vary
+# between runs, so numbers are only compared within the job. Not a required
+# check.
 # docs/BENCHMARKS.md describes the method, the recorded numbers and targets.
 
 on:
@@ -35,6 +37,7 @@ concurrency:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,13 +74,14 @@ jobs:
       - name: Benchmarks at the base commit
         if: github.event_name == 'pull_request'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # One target dir: the head build is incremental, and both runs'
           # results land in one target/criterion.
           CARGO_TARGET_DIR: ${{ github.workspace }}/backend/target
         run: |
           set -o pipefail
-          git worktree add "$RUNNER_TEMP/base" "$BASE_SHA"
+          # The merge ref's first parent is the base branch as merged, so
+          # this is right even when the pull request's base moved or is stacked.
+          git worktree add "$RUNNER_TEMP/base" HEAD^1
           cd "$RUNNER_TEMP/base/backend"
           targets="$("$GITHUB_WORKSPACE/scripts/bench-targets.sh")"
           read -r -a benches <<<"$targets"
@@ -111,6 +115,12 @@ jobs:
             cat "$RUNNER_TEMP/compare.md"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
+          # A regression is a warning until the team decides to gate on it.
+          # Exit 2 (nothing compared, bad estimates) still fails the job.
+          if [[ $status == 1 ]]; then
+            echo "::warning::benchmark regression, see the job summary"
+            status=0
+          fi
           exit "$status"
       - name: Raw output
         if: always() && github.event_name != 'push'

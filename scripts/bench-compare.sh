@@ -6,7 +6,9 @@
 # interval is a slowdown bigger than the threshold.
 #
 #   bench-compare.sh <criterion-dir> [threshold]   table on stdout; exit 1 if
-#                                                 any benchmark regressed
+#                                                 any benchmark regressed, 2
+#                                                 if none was compared or the
+#                                                 input is unusable
 #   bench-compare.sh selftest                      check the rule on fixtures
 #
 # The threshold is a fraction (default 0.10). Only benchmarks with a
@@ -46,7 +48,11 @@ compare() {
         echo "| \`$id\` | $(pct "$point") | $(pct "$lower") to $(pct "$upper") | $verdict |"
         rows=$((rows + 1))
     done < <(find "$dir" -path '*/change/estimates.json' | LC_ALL=C sort)
-    [[ "$rows" -gt 0 ]] || echo "| (no compared benchmarks) | | | |"
+    if [[ "$rows" -eq 0 ]]; then
+        echo "| (no compared benchmarks) | | | |"
+        echo "bench-compare: no benchmark was compared; nothing to judge" >&2
+        return 2
+    fi
     return "$regressed"
 }
 
@@ -84,7 +90,8 @@ selftest() {
     ! grep -q 'g/new' <<<"$out" || { echo "FAIL: selftest: judged a benchmark with no change/"; exit 1; }
 
     mkdir -p "$tmp/empty"
-    expect 0 "$tmp/empty" 'no compared benchmarks'
+    # Nothing compared is an error, never a pass.
+    expect 2 "$tmp/empty" 'no compared benchmarks'
 
     # Malformed estimates are an error, never a verdict.
     mkdir -p "$tmp/null/g/x/change"

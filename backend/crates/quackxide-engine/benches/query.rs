@@ -12,16 +12,8 @@ use platform_core::ZkMode;
 use quackxide_engine::{EngineSettings, MinCountThreshold, QueryScope};
 use synth_data::{SchemaName, Spec};
 
-const QUERIES: [(&str, &str); 2] = [
-    (
-        "count",
-        "SELECT region, COUNT(*) AS n FROM t GROUP BY region",
-    ),
-    (
-        "filter",
-        "SELECT bucket, COUNT(*) AS n FROM t WHERE flag GROUP BY bucket",
-    ),
-];
+mod common;
+use common::QUERIES;
 
 /// Seed 1, `rows` rows, in `objects` equal Parquet objects (seeds 1..=objects).
 fn dataset(rows: usize, objects: usize) -> Vec<Vec<u8>> {
