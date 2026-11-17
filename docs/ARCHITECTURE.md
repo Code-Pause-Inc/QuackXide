@@ -201,8 +201,11 @@ header: version, obj, row cap,
   then refuses an upload whose suite the deployment does not accept
   (`HPK1` in production, 422) or that differs from the suite of the
   tenant's enrolled key (422), since neither could ever open; each is also
-  a `crypto.suite_refused` event. With no enrolled key there is nothing to
-  compare with. In development an `HPK1` upload opens only under the test
+  a `crypto.suite_refused` event. With no enrolled key to name the suite,
+  `commit_upload` refuses (422) an upload whose suite differs from the
+  current snapshot's, the same way; with one, a previous snapshot in
+  another suite does not block it, so re-enrolling in `HPK2` (P36) lets the
+  next upload replace an `HPK1` snapshot. In development an `HPK1` upload opens only under the test
   key providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`):
   development key release is `HPK2`-only. A declared schema
   unlike the dataset's recorded one is refused (422). Every refusal after

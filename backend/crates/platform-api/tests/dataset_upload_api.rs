@@ -794,3 +794,63 @@ async fn an_unreadable_enrollment_record_fails_the_upload_closed() {
         capture.events()
     );
 }
+
+#[tokio::test]
+async fn with_no_enrolled_key_an_upload_must_use_the_current_snapshots_suite() {
+    use platform_crypto::EnvelopeSuite::{Hpk1, Hpk2};
+
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    // A first upload with nothing enrolled and no snapshot is accepted.
+    let key = TenantKeypair::generate(Hpk2).public_key();
+    let first = cohorts_upload(tenant, &key, DATASET, None);
+    let (status, body) = put_upload(&app, Some(&token), DATASET, first.body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let other = TenantKeypair::generate(Hpk1).public_key();
+    let second = cohorts_upload(tenant, &other, DATASET, Some(&first.version));
+    let (status, body) = put_upload(&app, Some(&token), DATASET, second.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "upload suite does not match the dataset");
+    // The snapshot that opens is still the only one.
+    assert_eq!(snapshot_paths(&*vault, tenant).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn re_enrolling_in_another_suite_lets_the_next_upload_replace_the_snapshot() {
+    use platform_crypto::EnvelopeSuite::{Hpk1, Hpk2};
+
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    let old = TenantKeypair::generate(Hpk1).public_key();
+    assert_eq!(
+        common::enroll_key(&app, &token, &old).await,
+        StatusCode::NO_CONTENT
+    );
+    let first = cohorts_upload(tenant, &old, DATASET, None);
+    assert_eq!(
+        put_upload(&app, Some(&token), DATASET, first.body).await.0,
+        StatusCode::OK
+    );
+
+    // The P36 migration: the key moves to HPK2, and so does the next upload.
+    let new = TenantKeypair::generate(Hpk2).public_key();
+    assert_eq!(
+        common::enroll_key(&app, &token, &new).await,
+        StatusCode::NO_CONTENT
+    );
+    let second = cohorts_upload(tenant, &new, DATASET, Some(&first.version));
+    let (status, body) = put_upload(&app, Some(&token), DATASET, second.body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["suite"], "HPK2");
+}

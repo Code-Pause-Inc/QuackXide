@@ -255,6 +255,10 @@ pub enum UploadCommitError {
     /// recorded schema is unknown (fail closed).
     #[error("the current snapshot's record is missing or malformed")]
     RecordUnreadable,
+    /// With no enrolled key to name the suite, the upload's suite differs
+    /// from the current snapshot's, which no key could then open both of.
+    #[error("upload suite differs from the dataset's current snapshot")]
+    SuiteMismatch,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -268,6 +272,7 @@ impl UploadCommitError {
             UploadCommitError::StaleVersion => "stale_version",
             UploadCommitError::SchemaMismatch => "schema_mismatch",
             UploadCommitError::RecordUnreadable => "record_unreadable",
+            UploadCommitError::SuiteMismatch => "suite_mismatch",
             UploadCommitError::Storage(_) => "storage",
         }
     }
@@ -288,6 +293,9 @@ pub struct UploadReport {
 /// new snapshot does not list is pruned, including an object that an earlier
 /// attempt at the same version left. The first upload creates the dataset.
 /// A later one must carry a newer version and the schema already recorded.
+/// With no key `enrolled` for the tenant it must also use the suite already
+/// recorded; an enrolled key's suite is checked by the caller, and may
+/// differ from the previous snapshot's (a re-enrollment in another suite).
 /// A version keeps the first record stored for it and commits once, so an
 /// upload is stale if another write committed its version first, or stored
 /// a record for it that differs from the upload's. A retry of an attempt
@@ -299,6 +307,7 @@ pub async fn commit_upload(
     tenant: TenantId,
     dataset: &ConnectorSlug,
     upload: UploadBody,
+    enrolled: bool,
     now: SystemTime,
 ) -> Result<UploadReport, UploadCommitError> {
     if dataset.kind() != DatasetKind::Upload {
@@ -322,19 +331,22 @@ pub async fn commit_upload(
             return Err(UploadCommitError::StaleVersion);
         }
         let record_path = TenantPaths::connector_record(tenant, dataset, &current);
-        let recorded = match vault.get(&record_path).await {
-            Ok(bytes) => SnapshotRecord::parse(&bytes, &current)
-                .ok()
-                .and_then(|record| record.schema),
+        let record = match vault.get(&record_path).await {
+            Ok(bytes) => SnapshotRecord::parse(&bytes, &current).ok(),
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(err.into()),
         };
-        match recorded {
-            None => return Err(UploadCommitError::RecordUnreadable),
-            Some(recorded) if recorded != header.schema => {
-                return Err(UploadCommitError::SchemaMismatch);
-            }
-            Some(_) => {}
+        let Some(record) = record else {
+            return Err(UploadCommitError::RecordUnreadable);
+        };
+        let Some(recorded) = record.schema else {
+            return Err(UploadCommitError::RecordUnreadable);
+        };
+        if recorded != header.schema {
+            return Err(UploadCommitError::SchemaMismatch);
+        }
+        if !enrolled && record.suite != suite.id() {
+            return Err(UploadCommitError::SuiteMismatch);
         }
     }
 
@@ -492,7 +504,15 @@ mod tests {
             body: Vec<u8>,
         ) -> Result<UploadReport, UploadCommitError> {
             let parsed = parse_upload_body(body.into(), MAX).expect("parse");
-            commit_upload(vault, self.tenant, &self.dataset, parsed, SystemTime::now()).await
+            commit_upload(
+                vault,
+                self.tenant,
+                &self.dataset,
+                parsed,
+                false,
+                SystemTime::now(),
+            )
+            .await
         }
     }
 
@@ -1099,6 +1119,7 @@ mod tests {
             fixture.tenant,
             &connector,
             parsed,
+            false,
             SystemTime::now(),
         )
         .await

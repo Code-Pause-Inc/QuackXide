@@ -1556,3 +1556,36 @@ async fn an_unreadable_enrollment_record_is_audited_on_upload() {
         "upload failed dataset=upload_cohorts reason=enrollment_unreadable",
     );
 }
+
+#[tokio::test]
+async fn an_upload_in_another_suite_than_the_snapshot_is_audited() {
+    let capture = AuditCapture::install();
+    let mut state = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let steward = TenantId::generate();
+    let token = token_for(steward);
+    let hpk2 = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    let first = common::cohorts_upload(steward, &hpk2, "upload_cohorts", None);
+    let (status, _) = common::put_upload(&app, Some(&token), "upload_cohorts", first.body).await;
+    assert_eq!(status, StatusCode::OK);
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+    let second = common::cohorts_upload(steward, &hpk1, "upload_cohorts", Some(&first.version));
+    let (status, _) = common::put_upload(&app, Some(&token), "upload_cohorts", second.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert_tenant_event(
+        &capture,
+        "crypto.suite_refused",
+        "denied",
+        steward,
+        "refused an upload sealed in a suite other than the dataset's current snapshot",
+    );
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        "upload refused dataset=upload_cohorts reason=suite_mismatch",
+    );
+}

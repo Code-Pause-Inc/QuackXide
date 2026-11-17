@@ -134,7 +134,8 @@ pub(crate) async fn put_dataset(
     }
     // Neither does an upload in another suite than the enrolled key's open:
     // every query would fail, and the commit would prune the snapshot that
-    // does. Without an enrollment there is no key to compare with. In
+    // does. Without an enrollment, `commit_upload` compares with the current
+    // snapshot's suite instead. In
     // development an HPK1 upload also needs a test key provider
     // (`DevKeyProvider`, `MultiTenantDevKeyProvider`) to open: development
     // key release (`key_release.rs`, `stand_in.rs`) is HPK2-only.
@@ -154,27 +155,46 @@ pub(crate) async fn put_dataset(
         ));
     }
 
-    let report = upload::commit_upload(&*state.vault, steward, &dataset, upload, SystemTime::now())
-        .await
-        .map_err(|err| {
-            let reason = err.reason();
-            let (outcome, refusal) = match err {
-                UploadCommitError::NotUploadDataset => ("denied", ApiError::NotFound),
-                UploadCommitError::VersionAhead => (
+    let report = upload::commit_upload(
+        &*state.vault,
+        steward,
+        &dataset,
+        upload,
+        enrolled.is_some(),
+        SystemTime::now(),
+    )
+    .await
+    .map_err(|err| {
+        let reason = err.reason();
+        let (outcome, refusal) = match err {
+            UploadCommitError::NotUploadDataset => ("denied", ApiError::NotFound),
+            UploadCommitError::VersionAhead => (
+                "denied",
+                ApiError::MalformedUpload("snapshot version is ahead of the server clock"),
+            ),
+            UploadCommitError::StaleVersion => ("denied", ApiError::StaleSnapshot),
+            UploadCommitError::SchemaMismatch => ("denied", ApiError::SchemaMismatch),
+            UploadCommitError::SuiteMismatch => {
+                security_audit_event(
+                    AuditKind::SuiteRefused,
+                    Some(steward),
                     "denied",
-                    ApiError::MalformedUpload("snapshot version is ahead of the server clock"),
-                ),
-                UploadCommitError::StaleVersion => ("denied", ApiError::StaleSnapshot),
-                UploadCommitError::SchemaMismatch => ("denied", ApiError::SchemaMismatch),
-                // The recorded schema is unknown, so nothing can be compared.
-                UploadCommitError::RecordUnreadable => ("failed", ApiError::Backend),
-                // The manifest is written last, so a failure before it leaves
-                // the current snapshot in place.
-                UploadCommitError::Storage(storage) => ("failed", ApiError::from(storage)),
-            };
-            audit_refusal(steward, dataset.as_str(), outcome, reason);
-            refusal
-        })?;
+                    "refused an upload sealed in a suite other than the dataset's current snapshot",
+                );
+                (
+                    "denied",
+                    ApiError::MalformedUpload("upload suite does not match the dataset"),
+                )
+            }
+            // The recorded schema is unknown, so nothing can be compared.
+            UploadCommitError::RecordUnreadable => ("failed", ApiError::Backend),
+            // The manifest is written last, so a failure before it leaves
+            // the current snapshot in place.
+            UploadCommitError::Storage(storage) => ("failed", ApiError::from(storage)),
+        };
+        audit_refusal(steward, dataset.as_str(), outcome, reason);
+        refusal
+    })?;
 
     Ok(Json(json!({
         "dataset": dataset,

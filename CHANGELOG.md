@@ -294,7 +294,8 @@ uses [Semantic Versioning](https://semver.org/).
   AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
   Enrollment and snapshot records name the key's suite, and the upload
   route refuses a frame of a suite the deployment does not accept (`HPK1`
-  in production) or other than the enrolled key's with 422, each with a
+  in production), other than the enrolled key's, or, with no enrolled key,
+  other than the current snapshot's with 422, each with a
   `crypto.suite_refused` event; a development `HPK1` upload opens only
   under the test key providers, since development key release is
   `HPK2`-only. Production therefore refuses the browser's `HPK1`
