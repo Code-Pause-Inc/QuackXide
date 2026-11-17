@@ -27,7 +27,7 @@ vi.mock("../lib/crypto/workerClient", () => ({
 const ready: InitResult = {
   created: false,
   tenantId: "6f2c8a2e-1111-4222-8333-444455556666",
-  x25519Supported: true,
+  hpkeKeyAvailable: true,
   hpkePublicKeyB64: "AAAA",
   fingerprint: "ab12-cd34-ef56-7890",
 };

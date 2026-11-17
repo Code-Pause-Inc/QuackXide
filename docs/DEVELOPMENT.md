@@ -18,7 +18,7 @@ How to set up a machine, run the tests, and fix a failing
 * **cargo-deny**, to run the dependency audit locally:
   `cargo install --locked cargo-deny`.
 * Optional: **gitleaks**, which `scripts/check.sh` runs when it is installed
-  (CI always runs it).
+  (CI always runs it). The scan needs git 2.41 or later.
 
 Then, once per clone:
 

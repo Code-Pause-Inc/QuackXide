@@ -30,6 +30,19 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser tests (#223 stage A). A vitest `browser` project runs the module
+  crypto worker, Web Crypto keys, the sealed HPKE device key, IndexedDB
+  persistence across a worker restart and a drive round trip in real
+  browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
+  The `browser` workflow runs Chromium on every pull request and Chromium,
+  Firefox and WebKit on `main` and nightly.
+* Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
+  `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
+  4 MiB, and a unit test pins the 52-byte envelope overhead. `cargo test`
+  runs each benchmark once, so `scripts/check.sh` fails on a broken one. The
+  `bench` workflow runs them on pull requests that touch `backend/` or
+  `rust-toolchain.toml` and reports only. `docs/BENCHMARKS.md` records the
+  method and the baseline the hybrid suite (#187) is compared against.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
@@ -51,6 +64,19 @@ uses [Semantic Versioning](https://semver.org/).
   Only `dev` builds have this backend: a release `platform-api` refuses to
   start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
   accepts `object_store` 0.13's uploads (#153).
+* Browser envelope open (P34 checkpoint B): `envelope-wasm` exports
+  `openEnvelope` and `publicKeyFromPrivateKey`, over the new
+  `platform_crypto::hpke_open_with_private_key` and
+  `tenant_public_key_from_private`. The crypto worker holds the device's
+  HPKE private key as ADR 0007 describes: 32 random bytes, stored only
+  encrypted under a non-extractable AES-256-GCM seed key with AAD
+  `x25519-key-v1|{tenant}|{SHA-256 of the public key}`, decrypted just
+  before an open and zeroed after (`lib/crypto/devicekey.ts`). The Web
+  Crypto X25519 key, which could not open anything, is gone; device
+  records that hold one get a new key on the next init. `InitResult`'s
+  `x25519Supported` is now `hpkeKeyAvailable`. `fixtures/envelope/hpk1.json`
+  carries each recipient's test-only private key, and the browser tests
+  open every Rust-sealed vector.
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
@@ -189,6 +215,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* A follow-up access request's approval adds its query budget to the
+  existing grant instead of being dropped, and a retry of the same
+  approval adds nothing (`BudgetLedger::top_up_once`). A retry of an
+  approval whose grant was revoked and re-granted since is refused, so it
+  cannot add to the newer grant. A pending request for an unpublished
+  listing can no longer be approved (#96).
 * GCS emulator writes (`STORAGE_EMULATOR_HOST`) no longer ask the GCE
   metadata server for a credential: `object_store` 0.13 skips signing on
   reads only, so the emulator client now carries a placeholder credential.
@@ -262,6 +294,14 @@ uses [Semantic Versioning](https://semver.org/).
   unchanged and the same in both cases. Grant events stay under
   `tenant.provisioned` (`docs/ARCHITECTURE.md`), and `audit_coverage.rs`
   now covers grants and budgets.
+* X25519 private keys and Diffie-Hellman results are zeroized on drop.
+  `hpke` holds them in `x25519-dalek` types, which wipe themselves only
+  with that crate's `zeroize` feature, and nothing turned it on, so every
+  `TenantKeypair` (the key-release stand-in's per-query sessions, the dev
+  key providers, `EnclaveIdentity`'s HPKE key) and each envelope's
+  ephemeral key, in the enclave and in the browser's envelope module, was
+  freed without being wiped. `platform-crypto` turns the feature on, and
+  `TenantKeypair` implements `ZeroizeOnDrop`.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is
