@@ -46,7 +46,9 @@ Every pull request runs:
 * a coverage report in the job summary;
 * when `backend/` or `rust-toolchain.toml` changes, the benchmarks in
   `docs/BENCHMARKS.md`, in the job summary (report only, never fails on
-  the numbers).
+  the numbers);
+* the browser tests (`npm run test:browser`) in Chromium. Pushes to `main`
+  and a nightly run add Firefox and WebKit.
 
 Every cargo build, check, clippy and test command runs with `--locked`, so
 commit `Cargo.lock` (and `backend/fuzz/Cargo.lock`, which a workspace

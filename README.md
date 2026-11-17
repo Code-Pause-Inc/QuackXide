@@ -135,6 +135,9 @@ committed). It needs the `wasm32-unknown-unknown` target, which
 `rust-toolchain.toml` lists, and the `wasm-bindgen` CLI at the version
 `backend/Cargo.lock` pins. Rerun it after changing the envelope code.
 
+The drive works in current Chromium, Firefox and Safari (WebKit), which CI
+tests (`npm run test:browser`).
+
 ```sh
 cargo install --locked wasm-bindgen-cli --version 0.2.126   # once
 ../scripts/build-wasm.sh
