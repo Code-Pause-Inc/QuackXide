@@ -22,6 +22,7 @@ use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 
+use platform_config::PlatformConfig;
 use platform_crypto::{EnvelopeSuite, TenantKeypair};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_tenancy::{
@@ -106,14 +107,16 @@ async fn granted_researcher_gets_disclosure_controlled_aggregates() {
     assert_eq!(body["budget_remaining"], 99);
 }
 
-#[tokio::test]
-async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
+/// The steward uploads a cohort sealed in `suite` under `config`, and a
+/// granted researcher queries it.
+async fn researcher_queries_an_uploaded_dataset(suite: EnvelopeSuite, config: PlatformConfig) {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let keypair = TenantKeypair::generate(suite);
     let key = keypair.public_key();
-    let app = common::upload_research_app(
+    let app = common::upload_research_app_with_config(
         SECRET,
+        config,
         vec![(steward, keypair)],
         Arc::new(platform_storage::ObjectStoreVault::new_in_memory()),
     );
@@ -155,6 +158,17 @@ async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
     assert_eq!(rows[0]["condition"], "flu");
     assert_eq!(rows[0]["n"], 6);
     assert_eq!(body["budget_remaining"], 99);
+}
+
+#[tokio::test]
+async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
+    researcher_queries_an_uploaded_dataset(EnvelopeSuite::CURRENT, common::default_config()).await;
+}
+
+/// The browser seals `HPK1` until P36, which only development accepts.
+#[tokio::test]
+async fn granted_researcher_queries_an_hpk1_dataset_uploaded_in_development() {
+    researcher_queries_an_uploaded_dataset(EnvelopeSuite::Hpk1, common::development_config()).await;
 }
 
 #[tokio::test]

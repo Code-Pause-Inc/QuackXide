@@ -476,6 +476,17 @@ pub fn upload_research_app(
     stewards: Vec<(TenantId, TenantKeypair)>,
     vault: Arc<dyn VaultStore>,
 ) -> Router {
+    upload_research_app_with_config(secret, default_config(), stewards, vault)
+}
+
+/// As [`upload_research_app`], under `config`: `development_config()` for
+/// stewards whose keys are `HPK1`.
+pub fn upload_research_app_with_config(
+    secret: &str,
+    config: PlatformConfig,
+    stewards: Vec<(TenantId, TenantKeypair)>,
+    vault: Arc<dyn VaultStore>,
+) -> Router {
     let mut stack = DevResearchStack::with_vault(vault.clone());
     for (steward, keypair) in stewards {
         stack.register_key(steward, keypair);
@@ -496,6 +507,7 @@ pub fn upload_research_app(
         false,
     );
     build_app(AppState {
+        config: Arc::new(config),
         research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)
