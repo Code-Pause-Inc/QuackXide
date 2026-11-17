@@ -4,7 +4,7 @@
 //! production mode (ADR 0009) refuses to start while the only sources are
 //! the embedded fixtures. In development (`APP_ENV=development`) it runs the
 //! pipeline against those fixtures for one demo tenant, set via
-//! `DEMO_TENANT_ID` and `DEMO_TENANT_PUBLIC_KEY_B64` (base64 raw X25519).
+//! `DEMO_TENANT_ID` and `DEMO_TENANT_PUBLIC_KEY_B64` (base64 raw X-Wing, or raw X25519 until P36).
 //! Without them it uses an ephemeral keypair whose ciphertext nobody can
 //! open.
 

@@ -167,7 +167,7 @@ uses [Semantic Versioning](https://semver.org/).
   token in an `HttpOnly` cookie, and the authorization-code + PKCE browser flow.
   `docs/ARCHITECTURE.md` gains the target authorization model and
   `docs/THREAT_MODEL.md` A3 and A4 list the new controls.
-* ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
+* ADR 0007 (Accepted): the hybrid suite construction (HPKE with X-Wing,
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
   migration mode in v1.
@@ -280,14 +280,19 @@ uses [Semantic Versioning](https://semver.org/).
   `TenantKeypair` (the key-release stand-in's per-query sessions, the dev
   key providers, `EnclaveIdentity`'s HPKE key) and each envelope's
   ephemeral key, in the enclave and in the browser's envelope module, was
-  freed without being wiped. `platform-crypto` turns the feature on, and
-  `TenantKeypair` implements `ZeroizeOnDrop`.
+  freed without being wiped. `hpke` 0.14 turns the feature on itself, a
+  test checks it for both suites' key types, and `TenantKeypair`
+  implements `ZeroizeOnDrop`.
 * Tenant envelopes use the hybrid post-quantum suite `HPK2` (ADR 0007, P35,
   #187): HPKE with X-Wing (X25519 + ML-KEM-768), HKDF-SHA256 and
   AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
   Enrollment and snapshot records name the key's suite, and the upload
   route refuses a frame of a suite the deployment does not accept (`HPK1`
-  in production) with 422. Every key loader takes a suite
+  in production) or other than the enrolled key's with 422, each with a
+  `crypto.suite_refused` event; a development `HPK1` upload opens only
+  under the test key providers, since development key release is
+  `HPK2`-only. Production therefore refuses the browser's `HPK1`
+  enrollments and uploads until P36 (#186). Every key loader takes a suite
   policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
   with a `crypto.suite_refused` audit event; development still accepts
   them until the browser moves to `HPK2` (P36). Private keys are exported

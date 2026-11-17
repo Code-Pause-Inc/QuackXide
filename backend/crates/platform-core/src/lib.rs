@@ -120,9 +120,11 @@ pub const UPLOAD_DATASET_PREFIX: &str = "upload_";
 /// sealed under. It follows from the slug alone, never from stored state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetKind {
-    /// Written by a connector sync in the enclave (`tenant-envelope-v1`).
+    /// Written by a connector sync in the enclave (`tenant-envelope-v2`, `-v1`
+    /// under `HPK1`).
     Connector,
-    /// Sealed in the steward's browser and uploaded (`steward-upload-v1`).
+    /// Sealed in the steward's browser and uploaded (`steward-upload-v2`, `-v1`
+    /// under `HPK1`).
     Upload,
 }
 
