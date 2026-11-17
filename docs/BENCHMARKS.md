@@ -97,6 +97,36 @@ runner noise.
 | `seal/4MiB` | 4 MiB | 5.63 ms | 5.72 ms | 711 MiB/s | 699 MiB/s |
 | `open/4MiB` | 4 MiB | 2.64 ms | 2.86 ms | 1.48 GiB/s | 1.37 GiB/s |
 
+## Browser timings
+
+`npm run bench:browser` (from `frontend/`) times chunk encryption and the
+wasm envelope module's cold start in real browsers; `docs/TESTING.md`
+describes the method. Each sample is a batch of calls lasting at least
+50 ms, so p50 and p99 are over batch means, not single calls. The cold start
+(the module's load plus its first seal) is one sample per page. The timings
+run on the page's main thread; the app does this work in the crypto worker.
+
+From [run 44010807289](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/44010807289)
+of #232, started by hand, on GitHub-hosted `ubuntu-latest` runners (Ubuntu
+26.04, 4 CPUs). Each browser ran as its own job on a different CPU, so read
+each column on its own rather than across:
+
+| | Chromium 158.0.8127.18 | Firefox 159.0 | WebKit 27.2 |
+| --- | --- | --- | --- |
+| CPU | AMD EPYC 9V45 | Intel Xeon 6975P-C | Intel Xeon 6973P-C |
+| `encryptPayload` 4 KiB, p50 / p99 | 6.65 / 8.31 µs | 37.8 / 58.3 µs | 35.2 / 53.4 µs |
+| `encryptPayload` 4 MiB, p50 / p99 | 4.58 / 12.3 ms | 5.56 / 6.28 ms | 1.19 / 1.58 ms |
+| Wasm cold start (load + first seal) | 6.6 ms | 7 ms | 11 ms |
+
+The wasm envelope module is 97 838 bytes, 39 200 gzipped.
+
+* Chromium's 4 MiB p99 is 2.7× its p50, so that run was noisy; take another
+  run before setting a target from it.
+* Firefox and WebKit report `performance.now()` to 1 ms, so their cold
+  starts carry about ±1 ms, and each is a single sample.
+* Like the backend numbers, these vary from run to run and are a reference,
+  not a gate.
+
 ## Targets and regression threshold
 
 **Proposed, needs @AxolDad.**
@@ -113,7 +143,7 @@ runner noise.
 
 * Query latency in `quackxide-engine` at stated dataset sizes and object
   counts, on data from `synth-data`.
-* Browser chunk encryption (`encryptPayload` in
-  `frontend/src/lib/crypto/core.ts`) as a Vitest bench.
-* The wasm envelope build's bundle size and load time (#171).
+* Targets and a regression run for the browser timings above.
+* Wasm seal throughput and peak memory in the crypto worker at large sizes
+  (#171's checkpoint A benchmark).
 * The regression check above, on a schedule as well as on pull requests.
