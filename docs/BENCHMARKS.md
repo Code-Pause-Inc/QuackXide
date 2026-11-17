@@ -81,8 +81,10 @@ together; never compare tables from different runs.
 On a pull request, the `bench` workflow does this itself: it benchmarks the
 base commit with `--save-baseline base`, then the head with
 `--baseline-lenient base`, on the same runner, and
-`scripts/bench-compare.sh` judges the result (below). The job fails when a
-benchmark regressed; it is not a required check. Run the script on your own
+`scripts/bench-compare.sh` judges the result (below). A regression beyond
+the threshold is flagged as a warning in the job summary; the job fails
+only when the comparison itself cannot run (nothing compared, unreadable
+estimates). It is not a required check. Run the script on your own
 comparison with `scripts/bench-compare.sh backend/target/criterion` (needs
 `jq`), starting from an empty `backend/target/criterion`: it judges every
 earlier comparison it finds there.
@@ -166,9 +168,13 @@ The wasm envelope module is 97 838 bytes, 39 200 gzipped.
 
 ## Targets and regression threshold
 
+**Proposed, needs @AxolDad.**
+
 **Regression threshold.** A benchmark regresses when the lower bound of the
 95 % confidence interval of its mean change against the base commit is
-above +10 %, so the whole interval is a slowdown of more than 10 %.
+above +10 %, so the whole interval is a slowdown of more than 10 %. The
+`bench` job flags it as a warning in the job summary and does not fail on
+it.
 Comparing against the numbers recorded above instead would flag runner
 noise, which often exceeds 10 % between runs.
 
@@ -178,9 +184,9 @@ recorded tables:
 * `hpk2/keygen` at most 1 ms.
 * `hpk2/seal/4KiB` and `hpk2/open/4KiB` at most 1 ms each.
 * `hpk2/seal/4MiB` and `hpk2/open/4MiB` at most 20 ms each.
-* The hybrid suite's cost: `hpk2` at most 4× `hpk1` for key generation and
-  for seal and open from 32 B to 4 KiB, and at most 1.25× at 4 MiB, in the
-  same run.
+* The hybrid suite's cost: `hpk2` at most 4× `hpk1` for seal and open
+  from 32 B to 4 KiB, and at most 1.25× at 4 MiB, in the same run. Key
+  generation is held to the absolute 1 ms above, not a ratio.
 * Engine queries, `count` and `filter` alike: at most 4 ms at 10 000 rows,
   25 ms at 100 000 rows, and 350 ms at 1 000 000 rows in one or eight
   objects (about 1.5× the recorded times, rounded up).
