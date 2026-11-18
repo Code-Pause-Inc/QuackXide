@@ -49,13 +49,24 @@ The defaults are placeholders until the query benchmarks measure them.
 | Decoded rows | `QUERY_MAX_DECODED_ROWS` | 1–10⁹ | 10⁷ | Every Parquet footer before any batch is decoded; decoded rows counted again |
 | Decoded bytes | `QUERY_MAX_DECODED_MIB` | 1–65536 | 1024 | Uncompressed sizes in every footer, before any batch is decoded |
 | Memory | `QUERY_MEMORY_MIB` | 1–16384 | 256 | DataFusion's memory pool for the query's operators |
-| Result rows | `QUERY_MAX_RESULT_ROWS` | 1–10⁶ | 10⁴ | Rows left after disclosure control |
+| Result rows | `QUERY_MAX_RESULT_ROWS` | 1–10⁶ | 10⁴ | Rows left after disclosure control; without a disclosure policy, as the result streams |
 | Result bytes | `QUERY_MAX_RESULT_MIB` | 1–256 | 4 | The result's JSON, as it is written |
+| Total memory | `QUERY_TOTAL_MEMORY_MIB` | 1–1048576 | 8192 | At startup: `QUERY_MAX_CONCURRENT` times one query's worst case |
 
 The input cap is the upload limit (ADR 0012), so every dataset an upload
 stores can be queried. A sealed manifest over the upload route's 16 KiB
 bound fails closed (502) before any key is released: at most 256 objects,
 the input-object ceiling, fit in it.
+
+Each limit is bounded on its own, so together they could promise more
+memory than any machine has. One query's worst case,
+`QueryLimits::worst_case_bytes`, is its pool, its decoded table as the
+footers report it, three copies of its input (the ciphertext, the
+plaintext the query service keeps, and the engine's copy for the decoder)
+and two of its result (the JSON and the rows parsed from it). Startup is
+refused when that, times `QUERY_MAX_CONCURRENT`, exceeds
+`QUERY_TOTAL_MEMORY_MIB`. The default total fits the default limits on
+the default four slots (4 × 1480 MiB).
 
 **No disk.** Each query scope gets its own `RuntimeEnv`: the empty
 object-store registry, a `GreedyMemoryPool` of `QUERY_MEMORY_MIB`, and
@@ -63,7 +74,28 @@ object-store registry, a `GreedyMemoryPool` of `QUERY_MEMORY_MIB`, and
 `tmp_files_enabled()` before spilling, so one that runs out of the pool
 fails with `ResourcesExhausted` instead of writing a temporary file. The
 engine reports that, wherever it is in the error chain, as the memory
-limit.
+limit. `SET` on a runtime key (`datafusion.runtime.temp_directory`,
+`max_temp_directory_size`, `memory_limit`) would change the runtime; the
+engine refuses every statement before it runs, and tests pin these three.
+
+**Streaming results.** The pool does not track the rows a query collects
+for its result. Without a disclosure policy those rows are the result, so
+the engine reads them as a stream and stops at the first row over
+`QUERY_MAX_RESULT_ROWS`. A disclosure policy has to see the whole
+aggregate, and a refusal that counted rows it withholds would tell the
+caller about them, so a gated query counts its rows after suppression.
+Its rows are at most the groups the pool held while computing them.
+
+**Yielding.** A time limit stops a query by dropping its future, which
+takes effect only when the plan returns to the runtime, and the tasks
+running a plan's partitions stop the same way when they are aborted.
+DataFusion consumes a task's cooperative budget only at scans and
+exchanges, so a join that reads each input once could run to its end with
+the time limit long past and its slot released. The engine adds a
+physical optimizer rule, `YieldEveryBatch`, that wraps every operator not
+already cooperative in DataFusion's `CooperativeExec`: each batch any
+operator produces consumes budget, so the plan stops at its next batch
+boundary.
 
 **Responses.** A limit refusal is `ApiError::QueryLimit(QueryLimit)`;
 `QueryUnavailable` stays the refusal for missing wiring.
@@ -83,8 +115,9 @@ charge, so each costs one unit, the slot-wait refusal included. Tests pin
 this order; if P54 moves the charge, they move with it.
 
 **Exit paths.** The time limit wraps everything that holds plaintext, so
-on expiry the work is dropped. The slot permit and the decrypted blobs
-belong to that work, so they are released and zeroized on every way out:
+on expiry the work is dropped, the plan with it. The slot permit and the
+decrypted blobs belong to that work, so they are released and zeroized
+on every way out:
 a result, an error, the time limit, the caller going away, or a panic
 unwinding (the release profile unwinds).
 
@@ -101,12 +134,23 @@ Rejected:
 * Counting decoded Arrow memory while decoding. Batches share buffers
   (dictionary values, view data), and per-batch sizes count each shared
   buffer once per batch, which would refuse honest data.
+* Counting a gated query's rows before suppression as they stream. The
+  refusal would depend on the cohorts suppression withholds.
+* Measuring the machine's memory at startup instead of
+  `QUERY_TOTAL_MEMORY_MIB`. A configured total behaves the same on every
+  host and can be tested.
 
 ## Consequences
 
 * A query that needs more memory than its pool is refused with 422
-  instead of spilling. Operators size `QUERY_MEMORY_MIB` and
-  `QUERY_MAX_CONCURRENT` together against the machine's memory.
+  instead of spilling. Operators set `QUERY_TOTAL_MEMORY_MIB` below the
+  machine's memory, and startup checks the other limits against it. With
+  the other defaults, a `DATASET_MAX_MIB` over 253 or a
+  `QUERY_MAX_CONCURRENT` over 5 needs a larger total.
+* The time limit takes effect at batch boundaries. One operator step can
+  outlast it: a nested-loop join compares a probe batch with its whole
+  build side before it next reads or produces a batch. The pool bounds
+  the build side, so it bounds the step.
 * A footer's uncompressed sizes understate columns that dictionary or
   run-length encoding shrinks, so a decoded table can take more memory
   than `QUERY_MAX_DECODED_MIB`; the row limit holds regardless.

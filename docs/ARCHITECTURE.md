@@ -61,6 +61,16 @@ Client key architecture:
 * **DEK (per-file key)** — random per file; extractable only in the instant
   before being wrapped under the KEK; every unwrapped copy is created
   non-extractable.
+* **HPKE private key** — the device's tenant key, which envelopes are sealed
+  to. Web Crypto cannot run the envelope suite's KEM, so this key is the
+  exception to the KEK note above (ADR 0007, "Browser private-key
+  storage"). It is 32 random bytes, stored only AES-256-GCM-encrypted under
+  a separate non-extractable **seed key** (encrypt/decrypt only), with AAD
+  `x25519-key-v1|{tenant}|{SHA-256 of the public key}`
+  (`lib/crypto/devicekey.ts`). The worker decrypts it immediately before an
+  open, hands it to wasm, and both copies are zeroed when the open ends.
+  Device records saved before this scheme held a Web Crypto key that could
+  never open anything; the worker replaces it with a new key in this form.
 * **Worker isolation** — all key handling, encryption, and vault I/O run in a
   dedicated Web Worker (`lib/crypto/worker.ts`). The DOM/UI thread exchanges
   only opaque ids, decrypted summaries it asked for, and download Blobs.
@@ -70,13 +80,13 @@ Client key architecture:
 * **Crypto-agility seam** — the crypto core sits behind `lib/crypto/core.ts`,
   `lib/crypto/envelope.ts` and the worker protocol. `envelope.ts` loads the
   wasm32 build of the backend's own envelope code (`envelope-wasm`, built by
-  `scripts/build-wasm.sh`) and seals to a tenant's raw public key, so the
-  browser and the enclave share one implementation. Seal needs no private
-  key, and the module never sees the KEK or file keys. The frame magic
-  names the suite, so a new suite changes no caller. Only the worker loads
-  the module (an ESLint rule refuses its glue elsewhere); no worker
-  operation exposes sealing to the UI yet. Opening in the browser is not
-  built.
+  `scripts/build-wasm.sh`), so the browser and the enclave share one
+  implementation. It seals to a tenant's raw public key, opens with the
+  device's HPKE private key (`openWithDeviceKey`), and derives the public
+  key it enrolls. The module never sees the KEK or file keys. The frame
+  magic names the suite, so a new suite changes no caller. Only the worker
+  loads the module (an ESLint rule refuses its glue elsewhere); no worker
+  operation exposes sealing or opening to the UI yet.
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
@@ -339,13 +349,21 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   query service that is not wired. From taking its slot through
   decryption, decoding, execution and serialization it runs within
   `QUERY_TIMEOUT_SECS`; on expiry the work is dropped and the query gets
-  503. However a query ends (a result, an error, the time limit, the caller
-  going away, or a panic unwinding, which the release profile does), the
-  decrypted blobs are zeroized and the slot is released.
+  503. Every operator yields to the runtime as it produces a batch, so a
+  running plan stops at its next batch boundary, on the tasks running its
+  partitions too. One operator step between batches runs to its end first:
+  a nested-loop join compares a probe batch with its whole build side,
+  which the memory pool bounds. However a query ends (a result, an error,
+  the time limit, the caller going away, or a panic unwinding, which the
+  release profile does), the decrypted blobs are zeroized and the slot is
+  released.
 * **Resource limits** ([ADR 0013](adr/0013-per-query-resource-limits.md)).
   `platform_core::QueryLimits`, read by `platform-config`, where each value
   is bounded and an invalid one refuses startup (`backend/.env.example`
-  lists them). Before any key is released,
+  lists them). Together they must fit `QUERY_TOTAL_MEMORY_MIB`:
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, its
+  decoded table, three copies of its input and two of its result), or
+  startup is refused. Before any key is released,
   the objects stored at the snapshot's version must fit
   `QUERY_MAX_INPUT_OBJECTS` and, in ciphertext bytes, `DATASET_MAX_MIB`, the
   upload limit, so every stored upload stays queryable; a sealed manifest
@@ -364,7 +382,10 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   fails the query instead of spilling decrypted rows to a temporary file. A
   result with more rows than `QUERY_MAX_RESULT_ROWS` after disclosure
   control, or more JSON than `QUERY_MAX_RESULT_MIB`, is refused, never
-  truncated. Each size limit is refused with 422 and a message of its own,
+  truncated. The pool does not track the rows collected for a result, so
+  without a disclosure policy the result streams and the query stops at
+  the first row over the limit; with one, suppression sees the whole
+  aggregate, whose groups the pool held. Each size limit is refused with 422 and a message of its own,
   never the 400 of SQL that cannot run, and each limit refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them (see "Rate level" below).
@@ -510,15 +531,21 @@ discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`), so the steward's
 dataset listing (section 2) shows exactly what it can publish. Researchers file
-access requests (idempotent while pending); approval mints the grant through the same code path as a direct
-grant. The approval is recorded first, with its query budget, so a failure
+access requests (idempotent while pending); approval mints the grant
+through the same code path as a direct grant, and adds its query budget
+to the grant once, keyed by the request: a follow-up request tops up a
+grant that already exists (spend is kept), and a retry adds nothing. A
+pending request whose listing has been unpublished can be denied but not
+approved (404, `denied` event). The approval is recorded first, with its
+query budget, so a failure
 partway leaves an approved request without a usable grant, never a grant
 behind a pending or denied one, and the steward's retry re-runs the
 idempotent grant and budget steps with the approved budget; a retry cannot
 change it. A retry never undoes a revoke: while the steward's grant to that
 researcher for that connector is revoked, the retry is refused (404) with a
 `denied` event, and only an explicit re-grant or a new request restores
-access. Denied is terminal. `research.catalog` events carry identifiers
+access. A retry is also refused once the grant was revoked after the
+approval, even if it has since been re-granted. Denied is terminal. `research.catalog` events carry identifiers
 only.
 
 **Residual risk:** overlapping-query differencing. See

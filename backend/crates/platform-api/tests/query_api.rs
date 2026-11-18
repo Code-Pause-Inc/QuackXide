@@ -683,6 +683,50 @@ async fn a_query_over_its_time_limit_is_dropped_and_releases_the_slot() {
     assert_eq!(keys.calls.load(Ordering::SeqCst), 4);
 }
 
+/// The time limit also stops a plan that is running, not only a slow key
+/// open: the dataset is decrypted and decoded well within the limit, and
+/// the plan, every invoice against a trillion numbers, would run for hours.
+/// Real time, since a busy plan never lets a paused clock advance.
+#[tokio::test]
+async fn a_running_plan_over_its_time_limit_is_stopped_and_releases_the_slot() {
+    let tenant = TenantId::generate();
+    let limits = QueryLimits {
+        timeout: Duration::from_secs(1),
+        ..QueryLimits::default()
+    };
+    let (service, keys) = one_slot_service(tenant, limits, None).await;
+    let connector = quickbooks();
+    let endless = "SELECT COUNT(*) AS n FROM quickbooks CROSS JOIN range(1000000000000) r \
+                   WHERE total + r.value > -1";
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        service.query(tenant, &connector, endless),
+    )
+    .await
+    .expect("the time limit stops the plan");
+    let stopped = started.elapsed();
+    let (status, retry_after, message) = refusal(result).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after, None);
+    assert_eq!(message, "query exceeded its time limit");
+    assert!(
+        stopped < Duration::from_secs(10),
+        "stopped after {stopped:?}"
+    );
+    // The manifest and the object were both opened: the limit passed while
+    // the plan ran.
+    assert_eq!(keys.calls.load(Ordering::SeqCst), 2);
+
+    let rows = service
+        .query(tenant, &connector, COUNT_SQL)
+        .await
+        .map_err(|_| "query failed")
+        .expect("the slot was released");
+    assert_eq!(rows["rows"][0]["n"], 3);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_cancelled_query_releases_the_slot() {
     let tenant = TenantId::generate();

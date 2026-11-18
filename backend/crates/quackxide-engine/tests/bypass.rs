@@ -429,6 +429,11 @@ const STATEMENTS: &[(&str, &str)] = &[
     ("copy_to", "COPY (SELECT * FROM people) TO '{dir}/out.csv' STORED AS CSV"),
     ("insert", "INSERT INTO people VALUES ('p99', 'eng', 1)"),
     ("set", "SET datafusion.execution.batch_size = 1"),
+    // No-spill rests on these: each would give the scope a spill directory
+    // or a larger pool.
+    ("set_temp_directory", "SET datafusion.runtime.temp_directory = '{dir}'"),
+    ("set_max_temp_directory_size", "SET datafusion.runtime.max_temp_directory_size = '1G'"),
+    ("set_memory_limit", "SET datafusion.runtime.memory_limit = '1G'"),
     ("prepare", "PREPARE p AS SELECT COUNT(*) AS n FROM people"),
 ];
 
