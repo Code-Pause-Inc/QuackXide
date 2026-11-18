@@ -326,6 +326,11 @@ uses [Semantic Versioning](https://semver.org/).
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
+* `backend/deny.toml` accepts the unmaintained advisories for `chrono`
+  (RUSTSEC-2026-0543), `chrono-tz` (RUSTSEC-2026-0555) and `humantime`
+  (RUSTSEC-2026-0542), which arrow, DataFusion 55 and `object_store` 0.13
+  depend on, and records when each is revisited. None reports a
+  vulnerability.
 * The secret scan reads every file's content whatever git attributes say:
   `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
   `.git/info/attributes`, a user's attributes file or a NUL byte from

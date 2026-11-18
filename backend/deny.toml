@@ -35,6 +35,28 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "no zstd with_context streams; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature not enabled; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0403", reason = "zstd legacy feature not enabled; DataFusion 55 pins zstd 0.13" },
+    # chrono, chrono-tz and humantime (unmaintained, no patched version;
+    # chronotope/chrono#1768): no vulnerability is reported, and a later one
+    # gets its own ID, which this list does not ignore. None can be removed
+    # while the workspace uses DataFusion 55 and object_store 0.13. arrow,
+    # parquet and DataFusion 55 handle dates and times with chrono, and
+    # object_store 0.13's API exposes it (`ObjectMeta::last_modified`);
+    # platform-api, -billing, -connectors, -storage and -tenancy also use it
+    # directly. Revisit when arrow, DataFusion and object_store move off
+    # chrono (apache/arrow-rs#9183, apache/datafusion#23568,
+    # apache/arrow-rs-object-store#909).
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; arrow, parquet, DataFusion 55 and object_store 0.13 use chrono" },
+    # chrono-tz: datafusion-common enables arrow's `chrono-tz` feature, which
+    # resolves named time zones from the tz database chrono-tz bundles
+    # (2025b). That database gets no further updates, so a zone whose rules
+    # change later is converted with its 2025b rules. Revisit when arrow and
+    # DataFusion resolve zones without it (apache/arrow-rs#11482).
+    { id = "RUSTSEC-2026-0555", reason = "unmaintained, no known vulnerability; DataFusion 55 enables arrow's chrono-tz feature" },
+    # humantime: object_store 0.13 uses it only to parse and print duration
+    # config strings, which come from the operator's environment, never from
+    # a request. Revisit when DataFusion moves to an object_store release
+    # without it (apache/arrow-rs-object-store#908).
+    { id = "RUSTSEC-2026-0542", reason = "unmaintained, no known vulnerability; object_store 0.13 parses duration config with humantime" },
 ]
 
 [licenses]
