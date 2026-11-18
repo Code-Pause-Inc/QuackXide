@@ -297,6 +297,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
+  (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
+  fixed release) do not fail the dependency audit: they report
+  maintenance, not a vulnerability, and arrow, DataFusion 55 and
+  object_store 0.13 depend on these crates until they move off `chrono`.
 * Per-query resource limits (ADR 0013, proposed; P52;
   `platform_core::QueryLimits`, read by `platform-config`; each bounded,
   and an invalid value refuses startup).
@@ -326,11 +331,6 @@ uses [Semantic Versioning](https://semver.org/).
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
-* `backend/deny.toml` accepts the unmaintained advisories for `chrono`
-  (RUSTSEC-2026-0543), `chrono-tz` (RUSTSEC-2026-0555) and `humantime`
-  (RUSTSEC-2026-0542), which arrow, DataFusion 55 and `object_store` 0.13
-  depend on, and records when each is revisited. None reports a
-  vulnerability.
 * The secret scan reads every file's content whatever git attributes say:
   `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
   `.git/info/attributes`, a user's attributes file or a NUL byte from
