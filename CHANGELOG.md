@@ -17,9 +17,10 @@ uses [Semantic Versioning](https://semver.org/).
   runs the research lifecycle on it. The script also checks that an upload
   is refused without a token (401), outside the upload namespace (404) and
   at a stale version (409), that an approval retry after a revoke is
-  refused (404), and that the vault holds only `HPK1` envelopes and the
-  upload's record, whose row cap and schema are the ones the steward
-  declared. The compose stack no longer passes `DEMO_TENANT_*` to
+  refused (404), and, after the upload and again after the queries, that
+  the vault holds exactly the upload's object and manifest as `HPK1`
+  envelopes and its record, whose row cap and schema are the ones the
+  steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
   `enclave-api`. The API tests seal uploads with the same code
   (`platform_api::dev::seal_upload`), and CI checks that release builds
   cannot contain `seal-upload`.

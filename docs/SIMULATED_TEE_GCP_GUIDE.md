@@ -105,15 +105,16 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 ./scripts/test-simulated-tee.sh
 ```
 
-It runs eight stages:
+It runs nine stages:
 1. Builds every image and starts `sim-attestation` and `key-release-service`.
 2. Enrolls the steward's key (`PUT /v1/keys`, which returns the public key).
 3. Starts `enclave-api` with an empty vault.
 4. Seals a synthetic cohort with `seal-upload` and uploads it as the steward (`PUT /api/v1/datasets/{dataset}`); requires `HTTP 401` without a token, `404` outside the upload namespace and `409` when the same version is sent again.
-5. Copies the vault out of the container and requires only the uploaded dataset, stored as `HPK1` envelopes and one plaintext record holding the suite and the row cap and schema the steward declared, and no Parquet magic bytes anywhere.
+5. Copies the vault out of the container and requires exactly three files, at the version and object id in the upload's header: the object and manifest as `HPK1` envelopes, and the plaintext record holding the suite and the row cap and schema the steward declared. It also requires no Parquet magic bytes anywhere.
 6. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
 7. Runs the research lifecycle on the upload: publish, request, approve, a query under disclosure control and a budget, revoke; then requires `HTTP 404` for an approval retry and `403` for the query after it.
 8. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
+9. Copies the vault out again and repeats stage 5's check, so a file the queries wrote fails the run.
 
 ---
 

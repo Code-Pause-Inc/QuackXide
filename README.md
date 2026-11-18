@@ -236,10 +236,11 @@ locally across isolated networks (`public_net` and `internal: true`
 `enclave-api` starts with an empty vault and keeps its sealed snapshots in
 a directory on the `enclave_vault` volume (`STORAGE_LOCAL_DIR`, dev builds
 only). The test script uploads the steward's dataset with `seal-upload`'s
-body, and checks that the vault holds only ciphertext, besides the upload's
-plaintext record: its suite and the row cap and schema the steward
-declared. No GCS emulator is part of the stack: `fake-gcs-server` does not
-accept the uploads `object_store` 0.13 sends (#153).
+body. After the upload, and again after the queries, it checks that the
+vault holds only that upload: its object and manifest as ciphertext, and
+its plaintext record, which holds the suite and the row cap and schema the
+steward declared. No GCS emulator is part of the stack: `fake-gcs-server`
+does not accept the uploads `object_store` 0.13 sends (#153).
 
 The simulation runs production's evidence path (the token verifier, its
 release policy, key release through the stand-in, sealed queries) on any
