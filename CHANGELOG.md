@@ -281,6 +281,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
+  (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
+  fixed release) do not fail the dependency audit: they report
+  maintenance, not a vulnerability, and arrow, DataFusion 55 and
+  object_store 0.13 depend on these crates until they move off `chrono`.
 * Per-query resource limits (ADR 0013, proposed; P52;
   `platform_core::QueryLimits`, read by `platform-config`; each bounded,
   and an invalid value refuses startup).
