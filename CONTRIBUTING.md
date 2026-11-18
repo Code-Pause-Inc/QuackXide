@@ -44,9 +44,10 @@ Every pull request runs:
   `backend/fuzz/Cargo.lock` is stale;
 * a gitleaks secret scan of the full history;
 * a coverage report in the job summary;
-* when `backend/` or `rust-toolchain.toml` changes, the benchmarks in
-  `docs/BENCHMARKS.md`, in the job summary (report only, never fails on
-  the numbers);
+* when `backend/`, `rust-toolchain.toml` or the browser envelope module
+  changes, the benchmarks in `docs/BENCHMARKS.md`, including the wasm seal
+  in Chromium, in the job summary (report only, never fails on the
+  numbers);
 * the browser tests (`npm run test:browser`) in Chromium. Pushes to `main`
   and a nightly run add Firefox and WebKit.
 

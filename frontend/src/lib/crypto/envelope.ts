@@ -21,18 +21,28 @@ import init, {
 } from "./wasm/envelope";
 
 let loading: Promise<void> | null = null;
+let memory: WebAssembly.Memory | null = null;
 
 /** Instantiate the module once. A failed load is not cached, so the next
  *  call retries; until one succeeds every seal is refused. */
 export function loadEnvelopeModule(source: string | URL = envelopeWasmUrl): Promise<void> {
   loading ??= init({ module_or_path: source }).then(
-    () => undefined,
+    (exports) => {
+      memory = exports.memory;
+    },
     (err: unknown) => {
       loading = null;
       throw err;
     },
   );
   return loading;
+}
+
+/** The module's linear memory size in bytes, or null before it loads.
+ *  Linear memory only grows, so after a seal this is the module's peak
+ *  (docs/BENCHMARKS.md). */
+export function envelopeMemoryBytes(): number | null {
+  return memory ? memory.buffer.byteLength : null;
 }
 
 /** Seal `plaintext` to a tenant's raw public key under `info`. Returns the
