@@ -605,18 +605,12 @@ impl TenantKeypair {
         // wiped before it is dropped.
         let mut framed = Vec::with_capacity(MAGIC_BYTES + 32);
         framed.extend_from_slice(&self.suite().magic());
-        match &self.0 {
-            KeypairInner::Hpk1 { private_key, .. } => {
-                let mut raw = private_key.to_bytes();
-                framed.extend_from_slice(&raw);
-                raw.as_mut_slice().zeroize();
-            }
-            KeypairInner::Hpk2(kp) => {
-                let mut raw = kp.private_key.to_bytes();
-                framed.extend_from_slice(&raw);
-                raw.as_mut_slice().zeroize();
-            }
-        }
+        let mut raw = match &self.0 {
+            KeypairInner::Hpk1 { private_key, .. } => private_key.to_bytes(),
+            KeypairInner::Hpk2(kp) => kp.private_key.to_bytes(),
+        };
+        framed.extend_from_slice(&raw);
+        raw.as_mut_slice().zeroize();
         SecretBytes::new(framed)
     }
 
