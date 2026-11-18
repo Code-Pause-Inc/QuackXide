@@ -32,4 +32,11 @@ zeroize.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "hpke"
+harness = false
+# `cargo test` runs each benchmark once, so its checks gate check.sh.
+test = true

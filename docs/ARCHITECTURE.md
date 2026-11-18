@@ -225,12 +225,16 @@ header: version, obj, row cap,
   snapshot only, from storage and the plaintext record, opening nothing:
   its version and write time, the ids, count and total ciphertext bytes
   of the objects stored at that version, and the suite the record names
-  (`null` if the record is missing, malformed or names a suite this build
-  does not read). Superseded snapshots and uploads that have not
-  committed are not counted. More than 1000 datasets
-  (`MAX_LISTED_OBJECTS`), or objects across them, is refused with 422
-  rather than listed in part, and a storage failure is an error (503 or
-  502), never an empty list. Each listing is a `data.access` event.
+  (`null` if the record is missing at the current version, malformed or
+  names a suite this build does not read). Superseded snapshots and
+  uploads that have not committed are not counted. If a snapshot's record
+  is gone when it is read, because an upload or sync committed during the
+  listing and pruned it, the dataset is read again, once, and described
+  as it is then; a dataset no longer held is left out. More than 1000
+  datasets (`MAX_LISTED_OBJECTS`), or objects across them, is refused
+  with 422 rather than listed in part, and a storage failure is an error
+  (503 or 502), never an empty list. Each listing is a `data.access`
+  event.
 
 Both routes need only the vault and the configuration, so they work
 where the query service is not configured. The browser half (sealing and
@@ -349,13 +353,21 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   query service that is not wired. From taking its slot through
   decryption, decoding, execution and serialization it runs within
   `QUERY_TIMEOUT_SECS`; on expiry the work is dropped and the query gets
-  503. However a query ends (a result, an error, the time limit, the caller
-  going away, or a panic unwinding, which the release profile does), the
-  decrypted blobs are zeroized and the slot is released.
+  503. Every operator yields to the runtime as it produces a batch, so a
+  running plan stops at its next batch boundary, on the tasks running its
+  partitions too. One operator step between batches runs to its end first:
+  a nested-loop join compares a probe batch with its whole build side,
+  which the memory pool bounds. However a query ends (a result, an error,
+  the time limit, the caller going away, or a panic unwinding, which the
+  release profile does), the decrypted blobs are zeroized and the slot is
+  released.
 * **Resource limits** ([ADR 0013](adr/0013-per-query-resource-limits.md)).
   `platform_core::QueryLimits`, read by `platform-config`, where each value
   is bounded and an invalid one refuses startup (`backend/.env.example`
-  lists them). Before any key is released,
+  lists them). Together they must fit `QUERY_TOTAL_MEMORY_MIB`:
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, its
+  decoded table, three copies of its input and two of its result), or
+  startup is refused. Before any key is released,
   the objects stored at the snapshot's version must fit
   `QUERY_MAX_INPUT_OBJECTS` and, in ciphertext bytes, `DATASET_MAX_MIB`, the
   upload limit, so every stored upload stays queryable; a sealed manifest
@@ -374,7 +386,10 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   fails the query instead of spilling decrypted rows to a temporary file. A
   result with more rows than `QUERY_MAX_RESULT_ROWS` after disclosure
   control, or more JSON than `QUERY_MAX_RESULT_MIB`, is refused, never
-  truncated. Each size limit is refused with 422 and a message of its own,
+  truncated. The pool does not track the rows collected for a result, so
+  without a disclosure policy the result streams and the query stops at
+  the first row over the limit; with one, suppression sees the whole
+  aggregate, whose groups the pool held. Each size limit is refused with 422 and a message of its own,
   never the 400 of SQL that cannot run, and each limit refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them (see "Rate level" below).
@@ -520,15 +535,21 @@ discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`), so the steward's
 dataset listing (section 2) shows exactly what it can publish. Researchers file
-access requests (idempotent while pending); approval mints the grant through the same code path as a direct
-grant. The approval is recorded first, with its query budget, so a failure
+access requests (idempotent while pending); approval mints the grant
+through the same code path as a direct grant, and adds its query budget
+to the grant once, keyed by the request: a follow-up request tops up a
+grant that already exists (spend is kept), and a retry adds nothing. A
+pending request whose listing has been unpublished can be denied but not
+approved (404, `denied` event). The approval is recorded first, with its
+query budget, so a failure
 partway leaves an approved request without a usable grant, never a grant
 behind a pending or denied one, and the steward's retry re-runs the
 idempotent grant and budget steps with the approved budget; a retry cannot
 change it. A retry never undoes a revoke: while the steward's grant to that
 researcher for that connector is revoked, the retry is refused (404) with a
 `denied` event, and only an explicit re-grant or a new request restores
-access. Denied is terminal. `research.catalog` events carry identifiers
+access. A retry is also refused once the grant was revoked after the
+approval, even if it has since been re-granted. Denied is terminal. `research.catalog` events carry identifiers
 only.
 
 **Residual risk:** overlapping-query differencing. See

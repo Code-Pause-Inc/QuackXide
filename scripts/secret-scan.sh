@@ -13,22 +13,21 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GITLEAKS="${GITLEAKS:-gitleaks}"
-# Attributes come from the empty tree, so a committed .gitattributes can't
-# mark files -diff or binary and drop them from the scan.
-EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
 fail() { echo "FAIL: $1"; exit 1; }
 
 # scan <repo>: only HEAD's history, so other branches' allowlists never
 # apply. Merges are diffed against their first parent, so a conflict
-# resolution is scanned too.
+# resolution is scanned too. --text --no-textconv diff every file's real
+# content, so attributes (-diff, binary, a textconv driver, in the repo or
+# the user's config) and NUL bytes can't hide a secret.
 scan() {
     local rev out status=0
     rev="$(git -C "$1" rev-parse --verify --quiet 'HEAD^{commit}')" \
         || { echo "FAIL: no commit at HEAD in $1"; return 1; }
-    out="$(GIT_ATTR_SOURCE="$EMPTY_TREE" "$GITLEAKS" git --no-banner --no-color --redact -v \
+    out="$("$GITLEAKS" git --no-banner --no-color --redact -v \
         --config "$ROOT/.gitleaks.toml" \
-        --log-opts="--no-color --diff-merges=first-parent $rev --" "$1" 2>&1)" || status=$?
+        --log-opts="--no-color --text --no-textconv --diff-merges=first-parent $rev --" "$1" 2>&1)" || status=$?
     printf '%s\n' "$out"
     # gitleaks logs a git error, stops reading, and still exits 0; output it
     # cannot parse scans no commits.
@@ -48,6 +47,9 @@ case "${1:-}" in
         scan "$ROOT"
         ;;
     selftest)
+        # A GIT_DIR from a hook or `git rebase -x` would make `git init` below
+        # reinitialise, and each case commit into, the caller's repository.
+        while read -r var; do unset "$var"; done < <(git rev-parse --local-env-vars)
         tmp="$(mktemp -d)"
         trap 'rm -rf "$tmp"' EXIT
         # Scratch repositories, untouched by the user's git config.
@@ -95,6 +97,17 @@ case "${1:-}" in
             && mkdir fixtures && echo "aws_key = \"$leak\"" >fixtures/k.txt \
             && echo '* -diff' >fixtures/.gitattributes && commit b)
         expect leak attributes
+
+        # A NUL byte makes git treat the file as binary and print no diff.
+        (repo nul && echo ok >a.txt && commit a \
+            && printf 'aws_key = "%s"\0' "$leak" >k.dat && commit b)
+        expect leak nul
+
+        # .git/info/attributes is not committed, so only the scan can undo it.
+        (repo info-attributes && echo ok >a.txt && commit a \
+            && echo "aws_key = \"$leak\"" >k.txt && commit b \
+            && echo 'k.txt -diff' >.git/info/attributes)
+        expect leak info-attributes
 
         (repo color && git config color.ui always && echo "aws_key = \"$leak\"" >a.txt && commit a)
         expect leak color

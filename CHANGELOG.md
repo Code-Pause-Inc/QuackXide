@@ -32,13 +32,14 @@ uses [Semantic Versioning](https://semver.org/).
   ciphertext bytes of the objects stored at that version, and the suite
   its plaintext record names, all read without opening anything;
   superseded snapshots and uploads that have not committed are not
-  counted. The tenant comes from the token only. The route needs no query
-  service, refuses more than `MAX_LISTED_OBJECTS` (1000) datasets, or
-  objects across them, with 422, and answers a storage failure with 503
-  or 502, never an empty list; each listing is audited as `data.access`.
-  `platform_connectors::snapshot` gains `held_datasets` and
-  `recorded_suite`, and `TenantPaths` gains `connectors_root` and
-  `connector_of`.
+  counted, and a snapshot that an upload or sync replaces during the
+  listing is described as the new one. The tenant comes from the token
+  only. The route needs no query service, refuses more than
+  `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
+  and answers a storage failure with 503 or 502, never an empty list; each
+  listing is audited as `data.access`. `platform_connectors::snapshot`
+  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
@@ -61,6 +62,19 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser tests (#223 stage A). A vitest `browser` project runs the module
+  crypto worker, Web Crypto keys, the sealed HPKE device key, IndexedDB
+  persistence across a worker restart and a drive round trip in real
+  browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
+  The `browser` workflow runs Chromium on every pull request and Chromium,
+  Firefox and WebKit on `main` and nightly.
+* Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
+  `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
+  4 MiB, and a unit test pins the 52-byte envelope overhead. `cargo test`
+  runs each benchmark once, so `scripts/check.sh` fails on a broken one. The
+  `bench` workflow runs them on pull requests that touch `backend/` or
+  `rust-toolchain.toml` and reports only. `docs/BENCHMARKS.md` records the
+  method and the baseline the hybrid suite (#187) is compared against.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
@@ -233,6 +247,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* A follow-up access request's approval adds its query budget to the
+  existing grant instead of being dropped, and a retry of the same
+  approval adds nothing (`BudgetLedger::top_up_once`). A retry of an
+  approval whose grant was revoked and re-granted since is refused, so it
+  cannot add to the newer grant. A pending request for an unpublished
+  listing can no longer be approved (#96).
 * GCS emulator writes (`STORAGE_EMULATOR_HOST`) no longer ask the GCE
   metadata server for a credential: `object_store` 0.13 skips signing on
   reads only, so the emulator client now carries a placeholder credential.
@@ -291,14 +311,27 @@ uses [Semantic Versioning](https://semver.org/).
   (502). Every Parquet footer must fit `QUERY_MAX_DECODED_ROWS` and
   `QUERY_MAX_DECODED_MIB` before anything is decoded, and a result over
   `QUERY_MAX_RESULT_ROWS` or `QUERY_MAX_RESULT_MIB` is refused, never
-  truncated. Size limits answer 422 and memory exhaustion is no longer
-  reported as the caller's SQL error (400). Each refusal is an
+  truncated; without a disclosure policy the result streams and the query
+  stops at the first row over the limit. Every operator yields to the
+  runtime as it produces a batch, so the time limit stops a running plan
+  and the tasks running its partitions. Startup is refused when
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, decoded
+  table, three copies of its input and two of its result) exceeds
+  `QUERY_TOTAL_MEMORY_MIB` (default 8192). Size limits answer 422 and
+  memory exhaustion is no longer reported as the caller's SQL error
+  (400). Each refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them, so each costs a unit (P54 decides the
   order). The slot is released and the decrypted blobs zeroized on every
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
+* The secret scan reads every file's content whatever git attributes say:
+  `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
+  `.git/info/attributes`, a user's attributes file or a NUL byte from
+  hiding a credential, so the scan no longer needs git 2.41
+  (`GIT_ATTR_SOURCE`). Its selftest no longer reinitialises the repository
+  named by an exported `GIT_DIR`, as a git hook or `git rebase -x` sets.
 * A revoke, top-up or budget read of a grant that is unknown or not the
   caller's is audited as `denied`: `tenant.provisioned` for a revoke and
   `research.budget` for the others, with the caller's tenant and the grant

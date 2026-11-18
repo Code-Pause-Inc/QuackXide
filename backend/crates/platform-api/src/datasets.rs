@@ -28,11 +28,11 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use platform_config::PlatformConfig;
-use platform_connectors::snapshot::{self, HeldDataset};
+use platform_connectors::snapshot::{self, HeldDataset, RecordedSuite};
 use platform_connectors::upload::{self, UploadCommitError, UploadError};
 use platform_core::{ConnectorSlug, DatasetKind, ObjectId, SnapshotVersion, TenantId};
 use platform_crypto::EnvelopeSuite;
-use platform_storage::StorageError;
+use platform_storage::{StorageError, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -149,8 +149,8 @@ struct DatasetEntry {
     /// When the current snapshot was written ([`written_at`]).
     written_at: String,
     /// The suite the snapshot's record names, or `None` if the record is
-    /// missing, malformed, or names a suite this build does not read, as a
-    /// query would refuse it.
+    /// missing at the current version, malformed, or names a suite this
+    /// build does not read, as a query would refuse it.
     suite: Option<&'static str>,
     object_count: usize,
     /// Total size of the current snapshot's objects as stored.
@@ -192,20 +192,54 @@ fn written_at(version: &SnapshotVersion) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// `held`, a dataset as listed, with the suite its record names. A missing
+/// record can mean that an upload or sync committed after the listing and
+/// pruned this snapshot, so the dataset is read again, once, with one
+/// listing of its own paths, and described as it is now: a newer snapshot
+/// with its record's suite, or at the same version, with no suite. `None`
+/// if the dataset is no longer held, so the listing still shows exactly the
+/// datasets held.
+async fn describe(
+    vault: &dyn VaultStore,
+    steward: TenantId,
+    held: HeldDataset,
+) -> Result<Option<DatasetEntry>, StorageError> {
+    match snapshot::recorded_suite(vault, steward, &held.slug, &held.version).await? {
+        RecordedSuite::Missing => {}
+        recorded => return Ok(Some(DatasetEntry::new(held, recorded.known()))),
+    }
+    let Some(current) = snapshot::held_dataset(vault, steward, &held.slug).await? else {
+        return Ok(None);
+    };
+    let suite = if current.version == held.version {
+        None
+    } else {
+        snapshot::recorded_suite(vault, steward, &current.slug, &current.version)
+            .await?
+            .known()
+    };
+    Ok(Some(DatasetEntry::new(current, suite)))
+}
+
 /// `GET /api/v1/datasets` — every research dataset the caller's tenant
 /// holds, by id: the datasets `snapshot::holds` is true for, which is the
 /// check publishing a listing makes. Each entry describes the current
 /// snapshot only: its version and write time, the objects stored at that
 /// version with their total ciphertext size, and the suite its record
 /// names. Nothing is opened, and objects of superseded snapshots or of
-/// uploads that have not committed are not counted. More than
-/// [`MAX_LISTED_OBJECTS`] datasets, or as many objects across them, is
-/// refused with 422 rather than listed in part. A storage failure is an
-/// error, never an empty list.
+/// uploads that have not committed are not counted. A snapshot replaced
+/// while the listing runs is described as the newer one ([`describe`]).
+/// More than [`MAX_LISTED_OBJECTS`] datasets, or as many objects across
+/// them, is refused with 422 rather than listed in part. A storage failure
+/// is an error, never an empty list.
 pub(crate) async fn list_datasets(
     State(state): State<AppState>,
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
 ) -> Result<Json<DatasetListing>, ApiError> {
+    // This lists every path under the tenant's datasets, superseded
+    // snapshots awaiting pruning included, before the cap is checked: the
+    // cap bounds the response and the record reads, not that listing. The
+    // drive listing does the same; v1 has no pagination.
     let held = snapshot::held_datasets(&*state.vault, steward).await?;
     let objects: usize = held.iter().map(|dataset| dataset.objects.len()).sum();
     if held.len() > MAX_LISTED_OBJECTS || objects > MAX_LISTED_OBJECTS {
@@ -223,11 +257,9 @@ pub(crate) async fn list_datasets(
 
     let vault = &*state.vault;
     let datasets: Vec<DatasetEntry> = futures::stream::iter(held)
-        .map(|held| async move {
-            let suite = snapshot::recorded_suite(vault, steward, &held.slug, &held.version).await?;
-            Ok::<_, StorageError>(DatasetEntry::new(held, suite))
-        })
+        .map(|held| describe(vault, steward, held))
         .buffered(LIST_READ_CONCURRENCY)
+        .try_filter_map(|entry| async move { Ok(entry) })
         .try_collect()
         .await?;
     security_audit_event(
