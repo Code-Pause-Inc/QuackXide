@@ -11,9 +11,10 @@
 //! holds, uploaded, synced or seeded, exactly when publishing it is
 //! allowed, described by its current snapshot alone; never a write that
 //! has not committed, a superseded snapshot's objects, or another tenant's
-//! dataset. Refusals: no or non-access token (401), more datasets or
-//! objects than the cap (422), and a storage failure (503 or 502, never an
-//! empty list).
+//! dataset. A snapshot replaced while the listing runs is listed as the new
+//! one, and a dataset removed meanwhile is not listed. Refusals: no or
+//! non-access token (401), more datasets or objects than the cap (422), and
+//! a storage failure (503 or 502, never an empty list).
 
 mod common;
 
@@ -27,6 +28,7 @@ use bytes::Bytes;
 use platform_api::{AppState, build_app};
 use platform_auth::TokenType;
 use platform_config::PlatformConfig;
+use platform_connectors::upload::{UploadBody, commit_upload, parse_upload_body};
 use platform_core::{ColumnType, ConnectorSlug, ObjectId, SnapshotVersion, TenantId};
 use platform_crypto::{TenantKeypair, TenantPublicKey};
 use platform_storage::{
@@ -1144,4 +1146,171 @@ async fn a_storage_failure_fails_the_listing() {
             "{faults:?}"
         );
     }
+}
+
+/// A write that lands after the listing found a snapshot and before its
+/// record is read.
+enum Race {
+    /// A re-upload commits, pruning the snapshot the listing found.
+    Reupload(UploadBody),
+    /// The dataset goes: every object under it is deleted.
+    Removal,
+    /// The snapshot's record is pruned, then storage goes down.
+    Outage,
+}
+
+/// An in-memory vault where an armed [`Race`] runs once, as the first
+/// snapshot record is read.
+struct RacingVault {
+    inner: ObjectStoreVault,
+    steward: TenantId,
+    race: std::sync::Mutex<Option<Race>>,
+    down: std::sync::atomic::AtomicBool,
+}
+
+impl RacingVault {
+    fn new(steward: TenantId) -> Self {
+        Self {
+            inner: ObjectStoreVault::new_in_memory(),
+            steward,
+            race: std::sync::Mutex::new(None),
+            down: false.into(),
+        }
+    }
+
+    fn arm(&self, race: Race) {
+        *self.race.lock().expect("lock") = Some(race);
+    }
+
+    async fn run_race(&self, path: &VaultPath) {
+        let race = if path.as_str().contains("/records/") {
+            self.race.lock().expect("lock").take()
+        } else {
+            None
+        };
+        match race {
+            None => {}
+            Some(Race::Reupload(body)) => {
+                commit_upload(
+                    &self.inner,
+                    self.steward,
+                    &slug(),
+                    body,
+                    std::time::SystemTime::now(),
+                )
+                .await
+                .expect("re-upload");
+            }
+            Some(Race::Removal) => {
+                let dataset = TenantPaths::connector_prefix(self.steward, &slug());
+                for stored in self.inner.list(&dataset).await.expect("list") {
+                    self.inner.delete(&stored).await.expect("delete");
+                }
+            }
+            Some(Race::Outage) => {
+                self.inner.delete(path).await.expect("prune");
+                self.down.store(true, SeqCst);
+            }
+        }
+    }
+
+    fn check(&self) -> Result<(), StorageError> {
+        if self.down.load(SeqCst) {
+            Err(common::outage())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl VaultStore for RacingVault {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.check()?;
+        self.inner.put(path, ciphertext).await
+    }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.check()?;
+        self.inner.put_if_absent(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        self.check()?;
+        self.run_race(path).await;
+        self.inner.get(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        self.check()?;
+        self.inner.delete(path).await
+    }
+    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        self.check()?;
+        self.inner.list(prefix).await
+    }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.check()?;
+        self.inner.list_entries(prefix).await
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.check()?;
+        self.inner.usage(prefix).await
+    }
+}
+
+/// An app over a [`RacingVault`] holding one committed upload, which is
+/// returned with it.
+async fn racing_app() -> (Router, Arc<RacingVault>, Steward, SealedUpload) {
+    let (steward, keypair) = steward();
+    let vault = Arc::new(RacingVault::new(steward.tenant));
+    let app = upload_research_app(SECRET, vec![(steward.tenant, keypair)], vault.clone());
+    let first = cohorts_upload(steward.tenant, &steward.key, DATASET, None);
+    assert_eq!(upload(&app, &steward, &first).await, StatusCode::OK);
+    (app, vault, steward, first)
+}
+
+#[tokio::test]
+async fn a_re_upload_during_a_listing_is_listed_as_the_new_snapshot() {
+    let (app, vault, steward, first) = racing_app().await;
+    // The listing finds the first snapshot; before its record is read, a
+    // re-upload commits and prunes it, record included.
+    let second = cohorts_upload(steward.tenant, &steward.key, DATASET, Some(&first.version));
+    let body = parse_upload_body(Bytes::from(second.body.clone()), 64 << 20).expect("parse");
+    vault.arm(Race::Reupload(body));
+
+    let entries = listed(&app, &steward.token).await;
+    assert!(vault.race.lock().expect("lock").is_none(), "the race ran");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["version"], second.version.as_str());
+    assert_eq!(entries[0]["objects"], object_ids(&[second.object]));
+    assert_eq!(entries[0]["suite"], "HPK1");
+}
+
+#[tokio::test]
+async fn a_dataset_removed_during_a_listing_is_not_listed() {
+    let (app, vault, steward, _) = racing_app().await;
+    // Every object of the dataset goes after the listing found it: it is no
+    // longer held, so it is not listed, as publishing agrees.
+    vault.arm(Race::Removal);
+
+    let (status, _, body) = list_datasets(&app, Some(&steward.token)).await;
+    assert!(vault.race.lock().expect("lock").is_none(), "the race ran");
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, EMPTY_LISTING));
+    assert!(!publishable(&app, &steward, DATASET).await);
+}
+
+#[tokio::test]
+async fn a_storage_failure_while_reading_a_dataset_again_is_503() {
+    let (app, vault, steward, _) = racing_app().await;
+    // The record is pruned, so the dataset is read again, and that read
+    // meets an outage: an error, not a stale entry.
+    vault.arm(Race::Outage);
+
+    let (status, headers, body) = list_datasets(&app, Some(&steward.token)).await;
+    assert!(vault.race.lock().expect("lock").is_none(), "the race ran");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(headers.contains_key(header::RETRY_AFTER));
 }

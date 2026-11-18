@@ -225,12 +225,16 @@ header: version, obj, row cap,
   snapshot only, from storage and the plaintext record, opening nothing:
   its version and write time, the ids, count and total ciphertext bytes
   of the objects stored at that version, and the suite the record names
-  (`null` if the record is missing, malformed or names a suite this build
-  does not read). Superseded snapshots and uploads that have not
-  committed are not counted. More than 1000 datasets
-  (`MAX_LISTED_OBJECTS`), or objects across them, is refused with 422
-  rather than listed in part, and a storage failure is an error (503 or
-  502), never an empty list. Each listing is a `data.access` event.
+  (`null` if the record is missing at the current version, malformed or
+  names a suite this build does not read). Superseded snapshots and
+  uploads that have not committed are not counted. If a snapshot's record
+  is gone when it is read, because an upload or sync committed during the
+  listing and pruned it, the dataset is read again, once, and described
+  as it is then; a dataset no longer held is left out. More than 1000
+  datasets (`MAX_LISTED_OBJECTS`), or objects across them, is refused
+  with 422 rather than listed in part, and a storage failure is an error
+  (503 or 502), never an empty list. Each listing is a `data.access`
+  event.
 
 Both routes need only the vault and the configuration, so they work
 where the query service is not configured. The browser half (sealing and

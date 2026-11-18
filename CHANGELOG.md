@@ -16,13 +16,14 @@ uses [Semantic Versioning](https://semver.org/).
   ciphertext bytes of the objects stored at that version, and the suite
   its plaintext record names, all read without opening anything;
   superseded snapshots and uploads that have not committed are not
-  counted. The tenant comes from the token only. The route needs no query
-  service, refuses more than `MAX_LISTED_OBJECTS` (1000) datasets, or
-  objects across them, with 422, and answers a storage failure with 503
-  or 502, never an empty list; each listing is audited as `data.access`.
-  `platform_connectors::snapshot` gains `held_datasets` and
-  `recorded_suite`, and `TenantPaths` gains `connectors_root` and
-  `connector_of`.
+  counted, and a snapshot that an upload or sync replaces during the
+  listing is described as the new one. The tenant comes from the token
+  only. The route needs no query service, refuses more than
+  `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
+  and answers a storage failure with 503 or 502, never an empty list; each
+  listing is audited as `data.access`. `platform_connectors::snapshot`
+  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
