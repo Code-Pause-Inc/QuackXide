@@ -336,12 +336,14 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
 * **Bounded plaintext.** `max_concurrent_queries` caps how many queries
   hold decrypted data at once; further queries wait for a slot, and a limit
   of zero refuses with 503.
-* **The snapshot as written.** Before any key is released, the query reads
-  the newest snapshot's plaintext record; a snapshot without a valid one
-  fails closed (502), as does a manifest that lists a missing object.
-  Objects open under their dataset kind's binding: `tenant-envelope-v2`
+* **The snapshot as written.** Before any key is released or budget
+  charged, the query reads the newest snapshot's plaintext record; a
+  snapshot without a valid one fails closed (502), as does one whose record
+  names another suite than the tenant's key (502, `crypto.suite_refused`)
+  and a manifest that lists a missing object. Objects open under the
+  record's suite and their dataset kind's binding: `tenant-envelope-v2`
   for a connector's, `steward-upload-v2` for an upload's (`-v1` under
-  `HPK1`). For an upload,
+  `HPK1`), so an envelope of another suite fails to open. For an upload,
   `QueryScope::register_parquet_declared` checks each object's schema
   and the rows its footer reports against what the steward declared before
   decoding, and the decoded rows after; a mismatch is refused with 502
@@ -394,6 +396,7 @@ upload; the **researcher** may run aggregate queries but never read rows.
 Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403 + audit
                  attestation gate
+                 snapshot record: valid, names the key's suite?  ──no──▶ 502 + audit
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
                  QueryScope, ZkMode FORCED Enabled:
@@ -613,8 +616,10 @@ Migration rules:
   browser works until P36. The
   key-release stand-in and released keys accept only `HPK2` in every mode;
   the browser build and the enclave's key-release key accept only `HPK1`
-  until P36 and P85. A key opens only frames of its own suite. Refusals at
-  enrollment, upload, key release and open emit `crypto.suite_refused`.
+  until P36 and P85. A key opens only frames of its own suite, and a query
+  opens only a snapshot whose record names its key's suite. Refusals at
+  enrollment, upload, key release, query and open emit
+  `crypto.suite_refused`.
 * No silent downgrade: production refuses `HPK1` frames and X25519
   enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):
   nothing has been sealed under `HPK1` outside development.
@@ -641,7 +646,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
-| `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope or upload whose suite does not match its key |
+| `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope, upload or snapshot record whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
 kind of their own: a grant is the steward provisioning access to its own

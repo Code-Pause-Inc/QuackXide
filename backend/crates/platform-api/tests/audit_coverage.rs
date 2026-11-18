@@ -630,7 +630,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         sim_signer().issuer(),
         sim_policy(),
     ));
-    rp.insert_tenant_key(tenant, &keypair);
+    rp.insert_tenant_key(tenant, &keypair).expect("HPK2 key");
     let ok_provider = Arc::new(AttestedKeyProvider::new(
         Arc::new(EnclaveIdentity::generate()),
         snp.clone(),

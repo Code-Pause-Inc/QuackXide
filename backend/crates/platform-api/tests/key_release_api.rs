@@ -195,7 +195,8 @@ async fn release_with(
 
 fn enrolled(rp: &KeyReleaseRelyingParty) -> TenantId {
     let tenant = TenantId::generate();
-    rp.insert_tenant_key(tenant, &TenantKeypair::generate(EnvelopeSuite::Hpk2));
+    rp.insert_tenant_key(tenant, &TenantKeypair::generate(EnvelopeSuite::Hpk2))
+        .expect("HPK2 key");
     tenant
 }
 
@@ -325,7 +326,8 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
 
     // The stand-in on an ephemeral local TCP port.
     let rp = static_rp();
-    rp.insert_tenant_key(steward, &steward_key);
+    rp.insert_tenant_key(steward, &steward_key)
+        .expect("HPK2 key");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let rp_router = rp.clone().router();
@@ -666,20 +668,39 @@ async fn stand_in_refuses_hpk1_and_unframed_tenant_keys() {
     );
 }
 
-#[tokio::test]
-async fn released_hpk1_key_is_refused_and_audited() {
+#[test]
+fn stand_in_refuses_inserting_an_hpk1_key() {
+    // Direct callers too, not only /v1/keys.
     let capture = platform_telemetry::capture::AuditCapture::install();
     let rp = static_rp();
-    let tenant = TenantId::generate();
-    // Bypasses /v1/keys, which would refuse it: the enclave must refuse too.
-    rp.insert_tenant_key(tenant, &TenantKeypair::generate(EnvelopeSuite::Hpk1));
-    let key_provider = AttestedKeyProvider::new(
-        Arc::new(EnclaveIdentity::generate()),
-        provider(SimulatedClaims::default()),
-        Arc::new(InProcessKeyReleaseClient(rp.clone())),
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+    assert!(rp.insert_tenant_key(TenantId::generate(), &hpk1).is_err());
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
     );
-    use platform_api::query::EnclaveKeyProvider as _;
-    assert!(key_provider.begin_query_session(tenant).await.is_err());
+}
+
+#[test]
+fn released_hpk1_key_is_refused_and_audited() {
+    // The stand-in refuses to hold one; a relying party that released one
+    // anyway must still be refused by the enclave.
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let identity = EnclaveIdentity::generate();
+    let enclave_key = TenantPublicKey::from_raw(
+        identity.enclave_hpke_public_key(),
+        SuitePolicy::only(EnvelopeSuite::Hpk1),
+    )
+    .expect("enclave key");
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).to_private_key_bytes();
+    let wrapped =
+        platform_crypto::hpke_seal_to_tenant(&enclave_key, b"info", hpk1.expose()).expect("seal");
+    assert!(
+        identity
+            .unwrap_released_key(TenantId::generate(), b"info", &wrapped)
+            .is_err()
+    );
     assert!(
         capture.contains("crypto.suite_refused", "denied"),
         "{:?}",

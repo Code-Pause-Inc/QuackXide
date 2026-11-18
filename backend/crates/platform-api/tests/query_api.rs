@@ -17,7 +17,7 @@ use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvi
 use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_info};
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
-use platform_crypto::{SecretBytes, TenantKeypair, hpke_seal_to_tenant};
+use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair, hpke_seal_to_tenant};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, SnapshotRecord, TenantPaths, VaultStore};
 use quackxide_engine::EngineSettings;
@@ -340,6 +340,10 @@ struct ObservedKeys {
 
 #[async_trait]
 impl EnclaveKeyProvider for ObservedKeys {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        self.inner.key_suite(tenant)
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -622,6 +626,56 @@ async fn a_record_naming_a_suite_this_build_cannot_read_fails_closed() {
 
     let result = service.query(tenant, &connector, COUNT_SQL).await;
     assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
+}
+
+/// The record names the suite, and the key must be of it: a record naming
+/// another suite than the key's is refused before any envelope opens, even
+/// when the envelopes themselves match the key.
+#[tokio::test]
+async fn a_record_naming_another_suite_than_the_key_opens_nothing() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk2);
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let keys = Arc::new(ObservedKeys {
+        inner: DevKeyProvider::new(tenant, keypair),
+        calls: AtomicUsize::new(0),
+        in_flight: AtomicUsize::new(0),
+        max_in_flight: AtomicUsize::new(0),
+        fail_on_call: None,
+    });
+    let service = ConnectorQueryService::new(
+        vault.clone(),
+        keys.clone(),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+        },
+        false,
+    );
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let path = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list")
+        .remove(0);
+    let version =
+        TenantPaths::connector_record_version(tenant, &connector, &path).expect("record path");
+    let mut record =
+        SnapshotRecord::parse(&vault.get(&path).await.expect("record"), &version).expect("parse");
+    assert_eq!(record.suite, EnvelopeSuite::Hpk2.id());
+    record.suite = EnvelopeSuite::Hpk1.id().to_owned();
+    vault.put(&path, record.to_bytes()).await.expect("put");
+
+    let result = service.query(tenant, &connector, COUNT_SQL).await;
+    assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
+    assert_eq!(keys.calls.load(Ordering::SeqCst), 0, "no envelope opened");
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
 }
 
 #[tokio::test]

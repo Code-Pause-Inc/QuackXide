@@ -303,8 +303,12 @@ uses [Semantic Versioning](https://semver.org/).
   policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
   with a `crypto.suite_refused` audit event; development still accepts
   them until the browser moves to `HPK2` (P36). Private keys are exported
-  as `magic || key`; the key-release stand-in imports only `HPK2` tenant
-  keys, and the enclave accepts only `HPK2` released keys.
+  as `magic || key`; the key-release stand-in holds only `HPK2` tenant
+  keys, whether enrolled over HTTP or inserted directly, and the enclave
+  accepts only `HPK2` released keys. A query refuses a snapshot whose
+  record names another suite than the tenant's key before any key is
+  released or budget charged, and opens its envelopes under the record's
+  suite.
   X-Wing known-answer tests against `@noble/post-quantum` and frames sealed
   by `hpke-js` pin interoperability. ADR 0007 is accepted.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on

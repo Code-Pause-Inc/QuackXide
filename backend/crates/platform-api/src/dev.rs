@@ -18,7 +18,7 @@ use platform_config::PlatformConfig;
 use platform_connectors::pipeline::PipelineError;
 use platform_connectors::snapshot::SnapshotWriter;
 use platform_core::{ConnectorSlug, SnapshotVersion, TenantId};
-use platform_crypto::{EnvelopeSuite, TenantKeypair};
+use platform_crypto::TenantKeypair;
 use platform_enclave::AttestationProvider;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
@@ -126,12 +126,11 @@ impl DevResearchStack {
             policy,
         ));
         for (tenant, keypair) in &self.keys {
-            assert_eq!(
-                keypair.suite(),
-                EnvelopeSuite::Hpk2,
-                "key release is HPK2-only; use query_service_with_attestation for {tenant}'s key"
-            );
-            relying_party.insert_tenant_key(*tenant, keypair);
+            relying_party.insert_tenant_key(*tenant, keypair).unwrap_or_else(|_| {
+                panic!(
+                    "key release is HPK2-only; use query_service_with_attestation for {tenant}'s key"
+                )
+            });
         }
         let identity = Arc::new(EnclaveIdentity::generate());
         let keys = Arc::new(AttestedKeyProvider::new(

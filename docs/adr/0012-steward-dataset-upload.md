@@ -103,8 +103,9 @@ without key release:
 * for an upload only, `row_cap` and `schema`: what the steward declared.
 
 A query refuses a snapshot without a valid record (502). A valid record
-names a suite this build reads (`EnvelopeSuite::from_id`), so an unknown
-suite fails closed before any key is released. P39 reads the suite from
+names a suite this build reads (`EnvelopeSuite::from_id`) and the suite
+of the tenant's key, so either mismatch fails closed before any key is
+released or budget charged. P39 reads the suite from
 the record and the write time from the version, without opening
 anything.
 

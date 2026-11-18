@@ -62,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
         signer.issuer(),
         policy,
     ));
-    relying_party.insert_tenant_key(tenant, &keypair);
+    relying_party
+        .insert_tenant_key(tenant, &keypair)
+        .expect("the demo tenant's key is HPK2");
 
     let identity = Arc::new(EnclaveIdentity::generate());
     let keys = Arc::new(AttestedKeyProvider::new(
