@@ -110,7 +110,7 @@ input": round-trips, and "arbitrary input is never accepted". Rust uses
 
 ### Frontend tests
 
-`frontend/vite.config.ts` defines three vitest projects. The `node` project
+`frontend/vite.config.ts` defines four vitest projects. The `node` project
 runs `*.test.ts` and has no DOM. The `dom` project runs `*.test.tsx` under
 jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 
@@ -127,6 +127,11 @@ npx playwright install chromium firefox webkit   # once
 npm run test:browser                              # Chromium
 BROWSERS=chromium,firefox,webkit npm run test:browser
 ```
+
+The `bench` project runs `*.browser.bench.ts` in headless Chromium: the
+wasm envelope seal benchmark, which needs generated data, so run it through
+`scripts/bench-wasm-seal.sh` (`docs/BENCHMARKS.md`). Neither `npm test` nor
+`npm run test:browser` runs it.
 
 The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).

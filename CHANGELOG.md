@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Browser envelope seal benchmark (P34 checkpoint A, #171).
+  `scripts/bench-wasm-seal.sh` seals synthetic Parquet from `synth-data`
+  at about 1 MiB, 100 MiB and 1 GiB with the wasm module in a Chromium
+  worker and reports seal time, the module's peak memory, module load time
+  and bundle size. The `bench` workflow's `wasm-seal` job runs it and
+  reports only. `docs/BENCHMARKS.md` records the baseline (about 50 MiB/s,
+  a module peak of three times the payload, 31.8 KiB brotli-compressed)
+  and the largest payload one seal can take (about 1.33 GiB).
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
