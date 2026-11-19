@@ -310,6 +310,12 @@ uses [Semantic Versioning](https://semver.org/).
   (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
   is `true`, which defaults to false: the toggles are not in v1.0 and
   nothing reads them (`docs/PROJECT_SCOPE.md`).
+* Code-owner review covers the query engine's source, the API's source,
+  grants and budgets (`platform-tenancy`), the audit-coverage and bypass
+  tests, `docs/THREAT_MODEL.md` and `docs/adr/`. `scripts/check.sh` fails
+  when a `CODEOWNERS` pattern matches no tracked path.
+  `CONTRIBUTING.md` describes the review stages, Dependabot handling, and
+  how a vulnerability is fixed privately in a security advisory's fork.
 * `jsonwebtoken` 12, on `elliptic-curve` 0.14, removes `crypto-bigint`
   0.5, so `backend/deny.toml` no longer ignores RUSTSEC-2026-0387.
   `jsonwebtoken` 12 refuses an empty HMAC secret: minting with one fails,
