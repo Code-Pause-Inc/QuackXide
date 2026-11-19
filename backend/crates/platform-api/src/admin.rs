@@ -4,7 +4,8 @@
 //!   that provision or suspend a tenant. Authorized by signature, not JWT.
 //! * `GET /admin/tenants`: tenants with storage usage and connector toggles.
 //! * `POST /admin/tenants/{tenant_id}/connectors/{slug}`: enable or disable a
-//!   connector.
+//!   connector. Not in v1.0: 503 unless `FEATURE_ADMIN_CONNECTOR_TOGGLES` is
+//!   set, since nothing reads the toggles.
 //!
 //! Admin routes require the JWT `adm` claim.
 

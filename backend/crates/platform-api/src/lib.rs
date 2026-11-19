@@ -127,6 +127,9 @@ pub enum ApiError {
     ResearchUnavailable,
     /// Admin provisioning is not configured (503).
     ProvisioningUnavailable,
+    /// The admin connector toggles are off (`FEATURE_ADMIN_CONNECTOR_TOGGLES`)
+    /// (503).
+    ConnectorTogglesDisabled,
     /// No MoR webhook secret is configured, so no event can be verified (503).
     WebhookNotConfigured,
     /// Query refused by the enclave attestation gate.
@@ -193,6 +196,7 @@ impl ApiError {
             ApiError::QueryUnavailable => "query_unavailable",
             ApiError::ResearchUnavailable => "research_unavailable",
             ApiError::ProvisioningUnavailable => "provisioning_unavailable",
+            ApiError::ConnectorTogglesDisabled => "connector_toggles_disabled",
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
             ApiError::QueryRejected(_) => "query_rejected",
@@ -270,6 +274,10 @@ impl IntoResponse for ApiError {
             ApiError::ProvisioningUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "provisioning not configured",
+            ),
+            ApiError::ConnectorTogglesDisabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector toggles are not enabled",
             ),
             ApiError::WebhookNotConfigured => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -628,6 +636,10 @@ async fn admin_toggle_connector(
     Path((tenant_id, slug)): Path<(String, String)>,
     Json(body): Json<admin::ToggleConnectorRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Not in v1.0 (docs/PROJECT_SCOPE.md): nothing reads the toggles.
+    if !state.config.features.admin_connector_toggles {
+        return Err(ApiError::ConnectorTogglesDisabled);
+    }
     let provisioning = provisioning_service(&state)?;
     let tenant: TenantId = tenant_id
         .parse()

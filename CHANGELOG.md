@@ -305,6 +305,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* The admin connector toggle route,
+  `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
+  (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
+  is `true`, which defaults to false: the toggles are not in v1.0 and
+  nothing reads them (`docs/PROJECT_SCOPE.md`).
 * `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
   (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
   fixed release) do not fail the dependency audit: they report
