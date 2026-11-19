@@ -660,7 +660,8 @@ impl QueryKeySession for ReleasedKeySession {
 #[async_trait]
 impl EnclaveKeyProvider for AttestedKeyProvider {
     /// Released keys are `HPK2` in every mode
-    /// ([`EnclaveIdentity::unwrap_released_key`]).
+    /// ([`EnclaveIdentity::unwrap_released_key`]). Whether `key-release`
+    /// holds one for the tenant is known only at release, which fails then.
     fn key_suite(&self, _tenant: TenantId) -> Option<EnvelopeSuite> {
         Some(EnvelopeSuite::Hpk2)
     }

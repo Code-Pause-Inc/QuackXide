@@ -76,9 +76,12 @@ impl<P: EnclaveKeyProvider + ?Sized> QueryKeySession for DelegatingKeySession<'_
 /// dev-only `key_release::AttestedKeyProvider`.
 #[async_trait]
 pub trait EnclaveKeyProvider: Send + Sync {
-    /// The suite of `tenant`'s key, which a snapshot's record must name, or
-    /// `None` if this provider holds no key for `tenant`. Read before any key
-    /// is released, so a snapshot the key can never open is refused first.
+    /// The suite of any key this provider would release for `tenant`, which
+    /// a snapshot's record must name, or `None` if it can release none for
+    /// `tenant`. Read before any key is released, so a snapshot the key can
+    /// never open is refused first. It releases nothing to answer: a
+    /// provider whose keys are held elsewhere answers with the one suite it
+    /// releases, and a tenant with no key there fails at release instead.
     fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite>;
 
     async fn open_envelope(
@@ -471,7 +474,15 @@ impl ConnectorQueryService {
             );
             return Err(ApiError::Backend);
         };
-        let key_suite = self.keys.key_suite(owner).ok_or(ApiError::Backend)?;
+        let Some(key_suite) = self.keys.key_suite(owner) else {
+            security_audit_event(
+                AuditKind::DataAccess,
+                Some(owner),
+                "failed",
+                "no tenant key can be released to open the snapshot",
+            );
+            return Err(ApiError::Backend);
+        };
         if key_suite != suite {
             security_audit_event(
                 AuditKind::SuiteRefused,

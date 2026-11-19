@@ -1816,3 +1816,38 @@ async fn resource_limit_refusals_are_audited() {
         );
     }
 }
+
+/// A snapshot no key can be released for is refused before any key release,
+/// with a `data.access` failure naming why.
+#[tokio::test]
+async fn a_snapshot_with_no_releasable_key_is_audited() {
+    let capture = AuditCapture::install();
+    let owner = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let vault = synced_vault(owner, &keypair, 1).await;
+    // The provider holds a key, but another tenant's.
+    let keys = DevKeyProvider::new(TenantId::generate(), keypair);
+    let service = ConnectorQueryService::new(
+        vault,
+        Arc::new(keys),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
+        },
+        false,
+    );
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let refused = service
+        .query(owner, &connector, "SELECT COUNT(*) AS n FROM quickbooks")
+        .await;
+    assert!(matches!(refused, Err(ApiError::Backend)));
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "failed",
+        owner,
+        "no tenant key can be released to open the snapshot",
+    );
+}
