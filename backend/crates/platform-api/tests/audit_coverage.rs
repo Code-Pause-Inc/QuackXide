@@ -28,7 +28,10 @@ use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
 
-use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
+use common::{
+    app_state, assert_event, bearer, call, dev_attestation, grant_body, json_header, post, send,
+    synced_vault,
+};
 
 const SECRET: &str = "audit-itest-secret";
 const PADDLE_SECRET: &str = "pdl_ntfset_audit_secret";
@@ -896,12 +899,8 @@ async fn research_catalog_is_audited() {
 
     // Re-granting the revoked grant tops its budget up, and so does a
     // follow-up approval; each is audited as a budget top-up.
-    let with_budget = |units: u64| {
-        format!(
-            r#"{{"researcher_tenant":"{researcher}","connector":"health","query_budget":{units}}}"#
-        )
-    };
-    let (status, regranted) = post(&app, "/api/v1/grants", &stoken, &with_budget(4)).await;
+    let (status, regranted) =
+        post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 4)).await;
     assert_eq!(status, StatusCode::OK, "re-grant: {regranted}");
     let regrant_limit = regranted["budget"]["limit"].as_u64().expect("limit");
     let (status, follow_up) = post(&app, &request_uri, &rtoken, "{}").await;
@@ -991,6 +990,12 @@ async fn research_catalog_is_audited() {
     );
     assert_event(
         &capture,
+        "tenant.provisioned",
+        "ok",
+        &format!("reactivated researcher={researcher} connector=health grant={grant_id}"),
+    );
+    assert_event(
+        &capture,
         "research.budget",
         "ok",
         &format!("top_up grant={grant_id} added=4 limit={regrant_limit}"),
@@ -1008,17 +1013,6 @@ async fn research_catalog_is_audited() {
         count_outcome(&capture, "research.budget", "ok"),
         2,
         "a retried follow-up adds nothing and audits nothing"
-    );
-}
-
-/// Asserts an event of `kind` with this outcome and exactly this detail.
-fn assert_event(capture: &AuditCapture, kind: &str, outcome: &str, detail: &str) {
-    let events = capture.events();
-    assert!(
-        events
-            .iter()
-            .any(|e| e.audit_kind == kind && e.outcome == outcome && e.detail == detail),
-        "no {kind} {outcome} event {detail:?} in {events:?}"
     );
 }
 

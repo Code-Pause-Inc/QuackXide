@@ -448,11 +448,13 @@ budget can still be read and topped up, which does not restore access.
 refused with 409 (a `tenant.provisioned` `denied` event) and a body that
 points to `POST /api/v1/grants/{grant_id}/budget`, where the steward raises
 the budget. A grant with no budget yet (a failed approval left it so) is
-funded. A revoked grant is re-activated first and then gets the new budget
-on top of its old one; if that funding fails, the grant stays active with
-its old budget and a retry is refused like any direct grant of an active grant, so
-nothing is added twice or dropped. Every top-up of an existing budget emits
-a `research.budget` event. Direct grants, approvals, top-ups and revokes take
+funded. A revoked grant is re-activated first, with a `tenant.provisioned`
+`reactivated` event at once, and keeps its budget: the request's
+`query_budget` is added on top, and nothing when it is omitted. If that
+funding fails, the grant stays active with its old budget; a retry is then
+refused like any direct grant of an active grant if the grant already had a
+budget, and funds it otherwise, so nothing is added twice or dropped. Every
+top-up that raises the limit emits a `research.budget` event. Direct grants, approvals, top-ups and revokes take
 one lock, because a grant and its budget live in two stores; that holds in one
 process, and several instances need conditional writes in the durable stores
 (P61, P62). Metering rides the `engine.query` event and doubles as the
@@ -484,8 +486,10 @@ leaves no placeholder entry. A
 pending request whose listing has been unpublished can be denied but not
 approved (404, `denied` event). The approval is recorded first, with its
 query budget, so a failure
-partway leaves an approved request without a usable grant, never a grant
-behind a pending or denied one, and the steward's retry re-runs the
+partway leaves an approved request, never a grant behind a pending or
+denied one. A new grant is then unusable until funded; a revoked grant the
+approval re-activated (audited at once, as a direct grant's) is usable on
+its old budget. The steward's retry re-runs the
 idempotent grant and budget steps with the approved budget; a retry cannot
 change it. A retry never undoes a revoke: while the steward's grant to that
 researcher for that connector is revoked, the retry is refused (404) with a
@@ -626,7 +630,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
-| `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
+| `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created, re-activated, refused and revoked, and refused revokes |
 | `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
 | `engine.query` | Every confidential query, with metering fields |
@@ -638,7 +642,7 @@ Grant events stay under `tenant.provisioned` rather than a `research.grant`
 kind of their own: a grant is the steward provisioning access to its own
 tenant's data, and keeping them there keeps the audit vocabulary
 (`AuditKind`) fixed. Their details tell them apart (`granted …`,
-`revoked …`, `revoke refused …`). Budget actions on a grant are
+`reactivated …`, `grant refused …`, `revoked …`, `revoke refused …`). Budget actions on a grant are
 `research.budget`, and a research query's grant check is an
 `auth.decision`. A refused revoke, top-up or budget read records the
 caller's tenant and the grant id, or `grant=malformed` when the path

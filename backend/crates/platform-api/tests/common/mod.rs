@@ -319,6 +319,30 @@ pub fn dev_attestation() -> Arc<dyn AttestationProvider> {
     Arc::new(DevAttestation::allow_insecure_dev())
 }
 
+/// A `POST /api/v1/grants` body granting `researcher` the `health` dataset
+/// with `query_budget` units.
+pub fn grant_body(researcher: TenantId, query_budget: u64) -> String {
+    format!(
+        r#"{{"researcher_tenant":"{researcher}","connector":"health","query_budget":{query_budget}}}"#
+    )
+}
+
+/// Asserts an event of `kind` with this outcome and exactly this detail.
+pub fn assert_event(
+    capture: &platform_telemetry::capture::AuditCapture,
+    kind: &str,
+    outcome: &str,
+    detail: &str,
+) {
+    let events = capture.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.audit_kind == kind && e.outcome == outcome && e.detail == detail),
+        "no {kind} {outcome} event {detail:?} in {events:?}"
+    );
+}
+
 // ── Steward uploads (ADR 0012) ──
 
 /// A declared schema from `(name, type)` pairs.
