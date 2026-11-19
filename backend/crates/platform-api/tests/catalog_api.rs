@@ -362,7 +362,11 @@ async fn unpublish_is_the_stewards_alone_and_removes_the_listing() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let outsider = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     let listing_id = listing["listing_id"].as_str().expect("id").to_owned();
