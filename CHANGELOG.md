@@ -22,8 +22,11 @@ uses [Semantic Versioning](https://semver.org/).
   bytes, base64url; 400 when missing or malformed, instead of a nonce the
   server chose) and returns ADR 0010's evidence bundle, and the key-release
   stand-in checks binding v2 and refuses a request key that is not `HPK2`
-  (audited as `crypto.suite_refused`). The sealed-query wire types are
-  defined; nothing routes to them yet. The public evidence token carries
+  (audited as `crypto.suite_refused`). A key-release request carries every
+  bound value, the KMS public key included, with its byte fields in
+  base64url as ADR 0010 sets out. The sealed-query wire types are
+  defined, with result signatures (`SignatureWire`) a type apart from the
+  signing keys; nothing routes to them yet. The public evidence token carries
   the audience `urn:platform:browser-attestation`, which key release
   refuses, so a caller who fetches it cannot open key release.
   ADR 0005 and ADR 0010 are accepted.

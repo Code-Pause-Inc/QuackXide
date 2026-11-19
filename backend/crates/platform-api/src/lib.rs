@@ -509,12 +509,7 @@ async fn get_attestation(
     let nonce: [u8; 32] = query
         .nonce
         .as_deref()
-        .and_then(|raw| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(raw)
-                .ok()
-        })
-        .and_then(|bytes| bytes.try_into().ok())
+        .and_then(key_release::decode_b64url_32)
         .ok_or(ApiError::BadRequest(
             "attestation nonce must be 32 bytes of base64url",
         ))?;

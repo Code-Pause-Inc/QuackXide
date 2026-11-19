@@ -35,7 +35,6 @@ use platform_config::PlatformConfig;
 use platform_connectors::snapshot::SnapshotWriter;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
-use platform_enclave::AttestationProvider;
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
@@ -43,6 +42,7 @@ use platform_enclave::token::{
     BROWSER_ATTESTATION_AUDIENCE, JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError,
     TokenVerifier, nonces_from_bytes,
 };
+use platform_enclave::{AttestationProvider, EnclaveKeyBinding};
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::EngineSettings;
@@ -162,20 +162,38 @@ fn request(
     nonce_b64: &str,
     token: String,
 ) -> KeyReleaseRequest {
+    request_bound_to(tenant, identity, identity.binding(), nonce_b64, token)
+}
+
+/// As [`request`], carrying `binding`'s KMS key, TLS key digest and
+/// configuration digest in place of `identity`'s.
+fn request_bound_to(
+    tenant: TenantId,
+    identity: &EnclaveIdentity,
+    binding: &EnclaveKeyBinding,
+    nonce_b64: &str,
+    token: String,
+) -> KeyReleaseRequest {
     KeyReleaseRequest {
         tenant_id: tenant.to_string(),
         nonce_b64: nonce_b64.to_owned(),
         token,
         request_key: KeyWire::from_public_key(&identity.request_public_key()),
-        signing_keys: SigningKeysWire::from_verifying_keys(&identity.verifying_keys()),
-        tls_spki_sha256: identity.binding().tls_spki_sha256.map(|d| B64URL.encode(d)),
-        config_digest_b64: B64.encode(identity.binding().config_digest),
+        signing_keys: identity.signing_keys().clone(),
+        kms_public_key: (!binding.kms_public_key.is_empty())
+            .then(|| B64URL.encode(&binding.kms_public_key)),
+        tls_spki_sha256: binding.tls_spki_sha256.map(|d| B64URL.encode(d)),
+        config_digest_b64: B64URL.encode(binding.config_digest),
     }
 }
 
 fn binding_nonces(identity: &EnclaveIdentity, nonce_b64: &str) -> Vec<String> {
-    let nonce: [u8; 32] = B64.decode(nonce_b64).unwrap().try_into().unwrap();
-    nonces_from_bytes(&identity.binding().report_data(&nonce)).unwrap()
+    nonces_for(identity.binding(), nonce_b64)
+}
+
+fn nonces_for(binding: &EnclaveKeyBinding, nonce_b64: &str) -> Vec<String> {
+    let nonce: [u8; 32] = B64URL.decode(nonce_b64).unwrap().try_into().unwrap();
+    nonces_from_bytes(&binding.report_data(&nonce)).unwrap()
 }
 
 /// Ask `rp` to release `tenant`'s key with a token from `token_signer`.
@@ -468,6 +486,43 @@ async fn replayed_challenge_is_refused() {
     );
 }
 
+/// Every value the token binds travels in the request, so the relying party
+/// rebuilds the same binding: a KMS key (P50), and byte fields whose
+/// base64url has `-` and `_` (ADR 0010).
+#[tokio::test]
+async fn a_binding_with_a_kms_key_and_url_safe_bytes_is_released() {
+    let rp = static_rp();
+    let tenant = enrolled(&rp);
+    let identity = EnclaveIdentity::generate();
+    let binding = EnclaveKeyBinding {
+        kms_public_key: vec![0xfb; 40],
+        config_digest: [0xfb; 32],
+        ..identity.binding().clone()
+    };
+    let challenge = rp.issue_challenge();
+    let nonces = nonces_for(&binding, &challenge.nonce_b64);
+    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    let req = request_bound_to(tenant, &identity, &binding, &challenge.nonce_b64, token);
+    assert!(
+        req.config_digest_b64.contains(['-', '_']),
+        "{}",
+        req.config_digest_b64
+    );
+    assert!(rp.release_key(&req).await.is_ok());
+
+    // Without the KMS key the rebuilt binding differs from the token's.
+    let challenge = rp.issue_challenge();
+    let nonces = nonces_for(&binding, &challenge.nonce_b64);
+    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    let mut req = request_bound_to(tenant, &identity, &binding, &challenge.nonce_b64, token);
+    req.kms_public_key = None;
+    assert!(matches!(
+        rp.release_key(&req).await,
+        Err(platform_api::ApiError::Forbidden)
+    ));
+    assert_eq!(rp.release_count(), 1);
+}
+
 #[tokio::test]
 async fn token_bound_to_other_keys_is_refused() {
     let rp = static_rp();
@@ -553,7 +608,7 @@ async fn a_public_attestation_token_does_not_open_key_release() {
     // The attacker takes a live key-release challenge and has the public
     // route bind its nonce.
     let challenge = rp.issue_challenge();
-    let nonce = B64.decode(&challenge.nonce_b64).unwrap();
+    let nonce = B64URL.decode(&challenge.nonce_b64).unwrap();
     let (status, body) = send(
         &app,
         "GET",
@@ -588,16 +643,11 @@ async fn an_hpk1_request_key_is_refused() {
     // A token correctly bound to an HPK1 request key: only the suite policy
     // refuses it.
     let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
-    let binding = platform_enclave::EnclaveKeyBinding {
+    let binding = EnclaveKeyBinding {
         request_key: hpk1.to_framed(),
         ..identity.binding().clone()
     };
-    let nonce: [u8; 32] = B64
-        .decode(&challenge.nonce_b64)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let nonces = nonces_from_bytes(&binding.report_data(&nonce)).unwrap();
+    let nonces = nonces_for(&binding, &challenge.nonce_b64);
     let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
     let mut req = request(tenant, &identity, &challenge.nonce_b64, token);
     req.request_key = KeyWire::from_public_key(&hpk1);

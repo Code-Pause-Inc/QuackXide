@@ -35,6 +35,9 @@ pub use stand_in::*;
 pub struct EnclaveIdentity {
     request: TenantKeypair,
     signing: ResultSigningKey,
+    /// The verifying keys as the wire carries them, encoded once: the
+    /// public attestation route and every key release send them.
+    signing_keys: SigningKeysWire,
     binding: EnclaveKeyBinding,
     key_id: String,
 }
@@ -65,6 +68,7 @@ impl EnclaveIdentity {
         Self {
             request,
             signing,
+            signing_keys: SigningKeysWire::from_verifying_keys(&verifying),
             binding,
             key_id,
         }
@@ -85,6 +89,10 @@ impl EnclaveIdentity {
 
     pub fn verifying_keys(&self) -> ResultVerifyingKeys {
         self.signing.verifying_keys()
+    }
+
+    pub fn signing_keys(&self) -> &SigningKeysWire {
+        &self.signing_keys
     }
 
     /// Open a frame sealed to the request key, inside enclave memory.
@@ -173,8 +181,9 @@ impl KeyWire {
     }
 }
 
-/// The two result-signing keys, or the two signatures over a result,
-/// base64url without padding (ADR 0010).
+/// The two result-signing keys, base64url without padding (ADR 0010). The
+/// signatures over a result are [`SignatureWire`](crate::sealed::SignatureWire),
+/// so neither can stand in for the other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SigningKeysWire {
@@ -222,12 +231,18 @@ impl AttestationBundle {
             key_id: identity.key_id().to_owned(),
             token,
             request_key: KeyWire::from_public_key(&identity.request_public_key()),
-            signing_keys: SigningKeysWire::from_verifying_keys(&identity.verifying_keys()),
+            signing_keys: identity.signing_keys().clone(),
             kms_public_key: (!binding.kms_public_key.is_empty())
                 .then(|| B64URL.encode(&binding.kms_public_key)),
             tls_spki_sha256: binding.tls_spki_sha256.map(|d| B64URL.encode(d)),
         }
     }
+}
+
+/// 32 bytes of base64url without padding (ADR 0010's byte fields), or
+/// `None` for anything else.
+pub(crate) fn decode_b64url_32(b64: &str) -> Option<[u8; 32]> {
+    B64URL.decode(b64).ok()?.try_into().ok()
 }
 
 #[cfg(test)]

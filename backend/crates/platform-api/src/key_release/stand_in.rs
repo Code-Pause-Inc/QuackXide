@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
-use super::{EnclaveIdentity, KeyWire, SigningKeysWire};
+use super::{EnclaveIdentity, KeyWire, SigningKeysWire, decode_b64url_32};
 use crate::ApiError;
 use crate::query::{EnclaveKeyProvider, QueryKeySession, open_tenant_envelope};
 
@@ -69,13 +69,18 @@ pub struct ChallengeResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every value the token's binding covers travels here, so the relying party
+/// rebuilds exactly the binding the enclave attested. Byte fields are
+/// base64url without padding (ADR 0010).
 pub struct KeyReleaseRequest {
     pub tenant_id: String,
     pub nonce_b64: String,
     pub token: String,
     pub request_key: KeyWire,
     pub signing_keys: SigningKeysWire,
-    /// base64url without padding; `None` until P67.
+    /// `None` until P50.
+    pub kms_public_key: Option<String>,
+    /// `None` until P67.
     pub tls_spki_sha256: Option<String>,
     pub config_digest_b64: String,
 }
@@ -233,7 +238,7 @@ impl KeyReleaseRelyingParty {
         }
         challenges.insert(nonce, now);
         ChallengeResponse {
-            nonce_b64: B64.encode(nonce),
+            nonce_b64: URL_SAFE_NO_PAD.encode(nonce),
         }
     }
 
@@ -295,7 +300,7 @@ impl KeyReleaseRelyingParty {
             ApiError::Forbidden
         })?;
 
-        let nonce = decode_32(&req.nonce_b64).ok_or_else(|| {
+        let nonce = decode_b64url_32(&req.nonce_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed challenge nonce");
             ApiError::Forbidden
         })?;
@@ -337,20 +342,21 @@ impl KeyReleaseRelyingParty {
             self.audit_denial(tenant, "malformed result-signing keys");
             ApiError::Forbidden
         })?;
+        let kms_public_key = match req.kms_public_key.as_deref() {
+            None => Vec::new(),
+            Some(b64) => URL_SAFE_NO_PAD.decode(b64).map_err(|_| {
+                self.audit_denial(tenant, "malformed KMS public key");
+                ApiError::Forbidden
+            })?,
+        };
         let tls_spki_sha256 = match req.tls_spki_sha256.as_deref() {
             None => None,
-            Some(b64) => Some(
-                URL_SAFE_NO_PAD
-                    .decode(b64)
-                    .ok()
-                    .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
-                    .ok_or_else(|| {
-                        self.audit_denial(tenant, "malformed TLS key digest");
-                        ApiError::Forbidden
-                    })?,
-            ),
+            Some(b64) => Some(decode_b64url_32(b64).ok_or_else(|| {
+                self.audit_denial(tenant, "malformed TLS key digest");
+                ApiError::Forbidden
+            })?),
         };
-        let config_digest = decode_32(&req.config_digest_b64).ok_or_else(|| {
+        let config_digest = decode_b64url_32(&req.config_digest_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed config digest");
             ApiError::Forbidden
         })?;
@@ -367,7 +373,7 @@ impl KeyReleaseRelyingParty {
             request_key: request_key.to_framed(),
             signing_ed25519: signing_keys.ed25519_bytes(),
             signing_ml_dsa_65: signing_keys.ml_dsa_65_bytes(),
-            kms_public_key: Vec::new(),
+            kms_public_key,
             tls_spki_sha256,
             config_digest,
         };
@@ -600,7 +606,7 @@ impl AttestedKeyProvider {
             );
             ApiError::AttestationUnavailable
         })?;
-        let nonce = decode_32(&challenge.nonce_b64).ok_or_else(|| {
+        let nonce = decode_b64url_32(&challenge.nonce_b64).ok_or_else(|| {
             security_audit_event(
                 AuditKind::KeyRelease,
                 Some(tenant),
@@ -630,9 +636,11 @@ impl AttestedKeyProvider {
             nonce_b64: challenge.nonce_b64,
             token: evidence.token,
             request_key: KeyWire::from_public_key(&self.identity.request_public_key()),
-            signing_keys: SigningKeysWire::from_verifying_keys(&self.identity.verifying_keys()),
+            signing_keys: self.identity.signing_keys().clone(),
+            kms_public_key: (!binding.kms_public_key.is_empty())
+                .then(|| URL_SAFE_NO_PAD.encode(&binding.kms_public_key)),
             tls_spki_sha256: binding.tls_spki_sha256.map(|d| URL_SAFE_NO_PAD.encode(d)),
-            config_digest_b64: B64.encode(binding.config_digest),
+            config_digest_b64: URL_SAFE_NO_PAD.encode(binding.config_digest),
         };
 
         // A refusal (403) or outage (503) at the stand-in is "attestation
@@ -685,11 +693,6 @@ impl EnclaveKeyProvider for AttestedKeyProvider {
         let keypair = self.acquire_keypair(tenant).await?;
         Ok(Box::new(ReleasedKeySession { tenant, keypair }))
     }
-}
-
-fn decode_32(b64: &str) -> Option<[u8; 32]> {
-    let raw = B64.decode(b64.trim()).ok()?;
-    raw.try_into().ok()
 }
 
 #[derive(Deserialize)]

@@ -40,7 +40,7 @@ enclave-api                      sim-attestation              key-release-servic
 3. POST /v1/token ─────────────▶ signs RS256 token with
    {audience, nonces}              the binding as eat_nonce
                  ◀────────────────
-4. POST /v1/release {tenant, token, public keys} ────────────▶ consumes the nonce, recomputes the binding,
+4. POST /v1/release {tenant, token, bound values} ──────────▶ consumes the nonce, recomputes the binding,
                                                                TokenVerifier + release policy,
                                                                seals the tenant key to the enclave HPKE key
 5. unwraps in RAM → decrypts the snapshot → query → zeroizes

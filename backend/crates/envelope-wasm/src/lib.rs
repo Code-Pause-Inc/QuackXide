@@ -123,11 +123,7 @@ pub fn research_result_info(researcher_tenant: &str, query: &str) -> Result<Vec<
 /// The `info` string for a research query sealed to the enclave, checked as
 /// [`steward_upload_info`].
 pub fn research_query_info(tenant: &str, grant_id: &str) -> Result<Vec<u8>, CryptoError> {
-    Ok(info::research_query(
-        SUITE,
-        info::check_field(tenant)?,
-        info::check_field(grant_id)?,
-    ))
+    info::research_query(SUITE, tenant, grant_id)
 }
 
 /// The `query` field of a research result's `info` string. The grant id is
@@ -142,12 +138,7 @@ pub fn research_query_binding(
     let request_nonce: &[u8; 32] = request_nonce
         .try_into()
         .map_err(|_| CryptoError::InvalidInfoField)?;
-    info::research_query_binding(
-        info::check_field(grant_id)?,
-        request_nonce,
-        sql,
-        schema_version.as_deref(),
-    )
+    info::research_query_binding(grant_id, request_nonce, sql, schema_version.as_deref())
 }
 
 // ── wasm exports ─────────────────────────────────────────────────────────────

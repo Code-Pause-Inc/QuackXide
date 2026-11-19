@@ -5,11 +5,12 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use platform_crypto::{CryptoError, ResultSignature};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::ApiError;
-use crate::key_release::{KeyWire, SigningKeysWire};
+use crate::key_release::{KeyWire, decode_b64url_32};
 
 /// `POST /api/v1/research/query`'s sealed body. `grant_id` is in the clear,
 /// because the enclave needs `info` before it can open `envelope`.
@@ -62,13 +63,9 @@ impl SealedQueryPlaintext {
 
     /// The request nonce's 32 bytes; anything else is a 400.
     pub fn request_nonce_bytes(&self) -> Result<[u8; 32], ApiError> {
-        URL_SAFE_NO_PAD
-            .decode(&self.request_nonce)
-            .ok()
-            .and_then(|raw| raw.try_into().ok())
-            .ok_or(ApiError::BadRequest(
-                "request nonce must be 32 bytes of base64url",
-            ))
+        decode_b64url_32(&self.request_nonce).ok_or(ApiError::BadRequest(
+            "request nonce must be 32 bytes of base64url",
+        ))
     }
 }
 
@@ -80,7 +77,36 @@ pub struct SealedQueryResponse {
     pub version: u32,
     pub key_id: String,
     pub sealed_result: String,
-    pub signature: SigningKeysWire,
+    pub signature: SignatureWire,
+}
+
+/// Both signatures over a sealed result, base64url without padding (ADR
+/// 0010). A type of its own, so a signature cannot be passed where keys are
+/// expected (`SigningKeysWire`), nor keys where a signature is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureWire {
+    pub ed25519: String,
+    pub ml_dsa_65: String,
+}
+
+impl SignatureWire {
+    pub fn from_signature(signature: &ResultSignature) -> Self {
+        Self {
+            ed25519: URL_SAFE_NO_PAD.encode(signature.ed25519),
+            ml_dsa_65: URL_SAFE_NO_PAD.encode(&signature.ml_dsa_65),
+        }
+    }
+
+    /// Malformed base64url or a wrong length is `SignatureInvalid`.
+    pub fn to_signature(&self) -> Result<ResultSignature, CryptoError> {
+        let decode = |b64: &str| {
+            URL_SAFE_NO_PAD
+                .decode(b64)
+                .map_err(|_| CryptoError::SignatureInvalid)
+        };
+        ResultSignature::from_bytes(&decode(&self.ed25519)?, &decode(&self.ml_dsa_65)?)
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +162,27 @@ mod tests {
             "signature": { "ed25519": "a", "ml_dsa_65": "b" },
         });
         assert!(serde_json::from_value::<SealedQueryResponse>(with_extra(response)).is_err());
+    }
+
+    #[test]
+    fn a_signature_round_trips_and_a_malformed_one_is_refused() {
+        let signature = platform_crypto::ResultSigningKey::generate().sign(b"info", b"frame");
+        let wire = SignatureWire::from_signature(&signature);
+        assert_eq!(wire.to_signature().expect("parses"), signature);
+        let padded = SignatureWire {
+            ed25519: base64::engine::general_purpose::URL_SAFE.encode(signature.ed25519),
+            ..wire.clone()
+        };
+        let short = SignatureWire {
+            ml_dsa_65: URL_SAFE_NO_PAD.encode(&signature.ml_dsa_65[1..]),
+            ..wire
+        };
+        for bad in [padded, short] {
+            assert!(matches!(
+                bad.to_signature(),
+                Err(CryptoError::SignatureInvalid)
+            ));
+        }
     }
 
     #[test]

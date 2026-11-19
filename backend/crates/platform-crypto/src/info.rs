@@ -89,13 +89,20 @@ pub fn research_result(
 
 /// A research query sealed to the enclave's request key (ADR 0010 "Sealed
 /// request"): `{tenant}` is the session's tenant, `{grant_id}` the grant the
-/// query runs under, sent in the clear beside the frame.
+/// query runs under, sent in the clear beside the frame. The enclave builds
+/// this from a request, so both fields are checked ([`check_field`]).
 pub fn research_query(
     suite: EnvelopeSuite,
-    tenant: impl Display,
-    grant_id: impl Display,
-) -> Vec<u8> {
-    format!("research-query-{}|{tenant}|{grant_id}", version(suite)).into_bytes()
+    tenant: &str,
+    grant_id: &str,
+) -> Result<Vec<u8>, CryptoError> {
+    Ok(format!(
+        "research-query-{}|{}|{}",
+        version(suite),
+        check_field(tenant)?,
+        check_field(grant_id)?
+    )
+    .into_bytes())
 }
 
 const QUERY_BINDING_TAG: &[u8] = b"research-query-binding-v1";
@@ -104,13 +111,15 @@ const QUERY_BINDING_TAG: &[u8] = b"research-query-binding-v1";
 /// of SHA-256 over the tag and, each after its `u32` big-endian length, the
 /// grant id, the request nonce, SHA-256 of the SQL text and the result
 /// schema version (ADR 0010). An absent schema version is the empty field,
-/// so a present one must not be empty.
+/// so a present one must not be empty. The grant id is checked
+/// ([`check_field`]).
 pub fn research_query_binding(
     grant_id: &str,
     request_nonce: &[u8; 32],
     sql: &str,
     schema_version: Option<&str>,
 ) -> Result<String, CryptoError> {
+    check_field(grant_id)?;
     if schema_version == Some("") {
         return Err(CryptoError::InvalidInfoField);
     }
@@ -163,8 +172,14 @@ mod tests {
             b"steward-upload-v2|t|d|o"
         );
         assert_eq!(research_result(Hpk2, "t", "q"), b"research-result-v2|t|q");
-        assert_eq!(research_query(Hpk1, "t", "g"), b"research-query-v1|t|g");
-        assert_eq!(research_query(Hpk2, "t", "g"), b"research-query-v2|t|g");
+        assert_eq!(
+            research_query(Hpk1, "t", "g").unwrap(),
+            b"research-query-v1|t|g"
+        );
+        assert_eq!(
+            research_query(Hpk2, "t", "g").unwrap(),
+            b"research-query-v2|t|g"
+        );
     }
 
     const GRANT: &str = "11111111-2222-4333-8444-555555555555";
@@ -182,6 +197,20 @@ mod tests {
             research_query_binding(GRANT, &nonce, SQL, None).expect("binding"),
             "RrAaM53KoifkboFugVTgwANY9D0l8ewR2MERgev1yOo"
         );
+    }
+
+    #[test]
+    fn a_research_query_refuses_an_empty_or_separated_grant_id() {
+        for grant in ["", "a|b"] {
+            assert!(matches!(
+                research_query(EnvelopeSuite::Hpk2, "tenant", grant),
+                Err(CryptoError::InvalidInfoField)
+            ));
+            assert!(matches!(
+                research_query_binding(grant, &[0x66; 32], SQL, None),
+                Err(CryptoError::InvalidInfoField)
+            ));
+        }
     }
 
     #[test]
