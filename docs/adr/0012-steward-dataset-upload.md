@@ -103,8 +103,9 @@ without key release:
 * for an upload only, `row_cap` and `schema`: what the steward declared.
 
 A query refuses a snapshot without a valid record (502). A valid record
-names a suite this build reads (`EnvelopeSuite::from_id`), so an unknown
-suite fails closed before any key is released. P39 reads the suite from
+names a suite this build reads (`EnvelopeSuite::from_id`) and the suite
+of the tenant's key, so either mismatch fails closed before any key is
+released or budget charged. P39 reads the suite from
 the record and the write time from the version, without opening
 anything.
 
@@ -225,7 +226,8 @@ not what the API stores.
 | Body or object over the limit | 413 | denied, `too_large` |
 | Malformed body, header, or envelope frame | 422 | denied, with the reason |
 | Frame of a suite the deployment refuses (`HPK1` in production, ADR 0007) | 422 | denied, `suite_refused`, and `crypto.suite_refused` |
-| Frame of another suite than the tenant's enrolled key, or, with no enrolled key, than the current snapshot's | 422 | denied, `suite_mismatch`, and `crypto.suite_refused` |
+| Frame of another suite than the tenant's enrolled key | 422 | denied, `enrolled_suite_mismatch`, and `crypto.suite_refused` |
+| With no enrolled key, frame of another suite than the current snapshot's | 422 | denied, `snapshot_suite_mismatch`, and `crypto.suite_refused` |
 | Version more than five minutes ahead | 422 | denied, `version_ahead` |
 | Declared schema unlike the recorded one | 422 | denied, `schema_mismatch` |
 | Version not newer than the current one, or another write committed it or recorded it differently first | 409 | denied, `stale_version` |

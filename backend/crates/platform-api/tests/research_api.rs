@@ -29,7 +29,7 @@ use platform_tenancy::{
     BudgetError, BudgetLedger, BudgetState, DatasetGrant, GrantOutcome, GrantRegistry,
     InMemoryBudgetLedger, InMemoryGrantRegistry, TenancyError,
 };
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 use common::{call, dev_attestation, post};
 
@@ -191,6 +191,7 @@ fn the_release_path_refuses_a_stack_holding_an_hpk1_key() {
     let settings = EngineSettings {
         zk: ZkMode::Disabled,
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     };
     stack.query_service(settings, research);
 }
@@ -302,6 +303,63 @@ async fn refused_attestation_charges_no_budget() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(budget["spent"], 0, "budget: {budget}");
     }
+}
+
+/// A snapshot sealed before the steward's key moved to `HPK2` (record and
+/// envelopes `HPK1`) can never open: the query is refused before its budget
+/// is charged.
+#[tokio::test]
+async fn a_snapshot_the_key_cannot_open_charges_no_budget() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let vault: Arc<dyn platform_storage::VaultStore> =
+        Arc::new(platform_storage::ObjectStoreVault::new_in_memory());
+    let connector = ConnectorSlug::new("health").expect("slug");
+    DevResearchStack::with_vault(vault.clone())
+        .commit_snapshot(
+            steward,
+            TenantKeypair::generate(EnvelopeSuite::Hpk1),
+            &connector,
+            "cohorts",
+            &common::cohorts_parquet(),
+        )
+        .await
+        .expect("commit");
+    let app = common::upload_research_app(
+        SECRET,
+        vec![(steward, TenantKeypair::generate(EnvelopeSuite::Hpk2))],
+        vault,
+    );
+
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+
+    let (status, body) = post(
+        &app,
+        "/api/v1/research/query",
+        &token_for(researcher),
+        &format!(r#"{{"steward_tenant":"{steward}","connector":"health","sql":"{AGG_SQL}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+
+    let (status, budget) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/grants/{grant_id}/budget"),
+        &token_for(researcher),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(budget["spent"], 0, "budget: {budget}");
 }
 
 #[tokio::test]
@@ -1036,6 +1094,7 @@ async fn research_app_with_stores(
     let settings = EngineSettings {
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     };
     let research = Arc::new(ResearchService::new(stores, vault.clone(), 5, 100));
     let service = stack.query_service(settings, research.clone());

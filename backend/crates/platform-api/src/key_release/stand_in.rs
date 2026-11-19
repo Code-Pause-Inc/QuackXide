@@ -208,17 +208,31 @@ impl KeyReleaseRelyingParty {
         self.release_count.load(Ordering::SeqCst)
     }
 
-    /// Register a tenant's key material with the relying party.
-    pub fn insert_tenant_key(&self, tenant: TenantId, keypair: &TenantKeypair) {
-        self.insert_raw_tenant_key(tenant, keypair.to_private_key_bytes());
-    }
-
-    pub fn insert_raw_tenant_key(&self, tenant: TenantId, private_key_bytes: SecretBytes) {
+    /// Register a tenant's key with the relying party. Only `HPK2` keys, in
+    /// every mode: the enclave accepts no other released key
+    /// ([`EnclaveIdentity::unwrap_released_key`]), so any other would be
+    /// refused only after a query had charged its budget.
+    pub fn insert_tenant_key(
+        &self,
+        tenant: TenantId,
+        keypair: &TenantKeypair,
+    ) -> Result<(), platform_crypto::CryptoError> {
+        SuitePolicy::only(EnvelopeSuite::Hpk2)
+            .check(keypair.suite())
+            .inspect_err(|_| {
+                security_audit_event(
+                    AuditKind::SuiteRefused,
+                    Some(tenant),
+                    "denied",
+                    "refused a tenant private key that is not HPK2",
+                );
+            })?;
         let mut keys = self
             .keys
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        keys.insert(tenant, private_key_bytes);
+        keys.insert(tenant, keypair.to_private_key_bytes());
+        Ok(())
     }
 
     /// Mint a fresh 32-byte single-use challenge nonce.
@@ -467,20 +481,12 @@ impl KeyReleaseRelyingParty {
                         let raw = B64
                             .decode(req.private_key_b64.trim())
                             .map_err(|_| ApiError::BadRequest("invalid base64 private key"))?;
-                        // HPK2 only, in every mode: the e2e script is the only client.
-                        let kp = TenantKeypair::from_private_key_bytes(&raw, SuitePolicy::only(EnvelopeSuite::Hpk2))
-                            .map_err(|e| {
-                                if matches!(e, platform_crypto::CryptoError::SuiteRefused) {
-                                    security_audit_event(
-                                        AuditKind::SuiteRefused,
-                                        Some(tenant),
-                                        "denied",
-                                        "refused a tenant private key that is not HPK2",
-                                    );
-                                }
-                                ApiError::BadRequest("invalid tenant private key")
-                            })?;
-                        rp.insert_tenant_key(tenant, &kp);
+                        // Any framed key parses; `insert_tenant_key` then
+                        // refuses every suite but HPK2, in every mode.
+                        let invalid = |_| ApiError::BadRequest("invalid tenant private key");
+                        let kp = TenantKeypair::from_private_key_bytes(&raw, SuitePolicy::DEVELOPMENT)
+                            .map_err(invalid)?;
+                        rp.insert_tenant_key(tenant, &kp).map_err(invalid)?;
                         let public_key_b64 = B64.encode(kp.public_key().to_raw());
                         Ok::<_, ApiError>(Json(json!({ "public_key_b64": public_key_b64 })))
                     },
@@ -676,6 +682,13 @@ impl QueryKeySession for ReleasedKeySession {
 
 #[async_trait]
 impl EnclaveKeyProvider for AttestedKeyProvider {
+    /// Released keys are `HPK2` in every mode
+    /// ([`EnclaveIdentity::unwrap_released_key`]). Whether `key-release`
+    /// holds one for the tenant is known only at release, which fails then.
+    fn key_suite(&self, _tenant: TenantId) -> Option<EnvelopeSuite> {
+        Some(EnvelopeSuite::Hpk2)
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,

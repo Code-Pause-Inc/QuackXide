@@ -18,7 +18,7 @@ use platform_core::{TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::DevAttestation;
 use platform_storage::{ObjectStoreVault, VaultStore};
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use tower::ServiceExt;
 
 const SECRET: &str = "metrics-itest-secret";
@@ -53,6 +53,7 @@ async fn apps(tenant: TenantId) -> (Router, Router) {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );

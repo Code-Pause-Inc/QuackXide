@@ -21,7 +21,7 @@ use platform_enclave::simulated_token::{
 };
 use platform_enclave::token::ReleasePolicy;
 use platform_storage::{ObjectStoreVault, VaultStore};
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
         signer.issuer(),
         policy,
     ));
-    relying_party.insert_tenant_key(tenant, &keypair);
+    relying_party
+        .insert_tenant_key(tenant, &keypair)
+        .expect("the demo tenant's key is HPK2");
 
     let identity = Arc::new(EnclaveIdentity::generate());
     let keys = Arc::new(AttestedKeyProvider::new(
@@ -79,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     )
