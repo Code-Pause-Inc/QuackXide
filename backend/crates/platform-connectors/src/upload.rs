@@ -272,7 +272,7 @@ impl UploadCommitError {
             UploadCommitError::StaleVersion => "stale_version",
             UploadCommitError::SchemaMismatch => "schema_mismatch",
             UploadCommitError::RecordUnreadable => "record_unreadable",
-            UploadCommitError::SuiteMismatch => "suite_mismatch",
+            UploadCommitError::SuiteMismatch => "snapshot_suite_mismatch",
             UploadCommitError::Storage(_) => "storage",
         }
     }

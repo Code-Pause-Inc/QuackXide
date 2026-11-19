@@ -161,7 +161,12 @@ pub(crate) async fn put_dataset(
             "denied",
             "refused an upload sealed in a suite other than the enrolled key's",
         );
-        audit_refusal(steward, dataset.as_str(), "denied", "suite_mismatch");
+        audit_refusal(
+            steward,
+            dataset.as_str(),
+            "denied",
+            "enrolled_suite_mismatch",
+        );
         return Err(ApiError::MalformedUpload(
             "upload suite does not match the enrolled key",
         ));

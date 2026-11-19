@@ -1587,7 +1587,7 @@ async fn an_upload_in_another_suite_than_the_enrolled_key_is_audited() {
         "data.access",
         "denied",
         steward,
-        "upload refused dataset=upload_cohorts reason=suite_mismatch",
+        "upload refused dataset=upload_cohorts reason=enrolled_suite_mismatch",
     );
 }
 
@@ -1653,7 +1653,7 @@ async fn an_upload_in_another_suite_than_the_snapshot_is_audited() {
         "data.access",
         "denied",
         steward,
-        "upload refused dataset=upload_cohorts reason=suite_mismatch",
+        "upload refused dataset=upload_cohorts reason=snapshot_suite_mismatch",
     );
 }
 
