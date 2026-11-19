@@ -44,7 +44,7 @@ use platform_enclave::token::{
 };
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::InMemoryTenantRegistry;
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -244,6 +244,7 @@ async fn attestation_endpoint_returns_a_token_bound_to_caller_nonce_and_identity
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     )
@@ -352,6 +353,7 @@ async fn end_to_end_query_and_research_query_over_http_key_release_and_once_per_
         EngineSettings {
             zk: ZkMode::Enabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     )
@@ -740,6 +742,7 @@ async fn query_still_answers_503_when_the_stand_in_refuses() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );

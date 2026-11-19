@@ -8,6 +8,38 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
+  seeding it at startup. The dev-only `seal-upload` binary, run on demand
+  as its own image with no network, plays the steward's browser: it seals
+  a synthetic cohort and its manifest to the steward's public key
+  (ADR 0012) and writes the upload body, which the script sends through
+  `PUT /api/v1/datasets/{dataset}` before it publishes the dataset and
+  runs the research lifecycle on it. The script also checks that an upload
+  is refused without a token (401), outside the upload namespace (404) and
+  at a stale version (409), that an approval retry after a revoke is
+  refused (404), and, after the upload and again after the queries, that
+  the vault holds exactly the upload's object and manifest as `HPK1`
+  envelopes and its record, whose row cap and schema are the ones the
+  steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
+  `enclave-api`. The API tests seal uploads with the same code
+  (`platform_api::dev::seal_upload`), and CI checks that release builds
+  cannot contain `seal-upload`.
+* Steward dataset listing (P39): `GET /api/v1/datasets` lists every
+  research dataset the caller's tenant holds, connectors' and uploads'
+  alike: exactly those it may publish, decided by the same function as
+  `platform_connectors::snapshot::holds`. Each entry gives the dataset id,
+  the current snapshot's version and write time, the ids, count and total
+  ciphertext bytes of the objects stored at that version, and the suite
+  its plaintext record names, all read without opening anything;
+  superseded snapshots and uploads that have not committed are not
+  counted, and a snapshot that an upload or sync replaces during the
+  listing is described as the new one. The tenant comes from the token
+  only. The route needs no query service, refuses more than
+  `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
+  and answers a storage failure with 503 or 502, never an empty list; each
+  listing is audited as `data.access`. `platform_connectors::snapshot`
+  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
@@ -265,6 +297,40 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
+  (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
+  fixed release) do not fail the dependency audit: they report
+  maintenance, not a vulnerability, and arrow, DataFusion 55 and
+  object_store 0.13 depend on these crates until they move off `chrono`.
+* Per-query resource limits (ADR 0013, proposed; P52;
+  `platform_core::QueryLimits`, read by `platform-config`; each bounded,
+  and an invalid value refuses startup).
+  A query's scope runs in a fixed memory pool (`QUERY_MEMORY_MIB`) with
+  DataFusion's disk manager disabled, so a sort or aggregation that runs
+  out of memory fails instead of spilling decrypted rows to disk. A query
+  waits at most `QUERY_SLOT_WAIT_SECS` for a plaintext slot (503 with
+  `Retry-After`, distinct from the unwired 503) and holds plaintext within
+  `QUERY_TIMEOUT_SECS` (503). Before any key is released, the snapshot's
+  stored objects must fit `QUERY_MAX_INPUT_OBJECTS` and `DATASET_MAX_MIB`,
+  checked again while decrypting, and a manifest over 16 KiB fails closed
+  (502). Every Parquet footer must fit `QUERY_MAX_DECODED_ROWS` and
+  `QUERY_MAX_DECODED_MIB` before anything is decoded, and a result over
+  `QUERY_MAX_RESULT_ROWS` or `QUERY_MAX_RESULT_MIB` is refused, never
+  truncated; without a disclosure policy the result streams and the query
+  stops at the first row over the limit. Every operator yields to the
+  runtime as it produces a batch, so the time limit stops a running plan
+  and the tasks running its partitions. Startup is refused when
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, decoded
+  table, three copies of its input and two of its result) exceeds
+  `QUERY_TOTAL_MEMORY_MIB` (default 8192). Size limits answer 422 and
+  memory exhaustion is no longer reported as the caller's SQL error
+  (400). Each refusal is an
+  `engine.query` "denied" event naming the limit. A research query is
+  charged before all of them, so each costs a unit (P54 decides the
+  order). The slot is released and the decrypted blobs zeroized on every
+  way out, including the time limit, cancellation and a panic.
+  `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
+  the settings from configuration.
 * The secret scan reads every file's content whatever git attributes say:
   `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
   `.git/info/attributes`, a user's attributes file or a NUL byte from

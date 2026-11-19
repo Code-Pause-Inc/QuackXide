@@ -8,7 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use platform_core::ZkMode;
-use quackxide_engine::{EngineSettings, MinCountThreshold, QueryError, QueryScope};
+use quackxide_engine::{EngineSettings, MinCountThreshold, QueryError, QueryLimits, QueryScope};
 
 /// A cohort table: 6 "flu" patients, 1 "rare_disease" patient.
 fn cohorts_parquet() -> Vec<u8> {
@@ -32,6 +32,7 @@ fn research_scope(k: i64) -> QueryScope {
     let mut scope = QueryScope::new(EngineSettings {
         zk: ZkMode::Enabled,
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     });
     scope
         .register_parquet("cohorts", &cohorts_parquet())

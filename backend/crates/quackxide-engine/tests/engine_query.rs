@@ -9,7 +9,8 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use platform_core::ZkMode;
 use quackxide_engine::{
-    EngineSettings, MinCountThreshold, QueryError, QueryScope, blind_index_hex,
+    EngineSettings, MinCountThreshold, QueryError, QueryLimit, QueryLimits, QueryScope,
+    blind_index_hex,
 };
 
 const CUSTOMER_KEY: &[u8] = b"tenant-42/customer/index-key";
@@ -54,6 +55,7 @@ fn scope(zk: ZkMode) -> QueryScope {
     let mut scope = QueryScope::new(EngineSettings {
         zk,
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     });
     scope
         .register_parquet("invoices", &invoices_parquet())
@@ -201,6 +203,7 @@ fn register_declared(
     let mut scope = QueryScope::new(EngineSettings {
         zk: ZkMode::Disabled,
         max_concurrent_queries: 1,
+        limits: QueryLimits::default(),
     });
     let parquet = invoices_parquet();
     scope.register_parquet_declared("invoices", &[&parquet], schema, row_cap)
@@ -304,4 +307,107 @@ fn string_encodings_share_the_declared_string_family() {
         Some(ColumnType::Decimal)
     );
     assert_eq!(column_type_of(&DataType::Binary), None);
+}
+
+// ── Result limits: refused, never truncated ──
+
+fn scope_with_limits(zk: ZkMode, limits: QueryLimits) -> QueryScope {
+    let mut scope = QueryScope::new(EngineSettings {
+        zk,
+        max_concurrent_queries: 1,
+        limits,
+    });
+    scope
+        .register_parquet("invoices", &invoices_parquet())
+        .expect("register");
+    scope
+}
+
+const BY_CURRENCY: &str =
+    "SELECT currency, SUM(total) AS revenue FROM invoices GROUP BY currency ORDER BY currency";
+
+#[tokio::test]
+async fn a_result_over_the_row_limit_is_refused_not_truncated() {
+    let at_limit = scope_with_limits(
+        ZkMode::Disabled,
+        QueryLimits {
+            max_result_rows: 2,
+            ..QueryLimits::default()
+        },
+    );
+    let rows = at_limit.sql_json(BY_CURRENCY).await.expect("two rows fit");
+    assert_eq!(rows.as_array().expect("rows").len(), 2);
+
+    let under = scope_with_limits(
+        ZkMode::Disabled,
+        QueryLimits {
+            max_result_rows: 1,
+            ..QueryLimits::default()
+        },
+    );
+    let err = under.sql_json(BY_CURRENCY).await.expect_err("two rows");
+    assert!(
+        matches!(err, QueryError::LimitExceeded(QueryLimit::ResultRows)),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), "query exceeded its result_rows limit");
+}
+
+/// The limit counts the rows that leave, not those suppressed.
+#[tokio::test]
+async fn suppressed_rows_do_not_count_toward_the_row_limit() {
+    let mut scope = scope_with_limits(
+        ZkMode::Enabled,
+        QueryLimits {
+            max_result_rows: 1,
+            ..QueryLimits::default()
+        },
+    );
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: 2 }));
+    let rows = scope
+        .sql_json("SELECT currency, COUNT(*) AS n FROM invoices GROUP BY currency")
+        .await
+        .expect("one cohort leaves");
+    assert_eq!(rows, serde_json::json!([{ "currency": "USD", "n": 2 }]));
+    assert_eq!(scope.last_suppressed_rows(), 1);
+}
+
+#[tokio::test]
+async fn a_result_over_the_byte_limit_is_refused_not_truncated() {
+    // The JSON the result serializes to, as the engine writes it.
+    let batches = scope(ZkMode::Disabled)
+        .sql(BY_CURRENCY)
+        .await
+        .expect("query");
+    let refs: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+    let mut json = Vec::new();
+    let mut writer = arrow::json::ArrayWriter::new(&mut json);
+    writer.write_batches(&refs).expect("write");
+    writer.finish().expect("finish");
+    let exact = u64::try_from(json.len()).expect("length");
+
+    let at_limit = scope_with_limits(
+        ZkMode::Disabled,
+        QueryLimits {
+            max_result_bytes: exact,
+            ..QueryLimits::default()
+        },
+    );
+    let rows = at_limit.sql_json(BY_CURRENCY).await.expect("fits exactly");
+    assert_eq!(rows.as_array().expect("rows").len(), 2);
+
+    for max_result_bytes in [exact - 1, 1] {
+        let under = scope_with_limits(
+            ZkMode::Disabled,
+            QueryLimits {
+                max_result_bytes,
+                ..QueryLimits::default()
+            },
+        );
+        let err = under.sql_json(BY_CURRENCY).await.expect_err("too long");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::ResultBytes)),
+            "{max_result_bytes}: {err:?}"
+        );
+    }
 }

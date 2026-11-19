@@ -6,9 +6,11 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod limits;
 mod schema;
 mod secret;
 
+pub use limits::{QueryLimit, QueryLimits};
 pub use schema::{
     ColumnType, DeclaredColumn, DeclaredSchema, MAX_COLUMN_NAME_BYTES, MAX_DECLARED_COLUMNS,
 };
