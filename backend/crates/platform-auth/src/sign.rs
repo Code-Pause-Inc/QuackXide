@@ -105,12 +105,8 @@ pub fn mint_admin_token(
 }
 
 fn mint_hs256(secret: &str, claims: &RawClaims) -> Result<String, AuthError> {
-    encode(
-        &Header::new(Algorithm::HS256),
-        claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|_| AuthError::MintFailed)
+    let key = EncodingKey::from_secret(secret.as_bytes()).map_err(|_| AuthError::MintFailed)?;
+    encode(&Header::new(Algorithm::HS256), claims, &key).map_err(|_| AuthError::MintFailed)
 }
 
 fn raw_claims(
