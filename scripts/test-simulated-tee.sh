@@ -139,7 +139,7 @@ expect_tamper_refused() {
 # enclave_vault volume, #153) to WORK_DIR/NAME and requires exactly what the
 # upload stores (ADR 0012), at the version and object id the steward
 # declared (DECLARED, the upload header): the object and the manifest as
-# HPK1 envelopes, and the plaintext record. Any other file in the vault
+# HPK2 envelopes, and the plaintext record. Any other file in the vault
 # fails the check.
 check_vault() {
   local vault="${WORK_DIR}/$1"
@@ -161,17 +161,18 @@ check_vault() {
   # The record must hold its suite and what the steward declared, and nothing
   # else (`docs/THREAT_MODEL.md`, "Metadata").
   if ! jq -e --argjson declared "${DECLARED}" \
-      '. == ($declared | {version, suite: "HPK1", row_cap, schema})' \
+      '. == ($declared | {version, suite: "HPK2", row_cap, schema})' \
       "${vault}/${record}" >/dev/null 2>&1; then
     echo "ERROR: ${record} holds more or other than its suite and what the steward declared" >&2
     exit 1
   fi
-  # An HPK1 envelope (platform-crypto's frame): the magic, a 32-byte
-  # encapsulated key, then ciphertext ending in a 16-byte GCM tag.
+  # An HPK2 envelope (platform-crypto's frame, ADR 0007): the magic, a
+  # 1120-byte X-Wing encapsulated key, then ciphertext ending in a 16-byte
+  # GCM tag.
   for envelope in "${snapshot}" "${manifest}"; do
-    if ! cmp -s -n 4 <(printf 'HPK1') "${vault}/${envelope}" \
-        || (( $(wc -c < "${vault}/${envelope}") < 52 )); then
-      echo "ERROR: ${envelope} is not an HPK1 envelope" >&2
+    if ! cmp -s -n 4 <(printf 'HPK2') "${vault}/${envelope}" \
+        || (( $(wc -c < "${vault}/${envelope}") < 1140 )); then
+      echo "ERROR: ${envelope} is not an HPK2 envelope" >&2
       exit 1
     fi
   done
@@ -193,7 +194,9 @@ wait_for_http "http://127.0.0.1:8070/healthz"
 wait_for_http "http://127.0.0.1:8090/healthz"
 
 echo "==> [2/9] Enrolling the steward's key with key-release-service..."
-PRIVATE_KEY_B64=$(openssl rand -base64 32)
+# A framed HPK2 (X-Wing) private key: the suite magic, then a random 32-byte
+# seed. key-release-service accepts no other suite.
+PRIVATE_KEY_B64=$( { printf 'HPK2'; openssl rand 32; } | base64 | tr -d '\n')
 ENROLL_JSON=$(curl -fsS -X PUT "http://127.0.0.1:8090/v1/keys" \
   -H "Content-Type: application/json" \
   -d "{\"tenant_id\":\"${TENANT_ID}\",\"private_key_b64\":\"${PRIVATE_KEY_B64}\"}")
@@ -224,18 +227,18 @@ upload "${TOKEN}" quickbooks
 expect_response "upload outside the upload namespace is refused" 404
 upload "${TOKEN}" "${DATASET}"
 expect_response "steward uploads the dataset" 200 \
-  ".dataset == \"${DATASET}\" and .suite == \"HPK1\""
+  ".dataset == \"${DATASET}\" and .suite == \"HPK2\""
 upload "${TOKEN}" "${DATASET}"
 expect_response "the same upload again is refused as a stale version" 409
 
-echo "==> [5/9] Checking that the vault holds only the upload: two HPK1 envelopes and its record..."
+echo "==> [5/9] Checking that the vault holds only the upload: two HPK2 envelopes and its record..."
 # What the steward declared: the upload header, JSON after the 4-byte magic
 # and its 4-byte big-endian length.
 HEADER_LEN=$(od -An -tu1 -j4 -N4 "${UPLOAD_BODY}" \
   | awk '{ for (i = 1; i <= NF; i++) len = len * 256 + $i } END { print len + 0 }')
 DECLARED=$(head -c "$((8 + HEADER_LEN))" "${UPLOAD_BODY}" | tail -c "${HEADER_LEN}")
 check_vault after-upload
-echo "    The vault holds the upload's object and manifest as HPK1 envelopes and its record, which holds only its suite and what the steward declared; nothing else, and no Parquet."
+echo "    The vault holds the upload's object and manifest as HPK2 envelopes and its record, which holds only its suite and what the steward declared; nothing else, and no Parquet."
 
 echo "==> [6/9] Verifying the attestation token and the confidential query happy path..."
 NONCE_B64=$(openssl rand -base64 32)
@@ -318,6 +321,6 @@ echo "    Default claims accepted again after the simulator restarted with a new
 
 echo "==> [9/9] Checking the vault again after the queries..."
 check_vault after-queries
-echo "    The vault still holds only the upload's two HPK1 envelopes and its record."
+echo "    The vault still holds only the upload's two HPK2 envelopes and its record."
 
 echo "==> All simulated TEE Docker verification checks passed."

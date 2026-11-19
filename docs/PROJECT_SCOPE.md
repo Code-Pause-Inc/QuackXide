@@ -36,7 +36,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | --- | --- | --- |
 | Steward signs in | **Build** | Managed sign-in service. RS256/JWKS verification and a TOTP module exist; local development uses HS256 dev tokens. |
 | Upload | **Harden** | Browser-side drive encryption exists (Web Crypto, per-file keys, AAD-bound chunks). Research datasets enter through connector pipelines or the steward upload route (`PUT /api/v1/datasets/{dataset}`, ADR 0012), which stores Parquet sealed in the browser, and `GET /api/v1/datasets` lists the datasets a steward holds; browser sealing and the upload form are still needed. |
-| Hybrid post-quantum encryption | **Build** | X25519 + ML-KEM-768 key encapsulation; Ed25519 + ML-DSA-65 signatures. Current suite is X25519 only. No silent downgrade to classical-only. |
+| Hybrid post-quantum encryption | **Build** | X25519 + ML-KEM-768 key encapsulation; Ed25519 + ML-DSA-65 signatures. Tenant envelopes are hybrid (`HPK2`) on the backend; the browser is X25519 until P36. No silent downgrade to classical-only. |
 | Encrypted storage | **Harden** | `VaultStore` with GCS and in-memory backends; typed tenant paths. |
 
 ### Research lifecycle (researcher)
@@ -58,7 +58,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | --- | --- | --- |
 | Durable registries | **Build** | Tenant, grant, budget, and catalog registries are in-memory behind traits; add durable backends without touching call sites. |
 | Deployment | **Build** | Reproducible deployment of `platform-api`, with the query engine in-process, as a Confidential Space workload on an attested Intel TDX Confidential VM, with TLS terminating inside the VM and the frontend served from the same origin (ADR 0005). |
-| Benchmarks | **Build** | `HPK1` envelope keygen, seal and open benchmarks exist, reported in CI but not gated (`docs/BENCHMARKS.md`). Still to build: query latency against synthetic datasets, browser encryption throughput, enclave overhead, and regression tracking. |
+| Benchmarks | **Build** | `HPK1` and `HPK2` envelope keygen, seal and open benchmarks exist, reported in CI but not gated (`docs/BENCHMARKS.md`). Still to build: query latency against synthetic datasets, browser encryption throughput, enclave overhead, and regression tracking. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
 | DataFusion upgrade | **Built** | DataFusion 55, Arrow/Parquet 59, and `object_store` 0.13 ([ADR 0008](adr/0008-datafusion-55-upgrade.md)); `thrift`, `paste`, and `rustls-pemfile` advisories cleared; disclosure allowlist and `tests/bypass.rs` verified. |
 | Dominance rule | **Build** | Suppress `MIN`/`MAX` (and sums) dominated by a single individual, closing the extreme-value residual in `docs/THREAT_MODEL.md`. |

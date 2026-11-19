@@ -25,7 +25,7 @@ that breaking the result requires breaking both:
 * Bulk encryption: AES-256-GCM (unchanged).
 
 Implementations come from established libraries only. The suites change at
-the existing seams (`TenantKem`, the `JwtVerifier` construction site, the
+the existing seams (`EnvelopeSuite`, the `JwtVerifier` construction site, the
 browser crypto core) with a new frame version alongside `HPK1`. A reader
 configured for the hybrid suite refuses classical-only envelopes and
 signatures unless an explicit, logged migration mode is enabled.

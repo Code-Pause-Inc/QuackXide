@@ -33,7 +33,9 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use platform_core::TenantId;
-use platform_crypto::{SecretBytes, TenantKeypair, TenantPublicKey, hpke_seal_to_tenant};
+use platform_crypto::{
+    EnvelopeSuite, SecretBytes, SuitePolicy, TenantKeypair, TenantPublicKey, hpke_seal_to_tenant,
+};
 use platform_enclave::simulated_token::TokenSigner;
 use platform_enclave::token::{
     JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError, TokenVerifier, nonces_from_bytes,
@@ -46,7 +48,7 @@ use subtle::ConstantTimeEq;
 
 use super::EnclaveIdentity;
 use crate::ApiError;
-use crate::query::{EnclaveKeyProvider, QueryKeySession};
+use crate::query::{EnclaveKeyProvider, QueryKeySession, open_tenant_envelope};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 const MAX_PENDING_CHALLENGES: usize = 4096;
@@ -200,17 +202,31 @@ impl KeyReleaseRelyingParty {
         self.release_count.load(Ordering::SeqCst)
     }
 
-    /// Register a tenant's key material with the relying party.
-    pub fn insert_tenant_key(&self, tenant: TenantId, keypair: &TenantKeypair) {
-        self.insert_raw_tenant_key(tenant, keypair.to_private_key_bytes());
-    }
-
-    pub fn insert_raw_tenant_key(&self, tenant: TenantId, private_key_bytes: SecretBytes) {
+    /// Register a tenant's key with the relying party. Only `HPK2` keys, in
+    /// every mode: the enclave accepts no other released key
+    /// ([`EnclaveIdentity::unwrap_released_key`]), so any other would be
+    /// refused only after a query had charged its budget.
+    pub fn insert_tenant_key(
+        &self,
+        tenant: TenantId,
+        keypair: &TenantKeypair,
+    ) -> Result<(), platform_crypto::CryptoError> {
+        SuitePolicy::only(EnvelopeSuite::Hpk2)
+            .check(keypair.suite())
+            .inspect_err(|_| {
+                security_audit_event(
+                    AuditKind::SuiteRefused,
+                    Some(tenant),
+                    "denied",
+                    "refused a tenant private key that is not HPK2",
+                );
+            })?;
         let mut keys = self
             .keys
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        keys.insert(tenant, private_key_bytes);
+        keys.insert(tenant, keypair.to_private_key_bytes());
+        Ok(())
     }
 
     /// Mint a fresh 32-byte single-use challenge nonce.
@@ -318,10 +334,13 @@ impl KeyReleaseRelyingParty {
             self.audit_denial(tenant, "malformed enclave HPKE public key");
             ApiError::Forbidden
         })?;
-        let enclave_hpke_pk = TenantPublicKey::from_raw(&enclave_hpke_pk_raw).map_err(|_| {
-            self.audit_denial(tenant, "invalid X25519 enclave HPKE public key");
-            ApiError::Forbidden
-        })?;
+        // The enclave key is X25519 until P85 (#176): see `EnclaveIdentity`.
+        let enclave_hpke_pk =
+            TenantPublicKey::from_raw(&enclave_hpke_pk_raw, SuitePolicy::only(EnvelopeSuite::Hpk1))
+                .map_err(|_| {
+                    self.audit_denial(tenant, "invalid X25519 enclave HPKE public key");
+                    ApiError::Forbidden
+                })?;
 
         let result_signing_pk = decode_32(&req.result_signing_public_key_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed result-signing public key");
@@ -441,9 +460,12 @@ impl KeyReleaseRelyingParty {
                         let raw = B64
                             .decode(req.private_key_b64.trim())
                             .map_err(|_| ApiError::BadRequest("invalid base64 private key"))?;
-                        let kp = TenantKeypair::from_private_key_bytes(&raw)
-                            .map_err(|_| ApiError::BadRequest("invalid X25519 private key"))?;
-                        rp.insert_tenant_key(tenant, &kp);
+                        // Any framed key parses; `insert_tenant_key` then
+                        // refuses every suite but HPK2, in every mode.
+                        let invalid = |_| ApiError::BadRequest("invalid tenant private key");
+                        let kp = TenantKeypair::from_private_key_bytes(&raw, SuitePolicy::DEVELOPMENT)
+                            .map_err(invalid)?;
+                        rp.insert_tenant_key(tenant, &kp).map_err(invalid)?;
                         let public_key_b64 = B64.encode(kp.public_key().to_raw());
                         Ok::<_, ApiError>(Json(json!({ "public_key_b64": public_key_b64 })))
                     },
@@ -615,27 +637,35 @@ impl AttestedKeyProvider {
             .decode(&resp.wrapped_key_b64)
             .map_err(|_| ApiError::AttestationUnavailable)?;
         let info = key_release_info(tenant, &nonce);
-        let kp = self.identity.unwrap_released_key(&info, &wrapped_bytes)?;
+        let kp = self
+            .identity
+            .unwrap_released_key(tenant, &info, &wrapped_bytes)?;
         self.release_count.fetch_add(1, Ordering::SeqCst);
         Ok(kp)
     }
 }
 
 struct ReleasedKeySession {
+    tenant: TenantId,
     keypair: TenantKeypair,
 }
 
 #[async_trait]
 impl QueryKeySession for ReleasedKeySession {
     async fn open_envelope(&self, info: &[u8], envelope: &[u8]) -> Result<SecretBytes, ApiError> {
-        self.keypair
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        open_tenant_envelope(&self.keypair, self.tenant, info, envelope)
     }
 }
 
 #[async_trait]
 impl EnclaveKeyProvider for AttestedKeyProvider {
+    /// Released keys are `HPK2` in every mode
+    /// ([`EnclaveIdentity::unwrap_released_key`]). Whether `key-release`
+    /// holds one for the tenant is known only at release, which fails then.
+    fn key_suite(&self, _tenant: TenantId) -> Option<EnvelopeSuite> {
+        Some(EnvelopeSuite::Hpk2)
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -643,9 +673,7 @@ impl EnclaveKeyProvider for AttestedKeyProvider {
         envelope: &[u8],
     ) -> Result<SecretBytes, ApiError> {
         let keypair = self.acquire_keypair(tenant).await?;
-        keypair
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        open_tenant_envelope(&keypair, tenant, info, envelope)
     }
 
     async fn begin_query_session<'a>(
@@ -653,7 +681,7 @@ impl EnclaveKeyProvider for AttestedKeyProvider {
         tenant: TenantId,
     ) -> Result<Box<dyn QueryKeySession + 'a>, ApiError> {
         let keypair = self.acquire_keypair(tenant).await?;
-        Ok(Box::new(ReleasedKeySession { keypair }))
+        Ok(Box::new(ReleasedKeySession { tenant, keypair }))
     }
 }
 

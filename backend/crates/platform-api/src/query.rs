@@ -30,8 +30,10 @@ use platform_connectors::snapshot::{
     SnapshotManifest, manifest_info, newest_manifest, object_info,
 };
 use platform_connectors::upload::MAX_MANIFEST_BYTES;
-use platform_core::{ConnectorSlug, DatasetKind, DeclaredSchema, QueryLimit, TenantId};
-use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair};
+use platform_core::{
+    ConnectorSlug, DatasetKind, DeclaredSchema, QueryLimit, SnapshotVersion, TenantId,
+};
+use platform_crypto::{CryptoError, EnvelopeSuite, SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
@@ -74,6 +76,14 @@ impl<P: EnclaveKeyProvider + ?Sized> QueryKeySession for DelegatingKeySession<'_
 /// dev-only `key_release::AttestedKeyProvider`.
 #[async_trait]
 pub trait EnclaveKeyProvider: Send + Sync {
+    /// The suite of any key this provider would release for `tenant`, which
+    /// a snapshot's record must name, or `None` if it can release none for
+    /// `tenant`. Read before any key is released, so a snapshot the key can
+    /// never open is refused first. It releases nothing to answer: a
+    /// provider whose keys are held elsewhere answers with the one suite it
+    /// releases, and a tenant with no key there fails at release instead.
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite>;
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -95,6 +105,27 @@ pub trait EnclaveKeyProvider: Send + Sync {
     }
 }
 
+/// Open `envelope` with `tenant`'s `keypair`. A frame of another suite than
+/// the key's is audited as `crypto.suite_refused` before the generic error.
+pub(crate) fn open_tenant_envelope(
+    keypair: &TenantKeypair,
+    tenant: TenantId,
+    info: &[u8],
+    envelope: &[u8],
+) -> Result<SecretBytes, ApiError> {
+    keypair.open_envelope(info, envelope).map_err(|e| {
+        if matches!(e, CryptoError::SuiteMismatch) {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(tenant),
+                "denied",
+                "refused an envelope whose suite does not match the tenant key",
+            );
+        }
+        ApiError::Backend
+    })
+}
+
 /// DEV ONLY: holds one tenant keypair in process memory, which defeats the
 /// zero-trust boundary. For local development and tests.
 pub struct DevKeyProvider {
@@ -113,6 +144,10 @@ impl DevKeyProvider {
 
 #[async_trait]
 impl EnclaveKeyProvider for DevKeyProvider {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        (tenant == self.tenant).then(|| self.keypair.suite())
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -122,9 +157,7 @@ impl EnclaveKeyProvider for DevKeyProvider {
         if tenant != self.tenant {
             return Err(ApiError::Backend);
         }
-        self.keypair
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        open_tenant_envelope(&self.keypair, tenant, info, envelope)
     }
 }
 
@@ -147,17 +180,18 @@ impl MultiTenantDevKeyProvider {
 
 #[async_trait]
 impl EnclaveKeyProvider for MultiTenantDevKeyProvider {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        self.keys.get(&tenant).map(TenantKeypair::suite)
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
         info: &[u8],
         envelope: &[u8],
     ) -> Result<SecretBytes, ApiError> {
-        self.keys
-            .get(&tenant)
-            .ok_or(ApiError::Backend)?
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        let keypair = self.keys.get(&tenant).ok_or(ApiError::Backend)?;
+        open_tenant_envelope(keypair, tenant, info, envelope)
     }
 }
 
@@ -391,29 +425,18 @@ impl ConnectorQueryService {
         }
     }
 
-    /// Decrypt `owner`'s current snapshot of `dataset` to plaintext Parquet:
-    /// the objects listed by the newest manifest, and nothing else, so
-    /// repeated or interrupted writes never add rows. Objects open under the
-    /// `info` of the dataset's kind (ADR 0012). The snapshot's plaintext
-    /// record is read before any key is released and must name a suite this
-    /// build reads, and an upload's declared schema and row cap come back
-    /// for the engine to check. The blobs
-    /// zeroize on drop, so an error partway through wipes the objects
-    /// already opened.
-    ///
-    /// Before any key is released, the objects stored at the snapshot's
-    /// version must fit `QueryLimits::max_input_objects` and
-    /// `max_input_bytes` (ciphertext bytes) and the sealed manifest must
-    /// fit the upload route's manifest bound. Both input limits are checked
-    /// again on what the manifest lists, cumulatively, before each object
-    /// is opened.
-    async fn decrypt_dataset(
+    /// `owner`'s current snapshot of `dataset`, from the newest manifest's
+    /// path and the snapshot's plaintext record, opening nothing. The record
+    /// must name the suite of `owner`'s key, or the snapshot could never
+    /// open. An upload's declared schema and row cap come back for the
+    /// engine to check. `None` if no snapshot is committed.
+    async fn current_snapshot(
         &self,
         owner: TenantId,
         dataset: &ConnectorSlug,
-    ) -> Result<DecryptedDataset, ApiError> {
-        let Some((version, path)) = newest_manifest(&*self.vault, owner, dataset).await? else {
-            return Ok(DecryptedDataset::default());
+    ) -> Result<Option<CurrentSnapshot>, ApiError> {
+        let Some((version, manifest)) = newest_manifest(&*self.vault, owner, dataset).await? else {
+            return Ok(None);
         };
 
         let record = match self
@@ -421,12 +444,13 @@ impl ConnectorQueryService {
             .get(&TenantPaths::connector_record(owner, dataset, &version))
             .await
         {
-            Ok(bytes) => SnapshotRecord::parse(&bytes, &version)
-                .ok()
-                .filter(|record| EnvelopeSuite::from_id(&record.suite).is_ok()),
+            Ok(bytes) => SnapshotRecord::parse(&bytes, &version).ok(),
             Err(StorageError::NotFound) => None,
             Err(other) => return Err(other.into()),
         };
+        let suite = record
+            .as_ref()
+            .and_then(|record| EnvelopeSuite::from_id(&record.suite).ok());
         // Every committed snapshot has a record; an upload's must carry
         // what its steward declared.
         let declared = match (dataset.kind(), record) {
@@ -441,7 +465,7 @@ impl ConnectorQueryService {
             ) => Some(Some((schema, row_cap))),
             _ => None,
         };
-        let Some(declared) = declared else {
+        let (Some(suite), Some(declared)) = (suite, declared) else {
             security_audit_event(
                 AuditKind::DataAccess,
                 Some(owner),
@@ -449,6 +473,62 @@ impl ConnectorQueryService {
                 "snapshot record is missing, malformed, incomplete or of an unknown suite",
             );
             return Err(ApiError::Backend);
+        };
+        let Some(key_suite) = self.keys.key_suite(owner) else {
+            security_audit_event(
+                AuditKind::DataAccess,
+                Some(owner),
+                "failed",
+                "no tenant key can be released to open the snapshot",
+            );
+            return Err(ApiError::Backend);
+        };
+        if key_suite != suite {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(owner),
+                "denied",
+                "refused a snapshot whose record names another suite than the tenant key",
+            );
+            return Err(ApiError::Backend);
+        }
+        Ok(Some(CurrentSnapshot {
+            version,
+            manifest,
+            suite,
+            declared,
+        }))
+    }
+
+    /// Decrypt `owner`'s current snapshot of `dataset` to plaintext Parquet:
+    /// the objects listed by the newest manifest, and nothing else, so
+    /// repeated or interrupted writes never add rows. The snapshot is
+    /// resolved here ([`Self::current_snapshot`]), under the caller's slot,
+    /// so a re-upload that commits while the query waits is read rather
+    /// than the version it pruned. Every envelope opens under the `info` of
+    /// the record's suite and the dataset's kind (ADR 0012), so one of
+    /// another suite fails to open. The blobs zeroize on drop, so an error
+    /// partway through wipes the objects already opened.
+    ///
+    /// Before any key is released, the objects stored at the snapshot's
+    /// version must fit `QueryLimits::max_input_objects` and
+    /// `max_input_bytes` (ciphertext bytes) and the sealed manifest must
+    /// fit the upload route's manifest bound. Both input limits are checked
+    /// again on what the manifest lists, cumulatively, before each object
+    /// is opened.
+    async fn decrypt_dataset(
+        &self,
+        owner: TenantId,
+        dataset: &ConnectorSlug,
+    ) -> Result<DecryptedDataset, ApiError> {
+        let Some(CurrentSnapshot {
+            version,
+            manifest: path,
+            suite,
+            declared,
+        }) = self.current_snapshot(owner, dataset).await?
+        else {
+            return Ok(DecryptedDataset::default());
         };
 
         // Sized from storage alone. Objects at this version that the
@@ -479,7 +559,7 @@ impl ConnectorQueryService {
         }
 
         let key_session = self.keys.begin_query_session(owner).await?;
-        let info = manifest_info(&owner, dataset, &version);
+        let info = manifest_info(suite, &owner, dataset, &version);
         let plaintext = key_session.open_envelope(&info, &envelope).await?;
         let manifest = serde_json::from_slice::<SnapshotManifest>(plaintext.expose())
             .ok()
@@ -508,7 +588,7 @@ impl ConnectorQueryService {
             if input_bytes > limits.max_input_bytes {
                 return Err(ApiError::QueryLimit(QueryLimit::InputBytes));
             }
-            let info = object_info(&owner, dataset, object);
+            let info = object_info(suite, &owner, dataset, object);
             let plaintext = key_session.open_envelope(&info, &envelope).await?;
             blobs.push(plaintext);
         }
@@ -654,9 +734,14 @@ impl ConnectorQueryService {
 
         let tee_platform = platform_label(self.gate(researcher, "research query").await?);
 
+        // The snapshot's record is checked before the charge, so a snapshot
+        // the steward's key can never open costs no budget. Only a check:
+        // the query reads the snapshot that is current once it holds a slot.
+        self.current_snapshot(steward, connector).await?;
+
         // Budget charge — after the attestation gate so operator
         // infrastructure failures never burn researcher budget, but before
-        // any data is touched: an accepted query consumes budget even if the
+        // any data is opened: an accepted query consumes budget even if the
         // plan gate later rejects it, so probing the aggregate-only boundary
         // costs budget. Charges are not refunded.
         let budget = match research.charge(&grant.grant_id, RESEARCH_QUERY_COST).await {
@@ -774,6 +859,17 @@ fn platform_label(platform: platform_enclave::TeePlatform) -> &'static str {
 /// Decrypted dataset objects. Each element zeroizes on drop, so no exit
 /// path (error, early return, or cancellation) leaves plaintext behind.
 type DecryptedObjects = Vec<SecretBytes>;
+
+/// A committed snapshot whose record [`ConnectorQueryService::current_snapshot`]
+/// has checked, not yet opened.
+struct CurrentSnapshot {
+    version: SnapshotVersion,
+    /// The path of its sealed manifest.
+    manifest: VaultPath,
+    /// The suite its record names, which is the tenant key's.
+    suite: EnvelopeSuite,
+    declared: Option<(DeclaredSchema, u64)>,
+}
 
 /// A dataset's decrypted current snapshot and, for an upload, the schema
 /// and row cap its steward declared for it.
@@ -921,7 +1017,7 @@ mod tests {
     use futures::FutureExt;
     use parquet::arrow::ArrowWriter;
     use platform_connectors::snapshot::SnapshotWriter;
-    use platform_core::{ObjectId, QueryLimits, SnapshotVersion, ZkMode};
+    use platform_core::{ObjectId, QueryLimits, ZkMode};
     use platform_crypto::hpke_seal_to_tenant;
     use platform_enclave::DevAttestation;
     use platform_storage::ObjectStoreVault;
@@ -957,13 +1053,20 @@ mod tests {
             version: version.clone(),
             objects,
         };
-        let sealed = hpke_seal_to_tenant(
-            &TenantKeypair::generate().public_key(),
-            &manifest_info(&tenant, &dataset, &version),
-            &serde_json::to_vec(&manifest).expect("json"),
-        )
-        .expect("seal");
-        assert!(sealed.len() <= MAX_MANIFEST_BYTES, "{} bytes", sealed.len());
+        // Under either suite: HPK2's encapsulated key is the larger.
+        for suite in [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2] {
+            let sealed = hpke_seal_to_tenant(
+                &TenantKeypair::generate(suite).public_key(),
+                &manifest_info(suite, &tenant, &dataset, &version),
+                &serde_json::to_vec(&manifest).expect("json"),
+            )
+            .expect("seal");
+            assert!(
+                sealed.len() <= MAX_MANIFEST_BYTES,
+                "{suite:?}: {} bytes",
+                sealed.len()
+            );
+        }
     }
 
     /// A disclosure policy that panics, standing in for a panic anywhere in
@@ -979,7 +1082,7 @@ mod tests {
     /// A one-slot ZK query service over a committed `cohorts` snapshot.
     async fn one_slot_service() -> (ConnectorQueryService, TenantId, ConnectorSlug) {
         let tenant = TenantId::generate();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
         let dataset = ConnectorSlug::new("cohorts").expect("slug");
         let schema = Arc::new(Schema::new(vec![
             Field::new("condition", DataType::Utf8, false),

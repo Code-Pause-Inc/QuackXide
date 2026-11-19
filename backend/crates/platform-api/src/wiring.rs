@@ -226,7 +226,10 @@ async fn maybe_seed_demo_fixture(
 
     let tenant: platform_core::TenantId = raw_tenant.parse()?;
     let pk_bytes = B64.decode(raw_pk_b64)?;
-    let tenant_public_key = platform_crypto::TenantPublicKey::from_raw(&pk_bytes)?;
+    let tenant_public_key = platform_crypto::TenantPublicKey::from_raw(
+        &pk_bytes,
+        platform_crypto::SuitePolicy::for_env(config.env.is_production()),
+    )?;
 
     let pipeline = platform_connectors::pipeline::EnclavePipeline::new(
         attestation.clone(),
@@ -246,4 +249,48 @@ async fn maybe_seed_demo_fixture(
         "sealed simulated-TEE demo fixture into vault"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_config(env: &'static str, suite: platform_crypto::EnvelopeSuite) -> PlatformConfig {
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::STANDARD.encode(
+            platform_crypto::TenantKeypair::generate(suite)
+                .public_key()
+                .to_raw(),
+        );
+        PlatformConfig::from_source(move |k| match k {
+            "APP_ENV" => Some(env.to_owned()),
+            "DEMO_TENANT_ID" => Some("6f2c8a2e-1111-4222-8333-444455556666".to_owned()),
+            "DEMO_TENANT_PUBLIC_KEY_B64" => Some(key.clone()),
+            _ => None,
+        })
+        .expect("config loads")
+    }
+
+    // Production never seeds the fixture (it refuses the simulated TEE this
+    // runs under, so no `crypto.suite_refused` event is reachable); the
+    // suite policy is the second guard, should a caller reach the loader.
+    #[tokio::test]
+    async fn production_refuses_to_seed_a_demo_fixture_for_a_classical_key() {
+        let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+        let attestation = platform_enclave::provider_for(false);
+        let config = demo_config("production", platform_crypto::EnvelopeSuite::Hpk1);
+        let err = maybe_seed_demo_fixture(&config, &vault, &attestation)
+            .await
+            .expect_err("HPK1 refused");
+        assert!(err.to_string().contains("suite"), "{err}");
+        assert!(
+            vault
+                .list(&platform_storage::TenantPaths::tenant_root(
+                    "6f2c8a2e-1111-4222-8333-444455556666".parse().unwrap()
+                ))
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
 }

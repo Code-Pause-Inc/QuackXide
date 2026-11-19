@@ -22,7 +22,7 @@ use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_info};
 use platform_connectors::upload::MAX_MANIFEST_BYTES;
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
-use platform_crypto::{SecretBytes, TenantKeypair, hpke_seal_to_tenant};
+use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair, hpke_seal_to_tenant};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
     ObjectStoreVault, SnapshotRecord, StorageError, StorageUsage, TenantPaths, VaultEntry,
@@ -51,7 +51,7 @@ async fn app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let service = ConnectorQueryService::new(
         vault.clone(),
@@ -359,6 +359,10 @@ impl Drop for InFlight<'_> {
 
 #[async_trait]
 impl EnclaveKeyProvider for ObservedKeys {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        self.inner.key_suite(tenant)
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -459,7 +463,7 @@ async fn observed_service_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> (ConnectorQueryService, Arc<ObservedKeys>) {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, syncs).await;
     let observe = Observe {
         max_concurrent_queries,
@@ -606,7 +610,7 @@ async fn one_slot_service(
     limits: QueryLimits,
     slow_call: Option<(usize, Duration)>,
 ) -> (ConnectorQueryService, Arc<ObservedKeys>) {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let observe = Observe {
         max_concurrent_queries: 1,
@@ -620,6 +624,64 @@ async fn one_slot_service(
 /// Long enough to outlast a one-second wait, and within the default time
 /// limit.
 const HOLD: Duration = Duration::from_secs(30);
+
+/// A query reads the snapshot that is current once it holds a slot: a sync
+/// that commits while the query waits, pruning the snapshot that was
+/// current, is read rather than refused as a missing object (502).
+#[tokio::test(start_paused = true)]
+async fn a_query_reads_the_snapshot_committed_while_it_waited_for_a_slot() {
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let public_key = keypair.public_key();
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    // The first query holds the only slot while it opens its manifest, for
+    // less than the default slot wait.
+    let observe = Observe {
+        max_concurrent_queries: 1,
+        slow_call: Some((1, Duration::from_secs(5))),
+        ..Observe::default()
+    };
+    let (service, _) = observed(
+        tenant,
+        keypair,
+        vault.clone(),
+        observe,
+        dev_attestation(),
+        false,
+    );
+    let pipeline = platform_connectors::pipeline::EnclavePipeline::new(
+        dev_attestation(),
+        vault.clone(),
+        false,
+    );
+    let job = platform_connectors::pipeline::SyncJob {
+        tenant,
+        tenant_public_key: public_key,
+        source: Arc::new(
+            platform_connectors::source::FixtureSource::quickbooks_demo().expect("fixture"),
+        ),
+    };
+    let connector = quickbooks();
+    let (first, second, ()) = tokio::join!(
+        service.query(tenant, &connector, COUNT_SQL),
+        async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            service.query(tenant, &connector, COUNT_SQL).await
+        },
+        async {
+            // While the second query waits, a new sync commits and prunes
+            // the snapshot that was current when it arrived.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            pipeline.run_sync(&job).await.expect("sync");
+        }
+    );
+    // The first had opened the pruned snapshot's manifest, so its objects
+    // were gone: the race ran.
+    let (status, _, _) = refusal(first).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let second = second.map_err(|_| "second query failed").expect("second");
+    assert_eq!(second["rows"], serde_json::json!([{ "n": 3 }]), "{second}");
+}
 
 /// The paused clock runs each wait to its end only once nothing else can
 /// run, so these tests are deterministic and take no real time.
@@ -892,7 +954,7 @@ async fn the_input_limits_are_checked_again_while_decrypting() {
         ),
     ] {
         let tenant = TenantId::generate();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
         let vault = Arc::new(UnderReportedUsage(synced_vault(tenant, &keypair, 1).await));
         let observe = Observe {
             limits,
@@ -911,7 +973,7 @@ async fn the_input_limits_are_checked_again_while_decrypting() {
 #[tokio::test]
 async fn a_manifest_larger_than_any_writer_seals_fails_closed_before_key_release() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let manifest = vault
         .list(&TenantPaths::connector_manifests_prefix(
@@ -979,7 +1041,7 @@ const RESEARCH_SQL: &str = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP
 async fn a_research_query_refused_for_a_slot_is_charged() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     let vault = synced_vault(steward, &keypair, 1).await;
     let (research, grant_id) = research_grant(&vault, steward, researcher).await;
     let observe = Observe {
@@ -1037,7 +1099,7 @@ async fn research_queries_refused_by_a_size_limit_are_charged() {
     ] {
         let steward = TenantId::generate();
         let researcher = TenantId::generate();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
         let vault = synced_vault(steward, &keypair, 1).await;
         let (research, grant_id) = research_grant(&vault, steward, researcher).await;
         let observe = Observe {
@@ -1091,7 +1153,7 @@ async fn repeated_syncs_never_inflate_counts() {
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     for syncs in [1, 4] {
         let tenant = TenantId::generate();
-        let keypair = TenantKeypair::generate();
+        let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
         let vault = synced_vault(tenant, &keypair, syncs).await;
         let service = service_over(tenant, keypair, vault, ZkMode::Enabled);
 
@@ -1121,7 +1183,7 @@ async fn repeated_syncs_never_inflate_counts() {
 #[tokio::test]
 async fn superseded_snapshots_are_pruned() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 3).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let manifests = vault
@@ -1142,7 +1204,7 @@ async fn superseded_snapshots_are_pruned() {
 #[tokio::test]
 async fn a_snapshot_without_its_record_fails_closed() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let record = vault
@@ -1160,7 +1222,7 @@ async fn a_snapshot_without_its_record_fails_closed() {
 #[tokio::test]
 async fn a_record_naming_a_suite_this_build_cannot_read_fails_closed() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let service = service_over(tenant, keypair, vault.clone(), ZkMode::Disabled);
@@ -1187,10 +1249,62 @@ async fn a_record_naming_a_suite_this_build_cannot_read_fails_closed() {
     assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
 }
 
+/// The record names the suite, and the key must be of it: a record naming
+/// another suite than the key's is refused before any envelope opens, even
+/// when the envelopes themselves match the key.
+#[tokio::test]
+async fn a_record_naming_another_suite_than_the_key_opens_nothing() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk2);
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let keys = Arc::new(ObservedKeys {
+        inner: DevKeyProvider::new(tenant, keypair),
+        calls: AtomicUsize::new(0),
+        in_flight: AtomicUsize::new(0),
+        max_in_flight: AtomicUsize::new(0),
+        fail_on_call: None,
+        slow_call: None,
+    });
+    let service = ConnectorQueryService::new(
+        vault.clone(),
+        keys.clone(),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
+        },
+        false,
+    );
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let path = vault
+        .list(&TenantPaths::connector_records_prefix(tenant, &connector))
+        .await
+        .expect("list")
+        .remove(0);
+    let version =
+        TenantPaths::connector_record_version(tenant, &connector, &path).expect("record path");
+    let mut record =
+        SnapshotRecord::parse(&vault.get(&path).await.expect("record"), &version).expect("parse");
+    assert_eq!(record.suite, EnvelopeSuite::Hpk2.id());
+    record.suite = EnvelopeSuite::Hpk1.id().to_owned();
+    vault.put(&path, record.to_bytes()).await.expect("put");
+
+    let result = service.query(tenant, &connector, COUNT_SQL).await;
+    assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
+    assert_eq!(keys.calls.load(Ordering::SeqCst), 0, "no envelope opened");
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
 #[tokio::test]
 async fn an_uncommitted_sync_changes_nothing_queries_see() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
 
@@ -1221,7 +1335,7 @@ async fn an_uncommitted_sync_changes_nothing_queries_see() {
 #[tokio::test]
 async fn a_manifest_listing_an_object_twice_fails_closed() {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let connector = ConnectorSlug::new("quickbooks").expect("slug");
     let manifest_path = vault
@@ -1247,7 +1361,7 @@ async fn a_manifest_listing_an_object_twice_fails_closed() {
     };
     let envelope = hpke_seal_to_tenant(
         &keypair.public_key(),
-        &manifest_info(&tenant, &connector, &version),
+        &manifest_info(keypair.suite(), &tenant, &connector, &version),
         &serde_json::to_vec(&doubled).expect("json"),
     )
     .expect("seal");

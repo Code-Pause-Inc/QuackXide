@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     platform_telemetry::init_from_env();
 
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let tenant = TenantId::generate();
     let signer = Arc::new(TokenSigner::generate(
         "urn:query-demo:sim",
@@ -62,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
         signer.issuer(),
         policy,
     ));
-    relying_party.insert_tenant_key(tenant, &keypair);
+    relying_party
+        .insert_tenant_key(tenant, &keypair)
+        .expect("the demo tenant's key is HPK2");
 
     let identity = Arc::new(EnclaveIdentity::generate());
     let keys = Arc::new(AttestedKeyProvider::new(

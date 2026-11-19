@@ -69,12 +69,13 @@ uses [Semantic Versioning](https://semver.org/).
   The `browser` workflow runs Chromium on every pull request and Chromium,
   Firefox and WebKit on `main` and nightly.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
-  `HPK1` key generation and envelope seal and open at 32 B, 4 KiB and
-  4 MiB, and a unit test pins the 52-byte envelope overhead. `cargo test`
-  runs each benchmark once, so `scripts/check.sh` fails on a broken one. The
-  `bench` workflow runs them on pull requests that touch `backend/` or
-  `rust-toolchain.toml` and reports only. `docs/BENCHMARKS.md` records the
-  method and the baseline the hybrid suite (#187) is compared against.
+  key generation and envelope seal and open for `HPK1` and `HPK2` at 32 B,
+  4 KiB and 4 MiB, and a unit test pins each suite's envelope overhead
+  (52 and 1140 bytes). `cargo test` runs each benchmark once, so
+  `scripts/check.sh` fails on a broken one. The `bench` workflow runs them
+  on pull requests that touch `backend/` or `rust-toolchain.toml` and
+  reports only. `docs/BENCHMARKS.md` records the method and both suites'
+  numbers from one run.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
@@ -98,10 +99,11 @@ uses [Semantic Versioning](https://semver.org/).
   accepts `object_store` 0.13's uploads (#153).
 * Browser envelope open (P34 checkpoint B): `envelope-wasm` exports
   `openEnvelope` and `publicKeyFromPrivateKey`, over the new
-  `platform_crypto::hpke_open_with_private_key` and
-  `tenant_public_key_from_private`. The crypto worker holds the device's
-  HPKE private key as ADR 0007 describes: 32 random bytes, stored only
-  encrypted under a non-extractable AES-256-GCM seed key with AAD
+  `platform_crypto::hpk1_open_with_private_key` and
+  `hpk1_public_key_from_private` (`HPK1` only until P36). The crypto
+  worker holds the device's HPKE private key as ADR 0007 describes: 32
+  random bytes, stored only encrypted under a non-extractable AES-256-GCM
+  seed key with AAD
   `x25519-key-v1|{tenant}|{SHA-256 of the public key}`, decrypted just
   before an open and zeroed after (`lib/crypto/devicekey.ts`). The Web
   Crypto X25519 key, which could not open anything, is gone; device
@@ -197,7 +199,7 @@ uses [Semantic Versioning](https://semver.org/).
   token in an `HttpOnly` cookie, and the authorization-code + PKCE browser flow.
   `docs/ARCHITECTURE.md` gains the target authorization model and
   `docs/THREAT_MODEL.md` A3 and A4 list the new controls.
-* ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
+* ADR 0007 (Accepted): the hybrid suite construction (HPKE with X-Wing,
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
   migration mode in v1.
@@ -294,6 +296,12 @@ uses [Semantic Versioning](https://semver.org/).
   refused with 400. Each status event is audited as `tenant.provisioned`:
   `ok` when applied, `denied` with `reason=stale` or `reason=canceled`
   when skipped, and `miss` for an unknown subscription.
+* Enrollment audits every refused key as `crypto.key_enrollment` denied: a
+  key of a suite the deployment refuses (also `crypto.suite_refused`) and a
+  key that is not valid base64, which emitted nothing.
+* `DevResearchStack::query_service` panics on a stack holding an `HPK1`
+  key, since key release is `HPK2`-only and every query would fail after
+  charging its budget; `query_service_with_attestation` still takes both.
 
 ### Security
 
@@ -350,8 +358,31 @@ uses [Semantic Versioning](https://semver.org/).
   `TenantKeypair` (the key-release stand-in's per-query sessions, the dev
   key providers, `EnclaveIdentity`'s HPKE key) and each envelope's
   ephemeral key, in the enclave and in the browser's envelope module, was
-  freed without being wiped. `platform-crypto` turns the feature on, and
-  `TenantKeypair` implements `ZeroizeOnDrop`.
+  freed without being wiped. `hpke` 0.14 turns the feature on itself, a
+  test checks it for both suites' key types, and `TenantKeypair`
+  implements `ZeroizeOnDrop`.
+* Tenant envelopes use the hybrid post-quantum suite `HPK2` (ADR 0007, P35,
+  #187): HPKE with X-Wing (X25519 + ML-KEM-768), HKDF-SHA256 and
+  AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
+  Enrollment and snapshot records name the key's suite, and the upload
+  route refuses a frame of a suite the deployment does not accept (`HPK1`
+  in production), other than the enrolled key's, or, with no enrolled key,
+  other than the current snapshot's with 422, each with a
+  `crypto.suite_refused` event; a development `HPK1` upload opens only
+  under the test key providers, since development key release is
+  `HPK2`-only. Production therefore refuses the browser's `HPK1`
+  enrollments and uploads until P36 (#186). Every key loader takes a suite
+  policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
+  with a `crypto.suite_refused` audit event; development still accepts
+  them until the browser moves to `HPK2` (P36). Private keys are exported
+  as `magic || key`; the key-release stand-in holds only `HPK2` tenant
+  keys, whether enrolled over HTTP or inserted directly, and the enclave
+  accepts only `HPK2` released keys. A query refuses a snapshot whose
+  record names another suite than the tenant's key before any key is
+  released or budget charged, and opens its envelopes under the record's
+  suite.
+  X-Wing known-answer tests against `@noble/post-quantum` and frames sealed
+  by `hpke-js` pin interoperability. ADR 0007 is accepted.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is

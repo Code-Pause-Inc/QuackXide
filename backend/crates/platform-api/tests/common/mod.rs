@@ -206,6 +206,12 @@ pub fn default_config() -> PlatformConfig {
     PlatformConfig::from_source(|_| None).expect("config")
 }
 
+/// Config with `APP_ENV=development`, where `HPK1` keys are still accepted.
+pub fn development_config() -> PlatformConfig {
+    PlatformConfig::from_source(|k| (k == "APP_ENV").then(|| "development".to_owned()))
+        .expect("config")
+}
+
 /// Config with the merchant-of-record webhook secret set.
 pub fn config_with_mor_secret(secret: &str) -> PlatformConfig {
     PlatformConfig::from_source(|k| match k {
@@ -414,11 +420,39 @@ pub async fn put_upload(
     .await
 }
 
+/// `PUT /api/v1/drive/enrollment` of `key`, as `token`.
+pub async fn enroll_key(app: &Router, token: &str, key: &TenantPublicKey) -> StatusCode {
+    use base64::Engine as _;
+    let body = serde_json::json!({
+        "hpke_public_key_b64": base64::engine::general_purpose::STANDARD.encode(key.to_raw()),
+    });
+    send(
+        app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(token), json_header()],
+        body.to_string().into_bytes(),
+    )
+    .await
+    .0
+}
+
 /// An app over `vault` where each steward's key is held for queries but no
 /// data exists until it is uploaded, with the research layer (k=5, default
 /// budget 100) on the development attestation.
 pub fn upload_research_app(
     secret: &str,
+    stewards: Vec<(TenantId, TenantKeypair)>,
+    vault: Arc<dyn VaultStore>,
+) -> Router {
+    upload_research_app_with_config(secret, default_config(), stewards, vault)
+}
+
+/// As [`upload_research_app`], under `config`: `development_config()` for
+/// stewards whose keys are `HPK1`.
+pub fn upload_research_app_with_config(
+    secret: &str,
+    config: PlatformConfig,
     stewards: Vec<(TenantId, TenantKeypair)>,
     vault: Arc<dyn VaultStore>,
 ) -> Router {
@@ -443,6 +477,7 @@ pub fn upload_research_app(
         false,
     );
     build_app(AppState {
+        config: Arc::new(config),
         research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)

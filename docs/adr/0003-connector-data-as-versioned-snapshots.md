@@ -24,10 +24,12 @@ Connector data is stored as complete, versioned snapshots:
   segment.
 * Objects are written to
   `tenants/{t}/connectors/{slug}/snapshots/{version}/{object}.parquet`,
-  sealed as before (`tenant-envelope-v1|{tenant}|{slug}|{object}`).
+  sealed as before (`tenant-envelope-v2|{tenant}|{slug}|{object}`, `-v1`
+  under `HPK1`).
 * The sync then writes a manifest listing the snapshot's object ids to
   `tenants/{t}/connectors/{slug}/manifests/{version}.manifest`, sealed to
-  the tenant with `info` `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`.
+  the tenant with `info` `tenant-snapshot-manifest-v2|{tenant}|{slug}|{version}`
+  (`-v1` under `HPK1`).
   Writing the manifest is the commit.
 * A query opens only the newest manifest, checks that it names its own
   version and lists no object twice, and decrypts exactly the objects it

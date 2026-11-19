@@ -162,14 +162,14 @@ Browser crypto worker                API (Axum)                                 
 ─────────────────────                ──────────                                   ────────────
 Parquet file (device only)
 seal object to steward key
-  steward-upload-v1|t|ds|obj
+  steward-upload-v1|t|ds|obj           (-v2 under HPK2)
 seal manifest {version, [obj]}
-  tenant-snapshot-manifest-v1|t|ds|v
+  tenant-snapshot-manifest-v1|t|ds|v   (-v2 under HPK2)
 header: version, obj, row cap,
   declared schema ──────────TLS────▶ PUT /api/v1/datasets/{ds}
                                      authn (JWT); tenant from the token only
                                      ds in the upload_ namespace?    ──no──▶ 404
-                                     size, framing, header           ──bad─▶ 413 / 422
+                                     size, framing, header, suite    ──bad─▶ 413 / 422
                                      newer version, same schema?     ──no──▶ 409 / 422
                                      object ────────────────────────────────────▶ tenants/{t}/connectors/{ds}/snapshots/{v}/{obj}.parquet
                                      record: suite, row cap, schema ────────────▶ tenants/{t}/connectors/{ds}/records/{v}.json
@@ -197,7 +197,17 @@ header: version, obj, row cap,
   (`DATASET_MAX_MIB`, default 64, refused at startup when out of range).
   The parser (`platform_connectors::upload`, fuzzed) checks every length
   before reading past it, bounds the header, and requires both envelopes
-  to be complete frames of one suite it reads (`HPK1`). A declared schema
+  to be complete frames of one suite it reads (`HPK1` or `HPK2`). The route
+  then refuses an upload whose suite the deployment does not accept
+  (`HPK1` in production, 422) or that differs from the suite of the
+  tenant's enrolled key (422), since neither could ever open; each is also
+  a `crypto.suite_refused` event. With no enrolled key to name the suite,
+  `commit_upload` refuses (422) an upload whose suite differs from the
+  current snapshot's, the same way; with one, a previous snapshot in
+  another suite does not block it, so re-enrolling in `HPK2` (P36) lets the
+  next upload replace an `HPK1` snapshot. In development an `HPK1` upload opens only under the test
+  key providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`):
+  development key release is `HPK2`-only. A declared schema
   unlike the dataset's recorded one is refused (422). Every refusal after
   authentication, except a malformed dataset id (400), is an audited
   `data.access` denial with a fixed reason.
@@ -289,10 +299,10 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   are what disclosure control relies on. Parse errors carry line numbers,
   never line content.
 * **Envelope binding**: the HPKE `info` string is
-  `tenant-envelope-v1|{tenant}|{slug}|{object}` — an envelope replayed under
-  a different object id does not open (tested). Framing is versioned
-  (`HPK1 || encapped_key || ciphertext`) so cipher suites can migrate
-  without redesigning storage.
+  `tenant-envelope-v2|{tenant}|{slug}|{object}` (`-v1` for `HPK1`) — an
+  envelope replayed under a different object id does not open (tested).
+  Framing is versioned (`magic || encapped_key || ciphertext`, magic `HPK2`
+  or `HPK1`) and the pipeline seals in the tenant key's suite.
 * **Snapshots** ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)):
   every sync is a full sync, so each one writes a complete snapshot under
   a new time-ordered version, then a plaintext record naming its suite,
@@ -303,8 +313,8 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   would inflate cohort counts past *k*) and a sync that stops partway
   changes nothing a query sees. Superseded snapshots, records included,
   are deleted after the commit. The manifest's HPKE `info` is
-  `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`. Steward uploads
-  share this layout and code (section 2).
+  `tenant-snapshot-manifest-v2|{tenant}|{slug}|{version}` (`-v1` for
+  `HPK1`). Steward uploads share this layout and code (section 2).
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
   aborts siblings. On SIGTERM or Ctrl-C it lets the sync in flight commit
   and starts no more. The `connector-worker` binary runs fixture jobs
@@ -393,11 +403,16 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   never the 400 of SQL that cannot run, and each limit refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them (see "Rate level" below).
-* **The snapshot as written.** Before any key is released, the query reads
-  the newest snapshot's plaintext record; a snapshot without a valid one
-  fails closed (502), as does a manifest that lists a missing object.
-  Objects open under their dataset kind's binding: `tenant-envelope-v1`
-  for a connector's, `steward-upload-v1` for an upload's. For an upload,
+* **The snapshot as written.** Before any key is released or budget
+  charged, the query reads the newest snapshot's plaintext record (a
+  research query reads it before its charge, then again, with the snapshot
+  then current, once it holds a slot); a snapshot without a valid one
+  fails closed (502), as does one whose record names another suite than
+  the tenant's key (502, `crypto.suite_refused`) and a manifest that lists
+  a missing object. Objects open under the
+  record's suite and their dataset kind's binding: `tenant-envelope-v2`
+  for a connector's, `steward-upload-v2` for an upload's (`-v1` under
+  `HPK1`), so an envelope of another suite fails to open. For an upload,
   `QueryScope::register_parquet_declared` checks each object's schema
   and the rows its footer reports against what the steward declared before
   decoding, and the decoded rows after; a mismatch is refused with 502
@@ -450,6 +465,7 @@ upload; the **researcher** may run aggregate queries but never read rows.
 Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403 + audit
                  attestation gate
+                 snapshot record: valid, names the key's suite?  ──no──▶ 502 + audit
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
                  slot, time and size limits as in Query (charged)  ──no──▶ 503 / 422 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
@@ -628,7 +644,8 @@ traits; durable backends replace them without touching call sites.
 * All primitives come from RustCrypto (`aes-gcm`, `hmac`, `sha2`,
   `rsa`) and the `hpke` crate; TOTP is RFC 6238 over the existing HMAC stack
   and is tested against the RFC's own vectors.
-* Suites are pinned at single seams (one `TenantKem` type alias, one
+* Suites are pinned at single seams (one `EnvelopeSuite` enum, whose
+  `CURRENT` is the suite new keys and envelopes use, and one
   `JwtVerifier` construction site) and encrypted framing is versioned, so
   algorithm migration is a code change plus a version bump — not a storage
   redesign.
@@ -644,11 +661,12 @@ traits; durable backends replace them without touching call sites.
 
 The release target is hybrid post-quantum cryptography, so ciphertext
 stored today stays protected against a future quantum adversary ("harvest
-now, decrypt later"). The current suites are classical.
+now, decrypt later"). Tenant envelopes are hybrid on the backend; the
+browser and signatures are still classical.
 
 | Use | Current | Target |
 | --- | --- | --- |
-| Key encapsulation (envelopes, enrollment) | X25519 (DHKEM, HKDF-SHA256), frame `HPK1` | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2` |
+| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The browser (`envelope-wasm`) and the enclave's key-release key are still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186; key-release key: P85, #176) |
 | Bulk encryption | AES-256-GCM | AES-256-GCM |
 | Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 for keys only an attested workload holds; tokens per ADR 0006 |
 
@@ -662,12 +680,23 @@ Migration rules:
 * Established implementations only, as ADR 0007 defines the term
   (RustCrypto, `hpke`, and Web Crypto where the browser supports the
   algorithm). No invented primitives.
-* The suite changes at the existing seams — `TenantKem`, the `JwtVerifier`
-  construction site, the browser crypto core — with a new frame version
-  alongside `HPK1`.
-* No silent downgrade: a reader configured for the hybrid suite refuses
-  classical-only envelopes and signatures. v1 has no migration mode
-  (ADR 0007): nothing has been sealed under `HPK1` outside development.
+* The suite changes at the existing seams — `EnvelopeSuite` (add a suite
+  and move `CURRENT`), the `JwtVerifier` construction site, the browser
+  crypto core — with a new frame version alongside `HPK1`.
+* Every key loader takes a `SuitePolicy`, except the raw `hpk1_*` loaders:
+  they are the browser's `HPK1` path and go away with P36 (#186). Tenant
+  enrollment and the demo tenant build it from `APP_ENV` (ADR 0009):
+  production accepts only `HPK2` keys, development also `HPK1`, so the
+  browser works until P36. The
+  key-release stand-in and released keys accept only `HPK2` in every mode;
+  the browser build and the enclave's key-release key accept only `HPK1`
+  until P36 and P85. A key opens only frames of its own suite, and a query
+  opens only a snapshot whose record names its key's suite. Refusals at
+  enrollment, upload, key release, query and open emit
+  `crypto.suite_refused`.
+* No silent downgrade: production refuses `HPK1` frames and X25519
+  enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):
+  nothing has been sealed under `HPK1` outside development.
 
 The work is tracked in `docs/PROJECT_SCOPE.md`; the threat it closes is A4
 in `docs/THREAT_MODEL.md`.
@@ -681,7 +710,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `audit_kind` | Emitted on |
 | --- | --- |
 | `service.start` | API or connector-worker boot |
-| `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
+| `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied; every refusal, a suite refusal included, is a denial) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
@@ -691,6 +720,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+| `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope, upload or snapshot record whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
 kind of their own: a grant is the steward provisioning access to its own
@@ -718,10 +748,10 @@ Rules, enforced by the capture tests:
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
-   enrollment (ok + denied), query attestation + execution (ok + failed),
-   query refusals by each kind of resource limit (denied), provisioning,
-   steward uploads (ok, committed, pruned, denied), the dataset listing
-   (ok + denied over its cap),
+   enrollment (ok + denied), suite refusals (enrollment and open), query
+   attestation + execution (ok + failed), query refusals by each kind of
+   resource limit (denied), provisioning, steward uploads (ok, committed,
+   pruned, denied), the dataset listing (ok + denied over its cap),
    connector snapshot commit and prune, the research catalog (ok +
    denied): publish and its refusal, request, approval and its retry, deny,
    and the refused retry and deny, and research grants and budgets (ok +

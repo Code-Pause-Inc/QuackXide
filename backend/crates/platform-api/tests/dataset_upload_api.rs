@@ -2,7 +2,8 @@
 //! browser-sealed upload is stored as the dataset's new snapshot and is
 //! queryable in the enclave; a re-upload replaces it; an upload that fails
 //! partway is never visible. Refusals: no or non-access token (401), a
-//! malformed body (422), an oversized one (413), a declared schema that
+//! malformed body (422), a frame of a suite the deployment refuses or the
+//! enrolled key does not use (422), an oversized one (413), a declared schema that
 //! differs from the recorded one (422), a stale version (409), a dataset id
 //! outside the upload namespace (404), a storage outage (503), and data
 //! that does not match its declaration (502, in the enclave).
@@ -59,7 +60,7 @@ struct Steward {
 
 fn steward() -> (Steward, TenantKeypair) {
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let steward = Steward {
         tenant,
         key: keypair.public_key(),
@@ -125,7 +126,7 @@ async fn an_upload_is_stored_sealed_and_queryable() {
     assert_eq!(body["dataset"], DATASET);
     assert_eq!(body["version"], sealed.version.as_str());
     assert_eq!(body["object"], sealed.object.to_string());
-    assert_eq!(body["suite"], "HPK1");
+    assert_eq!(body["suite"], "HPK2");
 
     // Stored at the snapshot layout: object, record, manifest; the object
     // is the ciphertext the browser sent, never Parquet.
@@ -139,7 +140,7 @@ async fn an_upload_is_stored_sealed_and_queryable() {
         ))
         .await
         .expect("object");
-    assert_eq!(&object[..4], b"HPK1");
+    assert_eq!(&object[..4], b"HPK2");
     assert!(
         !object.windows(4).any(|w| w == b"PAR1"),
         "plaintext Parquet stored"
@@ -205,7 +206,7 @@ async fn uploads_without_an_access_token_are_401() {
         ..app_state(SECRET, vault.clone())
     });
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let sealed = cohorts_upload(tenant, &keypair.public_key(), DATASET, None);
 
     let (status, _) = put_upload(&app, None, DATASET, sealed.body.clone()).await;
@@ -230,7 +231,7 @@ async fn malformed_upload_bodies_are_422() {
     let relabelled = {
         let mut out = body.clone();
         let object_at = object_offset(body);
-        out[object_at..object_at + 4].copy_from_slice(b"HPK2");
+        out[object_at..object_at + 4].copy_from_slice(b"HPK9");
         out
     };
     for (name, bad) in [
@@ -740,6 +741,172 @@ async fn a_manifest_listing_an_object_that_was_not_uploaded_fails_closed() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
 }
 
+#[tokio::test]
+async fn production_refuses_an_upload_in_a_suite_it_does_not_accept() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let vault = in_memory();
+    // The default config is production, which accepts only HPK2.
+    let app = build_app(app_state(SECRET, vault.clone()));
+    let tenant = TenantId::generate();
+    let hpk1 = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
+    let sealed = cohorts_upload(tenant, &hpk1.public_key(), DATASET, None);
+
+    let (status, body) = put_upload(&app, Some(&token_for(tenant)), DATASET, sealed.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "upload suite not accepted");
+    assert!(stored(&*vault, tenant).await.is_empty());
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn development_accepts_an_hpk1_upload() {
+    // The browser seals HPK1 until P36, which development still accepts.
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    let tenant = TenantId::generate();
+    let hpk1 = TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk1);
+    let sealed = cohorts_upload(tenant, &hpk1.public_key(), DATASET, None);
+    let (status, body) = put_upload(&app, Some(&token_for(tenant)), DATASET, sealed.body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn an_upload_in_another_suite_than_the_enrolled_key_is_refused() {
+    use platform_crypto::EnvelopeSuite::{Hpk1, Hpk2};
+
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    // Both suites pass the development policy; the enrolled key decides.
+    for (enrolled, sealed_as) in [(Hpk2, Hpk1), (Hpk1, Hpk2)] {
+        let tenant = TenantId::generate();
+        let token = token_for(tenant);
+        let enrolled_key = TenantKeypair::generate(enrolled).public_key();
+        assert_eq!(
+            common::enroll_key(&app, &token, &enrolled_key).await,
+            StatusCode::NO_CONTENT
+        );
+        // The same suite as the enrolled key is stored.
+        let first = cohorts_upload(tenant, &enrolled_key, DATASET, None);
+        let (status, body) = put_upload(&app, Some(&token), DATASET, first.body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let other = TenantKeypair::generate(sealed_as).public_key();
+        let sealed = cohorts_upload(tenant, &other, DATASET, Some(&first.version));
+        let (status, body) = put_upload(&app, Some(&token), DATASET, sealed.body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "upload suite does not match the enrolled key"
+        );
+        // Nothing was committed: the previous snapshot is not pruned.
+        assert_eq!(snapshot_paths(&*vault, tenant).await, (1, 1, 1));
+    }
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_enrollment_record_fails_the_upload_closed() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let vault = in_memory();
+    let (app, steward) = app_over(vault.clone());
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(steward.tenant),
+            Bytes::from_static(b"not an enrollment record"),
+        )
+        .await
+        .expect("put");
+    let sealed = cohorts_upload(steward.tenant, &steward.key, DATASET, None);
+    let (status, body) = put_upload(&app, Some(&steward.token), DATASET, sealed.body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (0, 0, 0));
+    assert!(
+        capture
+            .events()
+            .iter()
+            .any(|e| e.audit_kind == "data.access"
+                && e.outcome == "failed"
+                && e.detail == "upload failed dataset=upload_cohorts reason=enrollment_unreadable"),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
+async fn with_no_enrolled_key_an_upload_must_use_the_current_snapshots_suite() {
+    use platform_crypto::EnvelopeSuite::{Hpk1, Hpk2};
+
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    // A first upload with nothing enrolled and no snapshot is accepted.
+    let key = TenantKeypair::generate(Hpk2).public_key();
+    let first = cohorts_upload(tenant, &key, DATASET, None);
+    let (status, body) = put_upload(&app, Some(&token), DATASET, first.body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let other = TenantKeypair::generate(Hpk1).public_key();
+    let second = cohorts_upload(tenant, &other, DATASET, Some(&first.version));
+    let (status, body) = put_upload(&app, Some(&token), DATASET, second.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "upload suite does not match the dataset");
+    // The snapshot that opens is still the only one.
+    assert_eq!(snapshot_paths(&*vault, tenant).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn re_enrolling_in_another_suite_lets_the_next_upload_replace_the_snapshot() {
+    use platform_crypto::EnvelopeSuite::{Hpk1, Hpk2};
+
+    let vault = in_memory();
+    let app = build_app(AppState {
+        config: Arc::new(common::development_config()),
+        ..app_state(SECRET, vault.clone())
+    });
+    let tenant = TenantId::generate();
+    let token = token_for(tenant);
+    let old = TenantKeypair::generate(Hpk1).public_key();
+    assert_eq!(
+        common::enroll_key(&app, &token, &old).await,
+        StatusCode::NO_CONTENT
+    );
+    let first = cohorts_upload(tenant, &old, DATASET, None);
+    assert_eq!(
+        put_upload(&app, Some(&token), DATASET, first.body).await.0,
+        StatusCode::OK
+    );
+
+    // The P36 migration: the key moves to HPK2, and so does the next upload.
+    let new = TenantKeypair::generate(Hpk2).public_key();
+    assert_eq!(
+        common::enroll_key(&app, &token, &new).await,
+        StatusCode::NO_CONTENT
+    );
+    let second = cohorts_upload(tenant, &new, DATASET, Some(&first.version));
+    let (status, body) = put_upload(&app, Some(&token), DATASET, second.body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["suite"], "HPK2");
+}
+
 // ── The dataset listing ──
 
 /// What a tenant that holds no dataset is sent.
@@ -797,7 +964,7 @@ async fn the_listing_shows_each_upload_as_the_current_snapshot() {
     let entry = &entries[0];
     assert_eq!(entry["dataset"], DATASET);
     assert_eq!(entry["version"], first.version.as_str());
-    assert_eq!(entry["suite"], "HPK1");
+    assert_eq!(entry["suite"], platform_crypto::EnvelopeSuite::CURRENT.id());
     assert_eq!(entry["object_count"], 1);
     assert_eq!(entry["objects"], object_ids(&[first.object]));
     assert_eq!(entry["ciphertext_bytes"], uploaded["ciphertext_bytes"]);
@@ -955,7 +1122,7 @@ async fn synced_and_seeded_datasets_are_listed_as_publishing_sees_them() {
     let app = common::research_app(
         SECRET,
         seeded,
-        TenantKeypair::generate(),
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
         common::dev_attestation(),
         false,
     )
@@ -963,7 +1130,10 @@ async fn synced_and_seeded_datasets_are_listed_as_publishing_sees_them() {
     let entries = listed(&app, &token_for(seeded)).await;
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0]["dataset"], "health");
-    assert_eq!(entries[0]["suite"], "HPK1");
+    assert_eq!(
+        entries[0]["suite"],
+        platform_crypto::EnvelopeSuite::CURRENT.id()
+    );
     assert_eq!(entries[0]["object_count"], 1);
 
     // Two connector syncs, the second superseding the first, then an upload.
@@ -995,7 +1165,10 @@ async fn synced_and_seeded_datasets_are_listed_as_publishing_sees_them() {
         .await
         .expect("usage");
     assert_eq!(entries[0]["version"], version.as_str());
-    assert_eq!(entries[0]["suite"], "HPK1");
+    assert_eq!(
+        entries[0]["suite"],
+        platform_crypto::EnvelopeSuite::CURRENT.id()
+    );
     assert_eq!(entries[0]["object_count"], stored.object_count);
     assert_eq!(entries[0]["ciphertext_bytes"], stored.total_bytes);
 
@@ -1237,6 +1410,7 @@ impl RacingVault {
                     self.steward,
                     &slug(),
                     body,
+                    false,
                     std::time::SystemTime::now(),
                 )
                 .await
@@ -1322,7 +1496,10 @@ async fn a_re_upload_during_a_listing_is_listed_as_the_new_snapshot() {
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0]["version"], second.version.as_str());
     assert_eq!(entries[0]["objects"], object_ids(&[second.object]));
-    assert_eq!(entries[0]["suite"], "HPK1");
+    assert_eq!(
+        entries[0]["suite"],
+        platform_crypto::EnvelopeSuite::CURRENT.id()
+    );
 }
 
 #[tokio::test]
