@@ -305,6 +305,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `jsonwebtoken` 12, on `elliptic-curve` 0.14, removes `crypto-bigint`
+  0.5, so `backend/deny.toml` no longer ignores RUSTSEC-2026-0387.
+  `jsonwebtoken` 12 refuses an empty HMAC secret: minting with one fails,
+  and `JwtVerifier::hs256` built from one rejects every token.
 * `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
   (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
   fixed release) do not fail the dependency audit: they report

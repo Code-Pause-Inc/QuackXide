@@ -19,12 +19,6 @@ ignore = [
     # 55 to quick-xml 0.39). Revisit when object_store moves to quick-xml 0.41+.
     { id = "RUSTSEC-2026-0194", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
     { id = "RUSTSEC-2026-0195", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
-    # crypto-bigint timing (fixed in >= 0.7.6): 0.5 comes in only through
-    # elliptic-curve 0.13 (p256 and p384 via jsonwebtoken 11); hpke 0.14 no
-    # longer pulls it in. No ES256/ES384 token is signed or accepted: platform
-    # tokens are RS256 or HS256, attestation tokens RS256. Revisit with a
-    # jsonwebtoken release on elliptic-curve 0.14.
-    { id = "RUSTSEC-2026-0387", reason = "no P-256/P-384 arithmetic on secrets; elliptic-curve 0.13 pins crypto-bigint 0.5" },
     # zstd and zstd-safe (fixed in zstd >= 0.14.3, zstd-safe >= 8.2.0):
     # arrow, parquet and DataFusion 55 pin zstd 0.13. arrow-ipc and parquet
     # use the bulk API and async-compression drives zstd-safe directly, never
