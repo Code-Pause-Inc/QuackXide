@@ -35,6 +35,18 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "no zstd with_context streams; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature not enabled; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0403", reason = "zstd legacy feature not enabled; DataFusion 55 pins zstd 0.13" },
+    # chrono, chrono-tz and humantime (unmaintained, all versions, no fixed
+    # release): a maintenance notice, not a vulnerability. arrow, parquet,
+    # DataFusion 55 and object_store 0.13 depend on chrono; chrono-tz comes
+    # in through arrow-array and DataFusion, humantime through object_store;
+    # platform-api, -billing, -connectors, -storage and -tenancy use chrono
+    # for timestamps. A vulnerability in any of them would be a new advisory
+    # and still fail this check. Revisit when arrow, DataFusion and
+    # object_store move off chrono (the advisory suggests jiff or time); the
+    # workspace crates can move with them.
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained, no vulnerability; object_store 0.13 depends on it" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability; arrow, DataFusion 55 and object_store 0.13 depend on it" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, no vulnerability; arrow-array 59 and DataFusion 55 depend on it" },
 ]
 
 [licenses]

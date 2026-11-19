@@ -8,6 +8,38 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
+  seeding it at startup. The dev-only `seal-upload` binary, run on demand
+  as its own image with no network, plays the steward's browser: it seals
+  a synthetic cohort and its manifest to the steward's public key
+  (ADR 0012) and writes the upload body, which the script sends through
+  `PUT /api/v1/datasets/{dataset}` before it publishes the dataset and
+  runs the research lifecycle on it. The script also checks that an upload
+  is refused without a token (401), outside the upload namespace (404) and
+  at a stale version (409), that an approval retry after a revoke is
+  refused (404), and, after the upload and again after the queries, that
+  the vault holds exactly the upload's object and manifest as `HPK1`
+  envelopes and its record, whose row cap and schema are the ones the
+  steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
+  `enclave-api`. The API tests seal uploads with the same code
+  (`platform_api::dev::seal_upload`), and CI checks that release builds
+  cannot contain `seal-upload`.
+* Steward dataset listing (P39): `GET /api/v1/datasets` lists every
+  research dataset the caller's tenant holds, connectors' and uploads'
+  alike: exactly those it may publish, decided by the same function as
+  `platform_connectors::snapshot::holds`. Each entry gives the dataset id,
+  the current snapshot's version and write time, the ids, count and total
+  ciphertext bytes of the objects stored at that version, and the suite
+  its plaintext record names, all read without opening anything;
+  superseded snapshots and uploads that have not committed are not
+  counted, and a snapshot that an upload or sync replaces during the
+  listing is described as the new one. The tenant comes from the token
+  only. The route needs no query service, refuses more than
+  `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
+  and answers a storage failure with 503 or 502, never an empty list; each
+  listing is audited as `data.access`. `platform_connectors::snapshot`
+  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
@@ -265,6 +297,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
+  (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
+  fixed release) do not fail the dependency audit: they report
+  maintenance, not a vulnerability, and arrow, DataFusion 55 and
+  object_store 0.13 depend on these crates until they move off `chrono`.
 * Per-query resource limits (ADR 0013, proposed; P52;
   `platform_core::QueryLimits`, read by `platform-config`; each bounded,
   and an invalid value refuses startup).
