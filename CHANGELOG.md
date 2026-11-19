@@ -350,6 +350,11 @@ uses [Semantic Versioning](https://semver.org/).
   literals, including a researcher's `WHERE` values, to the host's logs.
   Query engine errors keep a fixed category instead of library error
   text, which could quote cell values.
+* `backend/deny.toml` records why the unmaintained advisories for `chrono`
+  (RUSTSEC-2026-0543), `chrono-tz` (RUSTSEC-2026-0555) and `humantime`
+  (RUSTSEC-2026-0542) are accepted until arrow and `object_store` move off
+  them: none has a patched release, and arrow, DataFusion 55 and
+  `object_store` 0.13 depend on all three.
 
 ### Changed
 

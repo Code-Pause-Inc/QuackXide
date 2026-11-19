@@ -35,6 +35,24 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "no zstd with_context streams; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature not enabled; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0403", reason = "zstd legacy feature not enabled; DataFusion 55 pins zstd 0.13" },
+    # chrono, chrono-tz and humantime (unmaintained, no known vulnerability,
+    # no patched release; chrono is soft-deprecated in favour of jiff):
+    # * chrono is in the public API of arrow, parquet, DataFusion 55 and
+    #   object_store 0.13 (`ObjectMeta::last_modified`), and the workspace
+    #   uses it for timestamps. The only outside input it parses is the
+    #   Paddle webhook `occurred_at`, after the signature check.
+    # * chrono-tz is a default feature of arrow-array, which every arrow
+    #   crate enables, so it cannot be switched off.
+    # * humantime comes in only through object_store 0.13, which parses and
+    #   formats duration strings in its config (operator environment via
+    #   `GoogleCloudStorageBuilder::from_env`); tenant input never reaches it.
+    # Revisit when arrow and object_store move off chrono, and when
+    # object_store drops humantime (apache/arrow-rs-object-store#908) in a
+    # release DataFusion adopts. Any vulnerability advisory has its own ID and
+    # still fails this check.
+    { id = "RUSTSEC-2026-0542", reason = "humantime only via object_store 0.13 config durations; no patched release" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is in the arrow, DataFusion 55 and object_store public APIs; no patched release" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is a default arrow-array feature; no patched release" },
 ]
 
 [licenses]
