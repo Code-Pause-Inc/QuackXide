@@ -195,11 +195,16 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   only with the `dev` feature.
 * **Resource limits as a side channel.** Whether a query runs out of its
   memory pool or its time limit depends on the rows it reads, including
-  rows in cohorts that suppression withholds, so the refusal can answer a
-  coarse question about them, as response time can. Size limits on the
-  input and the decoded dataset depend only on the dataset, and the result
-  limits only on the rows released. Each probe costs a research query one
-  unit; own-data queries have no budget (see above).
+  rows in cohorts that suppression withholds. A gated query (ZK own-data or
+  research) gets both refusals as a disclosure-control refusal, so the
+  response does not say which limit tripped (ADR 0013). It still shows that
+  the query was refused. The caller can tell any other refusal from its own
+  SQL and the schema, so a refused query that passes those checks still
+  answers one question about the rows it read. A time refusal also arrives
+  only after the time limit, as response time otherwise shows. Size limits
+  on the input and the decoded dataset depend only on the dataset, and the
+  result limits only on the rows released. Each probe costs a research
+  query one unit; own-data queries have no budget (see above).
 * **Extreme values.** `MIN` and `MAX` over a cohort of at least *k* still
   return one individual's actual value. This is standard for aggregate
   release; removing them from the allowlist, or applying a dominance rule,

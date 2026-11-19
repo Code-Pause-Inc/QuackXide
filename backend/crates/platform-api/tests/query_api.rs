@@ -387,6 +387,7 @@ impl EnclaveKeyProvider for ObservedKeys {
 
 /// How [`observed`] builds its query service.
 struct Observe {
+    zk: ZkMode,
     max_concurrent_queries: usize,
     limits: QueryLimits,
     fail_on_call: Option<usize>,
@@ -396,6 +397,7 @@ struct Observe {
 impl Default for Observe {
     fn default() -> Self {
         Self {
+            zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
             limits: QueryLimits::default(),
             fail_on_call: None,
@@ -404,8 +406,9 @@ impl Default for Observe {
     }
 }
 
-/// A query service (ZK off) over `vault`, which holds data sealed to
-/// `keypair` for `tenant`, opening keys through [`ObservedKeys`].
+/// A query service (ZK off unless [`Observe::zk`] says otherwise) over
+/// `vault`, which holds data sealed to `keypair` for `tenant`, opening keys
+/// through [`ObservedKeys`].
 fn observed(
     tenant: TenantId,
     keypair: TenantKeypair,
@@ -427,7 +430,7 @@ fn observed(
         keys.clone(),
         attestation,
         EngineSettings {
-            zk: ZkMode::Disabled,
+            zk: observe.zk,
             max_concurrent_queries: observe.max_concurrent_queries,
             limits: observe.limits,
         },
@@ -1121,6 +1124,228 @@ async fn research_queries_refused_by_a_size_limit_are_charged() {
             "{expected}"
         );
     }
+}
+
+// ── Gated queries: memory and time refusals look like disclosure refusals ──
+
+/// A whole response, status, headers and body, so two refusals can be
+/// compared byte for byte.
+type RawResponse = (StatusCode, axum::http::HeaderMap, String);
+
+/// `body` posted to `uri` as `caller`, answered as a [`RawResponse`].
+async fn raw_post(
+    app: &Router,
+    uri: &str,
+    caller: TenantId,
+    body: &serde_json::Value,
+) -> RawResponse {
+    let (status, headers, bytes) = common::send_with_headers(
+        app,
+        "POST",
+        uri,
+        &[bearer(&token_for(caller)), common::json_header()],
+        body.to_string().into_bytes(),
+    )
+    .await;
+    (
+        status,
+        headers,
+        String::from_utf8(bytes).expect("utf-8 body"),
+    )
+}
+
+/// What a memory refusal, a time refusal and a disclosure refusal of the
+/// same gated caller look like, and the audit events they left.
+struct GatedRefusals {
+    memory: RawResponse,
+    time: RawResponse,
+    disclosure: RawResponse,
+    audit: Vec<platform_telemetry::capture::CapturedAudit>,
+}
+
+/// One case of [`gated_cases`]: its limits, which key open is slowed and
+/// for how long ([`Observe::slow_call`]), and its SQL.
+type GatedCase = (QueryLimits, Option<(usize, Duration)>, &'static str);
+
+/// The memory, time and disclosure cases of [`GatedRefusals`], in that
+/// order, as limits, a slowed key open and SQL: the memory
+/// pool too small for any aggregation, or a time limit that passes while
+/// the snapshot's object opens. The disclosure case runs under the
+/// defaults.
+fn gated_cases() -> [GatedCase; 3] {
+    let defaults = QueryLimits::default();
+    [
+        (
+            QueryLimits {
+                memory_bytes: 1,
+                ..defaults
+            },
+            None,
+            RESEARCH_SQL,
+        ),
+        (
+            QueryLimits {
+                timeout: Duration::from_secs(1),
+                ..defaults
+            },
+            Some((2, HOLD)),
+            RESEARCH_SQL,
+        ),
+        // No `COUNT(*) AS n`: refused by disclosure control.
+        (defaults, None, BY_CURRENCY),
+    ]
+}
+
+/// Research queries through `POST /api/v1/research/query`, each by its
+/// own researcher on its own steward's QuickBooks data, so no response
+/// differs by an id. Each case is charged one unit.
+async fn research_refusals() -> GatedRefusals {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let mut responses = Vec::new();
+    for (limits, slow_call, sql) in gated_cases() {
+        let steward = TenantId::generate();
+        let researcher = TenantId::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+        let vault = synced_vault(steward, &keypair, 1).await;
+        let (research, grant_id) = research_grant(&vault, steward, researcher).await;
+        let observe = Observe {
+            limits,
+            slow_call,
+            ..Observe::default()
+        };
+        let (service, _) = observed(
+            steward,
+            keypair,
+            vault.clone(),
+            observe,
+            dev_attestation(),
+            false,
+        );
+        let app = build_app(AppState {
+            research: Some(research.clone()),
+            query: Some(Arc::new(service.with_research(research.clone()))),
+            ..app_state(SECRET, vault)
+        });
+        let body = serde_json::json!({
+            "steward_tenant": steward.to_string(),
+            "connector": "quickbooks",
+            "sql": sql,
+        });
+        responses.push(raw_post(&app, "/api/v1/research/query", researcher, &body).await);
+        assert_eq!(spent(&research, researcher, &grant_id).await, 1, "{sql}");
+    }
+    let [memory, time, disclosure] = responses.try_into().expect("three cases");
+    GatedRefusals {
+        memory,
+        time,
+        disclosure,
+        audit: capture.events(),
+    }
+}
+
+/// Own-data queries through `POST /api/v1/query`, each by its own tenant,
+/// with ZK mode as `zk` says.
+async fn own_data_refusals(zk: ZkMode) -> GatedRefusals {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let mut responses = Vec::new();
+    for (limits, slow_call, sql) in gated_cases() {
+        let tenant = TenantId::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+        let vault = synced_vault(tenant, &keypair, 1).await;
+        let observe = Observe {
+            zk,
+            limits,
+            slow_call,
+            ..Observe::default()
+        };
+        let (service, _) = observed(
+            tenant,
+            keypair,
+            vault.clone(),
+            observe,
+            dev_attestation(),
+            false,
+        );
+        let app = build_app(AppState {
+            query: Some(Arc::new(service)),
+            ..app_state(SECRET, vault)
+        });
+        let body = serde_json::json!({ "connector": "quickbooks", "sql": sql });
+        responses.push(raw_post(&app, "/api/v1/query", tenant, &body).await);
+    }
+    let [memory, time, disclosure] = responses.try_into().expect("three cases");
+    GatedRefusals {
+        memory,
+        time,
+        disclosure,
+        audit: capture.events(),
+    }
+}
+
+/// The `engine.query` "denied" events that name a limit.
+fn limit_denials(audit: &[platform_telemetry::capture::CapturedAudit]) -> Vec<&str> {
+    audit
+        .iter()
+        .filter(|event| event.audit_kind == "engine.query" && event.outcome == "denied")
+        .map(|event| event.detail.as_str())
+        .collect()
+}
+
+/// Whether a gated query runs out of memory or time depends on the rows it
+/// reads, suppressed cohorts included. A researcher gets exactly the
+/// response of a disclosure-control refusal for both, status, headers and
+/// body; only the audit record names the limit. Each refusal costs a unit.
+#[tokio::test(start_paused = true)]
+async fn a_researcher_cannot_tell_a_memory_or_time_refusal_from_a_disclosure_refusal() {
+    let refusals = research_refusals().await;
+    let (status, _, body) = &refusals.disclosure;
+    assert_eq!(*status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).expect("json"),
+        serde_json::json!({
+            "error": "query rejected by disclosure control (see cohort-size rules)"
+        })
+    );
+    assert_eq!(refusals.memory, refusals.disclosure, "memory");
+    assert_eq!(refusals.time, refusals.disclosure, "time");
+
+    let denials = limit_denials(&refusals.audit);
+    assert_eq!(denials.len(), 2, "{denials:?}");
+    assert!(
+        denials[0].ends_with("connector=quickbooks limit=memory budget_remaining=9"),
+        "{denials:?}"
+    );
+    assert!(
+        denials[1].ends_with("connector=quickbooks limit=time budget_remaining=9"),
+        "{denials:?}"
+    );
+}
+
+/// The same holds for an own-data query in ZK mode. Without ZK mode each
+/// limit keeps its own status and message (the tests above), since the
+/// caller may read the rows anyway.
+#[tokio::test(start_paused = true)]
+async fn a_zk_query_cannot_tell_a_memory_or_time_refusal_from_a_disclosure_refusal() {
+    let refusals = own_data_refusals(ZkMode::Enabled).await;
+    assert_eq!(refusals.disclosure.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(refusals.memory, refusals.disclosure, "memory");
+    assert_eq!(refusals.time, refusals.disclosure, "time");
+    assert_eq!(
+        limit_denials(&refusals.audit),
+        [
+            "connector=quickbooks limit=memory zk=true",
+            "connector=quickbooks limit=time zk=true"
+        ]
+    );
+
+    let ungated = own_data_refusals(ZkMode::Disabled).await;
+    let message = |response: &RawResponse| {
+        serde_json::from_str::<serde_json::Value>(&response.2).expect("json")["error"].clone()
+    };
+    assert_eq!(ungated.memory.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(message(&ungated.memory), "query exceeds its memory limit");
+    assert_eq!(ungated.time.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(message(&ungated.time), "query exceeded its time limit");
 }
 
 // ── Snapshots: repeated or interrupted syncs never change what a query reads ──

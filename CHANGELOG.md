@@ -343,6 +343,18 @@ uses [Semantic Versioning](https://semver.org/).
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
+* A gated query (ZK own-data or research) that runs out of its memory pool
+  or its time limit gets exactly the response of a disclosure-control
+  refusal: 422, "query rejected by disclosure control (see cohort-size
+  rules)", with the same headers, as `ApiError::GatedQueryLimit`. Both
+  limits can trip on rows that suppression withholds. Before this change,
+  their own 422 and 503 told a researcher which limit a withheld cohort
+  tripped (ADR 0013). The `engine.query` "denied" event still names the
+  limit, the operator-only metrics keep `query_limit` and
+  `query_timed_out`, and the other limits, and ungated queries, keep their
+  responses. Whether a query was refused, and how long the refusal took,
+  are still visible and recorded as a residual risk in
+  `docs/THREAT_MODEL.md`.
 * The secret scan reads every file's content whatever git attributes say:
   `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
   `.git/info/attributes`, a user's attributes file or a NUL byte from

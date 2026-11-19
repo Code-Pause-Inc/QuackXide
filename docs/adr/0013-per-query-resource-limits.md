@@ -98,7 +98,8 @@ operator produces consumes budget, so the plan stops at its next batch
 boundary.
 
 **Responses.** A limit refusal is `ApiError::QueryLimit(QueryLimit)`;
-`QueryUnavailable` stays the refusal for missing wiring.
+`QueryUnavailable` stays the refusal for missing wiring. A gated query's
+memory and time refusals differ, as "Gated queries" below says.
 
 | Limit | Status | Metrics kind |
 | --- | --- | --- |
@@ -109,6 +110,28 @@ boundary.
 A result over a limit is refused, never truncated: a partial result would
 look whole. Each refusal emits one `engine.query` "denied" event naming
 the limit (`limit=<name>`), with no SQL text.
+
+**Gated queries.** A ZK own-data query or a research query can run out of
+its memory pool or its time on rows that suppression withholds. One
+aggregate over one scan holds a hash-table entry for every group,
+suppressed ones included, and scans every row its filter reads. With
+their own statuses and messages, two queries over two cohorts would tell
+the caller which limit, if any, a withheld cohort tripped. So in gated
+mode both refusals are `ApiError::GatedQueryLimit(QueryLimit)`, whose
+response is exactly a disclosure-control refusal's: 422, "query rejected
+by disclosure control (see cohort-size rules)", with the same headers.
+The audit event is written before the swap and still names the limit.
+The metrics keep `query_limit` and `query_timed_out`, because they are
+served only on the operator's loopback listener. The other limits keep
+their responses in gated mode. The slot wait reads no data. The input
+and decode limits depend only on the dataset, the same for every query
+over it. The result limits count only the rows released.
+
+| Limit | Ungated | Gated (ZK or research) |
+| --- | --- | --- |
+| Memory | 422, "query exceeds its memory limit" | 422, the disclosure-control refusal |
+| Time | 503, "query exceeded its time limit" | 422, the disclosure-control refusal |
+| Every other limit | As above | As above |
 
 **Budget.** Every limit refusal of a research query comes after the
 charge, so each costs one unit, the slot-wait refusal included. Tests pin
@@ -129,8 +152,20 @@ Rejected:
   and P53 moves it into the scan.
 * A separate input-size key. One value cannot drift from the upload
   limit.
-* 422 for the time limit. A query can time out because storage or key
-  release is slow, not only because of its SQL.
+* 422 for the time limit of an ungated query. A query can time out because
+  storage or key release is slow, not only because of its SQL. A gated
+  query gets 422 anyway, because hiding which limit tripped is worth more
+  there than a hint to retry.
+* A plan-gate restriction instead of the gated response. A plan's memory
+  and running time depend on how many groups and rows match its filter,
+  which no check before execution can know.
+* A 503 for a gated query's time limit only when it passes before the
+  engine runs, while the query waits on storage or key release. Both
+  cases come from one timer. Telling them apart would add a branch and
+  reveal how far the query got.
+* A gated response of its own. Every other refusal of a gated query
+  depends only on its SQL and the dataset's schema, so a response of its
+  own would name the cause just as the limit's message does.
 * Counting decoded Arrow memory while decoding. Batches share buffers
   (dictionary values, view data), and per-batch sizes count each shared
   buffer once per batch, which would refuse honest data.
@@ -143,7 +178,7 @@ Rejected:
 ## Consequences
 
 * A query that needs more memory than its pool is refused with 422
-  instead of spilling. Operators set `QUERY_TOTAL_MEMORY_MIB` below the
+  instead of spilling; a gated one, as a disclosure-control refusal. Operators set `QUERY_TOTAL_MEMORY_MIB` below the
   machine's memory, and startup checks the other limits against it. With
   the other defaults, a `DATASET_MAX_MIB` over 253 or a
   `QUERY_MAX_CONCURRENT` over 5 needs a larger total.
@@ -155,10 +190,20 @@ Rejected:
   run-length encoding shrinks, so a decoded table can take more memory
   than `QUERY_MAX_DECODED_MIB`; the row limit holds regardless.
 * Whether a query runs out of memory or time depends on the rows it
-  reads, including suppressed ones, so these refusals are a coarse side
-  channel, recorded as a residual risk in `docs/THREAT_MODEL.md`. The
-  input, decode and result limits do not depend on the query's
-  suppressed rows.
+  reads, including suppressed ones. In gated mode the response no longer
+  says which limit tripped, but it still shows that a query was refused.
+  Every other refusal of a gated query depends only on its SQL and the
+  schema, which the caller knows, so a refused query that otherwise
+  passes still answers one question about the rows it read. A time
+  refusal also arrives only after the time limit, while a
+  disclosure-control refusal arrives at once. Each probe costs a research
+  query one unit, and own-data queries have no budget. This channel is
+  recorded as a residual risk in `docs/THREAT_MODEL.md`. The input,
+  decode and result limits do not depend on the query's suppressed rows.
+* In gated mode a query that times out on slow storage or key release
+  looks like a disclosure refusal, and a research query that is retried
+  is charged again. Operators see the time limit in the audit record and
+  in `query_timed_out`.
 * Rate limiting and per-tenant fairness stay outside v1: one tenant's
   queries can hold every slot while others are refused with 503.
 * A new limit needs a `QueryLimits` field, a configuration key, a
