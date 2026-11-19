@@ -144,7 +144,7 @@ jobs:
             echo "::error::platform-api is missing from the build report; the check cannot run"
             exit 1
           fi
-          for bin in devstack key-release query-demo sim-attestation; do
+          for bin in devstack key-release query-demo seal-upload sim-attestation; do
             if grep -qx "$bin" <<<"$built"; then
               echo "::error::the default-feature release build produced the dev-only binary $bin"
               exit 1
@@ -152,7 +152,7 @@ jobs:
           done
       - name: Dev-only binaries cannot be built without the dev feature
         run: |
-          for bin in devstack key-release query-demo sim-attestation; do
+          for bin in devstack key-release query-demo seal-upload sim-attestation; do
             if cargo build --manifest-path backend/Cargo.toml --release --locked -p platform-api --bin "$bin" 2> "$bin.err"; then
               echo "::error::$bin built without --features dev"
               exit 1

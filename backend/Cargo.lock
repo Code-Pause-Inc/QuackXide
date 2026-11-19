@@ -3636,6 +3636,7 @@ dependencies = [
  "arrow",
  "bytes",
  "datafusion",
+ "futures",
  "object_store",
  "parquet",
  "platform-core",
@@ -3645,6 +3646,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]
