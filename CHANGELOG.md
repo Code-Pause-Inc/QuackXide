@@ -305,6 +305,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* Code-owner review covers the query engine's source, the API's source,
+  grants and budgets (`platform-tenancy`), the audit-coverage and bypass
+  tests, `docs/THREAT_MODEL.md` and `docs/adr/`. `scripts/check.sh` fails
+  when a `CODEOWNERS` pattern matches no tracked path.
+  `CONTRIBUTING.md` describes the review stages, Dependabot handling, and
+  how a vulnerability is fixed privately in a security advisory's fork.
 * `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
   (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
   fixed release) do not fail the dependency audit: they report
