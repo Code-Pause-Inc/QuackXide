@@ -7,7 +7,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-mapfile -t tracked < <(git -C "$ROOT" ls-files)
+tracked=()
+while IFS= read -r path; do tracked+=("$path"); done < <(git -C "$ROOT" ls-files)
 status=0
 while read -r pattern _; do
     pattern="${pattern%$'\r'}"
