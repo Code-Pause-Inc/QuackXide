@@ -193,19 +193,19 @@ Rejected:
   distinct value once. Views point into the pages and dictionaries they
   came from; a dictionary array would not do, since the reader expands one
   inside a batch that crosses into another row group or from
-  dictionary-encoded pages to plain ones. The table can pass
-  `QUERY_MAX_DECODED_MIB` only by the other columns of the batch of 1024
-  rows that crosses it; a string or binary column nested in a list or
-  struct is counted only after it expands, one page decompresses whole, to
-  the size its own header states, before any count sees it, and a
-  `DELTA_BYTE_ARRAY` page, which rebuilds each value from the one before
-  it, can copy up to its own size once per row of the batch. Arrow memory
-  exceeds a footer's sizes for most dictionary-encoded columns, so a
-  dataset near the limit by its footers can be refused. A column the
-  file's own Arrow schema declares as a view type, or as a dictionary of
-  anything but strings or binary, shares buffers across batches, and each
-  batch counts them again, so such a dataset can be refused below the
-  limit.
+  dictionary-encoded pages to plain ones. Fixed-width columns are checked
+  from their widths before each batch of 1024 rows decodes. The table can
+  pass `QUERY_MAX_DECODED_MIB` only by the batch's list columns, and its
+  strings or binary inside a struct, which are counted only after they
+  expand; one page decompresses whole, to the size its own header states,
+  before any count sees it, and a `DELTA_BYTE_ARRAY` page, which rebuilds
+  each value from the one before it, can copy up to its own size once per
+  row of the batch. Arrow memory exceeds a footer's sizes for most
+  dictionary-encoded columns, so a dataset near the limit by its footers
+  can be refused. A column the file's own Arrow schema declares as a view
+  type, or as a dictionary of anything but strings or binary, shares
+  buffers across batches, and each batch counts them again, so such a
+  dataset can be refused below the limit.
 * Whether a query runs out of memory or time depends on the rows it
   reads, including suppressed ones. In gated mode the response no longer
   says which limit tripped, but it still shows that a query was refused.

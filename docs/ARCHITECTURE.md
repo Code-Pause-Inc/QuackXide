@@ -395,13 +395,14 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   into the pages and dictionaries they came from. Plain ones are measured
   before they expand, so a value repeated across rows is refused before it
   is copied once per row, and dictionaries are rebuilt from the views, each
-  distinct value once; the decoded table can pass `QUERY_MAX_DECODED_MIB`
-  only by the other columns of the batch that crosses it. A string or
-  binary column nested in a list or struct is counted only after it
-  expands, a page decompresses whole, to the size its own header states,
+  distinct value once. Fixed-width columns are checked from their widths
+  before each batch decodes. The decoded table can pass
+  `QUERY_MAX_DECODED_MIB` only by the batch's list columns, and its
+  strings or binary inside a struct, which are counted only after they
+  expand; a page decompresses whole, to the size its own header states,
   and a `DELTA_BYTE_ARRAY` page, which rebuilds each value from the one
-  before it, can copy up to its own size once per row of the batch.
-  Decoding is synchronous, so these limits also bound the one stretch the time limit
+  before it, can copy up to its own size once per row of the batch. Decoding is synchronous, so these limits
+  also bound the one stretch the time limit
   cannot interrupt. Operators run in a pool of `QUERY_MEMORY_MIB` with
   DataFusion's disk manager disabled, so a sort or aggregation that runs out
   fails the query instead of spilling decrypted rows to a temporary file. A

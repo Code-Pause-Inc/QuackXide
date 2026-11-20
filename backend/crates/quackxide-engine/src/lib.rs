@@ -20,14 +20,19 @@
 //! a fixed memory pool with nothing spilled to disk, and a result over the
 //! row or byte limit is refused, never truncated.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Array, AsArray, RecordBatch};
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BinaryViewArray, DictionaryArray, Int32Array, RecordBatch,
+    StringViewArray,
+};
+use arrow::buffer::ScalarBuffer;
+use arrow::compute::{CastOptions, cast_with_options};
+use arrow::datatypes::{DataType, FieldRef, Int32Type, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{DataFusionError, exec_err};
@@ -224,9 +229,11 @@ impl QueryScope {
     /// track the decoded table. Both are counted again as batches decode:
     /// the rows, and the Arrow memory each batch holds, since a footer
     /// understates a column that dictionary or run-length encoding shrinks.
-    /// Top-level string and binary columns are measured before they expand,
-    /// so the decoded table can pass the byte limit only by the other
-    /// columns of the batch that crosses it. Either refusal is
+    /// Each batch is measured before it expands, its fixed-width columns
+    /// from their widths and its string and binary columns from their
+    /// views, so the decoded table can pass the byte limit only by the list
+    /// columns of the batch that crosses it, and its strings inside a
+    /// struct. Either refusal is
     /// [`QueryError::LimitExceeded`]. Decoding is synchronous, so these
     /// limits also bound how long it runs.
     pub fn register_parquet_many(
@@ -312,15 +319,40 @@ impl QueryScope {
             // repeats is held once until its expanded size is known to fit
             // (`expand_views`).
             let options = ArrowReaderOptions::new().with_schema(view_hint(&file_schema));
+            // Rows the reader will produce: its row groups' counts.
+            let mut rows_left = metadata
+                .row_groups()
+                .iter()
+                .map(|group| u64::try_from(group.num_rows()).unwrap_or(0))
+                .fold(0u64, u64::saturating_add);
+            // Fixed-width columns take this many bytes a row, which a
+            // dictionary-encoded page can expand to before any batch is
+            // counted, so each batch is checked before it is decoded.
+            let row_width = file_schema
+                .fields()
+                .iter()
+                .map(|field| fixed_width(field.data_type()))
+                .fold(0u64, u64::saturating_add);
             let metadata = ArrowReaderMetadata::try_new(metadata, options)
                 .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?;
-            let mut batches = Vec::new();
-            for batch in ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
+            let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
                 .with_batch_size(DECODE_BATCH_ROWS)
                 .build()
-                .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?
-            {
+                .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?;
+            let mut batches = Vec::new();
+            loop {
+                let next_rows = rows_left.min(DECODE_BATCH_ROWS as u64);
+                if bytes.saturating_add(row_width.saturating_mul(next_rows))
+                    > limits.max_decoded_bytes
+                {
+                    return Err(QueryError::LimitExceeded(QueryLimit::DecodedBytes));
+                }
+                let Some(batch) = reader.next() else {
+                    break;
+                };
                 let batch = batch.map_err(|_| QueryError::Parquet(ParquetStage::Batch))?;
+                rows_left =
+                    rows_left.saturating_sub(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
                 rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
                 check_rows(rows)?;
                 let batch = expand_views(
@@ -608,16 +640,37 @@ fn scope_runtime(limits: &QueryLimits) -> Arc<RuntimeEnv> {
         .expect("a runtime with no object store and no disk always builds")
 }
 
-/// Rows per decoded batch: the Parquet reader's default. String and binary
-/// columns are checked against [`QueryLimits::max_decoded_bytes`] before
-/// they expand ([`expand_views`]). The other columns are counted once
-/// decoded: most have a fixed width, so a batch of them is small, but a
-/// string or binary column inside a list or struct expands first. The pages
-/// themselves are not bounded here: a page decompresses whole, to the size
-/// its own header states, and a `DELTA_BYTE_ARRAY` page rebuilds each
-/// value from its predecessor's prefix, so it can copy up to its own size
-/// once per row.
+/// Rows per decoded batch: the Parquet reader's default. Each batch is
+/// checked against [`QueryLimits::max_decoded_bytes`] before it expands:
+/// its fixed-width columns from their widths ([`fixed_width`]) before the
+/// reader decodes it, and its string and binary columns from their views
+/// ([`expand_views`]). A list column, or a string or binary column inside a
+/// struct, is counted only once decoded. The pages themselves are not bounded here: a
+/// page decompresses whole, to the size its own header states, and a
+/// `DELTA_BYTE_ARRAY` page rebuilds each value from its predecessor's
+/// prefix, so it can copy up to its own size once per row.
 const DECODE_BATCH_ROWS: usize = 1024;
+
+/// Bytes a row of a column of this type takes whatever its values: its
+/// fixed-width data, including fixed-size binary and lists and structs of
+/// them. Zero for a variable-width column, which is measured otherwise, and
+/// for booleans, a bit a row.
+fn fixed_width(data_type: &DataType) -> u64 {
+    match data_type {
+        DataType::FixedSizeBinary(width) => u64::try_from(*width).unwrap_or(0),
+        DataType::FixedSizeList(item, length) => u64::try_from(*length)
+            .unwrap_or(0)
+            .saturating_mul(fixed_width(item.data_type())),
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| fixed_width(field.data_type()))
+            .fold(0u64, u64::saturating_add),
+        DataType::Dictionary(keys, _) => fixed_width(keys),
+        other => other
+            .primitive_width()
+            .map_or(0, |width| u64::try_from(width).unwrap_or(u64::MAX)),
+    }
+}
 
 /// A top-level string or binary column, which decodes as a view first.
 fn is_plain_bytes(data_type: &DataType) -> bool {
@@ -658,11 +711,12 @@ fn view_hint(schema: &Schema) -> SchemaRef {
 }
 
 /// `batch`, decoded under [`view_hint`], with its view columns cast back to
-/// the file's own types. A dictionary column is rebuilt from the views,
-/// each distinct value once. A plain column expands, so it is measured
-/// first: refused when the plain columns would take more than `budget`
-/// bytes. Either kind is refused as malformed when its values could need
-/// more than 32-bit offsets allow, which the cast could not represent.
+/// the file's own types, refused before anything is copied when they would
+/// take more than `budget` bytes. A plain column expands, measured from its
+/// views' lengths ([`plain_size`]). A dictionary column is rebuilt from its
+/// distinct views ([`ViewDictionary`]), measured from theirs. Either is
+/// refused as malformed when its values would need more than 32-bit
+/// offsets allow, which the cast could not represent.
 fn expand_views(
     batch: &RecordBatch,
     file_schema: &SchemaRef,
@@ -671,18 +725,25 @@ fn expand_views(
     let narrow = |values: &DataType| matches!(values, DataType::Utf8 | DataType::Binary);
     let mut expanded = 0u64;
     let mut too_long = false;
+    let mut dictionaries = Vec::with_capacity(batch.num_columns());
     for (column, field) in batch.columns().iter().zip(file_schema.fields()) {
+        let mut dictionary = None;
         match field.data_type() {
             plain if is_plain_bytes(plain) => {
                 let size = plain_size(column.as_ref(), plain)?;
                 expanded = expanded.saturating_add(size);
                 too_long |= narrow(plain) && size > i32::MAX as u64;
             }
-            DataType::Dictionary(_, values) if narrow(values) => {
-                too_long |= distinct_bound(column.as_ref()) > i32::MAX as u64;
+            DataType::Dictionary(_, values) if is_plain_bytes(values) => {
+                let distinct = ViewDictionary::new(column.as_ref())?;
+                let size = distinct.size();
+                expanded = expanded.saturating_add(size);
+                too_long |= narrow(values) && size > i32::MAX as u64;
+                dictionary = Some(distinct);
             }
             _ => {}
         }
+        dictionaries.push(dictionary);
     }
     if expanded > budget {
         return Err(QueryError::LimitExceeded(QueryLimit::DecodedBytes));
@@ -690,40 +751,116 @@ fn expand_views(
     if too_long {
         return Err(QueryError::Parquet(ParquetStage::Batch));
     }
+    // An overflow, such as more distinct values than the declared key type
+    // indexes, is an error, not a null.
+    let options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
     let columns = batch
         .columns()
         .iter()
         .zip(file_schema.fields())
-        .map(|(column, field)| {
-            if byte_view(field.data_type()).is_some() {
-                cast(column, field.data_type())
+        .zip(dictionaries)
+        .map(|((column, field), dictionary)| match dictionary {
+            Some(dictionary) => dictionary.finish(column.as_ref(), field.data_type(), &options),
+            None if is_plain_bytes(field.data_type()) => {
+                cast_with_options(column, field.data_type(), &options)
                     .map_err(|_| QueryError::Parquet(ParquetStage::Batch))
-            } else {
-                Ok(column.clone())
             }
+            None => Ok(column.clone()),
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(file_schema.clone(), columns)
         .map_err(|_| QueryError::Parquet(ParquetStage::Batch))
 }
 
-/// The most bytes a view column's distinct values can take: a value is
-/// either inline in its view (at most 12 bytes) or in one of the column's
-/// data buffers, so their sizes and 12 bytes a row bound it.
-fn distinct_bound(column: &dyn Array) -> u64 {
-    let buffers = if let Some(views) = column.as_string_view_opt() {
-        views.data_buffers()
-    } else if let Some(views) = column.as_binary_view_opt() {
-        views.data_buffers()
-    } else {
-        return u64::try_from(column.get_array_memory_size()).unwrap_or(u64::MAX);
-    };
-    let held = buffers
-        .iter()
-        .map(|buffer| u64::try_from(buffer.len()).unwrap_or(u64::MAX))
-        .fold(0u64, u64::saturating_add);
-    let rows = u64::try_from(column.len()).unwrap_or(u64::MAX);
-    held.saturating_add(rows.saturating_mul(12))
+/// A view column's rows keyed by their views. Rows with the same view hold
+/// the same value, so a value the file's dictionary repeats takes one key,
+/// found without reading the value once per row.
+struct ViewDictionary {
+    keys: Int32Array,
+    distinct: Vec<u128>,
+}
+
+impl ViewDictionary {
+    fn new(column: &dyn Array) -> Result<Self, QueryError> {
+        let malformed = || QueryError::Parquet(ParquetStage::Batch);
+        let views = if let Some(strings) = column.as_string_view_opt() {
+            strings.views()
+        } else if let Some(binary) = column.as_binary_view_opt() {
+            binary.views()
+        } else {
+            return Err(malformed());
+        };
+        let mut index: HashMap<u128, i32> = HashMap::new();
+        let mut distinct = Vec::new();
+        let mut keys = Vec::with_capacity(column.len());
+        for (row, view) in views.iter().enumerate() {
+            if column.is_null(row) {
+                keys.push(None);
+                continue;
+            }
+            let next = i32::try_from(distinct.len()).map_err(|_| malformed())?;
+            let key = *index.entry(*view).or_insert_with(|| {
+                distinct.push(*view);
+                next
+            });
+            keys.push(Some(key));
+        }
+        Ok(Self {
+            keys: Int32Array::from(keys),
+            distinct,
+        })
+    }
+
+    /// Bytes the rebuilt column takes: its distinct values, an offset each,
+    /// and a key a row.
+    fn size(&self) -> u64 {
+        let values = self
+            .distinct
+            .iter()
+            // A view's low 32 bits are its value's length.
+            .map(|view| u64::from(*view as u32))
+            .fold(0u64, u64::saturating_add);
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        values
+            .saturating_add(
+                count(self.distinct.len())
+                    .saturating_add(1)
+                    .saturating_mul(8),
+            )
+            .saturating_add(count(self.keys.len()).saturating_mul(4))
+    }
+
+    /// The dictionary of `target` type: the distinct views as the values,
+    /// over `column`'s data buffers, cast to the target's value and key
+    /// types.
+    fn finish(
+        self,
+        column: &dyn Array,
+        target: &DataType,
+        options: &CastOptions,
+    ) -> Result<ArrayRef, QueryError> {
+        let malformed = |_| QueryError::Parquet(ParquetStage::Batch);
+        let distinct = ScalarBuffer::from(self.distinct);
+        let values: ArrayRef = if let Some(strings) = column.as_string_view_opt() {
+            Arc::new(
+                StringViewArray::try_new(distinct, strings.data_buffers().to_vec(), None)
+                    .map_err(malformed)?,
+            )
+        } else if let Some(binary) = column.as_binary_view_opt() {
+            Arc::new(
+                BinaryViewArray::try_new(distinct, binary.data_buffers().to_vec(), None)
+                    .map_err(malformed)?,
+            )
+        } else {
+            return Err(QueryError::Parquet(ParquetStage::Batch));
+        };
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(self.keys, values).map_err(malformed)?;
+        cast_with_options(&dictionary, target, options).map_err(malformed)
+    }
 }
 
 /// Bytes a string or binary view column takes once expanded to `plain`:
@@ -868,7 +1005,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::streaming::PartitionStream;
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::basic::{Compression, Encoding, ZstdLevel};
     use parquet::file::properties::WriterProperties;
 
     use super::*;
@@ -1214,18 +1351,94 @@ mod tests {
         }
     }
 
-    /// A string column registers with its own type, not as the view it
-    /// decodes through.
+    /// A fixed-size binary column whose dictionary holds one 64 KiB value:
+    /// a batch of it is 64 MiB, which the footer does not show. It is
+    /// refused from its width before the reader decodes a batch.
+    #[test]
+    fn a_wide_fixed_column_is_refused_before_it_decodes() {
+        use parquet::data_type::{FixedLenByteArray, FixedLenByteArrayType};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        const WIDTH: usize = 64 << 10;
+        assert_eq!(
+            fixed_width(&DataType::FixedSizeBinary(WIDTH as i32)),
+            64 << 10
+        );
+        assert_eq!(fixed_width(&DataType::Int64), 8);
+        assert_eq!(fixed_width(&DataType::Utf8), 0);
+        // Writers store fixed-size binary plain unless writing Parquet 2.0;
+        // any file may dictionary-encode it.
+        let schema = Arc::new(
+            parse_message_type(&format!(
+                "message m {{ required fixed_len_byte_array({WIDTH}) w; }}"
+            ))
+            .expect("schema"),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+                .set_dictionary_enabled(true)
+                .build(),
+        );
+        let value = FixedLenByteArray::from(vec![7u8; WIDTH]);
+        let values = vec![value; DECODE_BATCH_ROWS];
+        let mut parquet = Vec::new();
+        let mut writer = SerializedFileWriter::new(&mut parquet, schema, props).expect("writer");
+        let mut group = writer.next_row_group().expect("row group");
+        let mut column = group.next_column().expect("column").expect("a column");
+        column
+            .typed::<FixedLenByteArrayType>()
+            .write_batch(&values, None, None)
+            .expect("write");
+        column.close().expect("column");
+        group.close().expect("row group");
+        writer.close().expect("close");
+
+        let footer =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet.clone())).expect("footer");
+        let chunk = footer.metadata().row_group(0).column(0);
+        assert!(
+            chunk
+                .encodings()
+                .any(|encoding| encoding == Encoding::RLE_DICTIONARY),
+            "{:?}",
+            chunk.encodings().collect::<Vec<_>>()
+        );
+        let (_, footer_bytes) = footer_size(footer.metadata()).expect("sizes");
+        let limits = QueryLimits {
+            max_decoded_bytes: 16 * MIB,
+            ..QueryLimits::default()
+        };
+        assert!(footer_bytes < limits.max_decoded_bytes, "{footer_bytes}");
+        let mut scope = scope_with(ZkMode::Disabled, limits);
+        let err = scope.register_parquet("t", &parquet).expect_err("refused");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+            "{err:?}"
+        );
+    }
+
+    /// String and binary columns, plain or declared as dictionaries, register
+    /// with their own types, not as the views they decode through.
     #[test]
     fn string_columns_keep_their_type() {
+        let declared = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
         let schema = Arc::new(Schema::new(vec![
             Field::new("s", DataType::Utf8, true),
             Field::new("b", DataType::LargeBinary, false),
+            Field::new("d", declared.clone(), true),
         ]));
         let strings = StringArray::from(vec![Some("a"), None, Some("a")]);
         let binary = arrow::array::LargeBinaryArray::from_iter_values([b"x", b"y", b"x"]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(strings), Arc::new(binary)])
-            .expect("batch");
+        let dictionary: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+            vec![Some("p"), None, Some("p")].into_iter().collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(strings), Arc::new(binary), Arc::new(dictionary)],
+        )
+        .expect("batch");
         let mut parquet = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut parquet, schema.clone(), None).expect("writer");
         writer.write(&batch).expect("write");
@@ -1245,11 +1458,14 @@ mod tests {
             .expect("decoded");
         assert_eq!(decoded.column(0).data_type(), &DataType::Utf8View);
         assert_eq!(decoded.column(1).data_type(), &DataType::BinaryView);
+        assert_eq!(decoded.column(2).data_type(), &DataType::Utf8View);
         // The null row's length is not counted: "a", "a", four 4-byte
         // offsets and a bitmap byte; for the binary column three 1-byte
-        // values, four 8-byte offsets and a bitmap byte.
+        // values, four 8-byte offsets and a bitmap byte; for the dictionary
+        // its one distinct value, two offsets and three keys.
         let strings = 2 + 4 * 4 + 1;
         let binary = 3 + 4 * 8 + 1;
+        let distinct = 1 + 2 * 8 + 3 * 4;
         assert_eq!(
             plain_size(decoded.column(0).as_ref(), &DataType::Utf8).expect("size"),
             strings
@@ -1258,12 +1474,13 @@ mod tests {
             plain_size(decoded.column(1).as_ref(), &DataType::LargeBinary).expect("size"),
             binary
         );
-        // Three views' inline bytes, and the small page buffer they came from.
-        let bound = distinct_bound(decoded.column(0).as_ref());
-        assert!((3 * 12..1024).contains(&bound), "{bound}");
+        let views = ViewDictionary::new(decoded.column(2).as_ref()).expect("views");
+        assert_eq!(views.size(), distinct);
+        assert_eq!(file_schema.field(2).data_type(), &declared);
         let expanded = expand_views(&decoded, &file_schema, u64::MAX).expect("expands");
         assert_eq!(expanded, batch);
-        let err = expand_views(&decoded, &file_schema, strings + binary - 1).expect_err("over");
+        let err = expand_views(&decoded, &file_schema, strings + binary + distinct - 1)
+            .expect_err("over");
         assert!(
             matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
             "{err:?}"

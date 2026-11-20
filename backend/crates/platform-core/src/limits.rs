@@ -67,7 +67,7 @@ impl Default for QueryLimits {
 impl QueryLimits {
     /// The most memory one query can hold at once under these limits: its
     /// operators' pool, its decoded table (up to this limit, plus the
-    /// non-string columns of the batch that crosses it), three copies of its
+    /// list columns of the batch that crosses it), three copies of its
     /// input (the ciphertext, the plaintext the query service
     /// keeps, and the engine's copy for the decoder) and two of its result
     /// (the JSON and the rows parsed from it). Only the pool is enforced as

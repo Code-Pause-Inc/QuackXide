@@ -327,7 +327,8 @@ uses [Semantic Versioning](https://semver.org/).
   instead of decoding past the limit. String and binary columns decode as
   view arrays and are measured before they expand, so a value the file's
   dictionary repeats is refused before it is copied once per row; a
-  column the file declares as a dictionary is rebuilt as one. A
+  column the file declares as a dictionary is rebuilt as one, and
+  fixed-width columns are checked from their widths before each batch. A
   dataset whose decoded columns take more memory than its footers state
   can now be refused where it was accepted before.
 * `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
