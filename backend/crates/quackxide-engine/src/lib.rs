@@ -335,8 +335,11 @@ impl QueryScope {
                 .fold(0u64, u64::saturating_add);
             let metadata = ArrowReaderMetadata::try_new(metadata, options)
                 .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?;
+            // The reader stops at the rows accounted for, whatever the
+            // pages hold.
             let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
                 .with_batch_size(DECODE_BATCH_ROWS)
+                .with_limit(usize::try_from(rows_left).unwrap_or(usize::MAX))
                 .build()
                 .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?;
             let mut batches = Vec::new();
@@ -351,8 +354,11 @@ impl QueryScope {
                     break;
                 };
                 let batch = batch.map_err(|_| QueryError::Parquet(ParquetStage::Batch))?;
-                rows_left =
-                    rows_left.saturating_sub(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+                let batch_rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
+                if batch_rows > next_rows {
+                    return Err(QueryError::Parquet(ParquetStage::Batch));
+                }
+                rows_left -= batch_rows;
                 rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
                 check_rows(rows)?;
                 let batch = expand_views(
@@ -665,7 +671,9 @@ fn fixed_width(data_type: &DataType) -> u64 {
             .iter()
             .map(|field| fixed_width(field.data_type()))
             .fold(0u64, u64::saturating_add),
-        DataType::Dictionary(keys, _) => fixed_width(keys),
+        // The reader may decode a dictionary's values a row each before it
+        // packs them, so both count.
+        DataType::Dictionary(keys, values) => fixed_width(keys).saturating_add(fixed_width(values)),
         other => other
             .primitive_width()
             .map_or(0, |width| u64::try_from(width).unwrap_or(u64::MAX)),
@@ -1367,6 +1375,11 @@ mod tests {
         );
         assert_eq!(fixed_width(&DataType::Int64), 8);
         assert_eq!(fixed_width(&DataType::Utf8), 0);
+        let wide_dictionary = DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::FixedSizeBinary(WIDTH as i32)),
+        );
+        assert_eq!(fixed_width(&wide_dictionary), 4 + (64 << 10));
         // Writers store fixed-size binary plain unless writing Parquet 2.0;
         // any file may dictionary-encode it.
         let schema = Arc::new(
