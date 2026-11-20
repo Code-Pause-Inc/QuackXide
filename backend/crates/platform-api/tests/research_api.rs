@@ -651,7 +651,7 @@ async fn re_granting_an_active_grant_is_refused_and_keeps_its_budget() {
     let capture = platform_telemetry::capture::AuditCapture::install();
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
 
     let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
@@ -679,7 +679,7 @@ async fn re_granting_an_active_grant_is_refused_and_keeps_its_budget() {
 async fn re_granting_a_revoked_grant_adds_its_budget_once_per_revoke() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let (_, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
     let grant_id = grant["grant_id"].as_str().expect("grant id");
@@ -713,7 +713,12 @@ async fn direct_grant_retried_after_a_budget_failure_opens_its_budget() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let body = grant_body(researcher, 28);
     let (status, _) = post(&app, "/api/v1/grants", &stoken, &body).await;
@@ -737,7 +742,12 @@ async fn a_failed_budget_read_fails_a_direct_grant_of_a_funded_grant() {
         budgets: ledger.clone(),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
@@ -761,7 +771,12 @@ async fn a_failed_budget_read_fails_a_re_grant_after_re_activating() {
         budgets: ledger.clone(),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let grant_id = grant_and_revoke(&app, steward, researcher, 28).await;
 
     ledger.fail_state.store(true, Ordering::SeqCst);
@@ -814,7 +829,12 @@ async fn re_grant_converges_after_a_failure(revoke_between: bool) {
         grants: registry.clone(),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -858,7 +878,12 @@ async fn re_grant_whose_funding_fails_leaves_the_grant_active_and_its_retry_is_r
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -899,7 +924,12 @@ async fn a_re_grant_after_a_failed_one_adds_its_own_amount() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -926,7 +956,12 @@ async fn an_approval_that_re_activates_a_grant_audits_it_even_if_funding_fails()
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let grant_id = grant_and_revoke(&app, steward, researcher, 28).await;
 
     let request_id = pending_request(&app, steward, researcher).await;
@@ -950,7 +985,7 @@ async fn a_re_grant_without_a_budget_restores_the_old_one() {
     let capture = platform_telemetry::capture::AuditCapture::install();
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 25)).await;
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
@@ -981,7 +1016,12 @@ async fn re_granting_a_revoked_grant_with_no_budget_opens_one() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1009,7 +1049,12 @@ async fn a_failed_re_grant_leaves_the_budget_for_a_later_approval_to_add_to() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -1048,7 +1093,12 @@ async fn a_second_revoke_still_refuses_a_stale_approval_retry() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -1087,7 +1137,12 @@ async fn of_two_simultaneous_re_grants_of_a_revoked_grant_only_one_is_made() {
         grants: registry.clone(),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -1127,7 +1182,12 @@ async fn a_revoke_racing_a_grant_lands_after_it() {
         budgets: ledger.clone(),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     // A failed approval leaves an active grant with no budget entry.
     let request_id = pending_request(&app, steward, researcher).await;
@@ -1187,7 +1247,12 @@ async fn app_with_a_grant_and_a_request(
         budgets: ledger,
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
@@ -1279,7 +1344,7 @@ async fn a_zero_budget_re_grant_audits_no_top_up() {
     let capture = platform_telemetry::capture::AuditCapture::install();
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     grant_and_revoke(&app, steward, researcher, 28).await;
 
@@ -1300,7 +1365,12 @@ async fn a_failed_approval_leaves_no_budget_for_a_direct_grant_to_trip_over() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1324,7 +1394,7 @@ async fn a_failed_approval_leaves_no_budget_for_a_direct_grant_to_trip_over() {
 async fn a_zero_budget_grant_is_still_a_grant_a_direct_grant_cannot_replace() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 0)).await;
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
@@ -1351,7 +1421,12 @@ async fn a_grant_and_an_approval_at_once_drop_no_budget() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let listing_id = publish(&app, steward).await;
     let request_id = request_listing(&app, &listing_id, researcher).await;
@@ -1386,7 +1461,12 @@ async fn of_two_simultaneous_grants_only_one_is_made() {
         }),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let (body_a, body_b) = (grant_body(researcher, 28), grant_body(researcher, 50));
     let (first, second) = tokio::join!(
