@@ -163,8 +163,8 @@ results. Recorded numbers belong in `docs/BENCHMARKS.md`.
 
 `fixtures/envelope/` holds the vectors that keep the browser and the backend
 on one envelope format. `hpk1.json` (test-only recipient keys derived from
-published seeds, enrollment keys, `info` strings, and envelopes that open or
-must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
+published seeds, enrollment keys, `info` strings, research-query bindings,
+and envelopes that open or must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
 which fails when the file and its generator disagree; regenerate with
 `UPDATE_ENVELOPE_VECTORS=1 cargo test -p envelope-wasm --test vectors`.
 `hpk1-browser-sealed.json` holds envelopes sealed by the wasm module

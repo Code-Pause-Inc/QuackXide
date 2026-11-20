@@ -14,6 +14,8 @@ import init, {
   connectorObjectInfo,
   openEnvelope,
   publicKeyFromPrivateKey,
+  researchQueryBinding,
+  researchQueryInfo,
   researchResultInfo,
   sealEnvelope,
   snapshotManifestInfo,
@@ -98,5 +100,20 @@ export const envelopeInfo = {
   async researchResult(researcherTenant: string, query: string): Promise<Uint8Array> {
     await loadEnvelopeModule();
     return researchResultInfo(researcherTenant, query);
+  },
+  async researchQuery(tenant: string, grantId: string): Promise<Uint8Array> {
+    await loadEnvelopeModule();
+    return researchQueryInfo(tenant, grantId);
+  },
+  /** The `query` field of `researchResult` for a request (ADR 0010). The
+   *  request nonce is 32 bytes; an empty schema version is refused. */
+  async researchQueryBinding(
+    grantId: string,
+    requestNonce: Uint8Array,
+    sql: string,
+    schemaVersion?: string,
+  ): Promise<string> {
+    await loadEnvelopeModule();
+    return researchQueryBinding(grantId, requestNonce, sql, schemaVersion);
   },
 };

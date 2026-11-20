@@ -205,10 +205,9 @@ record reinstates it.
 Development (`APP_ENV=development`) also accepts `HPK1` keys and frames,
 because the browser still enrolls and seals X25519 keys until P36 (#186),
 which removes `HPK1`. This is not a migration mode: no production path
-reads `HPK1`, and nothing is re-sealed. The enclave's own key-release key
-also stays X25519 until P85 (#176) builds ADR 0010's binding v2, whose
-`request-key` entry holds a key of any length; its only use is
-development key release.
+reads `HPK1`, and nothing is re-sealed. The enclave's own request key,
+which development key release also wraps to, is `HPK2`: ADR 0010's
+binding v2 binds a key of any length.
 
 ## Consequences
 
