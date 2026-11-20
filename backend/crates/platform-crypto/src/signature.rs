@@ -7,7 +7,7 @@
 //! browser module, so nothing here needs the `server` feature.
 
 use ed25519_dalek::Signer as _;
-use ml_dsa::{EncodedVerifyingKey, Keypair as _, MlDsa65, Signer as _};
+use ml_dsa::{EncodedVerifyingKey, Keypair as _, MlDsa65};
 use zeroize::Zeroizing;
 
 use crate::CryptoError;
