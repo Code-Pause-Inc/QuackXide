@@ -57,6 +57,7 @@ jobs:
         working-directory: frontend
         run: npx playwright install --with-deps ${{ matrix.browser }}
       - name: Browser tests in ${{ matrix.browser }}
+        id: tests
         working-directory: frontend
         env:
           BROWSERS: ${{ matrix.browser }}
@@ -66,5 +67,55 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: browser-${{ matrix.browser }}
+          path: frontend/.vitest/
+          if-no-files-found: ignore
+      # Report only (#185): browser timings and the wasm module's size. Runs
+      # after the tests, also when they failed, but not when a setup step
+      # failed. Never a required check.
+      - name: Browser timings in ${{ matrix.browser }}
+        id: timings
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: frontend
+        env:
+          BROWSERS: ${{ matrix.browser }}
+          BROWSER_NAME: ${{ matrix.browser }}
+        run: |
+          status=0
+          npm run bench:browser || status=$?
+          wasm=src/lib/crypto/wasm/envelope_bg.wasm
+          {
+            echo "## Browser timings ($BROWSER_NAME)"
+            echo
+            echo "Report only. One shared runner; the timings run on the page's main thread."
+            echo "p50 and p99 are over batch means of at least 50 ms each, not single calls;"
+            echo "the cold start is one sample."
+            echo
+            echo '```'
+            lscpu | grep -E '^(Model name|CPU\(s\)):'
+            echo "$BROWSER_NAME $(node --input-type=module -e "import * as pw from 'playwright'; const b = await pw[process.env.BROWSER_NAME].launch(); console.log(b.version()); await b.close();")"
+            echo '```'
+            echo
+            echo '| Benchmark | p50 | p99 | Samples |'
+            echo '| --- | --- | --- | --- |'
+            rows=$(jq -r '
+              def sig3: if . == 0 then 0 else (log10 | floor) as $e | pow(10; 2 - $e) as $k | ((. * $k) | round) / $k end;
+              def fmt: if . < 1 then "\(. * 1000 | sig3) µs" else "\(sig3) ms" end;
+              .testResults[].assertionResults[].benchmarks[].tasks[]
+              | if .latency.samplesCount == 1
+                then "| \(.name) | \(.latency.mean | fmt) | | 1 |"
+                else "| \(.name) | \(.latency.p50 | fmt) | \(.latency.p99 | fmt) | \(.latency.samplesCount) |"
+                end' .vitest/bench.json) || rows=
+            if [ -n "$rows" ]; then echo "$rows"; else echo "| (no results) | | | |"; status=1; fi
+            echo
+            echo "wasm envelope module: $(wc -c < "$wasm") bytes, $(gzip -c "$wasm" | wc -c) gzipped"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Keep timing failure traces
+        if: ${{ !cancelled() && steps.timings.outcome == 'failure' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-${{ matrix.browser }}-timings
           path: frontend/.vitest/
           if-no-files-found: ignore

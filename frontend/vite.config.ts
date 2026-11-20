@@ -78,6 +78,8 @@ export default defineConfig(({ mode }) => {
           test: {
             name: "browser",
             include: ["src/**/*.browser.test.ts"],
+            // Timings: `npm run bench:browser`; `vitest run` never picks them up.
+            benchmark: { include: ["src/**/*.browser.bench.ts"] },
             browser: {
               enabled: true,
               provider: playwright(),
