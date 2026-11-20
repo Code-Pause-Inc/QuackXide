@@ -19,13 +19,6 @@ ignore = [
     # 55 to quick-xml 0.39). Revisit when object_store moves to quick-xml 0.41+.
     { id = "RUSTSEC-2026-0194", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
     { id = "RUSTSEC-2026-0195", reason = "object-store XML only; object_store 0.13 pins quick-xml 0.39 (< 0.41.0)" },
-    # crypto-bigint timing (fixed in >= 0.7.6): 0.5 comes in through
-    # elliptic-curve 0.13 (p256 via jsonwebtoken 11 and hpke, p384 via
-    # jsonwebtoken 11). The HPKE suite is X25519, and no ES256/ES384 token is
-    # signed or accepted: platform tokens are RS256 or HS256, attestation
-    # tokens RS256. Revisit with the hpke upgrade (P35) and a jsonwebtoken
-    # release on elliptic-curve 0.14.
-    { id = "RUSTSEC-2026-0387", reason = "no P-256/P-384 arithmetic on secrets; elliptic-curve 0.13 pins crypto-bigint 0.5" },
     # zstd and zstd-safe (fixed in zstd >= 0.14.3, zstd-safe >= 8.2.0):
     # arrow, parquet and DataFusion 55 pin zstd 0.13. arrow-ipc and parquet
     # use the bulk API and async-compression drives zstd-safe directly, never
@@ -35,6 +28,18 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "no zstd with_context streams; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature not enabled; DataFusion 55 pins zstd 0.13" },
     { id = "RUSTSEC-2026-0403", reason = "zstd legacy feature not enabled; DataFusion 55 pins zstd 0.13" },
+    # chrono, chrono-tz and humantime (unmaintained, all versions, no fixed
+    # release): a maintenance notice, not a vulnerability. arrow, parquet,
+    # DataFusion 55 and object_store 0.13 depend on chrono; chrono-tz comes
+    # in through arrow-array and DataFusion, humantime through object_store;
+    # platform-api, -billing, -connectors, -storage and -tenancy use chrono
+    # for timestamps. A vulnerability in any of them would be a new advisory
+    # and still fail this check. Revisit when arrow, DataFusion and
+    # object_store move off chrono (the advisory suggests jiff or time); the
+    # workspace crates can move with them.
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained, no vulnerability; object_store 0.13 depends on it" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability; arrow, DataFusion 55 and object_store 0.13 depend on it" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, no vulnerability; arrow-array 59 and DataFusion 55 depend on it" },
 ]
 
 [licenses]

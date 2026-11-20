@@ -82,6 +82,7 @@ could then decrypt; policy changes and break-glass access are audited
 | Read the object store | Ciphertext only; envelopes sealed to a key the operator does not hold | Built |
 | Read API host disk or logs | Plaintext never persisted; audit events carry no content, SQL, or filenames, and are written whatever `RUST_LOG` says; DataFusion and sqlparser output, which can quote SQL, never reaches the logs; engine errors keep no upstream text | Built, tested (`tests/log_leak.rs`, `audit_records_ignore_the_operational_filter`) |
 | Make a query write decrypted rows to disk (`COPY … TO`, `CREATE EXTERNAL TABLE`) | Only read-only queries run: DDL, DML, `COPY` and session statements are refused before anything executes, in every mode; a query scope has no object store, so no plan can reach the host's files | Built, tested (`tests/bypass.rs`, `query_api.rs`, `research_api.rs`) |
+| Make a query spill decrypted rows to disk under memory pressure (sorts, aggregations) | Each query scope has its own fixed memory pool (`QUERY_MEMORY_MIB`) and DataFusion's disk manager disabled, and `SET` on DataFusion's runtime keys is refused like every statement, so an operator that would spill fails the query with 422 instead of writing a temporary file ([ADR 0013](adr/0013-per-query-resource-limits.md)) | Built, tested (`quackxide-engine` unit tests, `bypass.rs`, `query_api.rs`) |
 | Decrypt drive content server-side | Drive keys exist only in the browser; no server decrypt path | Built |
 | Run a query outside a genuine enclave, or a modified binary inside one | Attestation gate with `TEE_ATTESTATION_REQUIRED=true`; Google's attestation token must name TDX hardware, a production Confidential Space image, debug disabled and an allowed image digest | Seam and token verifier built (`platform_enclave::token`, tested on the simulated TEE); **token acquisition and verified gates on hardware to build** (P48) — fails closed until then |
 | Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false`. Production mode, the default unless `APP_ENV=development` is set in the process environment, refuses to start when `TEE_ATTESTATION_REQUIRED=false`, `SIM_ATTESTATION_URL` or `KEY_RELEASE_URL` is set, so production refuses these by default (ADR 0009); `APP_ENV=development` re-enables them (see residual risks) | Built, tested (CI `release build has no dev binaries`; `platform-api/tests/startup.rs`) |
@@ -120,13 +121,12 @@ exist.
 
 | Attack | Control | Status |
 | --- | --- | --- |
-| Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, ADR 0007) | **To build** — current suite is X25519 only |
+| Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, frame `HPK2`, ADR 0007) | **Partial** — tenant envelopes are `HPK2` on the backend; the browser seals `HPK1` until P36 (#186), and the enclave's key-release key is X25519 until P85 (#176), so development key release wraps `HPK2` tenant keys classically |
 | Forge signatures | Hybrid Ed25519 + ML-DSA-65, including platform tokens (ADR 0006, P37) | **To build** — current tokens use RS256 |
-| Silent downgrade to classical-only | Versioned framing (`HPK2`); hybrid readers refuse `HPK1` and X25519-only keys, with no migration mode (ADR 0007) | **To build** |
+| Silent downgrade to classical-only | Versioned framing (`HPK2`); every key loader takes a suite policy (except the raw `hpk1_*` loaders, the browser's `HPK1` path until P36), and a key opens only frames of its own suite. Production refuses `HPK1` frames and X25519 keys with `crypto.suite_refused`; there is no migration mode (ADR 0007) | **Built** — development (`APP_ENV=development`) still accepts `HPK1` until P36 removes it; production is the default when `APP_ENV` is unset |
 
-The suite seams (`TenantKem`, the `JwtVerifier` construction site, the
-`HPK1` frame version) exist so this migration is a code change plus a
-version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
+The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
+`JwtVerifier` construction site and the frame magic. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
 
 ## Out of scope
 
@@ -136,7 +136,15 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   guarantees and Google's attestation service; microarchitectural attacks
   on the hardware itself are outside this model.
 * **Denial of service.** Availability is not a security goal of this
-  release.
+  release. Per-query limits (`QUERY_*`, see "Query" in
+  `docs/ARCHITECTURE.md`) bound how long one query waits for and holds
+  plaintext, how much it decrypts and decodes, its memory and its result,
+  `QUERY_MAX_CONCURRENT` bounds how many queries hold plaintext at once,
+  and `QUERY_TOTAL_MEMORY_MIB` what they may hold together. The time limit
+  stops a running plan at its next batch boundary; one operator step,
+  bounded by the memory pool, can run past it. Rate limiting and
+  per-tenant fairness are outside v1: one tenant's queries can hold every
+  plaintext slot while others wait and are refused with 503.
 * **Correctness of the underlying libraries.** RustCrypto, `hpke`,
   DataFusion, and Web Crypto are trusted. QuackXide implements no
   cryptographic primitives. The post-quantum crates (`x-wing`, `ml-kem`,
@@ -185,6 +193,18 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   host turns them all back on; the startup audit event records the mode.
   The simulator and key-release stand-in are not affected: they compile
   only with the `dev` feature.
+* **Resource limits as a side channel.** Whether a query runs out of its
+  memory pool or its time limit depends on the rows it reads, including
+  rows in cohorts that suppression withholds. A gated query (ZK own-data or
+  research) gets both refusals as a disclosure-control refusal, so the
+  response does not say which limit tripped (ADR 0013). It still shows that
+  the query was refused. The caller can tell any other refusal from its own
+  SQL and the schema, so a refused query that passes those checks still
+  answers one question about the rows it read. A time refusal also arrives
+  only after the time limit, as response time otherwise shows. Size limits
+  on the input and the decoded dataset depend only on the dataset, and the
+  result limits only on the rows released. Each probe costs a research
+  query one unit; own-data queries have no budget (see above).
 * **Extreme values.** `MIN` and `MAX` over a cohort of at least *k* still
   return one individual's actual value. This is standard for aggregate
   release; removing them from the allowlist, or applying a dominance rule,
@@ -211,8 +231,11 @@ version bump. See "Cryptography posture" in `docs/ARCHITECTURE.md`.
   delete the newest manifest so queries read an older one, and can rewrite
   the plaintext record, which makes queries fail but opens nothing. For
   uploads the API cannot check that the browser-sealed manifest lists what
-  it stored; a manifest that names a missing object fails closed. Closing
-  this needs an enclave signing key bound to attestation.
+  it stored; a manifest that names a missing object fails closed. The
+  steward's dataset listing (`GET /api/v1/datasets`) reports storage as
+  it finds it, so it shows a forged snapshot, a rollback or a rewritten
+  record's suite as the current state. Closing this needs an enclave
+  signing key bound to attestation.
 * **The key project's administrator.** Whoever administers the KMS key
   project can add an image digest to the release policy, and that image
   can then decrypt. This is the maintainer; changes are audited (P77),

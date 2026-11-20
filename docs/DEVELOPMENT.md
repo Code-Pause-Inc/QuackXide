@@ -18,7 +18,7 @@ How to set up a machine, run the tests, and fix a failing
 * **cargo-deny**, to run the dependency audit locally:
   `cargo install --locked cargo-deny`.
 * Optional: **gitleaks**, which `scripts/check.sh` runs when it is installed
-  (CI always runs it). The scan needs git 2.41 or later.
+  (CI always runs it).
 
 Then, once per clone:
 
@@ -36,6 +36,10 @@ dependency tree. On a 12-core machine, a cold
 `cargo test --workspace --no-run` takes about six minutes and leaves about
 24 GB in `backend/target/`; expect longer on fewer cores, and keep that much
 disk free. Later builds are incremental.
+
+The browser's envelope code is a wasm32 build (`envelope-wasm`, built by
+`scripts/build-wasm.sh`). It enables getrandom 0.4's `wasm_js` feature for
+`crypto.getRandomValues`, so it needs no `--cfg getrandom_backend` flag.
 
 ## Everyday commands
 
