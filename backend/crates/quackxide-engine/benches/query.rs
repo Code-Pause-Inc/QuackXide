@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use platform_core::ZkMode;
-use quackxide_engine::{EngineSettings, MinCountThreshold, QueryScope};
+use quackxide_engine::{EngineSettings, MinCountThreshold, QueryLimits, QueryScope};
 use synth_data::{SchemaName, Spec};
 
 mod common;
@@ -49,6 +49,7 @@ fn engine(c: &mut Criterion) {
                     let mut scope = QueryScope::new(EngineSettings {
                         zk: ZkMode::Disabled,
                         max_concurrent_queries: 1,
+                        limits: QueryLimits::default(),
                     });
                     scope
                         .register_parquet_many("t", black_box(blobs))
