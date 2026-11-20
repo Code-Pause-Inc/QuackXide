@@ -326,7 +326,7 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 
 ```
 POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none within the wait ⇒ 503)
-   (JWT tenant)        (gate_execution)       ── from here within the time limit (⇒ 503) ──
+   (JWT tenant)        (gate_execution)       ── from here within the time limit (⇒ 503; ZK: 422) ──
                                               newest committed snapshot
                                               tenants/{t}/connectors/{slug}/manifests/*
                                               its record (no record ⇒ 502)
@@ -338,7 +338,7 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
                           footers within the decode limits? (no ⇒ 422)
                                               │
                           QueryScope: DataFusion SQL over decrypted frames
-                          fixed memory pool, no disk (pool exhausted ⇒ 422)
+                          fixed memory pool, no disk (pool exhausted ⇒ 422; ZK: as disclosure)
                           ZkMode::Enabled → plan allowlist + cohort threshold
                           result within its row and byte limits? (no ⇒ 422)
                           zeroize blobs; Drop releases Arrow frames
@@ -363,7 +363,8 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   query service that is not wired. From taking its slot through
   decryption, decoding, execution and serialization it runs within
   `QUERY_TIMEOUT_SECS`; on expiry the work is dropped and the query gets
-  503. Every operator yields to the runtime as it produces a batch, so a
+  503, or a gated query the disclosure-control 422 (see "Resource limits"
+  below). Every operator yields to the runtime as it produces a batch, so a
   running plan stops at its next batch boundary, on the tasks running its
   partitions too. One operator step between batches runs to its end first:
   a nested-loop join compares a probe batch with its whole build side,
@@ -402,7 +403,11 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   aggregate, whose groups the pool held. Each size limit is refused with 422 and a message of its own,
   never the 400 of SQL that cannot run, and each limit refusal is an
   `engine.query` "denied" event naming the limit. A research query is
-  charged before all of them (see "Rate level" below).
+  charged before all of them (see "Rate level" below). In a gated query
+  (ZK own-data or research), running out of memory or time can depend on
+  rows that suppression withholds. Both refusals get exactly the response
+  of a disclosure-control refusal (422), and only the audit event names
+  the limit.
 * **The snapshot as written.** Before any key is released or budget
   charged, the query reads the newest snapshot's plaintext record (a
   research query reads it before its charge, then again, with the snapshot
@@ -467,7 +472,7 @@ Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  attestation gate
                  snapshot record: valid, names the key's suite?  ──no──▶ 502 + audit
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
-                 slot, time and size limits as in Query (charged)  ──no──▶ 503 / 422 + audit
+                 slot, time and size limits as in Query, gated (charged)  ──no──▶ 503 / 422 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
                  QueryScope, ZkMode FORCED Enabled:
                      plan gate: aggregate-only (no row egress)

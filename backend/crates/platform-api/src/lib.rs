@@ -159,8 +159,16 @@ pub enum ApiError {
     /// A query exceeded one of its resource limits (`QueryLimits`): no
     /// free plaintext slot within the wait (503 with `Retry-After`), the
     /// time limit (503), or a size limit on its input, decoding, memory or
-    /// result (422). Never reported as the caller's SQL error.
+    /// result (422). Never reported as the caller's SQL error. A gated
+    /// query's memory and time refusals are [`ApiError::GatedQueryLimit`]
+    /// instead.
     QueryLimit(QueryLimit),
+    /// A gated query (zero-knowledge or research) that exceeded its memory
+    /// or time limit. Whether either trips depends on rows that suppression
+    /// withholds, so the caller gets exactly the response of a
+    /// disclosure-control refusal (422). The `engine.query` audit event and
+    /// the metrics name the limit.
+    GatedQueryLimit(QueryLimit),
 }
 
 /// `Retry-After` on a transient storage failure. The storage client has
@@ -208,8 +216,9 @@ impl ApiError {
             ApiError::StaleSnapshot => "stale_snapshot",
             ApiError::DatasetMismatch => "dataset_mismatch",
             ApiError::QueryLimit(QueryLimit::SlotWait) => "query_busy",
-            ApiError::QueryLimit(QueryLimit::Time) => "query_timed_out",
-            ApiError::QueryLimit(_) => "query_limit",
+            ApiError::QueryLimit(QueryLimit::Time)
+            | ApiError::GatedQueryLimit(QueryLimit::Time) => "query_timed_out",
+            ApiError::QueryLimit(_) | ApiError::GatedQueryLimit(_) => "query_limit",
         }
     }
 }
@@ -313,6 +322,9 @@ impl IntoResponse for ApiError {
                 "stored dataset does not match its declared schema or row cap",
             ),
             ApiError::QueryLimit(limit) => query_limit_response(limit),
+            ApiError::GatedQueryLimit(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, query::DISCLOSURE_REFUSAL)
+            }
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
