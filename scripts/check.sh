@@ -89,6 +89,9 @@ else
     echo "skipped: gitleaks is not installed (CI runs it on every pull request)"
 fi
 
+echo "== CODEOWNERS guard: every pattern matches a tracked path =="
+"$ROOT/scripts/check-codeowners.sh"
+
 echo "== attribution guard: tools are never credited =="
 "$ROOT/scripts/attribution-guard.sh" selftest
 "$ROOT/scripts/attribution-guard.sh" tree

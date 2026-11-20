@@ -84,6 +84,13 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser timings (P73, #185). `npm run bench:browser`, a Vitest bench,
+  times `encryptPayload` at 4 KiB and 4 MiB and the wasm envelope module's
+  cold start (load plus first seal) in Chromium, Firefox and WebKit. It
+  reports p50 and p99 over batch means (each sample a batch of at least
+  50 ms); the cold start is one sample. The `browser` workflow writes them,
+  the runner's CPU and the module's size to each run's job summary, report
+  only.
 * Browser tests (#223 stage A). A vitest `browser` project runs the module
   crypto worker, Web Crypto keys, the sealed HPKE device key, IndexedDB
   persistence across a worker restart and a drive round trip in real
@@ -327,6 +334,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* The admin connector toggle route,
+  `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
+  (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
+  is `true`, which defaults to false: the toggles are not in v1.0 and
+  nothing reads them (`docs/PROJECT_SCOPE.md`).
+* Code-owner review covers the query engine's source, the API's source,
+  grants and budgets (`platform-tenancy`), the audit-coverage and bypass
+  tests, `docs/THREAT_MODEL.md` and `docs/adr/`. `scripts/check.sh` fails
+  when a `CODEOWNERS` pattern matches no tracked path.
+  `CONTRIBUTING.md` describes the review stages, Dependabot handling, and
+  how a vulnerability is fixed privately in a security advisory's fork.
+* `jsonwebtoken` 12, on `elliptic-curve` 0.14, removes `crypto-bigint`
+  0.5, so `backend/deny.toml` no longer ignores RUSTSEC-2026-0387.
+  `jsonwebtoken` 12 refuses an empty HMAC secret: minting with one fails,
+  and `JwtVerifier::hs256` built from one rejects every token.
 * `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
   (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
   fixed release) do not fail the dependency audit: they report
@@ -361,6 +383,18 @@ uses [Semantic Versioning](https://semver.org/).
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
+* A gated query (ZK own-data or research) that runs out of its memory pool
+  or its time limit gets exactly the response of a disclosure-control
+  refusal: 422, "query rejected by disclosure control (see cohort-size
+  rules)", with the same headers, as `ApiError::GatedQueryLimit`. Both
+  limits can trip on rows that suppression withholds. Before this change,
+  their own 422 and 503 told a researcher which limit a withheld cohort
+  tripped (ADR 0013). The `engine.query` "denied" event still names the
+  limit, the operator-only metrics keep `query_limit` and
+  `query_timed_out`, and the other limits, and ungated queries, keep their
+  responses. Whether a query was refused, and how long the refusal took,
+  are still visible and recorded as a residual risk in
+  `docs/THREAT_MODEL.md`.
 * The secret scan reads every file's content whatever git attributes say:
   `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
   `.git/info/attributes`, a user's attributes file or a NUL byte from

@@ -20,6 +20,9 @@
 //! refusal is an [`ApiError::QueryLimit`] with an `engine.query` "denied"
 //! event naming the limit. A research query is charged before any of them,
 //! so each costs a unit, as a plan-gate refusal does (P54 decides the order).
+//! A gated query's memory and time refusals depend on rows that suppression
+//! withholds, so the caller gets them as a disclosure-control refusal
+//! ([`ApiError::GatedQueryLimit`]); only the audit event names the limit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -649,11 +652,12 @@ impl ConnectorQueryService {
             .decrypt_and_run(tenant, connector, self.settings.clone(), disclosure, sql)
             .await
             .map_err(|stopped| {
-                stopped.audit(
+                let err = stopped.audit(
                     tenant,
                     &format!("connector={connector}"),
                     &format!("zk={zk_mode}"),
-                )
+                );
+                if zk_mode { gated_refusal(err) } else { err }
             })?;
         let Ran {
             objects: object_count,
@@ -773,13 +777,13 @@ impl ConnectorQueryService {
             )
             .await
             // Still charged, so the failed or refused attempt appears in the
-            // meter.
+            // meter. Research mode is always gated.
             .map_err(|stopped| {
-                stopped.audit(
+                gated_refusal(stopped.audit(
                     researcher,
                     &format!("research steward={steward} connector={connector}"),
                     &format!("budget_remaining={}", budget.remaining()),
-                )
+                ))
             })?;
         let Ran {
             objects: object_count,
@@ -941,14 +945,34 @@ async fn run_scoped(
     Ok((rows, scope.last_suppressed_rows()))
 }
 
+/// The message of a disclosure-control refusal (422), which a gated query's
+/// memory and time refusals share.
+pub(crate) const DISCLOSURE_REFUSAL: &str =
+    "query rejected by disclosure control (see cohort-size rules)";
+
+/// What the caller of a gated query (zero-knowledge or research) sees for
+/// `err`, once the audit event has named it. Whether a query runs out of
+/// its memory pool or its time depends on every row it reads, including
+/// cohorts that suppression withholds, so those two refusals are answered
+/// as a disclosure-control refusal ([`ApiError::GatedQueryLimit`]). The
+/// other limits keep their responses: the slot wait reads no data, the
+/// input and decode limits depend only on the dataset, and the result
+/// limits only on the rows released.
+fn gated_refusal(err: ApiError) -> ApiError {
+    match err {
+        ApiError::QueryLimit(limit @ (QueryLimit::Memory | QueryLimit::Time)) => {
+            ApiError::GatedQueryLimit(limit)
+        }
+        other => other,
+    }
+}
+
 fn map_query_error(err: QueryError) -> ApiError {
     match err {
         QueryError::ZkPolicy => {
             ApiError::QueryRejected("row-level egress is not permitted in zero-knowledge mode")
         }
-        QueryError::Disclosure(_) => {
-            ApiError::QueryRejected("query rejected by disclosure control (see cohort-size rules)")
-        }
+        QueryError::Disclosure(_) => ApiError::QueryRejected(DISCLOSURE_REFUSAL),
         QueryError::StatementNotAllowed => {
             ApiError::QueryRejected("only read-only queries are permitted")
         }

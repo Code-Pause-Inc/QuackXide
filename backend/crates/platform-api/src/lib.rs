@@ -128,6 +128,9 @@ pub enum ApiError {
     ResearchUnavailable,
     /// Admin provisioning is not configured (503).
     ProvisioningUnavailable,
+    /// The admin connector toggles are off (`FEATURE_ADMIN_CONNECTOR_TOGGLES`)
+    /// (503).
+    ConnectorTogglesDisabled,
     /// No MoR webhook secret is configured, so no event can be verified (503).
     WebhookNotConfigured,
     /// Query refused by the enclave attestation gate.
@@ -157,8 +160,16 @@ pub enum ApiError {
     /// A query exceeded one of its resource limits (`QueryLimits`): no
     /// free plaintext slot within the wait (503 with `Retry-After`), the
     /// time limit (503), or a size limit on its input, decoding, memory or
-    /// result (422). Never reported as the caller's SQL error.
+    /// result (422). Never reported as the caller's SQL error. A gated
+    /// query's memory and time refusals are [`ApiError::GatedQueryLimit`]
+    /// instead.
     QueryLimit(QueryLimit),
+    /// A gated query (zero-knowledge or research) that exceeded its memory
+    /// or time limit. Whether either trips depends on rows that suppression
+    /// withholds, so the caller gets exactly the response of a
+    /// disclosure-control refusal (422). The `engine.query` audit event and
+    /// the metrics name the limit.
+    GatedQueryLimit(QueryLimit),
 }
 
 /// `Retry-After` on a transient storage failure. The storage client has
@@ -194,6 +205,7 @@ impl ApiError {
             ApiError::QueryUnavailable => "query_unavailable",
             ApiError::ResearchUnavailable => "research_unavailable",
             ApiError::ProvisioningUnavailable => "provisioning_unavailable",
+            ApiError::ConnectorTogglesDisabled => "connector_toggles_disabled",
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
             ApiError::QueryRejected(_) => "query_rejected",
@@ -205,8 +217,9 @@ impl ApiError {
             ApiError::StaleSnapshot => "stale_snapshot",
             ApiError::DatasetMismatch => "dataset_mismatch",
             ApiError::QueryLimit(QueryLimit::SlotWait) => "query_busy",
-            ApiError::QueryLimit(QueryLimit::Time) => "query_timed_out",
-            ApiError::QueryLimit(_) => "query_limit",
+            ApiError::QueryLimit(QueryLimit::Time)
+            | ApiError::GatedQueryLimit(QueryLimit::Time) => "query_timed_out",
+            ApiError::QueryLimit(_) | ApiError::GatedQueryLimit(_) => "query_limit",
         }
     }
 }
@@ -272,6 +285,10 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "provisioning not configured",
             ),
+            ApiError::ConnectorTogglesDisabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector toggles are not enabled",
+            ),
             ApiError::WebhookNotConfigured => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "webhook secret not configured",
@@ -306,6 +323,9 @@ impl IntoResponse for ApiError {
                 "stored dataset does not match its declared schema or row cap",
             ),
             ApiError::QueryLimit(limit) => query_limit_response(limit),
+            ApiError::GatedQueryLimit(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, query::DISCLOSURE_REFUSAL)
+            }
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
@@ -626,6 +646,10 @@ async fn admin_toggle_connector(
     Path((tenant_id, slug)): Path<(String, String)>,
     Json(body): Json<admin::ToggleConnectorRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Not in v1.0 (docs/PROJECT_SCOPE.md): nothing reads the toggles.
+    if !state.config.features.admin_connector_toggles {
+        return Err(ApiError::ConnectorTogglesDisabled);
+    }
     let provisioning = provisioning_service(&state)?;
     let tenant: TenantId = tenant_id
         .parse()
