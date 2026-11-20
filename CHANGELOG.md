@@ -97,6 +97,14 @@ uses [Semantic Versioning](https://semver.org/).
   browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
   The `browser` workflow runs Chromium on every pull request and Chromium,
   Firefox and WebKit on `main` and nightly.
+* Engine query benchmarks and a regression check (P73, #185). Criterion
+  times two research-style queries in `quackxide-engine` over `synth-data`
+  tables of 10 000 to 1 000 000 rows. On pull requests the `bench` workflow
+  benchmarks the base commit and the head in one job, and
+  `scripts/bench-compare.sh` flags a benchmark whose whole 95 % interval is
+  more than 10 % slower as a warning in the job summary; the job fails only
+  when the comparison cannot run. `docs/BENCHMARKS.md` records the targets
+  for the hybrid suite and the engine.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   key generation and envelope seal and open for `HPK1` and `HPK2` at 32 B,
   4 KiB and 4 MiB, and a unit test pins each suite's envelope overhead
