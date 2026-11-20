@@ -122,8 +122,9 @@ release takes it on.
   is not deployed. The storage and grant model keyed by connector slug
   stays, because research datasets, listings and grants are built on it;
   the steward upload uses the same layout, as its ADR records.
-* **Admin connector toggles.** They are recorded on the tenant but nothing
-  reads them in v1.
+* **Admin connector toggles.** Nothing reads them in v1. The toggle route
+  answers 503 unless `FEATURE_ADMIN_CONNECTOR_TOGGLES=true`, which defaults
+  to false.
 * **Billing beyond tenant status.** The merchant-of-record webhook stays:
   it provisions tenants and applies pause, resume and cancel (ADR 0006).
   Enforcing tenant status is part of sign-in. Charging researchers the

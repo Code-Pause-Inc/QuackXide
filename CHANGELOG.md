@@ -305,6 +305,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* The admin connector toggle route,
+  `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
+  (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
+  is `true`, which defaults to false: the toggles are not in v1.0 and
+  nothing reads them (`docs/PROJECT_SCOPE.md`).
 * Code-owner review covers the query engine's source, the API's source,
   grants and budgets (`platform-tenancy`), the audit-coverage and bypass
   tests, `docs/THREAT_MODEL.md` and `docs/adr/`. `scripts/check.sh` fails

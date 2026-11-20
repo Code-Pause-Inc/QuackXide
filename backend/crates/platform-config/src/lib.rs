@@ -302,6 +302,10 @@ pub struct FeatureFlags {
     /// to run without valid SEV-SNP attestation. Defaults to true; only local
     /// development sets it false.
     pub tee_attestation_required: bool,
+    /// `FEATURE_ADMIN_CONNECTOR_TOGGLES` — the admin connector toggle route.
+    /// Defaults to false: the toggles are not in v1.0 (nothing reads them),
+    /// so the route answers 503 unless this is set.
+    pub admin_connector_toggles: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -548,6 +552,7 @@ impl PlatformConfig {
         let features = FeatureFlags {
             zk: ZkMode::from_flag(parse_bool(&get, "FEATURE_ZK_ENABLED", true)?),
             tee_attestation_required: parse_bool(&get, "TEE_ATTESTATION_REQUIRED", true)?,
+            admin_connector_toggles: parse_bool(&get, "FEATURE_ADMIN_CONNECTOR_TOGGLES", false)?,
         };
 
         Ok(Self {
@@ -929,6 +934,7 @@ mod tests {
         assert_eq!(cfg.auth.audience, "urn:platform:drive");
         assert!(cfg.features.zk.is_enabled());
         assert!(cfg.features.tee_attestation_required);
+        assert!(!cfg.features.admin_connector_toggles);
         assert_eq!(cfg.connectors.sync_interval_secs, 900);
         assert_eq!(cfg.research.min_cohort_size, 11);
         assert_eq!(cfg.research.default_query_budget, 100);
