@@ -115,6 +115,9 @@ pub enum ApiError {
     NotFound,
     /// A create-only or conditional write lost to an existing object (409).
     Conflict,
+    /// As [`Conflict`](Self::Conflict), for a request that conflicts with
+    /// existing state; the message says what to do instead.
+    ConflictWith(&'static str),
     BadRequest(&'static str),
     /// A backend failed in a way retrying does not fix (502).
     Backend,
@@ -197,7 +200,7 @@ impl ApiError {
             ApiError::Forbidden => "forbidden",
             ApiError::AuthNotConfigured => "auth_not_configured",
             ApiError::NotFound => "not_found",
-            ApiError::Conflict => "conflict",
+            ApiError::Conflict | ApiError::ConflictWith(_) => "conflict",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Backend => "backend",
             ApiError::StorageUnavailable => "storage_unavailable",
@@ -266,6 +269,7 @@ impl IntoResponse for ApiError {
             ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::Conflict => (StatusCode::CONFLICT, "conflict"),
+            ApiError::ConflictWith(msg) => (StatusCode::CONFLICT, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Backend => (StatusCode::BAD_GATEWAY, "storage backend error"),
             ApiError::StorageUnavailable => (
