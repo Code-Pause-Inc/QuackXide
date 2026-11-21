@@ -494,15 +494,22 @@ Researcher ──▶ POST /api/v1/research/query {version, key_id, grant_id, env
                ─▶ aggregate rows + suppressed_rows + budget_remaining + metering audit event
 ```
 
-The query is sealed to the enclave's request key from the attestation
-bundle (ADR 0010 "Sealed request"), so its SQL is plaintext only in the
-researcher's browser and inside the enclave. A sealed query runs in a task
-of its own, so a client that disconnects does not cancel it: its response
-is stored for an hour, and the same envelope sent again gets it with no new
-charge. A stored error replays unchanged, `Retry-After` included, so a
-client retries an error under a new nonce. A refused charge spends nothing,
-so its nonce is not kept. Development builds also take the plaintext body
-`{steward_tenant, connector, sql}`; a release build does not compile it.
+Before sealing, the researcher's client runs ADR 0010's five checks on the
+attestation bundle (`platform_enclave::evidence::verify_evidence`, which
+`enclave-check` and the browser module share): Google's signature and the
+token's validity, the platform claims, the image digest, its own
+challenge, and the binding of the enclave's keys and of the configuration
+the token reports (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+`RESEARCH_MIN_COHORT_SIZE`), held to the compiled policy. The query is
+then sealed to the bundle's request key (ADR 0010 "Sealed request"), so
+its SQL is plaintext only in the researcher's browser and inside the
+enclave. A sealed query runs in a task of its own, so a client that
+disconnects does not cancel it: its response is stored for an hour, and
+the same envelope sent again gets it with no new charge. A stored error
+replays unchanged, `Retry-After` included, so a client retries an error
+under a new nonce. A refused charge spends nothing, so its nonce is not
+kept. Development builds also take the plaintext body `{steward_tenant,
+connector, sql}`; a release build does not compile it.
 
 Three enforcement layers at one choke point, all in code:
 
@@ -786,7 +793,9 @@ Rules, enforced by the capture tests:
    budget reads of unknown, foreign and malformed grant ids, and sealed
    research queries refused (an unsupported version, an unknown key set, a
    frame that does not open, a reused nonce), each an `auth.decision`
-   naming its reason.
+   naming its reason, and key release refusing a deployment's configuration
+   (a digest the token does not carry, or a loosened control), each a
+   `crypto.key_release` denial naming its reason.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on

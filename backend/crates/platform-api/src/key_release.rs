@@ -43,10 +43,10 @@ pub struct EnclaveIdentity {
 }
 
 impl EnclaveIdentity {
-    /// A fresh key set with no TLS key and a zeroed configuration digest
-    /// (local development and tests).
+    /// A fresh key set with no TLS key, bound to an empty configuration
+    /// (local development and tests, whose tokens report none).
     pub fn generate() -> Self {
-        Self::with_metadata(None, [0u8; 32])
+        Self::with_metadata(None, platform_enclave::config::config_digest(|_| None))
     }
 
     /// A fresh key set bound to `tls_spki_sha256` (`None` until P67) and
@@ -133,6 +133,17 @@ impl EnclaveIdentity {
             }
             ApiError::AttestationUnavailable
         })
+    }
+}
+
+/// The configuration policy this build holds a deployment to (ADR 0010
+/// check 5): the simulator's in `dev` builds, which run on the simulated
+/// TEE, and the release policy otherwise.
+pub fn compiled_config_policy() -> platform_enclave::config::ConfigPolicy {
+    if cfg!(feature = "dev") {
+        platform_enclave::config::ConfigPolicy::SIMULATOR
+    } else {
+        platform_enclave::config::ConfigPolicy::RELEASE
     }
 }
 
@@ -249,6 +260,14 @@ pub(crate) fn decode_b64url_32(b64: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use platform_crypto::hpke_seal_to_tenant;
+
+    #[test]
+    fn generate_binds_an_empty_configuration() {
+        assert_eq!(
+            EnclaveIdentity::generate().binding().config_digest,
+            platform_enclave::config::config_digest(|_| None)
+        );
+    }
 
     #[test]
     fn key_id_is_stable_per_identity_and_differs_between_identities() {
