@@ -123,11 +123,6 @@ compiled-in floor (P54). P14's policy may require more, never less. No
 expected digest is published or compared: one frontend image serves every
 deployment, so there is no trusted place to publish one.
 
-Until P85 reads the configuration from the token's environment, the
-enclave takes the digest from `ENCLAVE_CONFIG_DIGEST_HEX` (all zero when
-unset), and the bundle does not carry it. With the variable set, a client
-cannot recompute `key_id`.
-
 ### Evidence bundle
 
 `GET /api/v1/attestation?nonce=<base64url, 32 bytes>` is unauthenticated,

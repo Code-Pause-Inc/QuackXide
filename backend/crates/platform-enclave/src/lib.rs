@@ -267,11 +267,13 @@ pub fn provider_for(attestation_required: bool) -> std::sync::Arc<dyn Attestatio
         let policy = token::ReleasePolicy {
             allowed_image_digests: vec![simulated_token::SIMULATED_IMAGE_DIGEST.to_owned()],
         };
-        return std::sync::Arc::new(simulated_token::SimulatedTokenProvider::from_url(
-            url.trim(),
-            &issuer,
-            policy,
-        ));
+        // As Confidential Space's launcher would, the tokens report the
+        // workload's bound configuration from its environment.
+        let workload_env = config::bound_env(|name| std::env::var(name).ok());
+        return std::sync::Arc::new(
+            simulated_token::SimulatedTokenProvider::from_url(url.trim(), &issuer, policy)
+                .with_workload_env(workload_env),
+        );
     }
     std::sync::Arc::new(RejectingProvider)
 }
