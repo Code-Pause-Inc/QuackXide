@@ -11,6 +11,7 @@ use rand::Rng;
 
 pub mod binding;
 pub mod config;
+pub mod evidence;
 #[cfg(feature = "simulated")]
 pub mod simulated_token;
 pub mod token;
