@@ -931,9 +931,12 @@ impl Stopped {
 }
 
 /// Run `sql` over a decrypted dataset in a fresh scope, registered as the
-/// table `dataset` and checked against its declaration, if any. Consumes
-/// the blobs, so they are zeroized when this returns on any path.
-/// Returns the rows and the number suppressed by disclosure control.
+/// table `dataset` and checked against its declaration, if any. The scope
+/// reads only the objects' footers when they are registered, and the query
+/// decodes only the columns it reads, once the plan gates pass. Consumes
+/// the blobs: the scope keeps a zeroizing copy of each, so they are
+/// zeroized as soon as it is registered, or when this returns on any other
+/// path. Returns the rows and the number suppressed by disclosure control.
 async fn run_scoped(
     settings: EngineSettings,
     disclosure: Option<Arc<dyn DisclosurePolicy>>,
@@ -953,6 +956,7 @@ async fn run_scoped(
         None => scope.register_parquet_many(dataset.as_str(), &blob_refs),
     }
     .map_err(map_query_error)?;
+    drop(decrypted);
     let rows = scope.sql_json(sql).await.map_err(map_query_error)?;
     Ok((rows, scope.last_suppressed_rows()))
 }
@@ -968,8 +972,8 @@ pub(crate) const DISCLOSURE_REFUSAL: &str =
 /// cohorts that suppression withholds, so those two refusals are answered
 /// as a disclosure-control refusal ([`ApiError::GatedQueryLimit`]). The
 /// other limits keep their responses: the slot wait reads no data, the
-/// input and decode limits depend only on the dataset, and the result
-/// limits only on the rows released.
+/// input and decode limits depend only on the dataset and the columns the
+/// SQL reads, and the result limits only on the rows released.
 fn gated_refusal(err: ApiError) -> ApiError {
     match err {
         ApiError::QueryLimit(limit @ (QueryLimit::Memory | QueryLimit::Time)) => {
@@ -990,6 +994,8 @@ fn map_query_error(err: QueryError) -> ApiError {
         }
         // A planning/execution failure is almost always the caller's SQL.
         QueryError::Execution(_) => ApiError::BadRequest("query could not be executed"),
+        // A stored object that fails to decode, at registration or in a
+        // scan, or whose columns differ from the others'.
         QueryError::Parquet(_) | QueryError::Serialize(_) => ApiError::Backend,
         // The stored data, not the caller's query, is at fault.
         QueryError::DeclarationMismatch(_) => ApiError::DatasetMismatch,

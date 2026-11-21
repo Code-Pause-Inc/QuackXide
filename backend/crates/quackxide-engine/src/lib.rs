@@ -5,37 +5,46 @@
 //! naming flows from `platform-config::BrandConfig`, and `scripts/check.sh`
 //! enforces this on the shipped frontend bundle.
 //!
-//! A [`QueryScope`] owns a DataFusion `SessionContext` over Arrow frames
-//! decoded from Parquet decrypted inside the attested enclave. Two paths:
+//! A [`QueryScope`] owns a DataFusion `SessionContext` over Parquet
+//! decrypted inside the attested enclave. Two paths:
 //!
 //! * **Ciphertext scan**: equality over a blind-index column ([`blind`]);
 //!   the engine never sees plaintext.
-//! * **In-enclave analytics**: SQL over the decrypted frames, which live only
+//! * **In-enclave analytics**: SQL over the decrypted data, which lives only
 //!   for the scope's lifetime. In `ZkMode::Enabled` the [`policy`] gate
 //!   restricts results to aggregates, and [`disclosure`] requires a genuine
 //!   `COUNT(*) AS n` and suppresses cohorts below the minimum size.
 //!
-//! A scope enforces its share of the [`QueryLimits`]: the Parquet footers
-//! must fit the decode limits before anything is decoded, operators run in
-//! a fixed memory pool with nothing spilled to disk, and a result over the
-//! row or byte limit is refused, never truncated.
+//! Registering a table reads only its Parquet footers. A query decodes the
+//! columns it reads, and no others, once its plan has passed every gate.
+//!
+//! A scope enforces its share of the [`QueryLimits`]: the footers of the
+//! columns a query reads must fit the decode limits before any of them is
+//! decoded, operators run in a fixed memory pool with nothing spilled to
+//! disk, and a result over the row or byte limit is refused, never
+//! truncated.
 
+use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, Schema};
+use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
+use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::{DataFusionError, exec_err};
-use datafusion::datasource::MemTable;
+use datafusion::common::{DataFusionError, exec_err, internal_err};
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::SchedulingType;
@@ -43,8 +52,12 @@ use datafusion::physical_plan::{ExecutionPlan, replace_children_if_necessary};
 use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
 use futures::StreamExt;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::file::metadata::ParquetMetaData;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder,
+};
+use parquet::file::metadata::{ParquetMetaData, ParquetStatisticsPolicy};
 use platform_core::{ColumnType, DeclaredSchema, ZkMode};
 use platform_crypto::{SecretBytes, ZeroizingWriter};
 use url::Url;
@@ -104,6 +117,8 @@ impl fmt::Display for Declaration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParquetStage {
     Metadata,
+    /// The objects of one table do not share their columns.
+    Schema,
     Reader,
     Batch,
 }
@@ -112,6 +127,7 @@ impl fmt::Display for ParquetStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             ParquetStage::Metadata => "reading metadata",
+            ParquetStage::Schema => "matching the objects' schemas",
             ParquetStage::Reader => "building the reader",
             ParquetStage::Batch => "decoding a batch",
         })
@@ -125,7 +141,6 @@ impl fmt::Display for ParquetStage {
 pub enum ExecutionStage {
     LoadTable,
     Plan,
-    Prepare,
     Execute,
 }
 
@@ -134,7 +149,6 @@ impl fmt::Display for ExecutionStage {
         f.write_str(match self {
             ExecutionStage::LoadTable => "loading the table",
             ExecutionStage::Plan => "planning",
-            ExecutionStage::Prepare => "preparing the plan",
             ExecutionStage::Execute => "executing",
         })
     }
@@ -155,9 +169,12 @@ pub struct EngineSettings {
 
 /// RAII scope for one query session.
 ///
-/// `Drop` deregisters every table, releasing the Arrow buffers so decrypted
-/// frames do not outlive the query. The decrypted Parquet input stays owned
-/// (and zeroized) by the caller.
+/// Each table keeps the engine's zeroizing copy of its decrypted Parquet and
+/// the footers parsed from it. A query decodes from them only the columns
+/// it reads, into Arrow arrays its plan holds until the query ends. `Drop`
+/// deregisters every table, releasing those copies (wiped as they go), so
+/// decrypted data does not outlive the scope. The caller's decrypted input
+/// stays its own.
 ///
 /// The scope's runtime holds no object store, so no plan reaches the host's
 /// files, and has no disk: its memory pool is
@@ -175,8 +192,13 @@ pub struct QueryScope {
 
 impl QueryScope {
     pub fn new(settings: EngineSettings) -> Self {
+        // `sql` gives each query a decode budget of its own. A plan built
+        // through the context directly shares this one for the scope's
+        // lifetime, so no scan goes unbudgeted.
+        let config =
+            SessionConfig::new().with_extension(Arc::new(DecodeBudget::new(&settings.limits)));
         let state = SessionStateBuilder::new()
-            .with_config(SessionConfig::new())
+            .with_config(config)
             .with_runtime_env(scope_runtime(&settings.limits))
             .with_default_features()
             .with_physical_optimizer_rule(Arc::new(YieldEveryBatch))
@@ -205,22 +227,24 @@ impl QueryScope {
         &self.settings
     }
 
-    /// Decode in-enclave decrypted Parquet and register it as `table`.
-    /// Returns the row count.
+    /// Register in-enclave decrypted Parquet as `table`. Returns the rows
+    /// its footer reports.
     pub fn register_parquet(&mut self, table: &str, parquet: &[u8]) -> Result<usize, QueryError> {
         self.register_parquet_many(table, std::slice::from_ref(&parquet))
     }
 
     /// Register several Parquet blobs as one table, one partition per blob.
-    /// All blobs must share a schema. Zero blobs is a no-op returning 0.
+    /// Zero blobs is a no-op returning 0. Returns the rows the footers
+    /// report.
     ///
-    /// Every blob's footer is read before any batch is decoded: the rows
-    /// and uncompressed bytes they report, summed, must fit
-    /// [`QueryLimits::max_decoded_rows`] and
-    /// [`QueryLimits::max_decoded_bytes`], since the memory pool does not
-    /// track the decoded table. Decoded rows are counted against the row
-    /// limit again. Either refusal is [`QueryError::LimitExceeded`].
-    /// Decoding is synchronous, so these limits also bound how long it runs.
+    /// Only the footers are read here; nothing is decoded until a query
+    /// reads the table (see [`sql`](Self::sql)). Every blob must have the
+    /// first one's columns (names, types and nullability, in order), or
+    /// the table is refused as [`QueryError::Parquet`]: the stored data is
+    /// at fault, not the caller. The rows the footers report, summed, must
+    /// fit [`QueryLimits::max_decoded_rows`], since every query decodes
+    /// every row of the columns it reads
+    /// ([`QueryError::LimitExceeded`]).
     pub fn register_parquet_many(
         &mut self,
         table: &str,
@@ -233,8 +257,8 @@ impl QueryScope {
     /// dataset whose shape a steward declared (ADR 0012). Each blob's schema
     /// must match `schema` (names in order, and [`ColumnType`] families),
     /// and the rows its footer reports, summed, must not exceed `row_cap`,
-    /// both checked before any batch is decoded. Decoded rows are counted
-    /// against `row_cap` again. A failure is
+    /// both checked here, from the footers. Each scan counts the rows it
+    /// decodes against `row_cap` again. A failure is
     /// [`QueryError::DeclarationMismatch`], which takes precedence over a
     /// decode limit.
     pub fn register_parquet_declared(
@@ -256,72 +280,44 @@ impl QueryScope {
         if blobs.is_empty() {
             return Ok(0);
         }
-        let limits = self.settings.limits;
         let row_cap = declared.map(|(_, row_cap)| row_cap);
-        // Each row count is checked against the declaration first: data
-        // unlike its declaration is a stored fault, whatever its size.
-        let check_rows = |rows: u64| {
-            if row_cap.is_some_and(|cap| rows > cap) {
-                Err(QueryError::DeclarationMismatch(Declaration::RowCap))
-            } else if rows > limits.max_decoded_rows {
-                Err(QueryError::LimitExceeded(QueryLimit::DecodedRows))
-            } else {
-                Ok(())
-            }
-        };
 
-        // Every footer first: nothing is decoded until the whole dataset is
-        // known to match its declaration and fit the decode limits.
-        let mut readers = Vec::with_capacity(blobs.len());
-        let mut footer_rows = 0u64;
-        let mut footer_bytes = 0u64;
+        // Footers only: no column is decoded here.
+        let mut objects: Vec<ParquetObject> = Vec::with_capacity(blobs.len());
+        let mut rows = 0u64;
         for blob in blobs {
-            let reader = ParquetRecordBatchReaderBuilder::try_new(wiped_copy(blob))
-                .map_err(|_| QueryError::Parquet(ParquetStage::Metadata))?;
+            let object = ParquetObject::read_footer(blob)?;
             if let Some((declared_schema, _)) = declared
-                && !matches_declared(reader.schema(), declared_schema)
+                && !matches_declared(object.schema(), declared_schema)
             {
                 return Err(QueryError::DeclarationMismatch(Declaration::Schema));
             }
-            let (rows, bytes) = footer_size(reader.metadata())?;
-            footer_rows = footer_rows.saturating_add(rows);
-            footer_bytes = footer_bytes.saturating_add(bytes);
-            readers.push(reader);
-        }
-        check_rows(footer_rows)?;
-        if footer_bytes > limits.max_decoded_bytes {
-            return Err(QueryError::LimitExceeded(QueryLimit::DecodedBytes));
-        }
-
-        let mut schema = None;
-        let mut partitions: Vec<Vec<RecordBatch>> = Vec::with_capacity(readers.len());
-        let mut rows = 0u64;
-        for reader in readers {
-            schema.get_or_insert_with(|| reader.schema().clone());
-            let mut batches = Vec::new();
-            for batch in reader
-                .build()
-                .map_err(|_| QueryError::Parquet(ParquetStage::Reader))?
+            if let Some(first) = objects.first()
+                && !same_columns(first.schema(), object.schema())
             {
-                let batch = batch.map_err(|_| QueryError::Parquet(ParquetStage::Batch))?;
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
-                check_rows(rows)?;
-                batches.push(batch);
+                return Err(QueryError::Parquet(ParquetStage::Schema));
             }
-            partitions.push(batches);
+            rows = rows.saturating_add(object.rows);
+            objects.push(object);
+        }
+        // The declaration first: data unlike it is a stored fault, whatever
+        // its size.
+        if row_cap.is_some_and(|cap| rows > cap) {
+            return Err(QueryError::DeclarationMismatch(Declaration::RowCap));
+        }
+        if rows > self.settings.limits.max_decoded_rows {
+            return Err(QueryError::LimitExceeded(QueryLimit::DecodedRows));
         }
 
-        let schema = schema.expect("non-empty blobs yield a schema");
-        let mem = MemTable::try_new(schema, partitions)
-            .map_err(|_| QueryError::Execution(ExecutionStage::LoadTable))?;
+        let table_provider = ParquetTable::new(objects, rows, row_cap);
         self.ctx
-            .register_table(table, Arc::new(mem))
+            .register_table(table, Arc::new(table_provider))
             .map_err(|_| QueryError::Execution(ExecutionStage::LoadTable))?;
         self.tables.push(table.to_owned());
         Ok(usize::try_from(rows).unwrap_or(usize::MAX))
     }
 
-    /// Run SQL over the registered frames. In `ZkMode::Enabled`, or with a
+    /// Run SQL over the registered tables. In `ZkMode::Enabled`, or with a
     /// disclosure policy attached, the plan must pass the aggregate-only
     /// allowlist and carry a genuine `COUNT(*) AS n`, a disclosure policy is
     /// required, and results pass through it before egress. A result with
@@ -330,6 +326,18 @@ impl QueryScope {
     /// scope's memory pool. Without a disclosure policy the result is
     /// refused as soon as it passes the row limit, and the plan stops.
     ///
+    /// Nothing is decoded until every check above that comes before
+    /// execution has passed. Each table scan in the plan then decodes, from
+    /// every object, only the columns the query reads. Before it decodes
+    /// any, the rows and uncompressed bytes the footers report for those
+    /// columns, summed over the query's scans (a table read twice counts
+    /// twice), must fit [`QueryLimits::max_decoded_rows`] and
+    /// [`QueryLimits::max_decoded_bytes`], since the memory pool does not
+    /// track decoded columns. Decoding is synchronous, so these limits also
+    /// bound how long it runs. A refusal is [`QueryError::LimitExceeded`]; a
+    /// stored object that fails to decode is [`QueryError::Parquet`], never
+    /// an error in the caller's SQL.
+    ///
     /// Dropping the returned future stops the plan at its next batch
     /// boundary: every operator yields to the runtime as it produces batches
     /// (`YieldEveryBatch`), so a time limit applied around this call is
@@ -337,23 +345,25 @@ impl QueryScope {
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>, QueryError> {
         self.last_suppressed_rows.store(0, Ordering::Relaxed);
 
+        // The query's own decode budget, which every scan in its plan draws
+        // on.
+        let mut query_state = self.ctx.state();
+        query_state
+            .config_mut()
+            .set_extension(Arc::new(DecodeBudget::new(&self.settings.limits)));
+
         // Plan without executing, then refuse anything but a read-only query
-        // in every mode: DataFusion runs DDL, `SET` and `PREPARE` while
-        // turning a plan into a DataFrame, before any gate below sees it.
-        let plan = self
-            .ctx
-            .state()
+        // in every mode. `SessionContext::execute_logical_plan` would run
+        // DDL, `SET` and `PREPARE` while turning a plan into a DataFrame; it
+        // only wraps a read-only plan, which is a query, as this does.
+        let plan = query_state
             .create_logical_plan(query)
             .await
             .map_err(|err| datafusion_error(ExecutionStage::Plan, &err))?;
         read_only()
             .verify_plan(&plan)
             .map_err(|_| QueryError::StatementNotAllowed)?;
-        let df = self
-            .ctx
-            .execute_logical_plan(plan)
-            .await
-            .map_err(|err| datafusion_error(ExecutionStage::Prepare, &err))?;
+        let df = DataFrame::new(query_state, plan);
 
         let gated = self.settings.zk.is_enabled() || self.disclosure.is_some();
         if gated {
@@ -451,6 +461,17 @@ fn matches_declared(actual: &Schema, declared: &DeclaredSchema) -> bool {
         })
 }
 
+/// Whether two objects' schemas have the same columns: names, types and
+/// nullability, in order. Their metadata may differ.
+fn same_columns(first: &Schema, other: &Schema) -> bool {
+    first.fields().len() == other.fields().len()
+        && first.fields().iter().zip(other.fields()).all(|(a, b)| {
+            a.name() == b.name()
+                && a.data_type() == b.data_type()
+                && a.is_nullable() == b.is_nullable()
+        })
+}
+
 /// The declared type family an Arrow type belongs to, if any.
 pub fn column_type_of(data_type: &DataType) -> Option<ColumnType> {
     Some(match data_type {
@@ -491,6 +512,274 @@ struct WipedParquet(SecretBytes);
 impl AsRef<[u8]> for WipedParquet {
     fn as_ref(&self) -> &[u8] {
         self.0.expose()
+    }
+}
+
+/// A table over decrypted Parquet objects, one partition per object.
+/// Registering it reads only the footers. Each scan decodes the columns it
+/// reads, once the footers show they fit the query's [`DecodeBudget`], into
+/// an in-memory plan that lives as long as the query's.
+struct ParquetTable {
+    /// The first object's schema, whose columns every object shares.
+    schema: SchemaRef,
+    objects: Vec<ParquetObject>,
+    /// Rows the footers report, summed.
+    rows: u64,
+    /// The most rows the steward declared, for a declared dataset.
+    row_cap: Option<u64>,
+}
+
+impl fmt::Debug for ParquetTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never the objects: their bytes and footers come from the data.
+        f.debug_struct("ParquetTable")
+            .field("objects", &self.objects.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ParquetTable {
+    /// `objects` must be non-empty and share the first one's columns.
+    fn new(objects: Vec<ParquetObject>, rows: u64, row_cap: Option<u64>) -> Self {
+        let schema = objects
+            .first()
+            .map(|object| Arc::clone(object.schema()))
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
+        Self {
+            schema,
+            objects,
+            rows,
+            row_cap,
+        }
+    }
+
+    /// Every object's `columns` (indices into the table's schema, in the
+    /// order the scan asks for them) as batches of `schema`, one partition
+    /// per object. Nothing is decoded until `budget` has taken the rows the
+    /// footers report and the uncompressed bytes they report for these
+    /// columns.
+    fn decode(
+        &self,
+        columns: &[usize],
+        schema: &SchemaRef,
+        budget: &DecodeBudget,
+    ) -> Result<Vec<Vec<RecordBatch>>, ScanFault> {
+        // The reader returns the columns it reads in file order.
+        let mut roots = columns.to_vec();
+        roots.sort_unstable();
+        roots.dedup();
+        let mut order = Vec::with_capacity(columns.len());
+        for column in columns {
+            let position = roots
+                .binary_search(column)
+                .map_err(|_| ScanFault::Parquet(ParquetStage::Reader))?;
+            order.push(position);
+        }
+
+        let bytes = self.objects.iter().fold(0u64, |sum, object| {
+            sum.saturating_add(object.column_bytes(&roots))
+        });
+        budget.take(self.rows, bytes)?;
+
+        let mut partitions = Vec::with_capacity(self.objects.len());
+        let mut decoded = 0u64;
+        for object in &self.objects {
+            let mut object_rows = 0u64;
+            let mut batches = Vec::new();
+            for batch in object.reader(&roots)? {
+                let batch = batch.map_err(|_| ScanFault::Parquet(ParquetStage::Batch))?;
+                let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
+                object_rows = object_rows.saturating_add(rows);
+                decoded = decoded.saturating_add(rows);
+                // Decoded rows are counted again: past the declared cap the
+                // data is unlike its declaration, and past what its footer
+                // reported, which the limits were checked against, the
+                // object is malformed.
+                if self.row_cap.is_some_and(|cap| decoded > cap) {
+                    return Err(ScanFault::Declaration(Declaration::RowCap));
+                }
+                if object_rows > object.rows {
+                    return Err(ScanFault::Parquet(ParquetStage::Batch));
+                }
+                let arrays = order
+                    .iter()
+                    .map(|&position| batch.columns().get(position).cloned())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(ScanFault::Parquet(ParquetStage::Batch))?;
+                let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                let batch = RecordBatch::try_new_with_options(Arc::clone(schema), arrays, &options)
+                    .map_err(|_| ScanFault::Parquet(ParquetStage::Batch))?;
+                batches.push(batch);
+            }
+            partitions.push(batches);
+        }
+        Ok(partitions)
+    }
+}
+
+#[async_trait]
+impl TableProvider for ParquetTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    /// DataFusion calls this while it builds the physical plan from the
+    /// final logical plan, which [`QueryScope::sql`] does only once the plan
+    /// has passed every gate: the columns decoded are the ones that run.
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let Some(budget) = state.config().get_extension::<DecodeBudget>() else {
+            return internal_err!("a scan outside a query scope's session");
+        };
+        let columns = match projection {
+            Some(columns) => columns.clone(),
+            None => (0..self.schema.fields().len()).collect(),
+        };
+        let schema = Arc::new(self.schema.project(&columns)?);
+        let partitions = self.decode(&columns, &schema, &budget)?;
+        Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
+    }
+}
+
+/// One decrypted Parquet object: the engine's zeroizing copy and its
+/// parsed footer.
+struct ParquetObject {
+    /// The decoder's input ([`wiped_copy`]).
+    bytes: Bytes,
+    /// The footer, parsed without its column statistics (whose minimum and
+    /// maximum are values from the data), and the Arrow schema it gives.
+    footer: ArrowReaderMetadata,
+    /// Rows the footer reports.
+    rows: u64,
+}
+
+impl ParquetObject {
+    /// Reads `blob`'s footer, and nothing else, from the engine's own copy.
+    fn read_footer(blob: &[u8]) -> Result<Self, QueryError> {
+        let bytes = wiped_copy(blob);
+        let options =
+            ArrowReaderOptions::new().with_column_stats_policy(ParquetStatisticsPolicy::SkipAll);
+        let footer = ArrowReaderMetadata::load(&bytes, options)
+            .map_err(|_| QueryError::Parquet(ParquetStage::Metadata))?;
+        let rows = footer_rows(footer.metadata())?;
+        Ok(Self {
+            bytes,
+            footer,
+            rows,
+        })
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        self.footer.schema()
+    }
+
+    /// Uncompressed bytes the footer reports for the column chunks of the
+    /// root columns `roots` (sorted), which [`footer_rows`] has checked.
+    fn column_bytes(&self, roots: &[usize]) -> u64 {
+        let metadata = self.footer.metadata();
+        let descr = metadata.file_metadata().schema_descr();
+        let mut bytes = 0u64;
+        for group in metadata.row_groups() {
+            for (leaf, column) in group.columns().iter().enumerate() {
+                if roots
+                    .binary_search(&descr.get_column_root_idx(leaf))
+                    .is_ok()
+                {
+                    let size = u64::try_from(column.uncompressed_size()).unwrap_or(u64::MAX);
+                    bytes = bytes.saturating_add(size);
+                }
+            }
+        }
+        bytes
+    }
+
+    /// A reader of the root columns `roots` (sorted) and no others.
+    fn reader(&self, roots: &[usize]) -> Result<ParquetRecordBatchReader, ScanFault> {
+        let descr = self.footer.metadata().file_metadata().schema_descr();
+        let root_columns = descr.root_schema().get_fields().len();
+        if roots.iter().any(|&root| root >= root_columns) {
+            return Err(ScanFault::Parquet(ParquetStage::Reader));
+        }
+        let mask = ProjectionMask::roots(descr, roots.iter().copied());
+        ParquetRecordBatchReaderBuilder::new_with_metadata(self.bytes.clone(), self.footer.clone())
+            .with_projection(mask)
+            .build()
+            .map_err(|_| ScanFault::Parquet(ParquetStage::Reader))
+    }
+}
+
+/// What the table scans of one query may decode, as the footers report it:
+/// every row, and the uncompressed bytes of the columns each scan reads,
+/// summed over the query's scans. [`QueryScope::sql`] gives each query its
+/// own, in the session config its scans see.
+#[derive(Debug)]
+struct DecodeBudget {
+    max_rows: u64,
+    max_bytes: u64,
+    /// Rows and bytes the query's scans have taken.
+    taken: Mutex<(u64, u64)>,
+}
+
+impl DecodeBudget {
+    fn new(limits: &QueryLimits) -> Self {
+        Self {
+            max_rows: limits.max_decoded_rows,
+            max_bytes: limits.max_decoded_bytes,
+            taken: Mutex::new((0, 0)),
+        }
+    }
+
+    /// Takes one scan's `rows` and `bytes`, or refuses the scan if the
+    /// query's scans would then pass either decode limit.
+    fn take(&self, rows: u64, bytes: u64) -> Result<(), ScanFault> {
+        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        let total = (taken.0.saturating_add(rows), taken.1.saturating_add(bytes));
+        if total.0 > self.max_rows {
+            return Err(ScanFault::Limit(QueryLimit::DecodedRows));
+        }
+        if total.1 > self.max_bytes {
+            return Err(ScanFault::Limit(QueryLimit::DecodedBytes));
+        }
+        *taken = total;
+        Ok(())
+    }
+}
+
+/// A refusal or failure while a scan decodes. It crosses DataFusion's
+/// planner as an external error, and [`datafusion_error`] reports it as
+/// itself, never as the caller's SQL. Holds no upstream message.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+enum ScanFault {
+    #[error("parquet decode failed while {0}")]
+    Parquet(ParquetStage),
+    #[error("dataset does not match its declared {0}")]
+    Declaration(Declaration),
+    #[error("query exceeded its {0} limit")]
+    Limit(QueryLimit),
+}
+
+impl From<ScanFault> for QueryError {
+    fn from(fault: ScanFault) -> Self {
+        match fault {
+            ScanFault::Parquet(stage) => QueryError::Parquet(stage),
+            ScanFault::Declaration(declaration) => QueryError::DeclarationMismatch(declaration),
+            ScanFault::Limit(limit) => QueryError::LimitExceeded(limit),
+        }
+    }
+}
+
+impl From<ScanFault> for DataFusionError {
+    fn from(fault: ScanFault) -> Self {
+        DataFusionError::External(Box::new(fault))
     }
 }
 
@@ -551,10 +840,18 @@ impl Write for CappedWriter {
     }
 }
 
-/// A DataFusion failure, with no upstream text. Running out of the scope's
-/// memory pool, or needing a temporary file the scope does not have, is
-/// the memory limit, not the caller's SQL.
+/// A DataFusion failure, with no upstream text. A [`ScanFault`] anywhere in
+/// the chain is reported as itself. Running out of the scope's memory pool,
+/// or needing a temporary file the scope does not have, is the memory
+/// limit. Neither is the caller's SQL.
 fn datafusion_error(stage: ExecutionStage, err: &DataFusionError) -> QueryError {
+    let mut source: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(error) = source {
+        if let Some(fault) = error.downcast_ref::<ScanFault>() {
+            return QueryError::from(*fault);
+        }
+        source = error.source();
+    }
     match err.find_root() {
         DataFusionError::ResourcesExhausted(_) => QueryError::LimitExceeded(QueryLimit::Memory),
         _ => QueryError::Execution(stage),
@@ -578,25 +875,22 @@ fn scope_runtime(limits: &QueryLimits) -> Arc<RuntimeEnv> {
         .expect("a runtime with no object store and no disk always builds")
 }
 
-/// Rows and uncompressed bytes a Parquet footer reports. Rows are the larger
-/// of the file's count and its row groups' sum; bytes, per row group, the
-/// larger of its total and its column chunks' sum. A negative size is
+/// Rows a Parquet footer reports: the larger of the file's count and its
+/// row groups' sum. A negative count or size anywhere in the footer is
 /// malformed metadata.
-fn footer_size(metadata: &ParquetMetaData) -> Result<(u64, u64), QueryError> {
+fn footer_rows(metadata: &ParquetMetaData) -> Result<u64, QueryError> {
     let size =
         |value: i64| u64::try_from(value).map_err(|_| QueryError::Parquet(ParquetStage::Metadata));
     let mut rows = 0u64;
-    let mut bytes = 0u64;
     for group in metadata.row_groups() {
         rows = rows.saturating_add(size(group.num_rows())?);
-        let mut columns = 0u64;
+        size(group.total_byte_size())?;
         for column in group.columns() {
-            columns = columns.saturating_add(size(column.uncompressed_size())?);
+            size(column.uncompressed_size())?;
         }
-        bytes = bytes.saturating_add(size(group.total_byte_size())?.max(columns));
     }
     let file_rows = size(metadata.file_metadata().num_rows())?;
-    Ok((rows.max(file_rows), bytes))
+    Ok(rows.max(file_rows))
 }
 
 /// Makes every operator yield to the runtime as it produces batches.
@@ -795,54 +1089,66 @@ mod tests {
         }
     }
 
+    /// `parquet` with every page overwritten and its footer intact, so
+    /// decoding any column fails and reading the footer does not. Pages run
+    /// from the leading magic to the footer, which ends with its length and
+    /// the trailing magic.
+    fn pages_wiped(parquet: &[u8]) -> Vec<u8> {
+        let footer_len = u32::from_le_bytes(
+            parquet[parquet.len() - 8..parquet.len() - 4]
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
+        let mut wiped = parquet.to_vec();
+        let pages_end = parquet.len() - 8 - footer_len;
+        wiped[4..pages_end].fill(0xA5);
+        wiped
+    }
+
+    const SUM_V: &str = "SELECT SUM(v) AS s FROM t";
+
     /// A million zeros, plain-encoded and compressed: a few kilobytes on
     /// disk that decode to 8 MB. Its pages are overwritten, so decoding any
-    /// of it would fail: a limit refusal shows nothing was decoded.
-    #[test]
-    fn decode_limits_refuse_a_compressible_dataset_from_its_footer() {
+    /// of it would fail: a limit refusal shows nothing was decoded. The row
+    /// limit refuses the table from its footer; the byte limit refuses a
+    /// query from the footer of the column it reads.
+    #[tokio::test]
+    async fn decode_limits_refuse_a_compressible_dataset_from_its_footer() {
         let props = WriterProperties::builder()
             .set_dictionary_enabled(false)
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .build();
         let parquet = int_parquet(Int64Array::from(vec![0; 1_000_000]), Some(props));
         assert!(parquet.len() < 64 * 1024, "{} bytes", parquet.len());
+        let pages_wiped = pages_wiped(&parquet);
 
-        // Pages run from the leading magic to the footer, which ends with
-        // its length and the trailing magic.
-        let footer_len = u32::from_le_bytes(
-            parquet[parquet.len() - 8..parquet.len() - 4]
-                .try_into()
-                .expect("4 bytes"),
-        ) as usize;
-        let mut pages_wiped = parquet.clone();
-        let pages_end = parquet.len() - 8 - footer_len;
-        pages_wiped[4..pages_end].fill(0xA5);
+        let rows_over = QueryLimits {
+            max_decoded_rows: 999_999,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope_with(ZkMode::Disabled, rows_over);
+        let err = scope
+            .register_parquet("t", &pages_wiped)
+            .expect_err("over the row limit");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedRows)),
+            "{err:?}"
+        );
 
-        for (limits, limit) in [
-            (
-                QueryLimits {
-                    max_decoded_bytes: MIB,
-                    ..QueryLimits::default()
-                },
-                QueryLimit::DecodedBytes,
-            ),
-            (
-                QueryLimits {
-                    max_decoded_rows: 999_999,
-                    ..QueryLimits::default()
-                },
-                QueryLimit::DecodedRows,
-            ),
-        ] {
-            let mut scope = scope_with(ZkMode::Enabled, limits);
-            let err = scope
-                .register_parquet("t", &pages_wiped)
-                .expect_err("over the limit");
-            assert!(
-                matches!(err, QueryError::LimitExceeded(found) if found == limit),
-                "{err:?}"
-            );
-        }
+        let bytes_over = QueryLimits {
+            max_decoded_bytes: MIB,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope_with(ZkMode::Disabled, bytes_over);
+        assert_eq!(
+            scope.register_parquet("t", &pages_wiped).expect("footer"),
+            1_000_000
+        );
+        let err = scope.sql(SUM_V).await.expect_err("over the byte limit");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+            "{err:?}"
+        );
 
         // Within both limits the intact file decodes, and the wiped one fails
         // to: the refusals above came before any decoding.
@@ -851,16 +1157,173 @@ mod tests {
             max_decoded_bytes: 16 * MIB,
             ..QueryLimits::default()
         };
-        let mut scope = scope_with(ZkMode::Enabled, fits);
-        assert_eq!(
-            scope.register_parquet("t", &parquet).expect("fits"),
-            1_000_000
-        );
-        let mut scope = scope_with(ZkMode::Enabled, fits);
+        let mut scope = scope_with(ZkMode::Disabled, fits);
+        scope.register_parquet("t", &parquet).expect("fits");
+        let rows = scope.sql_json(SUM_V).await.expect("decodes");
+        assert_eq!(rows, serde_json::json!([{ "s": 0 }]));
+        let mut scope = scope_with(ZkMode::Disabled, fits);
+        scope.register_parquet("t", &pages_wiped).expect("footer");
         assert!(matches!(
-            scope.register_parquet("t", &pages_wiped),
-            Err(QueryError::Parquet(_))
+            scope.sql(SUM_V).await,
+            Err(QueryError::Parquet(
+                ParquetStage::Batch | ParquetStage::Reader
+            ))
         ));
+    }
+
+    /// Every scan of a query counts toward the decode limits: a self-join
+    /// reads the table twice. Each query has a budget of its own, so the
+    /// scope runs the single scan again.
+    #[tokio::test]
+    async fn every_scan_of_a_query_counts_toward_the_decode_limits() {
+        let parquet = int_parquet(Int64Array::from_iter_values(0..1_000), None);
+        let self_join = "SELECT COUNT(*) AS n FROM t a JOIN t b ON a.v = b.v";
+        for (limits, limit) in [
+            (
+                QueryLimits {
+                    max_decoded_rows: 1_999,
+                    ..QueryLimits::default()
+                },
+                QueryLimit::DecodedRows,
+            ),
+            (
+                QueryLimits {
+                    max_decoded_bytes: column_bytes(&parquet) * 2 - 1,
+                    ..QueryLimits::default()
+                },
+                QueryLimit::DecodedBytes,
+            ),
+        ] {
+            let mut scope = scope_with(ZkMode::Disabled, limits);
+            scope.register_parquet("t", &parquet).expect("register");
+            for _ in 0..2 {
+                let rows = scope.sql_json(SUM_V).await.expect("one scan fits");
+                assert_eq!(rows, serde_json::json!([{ "s": 499_500 }]));
+            }
+            let err = scope.sql(self_join).await.expect_err("two scans");
+            assert!(
+                matches!(err, QueryError::LimitExceeded(found) if found == limit),
+                "{err:?}"
+            );
+        }
+
+        // Both scans fit when the limits allow two.
+        let limits = QueryLimits {
+            max_decoded_rows: 2_000,
+            max_decoded_bytes: column_bytes(&parquet) * 2,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope_with(ZkMode::Disabled, limits);
+        scope.register_parquet("t", &parquet).expect("register");
+        let rows = scope.sql_json(self_join).await.expect("two scans fit");
+        assert_eq!(rows, serde_json::json!([{ "n": 1_000 }]));
+    }
+
+    /// Uncompressed bytes `parquet`'s footer reports for its column chunks.
+    fn column_bytes(parquet: &[u8]) -> u64 {
+        let object = ParquetObject::read_footer(parquet).expect("footer");
+        let roots: Vec<usize> = (0..object.schema().fields().len()).collect();
+        object.column_bytes(&roots)
+    }
+
+    /// Objects of one table must share their columns. Unlike ones are a
+    /// stored fault (a Parquet failure, 5xx), never the caller's SQL.
+    #[test]
+    fn objects_with_unlike_columns_are_refused_as_a_parquet_failure() {
+        let ints = int_parquet(Int64Array::from(vec![1, 2]), None);
+        let renamed = {
+            let schema = Arc::new(Schema::new(vec![Field::new("w", DataType::Int64, false)]));
+            let values = Arc::new(Int64Array::from(vec![3]));
+            parquet_of(RecordBatch::try_new(schema, vec![values]).expect("batch"))
+        };
+        let nullable = {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+            let values = Arc::new(Int64Array::from(vec![Some(3), None]));
+            parquet_of(RecordBatch::try_new(schema, vec![values]).expect("batch"))
+        };
+        let wider = {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("v", DataType::Int64, false),
+                Field::new("w", DataType::Int64, false),
+            ]));
+            let values = Arc::new(Int64Array::from(vec![3]));
+            parquet_of(RecordBatch::try_new(schema, vec![values.clone(), values]).expect("batch"))
+        };
+        for other in [&renamed, &nullable, &wider] {
+            let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+            let err = scope
+                .register_parquet_many("t", &[ints.as_slice(), other.as_slice()])
+                .expect_err("unlike columns");
+            assert!(
+                matches!(err, QueryError::Parquet(ParquetStage::Schema)),
+                "{err:?}"
+            );
+        }
+
+        let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+        assert_eq!(
+            scope
+                .register_parquet_many("t", &[ints.as_slice(), ints.as_slice()])
+                .expect("alike"),
+            4
+        );
+    }
+
+    fn parquet_of(batch: RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        buf
+    }
+
+    /// The table's `Debug` names no value from the data, which a plan's
+    /// debug output would otherwise carry. Its footer keeps no column
+    /// statistics, whose minimum and maximum are values from the data.
+    #[tokio::test]
+    async fn the_table_formats_and_keeps_no_values_from_the_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "secret",
+            DataType::Utf8,
+            false,
+        )]));
+        let values = Arc::new(arrow::array::StringArray::from(vec!["MARKER-31337"]));
+        let parquet = parquet_of(RecordBatch::try_new(schema, vec![values]).expect("batch"));
+        let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+        scope.register_parquet("t", &parquet).expect("register");
+
+        let table = scope.ctx.table_provider("t").await.expect("table");
+        let formatted = format!("{table:?}");
+        assert!(!formatted.contains("MARKER"), "{formatted}");
+        let table = table
+            .downcast_ref::<ParquetTable>()
+            .expect("a ParquetTable");
+        let footer = format!("{:?}", table.objects[0].footer.metadata());
+        assert!(!footer.contains("MARKER"), "{footer}");
+        assert!(
+            table.objects[0]
+                .footer
+                .metadata()
+                .row_groups()
+                .iter()
+                .flat_map(|group| group.columns())
+                .all(|column| column.statistics().is_none())
+        );
+    }
+
+    /// Dropping the scope releases each table, with the engine's copy of
+    /// the decrypted Parquet it holds (wiped on drop, by type), once queries
+    /// have decoded from it.
+    #[tokio::test]
+    async fn dropping_the_scope_releases_its_tables() {
+        let parquet = int_parquet(Int64Array::from_iter_values(0..1_000), None);
+        let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+        scope.register_parquet("t", &parquet).expect("register");
+        scope.sql(SUM_V).await.expect("query");
+        let table = Arc::downgrade(&scope.ctx.table_provider("t").await.expect("table"));
+        assert!(table.upgrade().is_some());
+        drop(scope);
+        assert!(table.upgrade().is_none(), "the table outlived its scope");
     }
 
     /// A single partition of `batches` batches of `rows` rows each (`v`,
