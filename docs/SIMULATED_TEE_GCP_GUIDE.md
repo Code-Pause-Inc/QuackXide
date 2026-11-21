@@ -15,7 +15,7 @@ This document maps each component of the local simulated TEE to its production c
 | **`SIM_TOKEN_DBGSTAT`, `SIM_TOKEN_IMAGE_DIGEST`, `SIM_TOKEN_HWMODEL`** | Change the claims `sim-attestation` signs, to prove refusals. | A debug Confidential Space image, a different image, or other hardware. |
 | **`EnclaveIdentity` (`platform-api::key_release`)** | The key set generated in RAM at process start: an `HPK2` request key and an Ed25519 + ML-DSA-65 result-signing key, with a `key_id` (ADR 0010). The private keys never leave process memory. | The same key generation inside the TDX guest, whose memory TDX encrypts. |
 | **`GET /api/v1/attestation?nonce=...`** | Takes the caller's 32-byte nonce in base64url (400 if it is missing or malformed) and returns ADR 0010's evidence bundle: the token bound to that nonce and the enclave's key set, plus the public keys. | The same endpoint, returning Google's token for the browser (P85). |
-| **`KeyReleaseRelyingParty` (`bin/key-release.rs`, dev only)** | Issues single-use 60 s challenge nonces, verifies the token with `TokenVerifier` against the `sim-attestation` key set (refetched at most every 5 s on an unknown key id), and HPKE-seals the tenant private key (`key-release-v1\|{tenant_id}\|{nonce_b64}`) to the enclave's request key. Tenant keys are enrolled over plain HTTP (`PUT /v1/keys`). | Cloud KMS in the maintainer's key project. Each dataset's data key is wrapped to a KMS X-Wing key, and KMS decapsulates only for a workload identity federation principal whose token meets the release policy (P50). |
+| **`KeyReleaseRelyingParty` (`bin/key-release.rs`, dev only)** | Issues single-use 60 s challenge nonces, verifies the token with `TokenVerifier` against the `sim-attestation` key set (refetched at most every 5 s on an unknown key id), requires the configuration the token reports to be the one the request binds and to pass the simulator's policy, and HPKE-seals the tenant private key (`quackxide-key-release-v1\|{tenant_id}\|{nonce_b64}`) to the enclave's request key. Tenant keys are enrolled over plain HTTP (`PUT /v1/keys`). | Cloud KMS in the maintainer's key project. Each dataset's data key is wrapped to a KMS X-Wing key, and KMS decapsulates only for a workload identity federation principal whose token meets the release policy (P50). |
 | **`AttestedKeyProvider` & `ReleasedKeySession` (dev only)** | Challenge, token and HPKE unwrap **once per query**, holding the tenant key in RAM for the query and zeroizing it on `Drop`. | A production `EnclaveKeyProvider` asking KMS to decapsulate the data keys a query needs, once per query, with nothing cached (P50). |
 
 ---
@@ -97,6 +97,7 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 | **`sim-attestation` (target `sim-attestation`)** | **Google's attestation service** | Issues the token format and claims production verifies; its key is throwaway, so a verifier holding Google's keys refuses its tokens. |
 | **`key-release-service` (target `key-release`)** | **Cloud KMS + Workload Identity Federation** in the maintainer's key project | Checks the same claims as the attribute condition above before release. Holds tenant private keys itself; production KMS holds a non-exportable key and per-dataset data keys are wrapped to it. |
 | **`enclave_internal_net` (`internal: true`)** | **VPC Service Controls perimeter + Private Google Access** | Keeps enclave-to-KMS and enclave-to-storage traffic off the public ingress network (`public_net`). |
+| **`enclave-check` (target `enclave-check`, profile `tools`)** | **The researcher's browser** (#239) | Runs ADR 0010's five checks on the enclave's evidence bundle, fetching the simulator's key set itself, and seals a research query to the attested request key (`seal-query`); `keygen` makes the researcher's key. A development build holds the simulator's policy: `TEE_ATTESTATION_REQUIRED` may be `false` and the cohort floor is 2. It runs on the internal network. |
 | **`seal-upload` (target `seal-upload`, profile `tools`)** | **The steward's browser** (P40) | Seals a synthetic cohort and its snapshot manifest to the steward's public key, as the browser's crypto worker seals an upload (ADR 0012), and writes the upload body to stdout. It runs on demand with no network and holds no private key; the test script sends the body. |
 
 ### Running the Local Simulated TEE Verification Suite
@@ -105,16 +106,17 @@ ADR 0004 requires an off-the-shelf release mechanism, so production uses no Quac
 ./scripts/test-simulated-tee.sh
 ```
 
-It runs nine stages:
+It runs ten stages:
 1. Builds every image and starts `sim-attestation` and `key-release-service`.
 2. Enrolls the steward's `HPK2` key (`PUT /v1/keys`, which returns the public key).
 3. Starts `enclave-api` with an empty vault.
 4. Seals a synthetic cohort with `seal-upload` and uploads it as the steward (`PUT /api/v1/datasets/{dataset}`); requires `HTTP 401` without a token, `404` outside the upload namespace and `409` when the same version is sent again.
 5. Copies the vault out of the container and requires exactly three files, at the version and object id in the upload's header: the object and manifest as `HPK2` envelopes, and the plaintext record holding the suite and the row cap and schema the steward declared. It also requires no Parquet magic bytes anywhere.
 6. Checks that `GET /api/v1/attestation` returns a token and that `POST /api/v1/query` returns rows after token-gated key release.
-7. Runs the research lifecycle on the upload: publish, request, approve, a query under disclosure control and a budget, revoke; then requires `HTTP 404` for an approval retry and `403` for the query after it.
+7. Checks the enclave with `enclave-check verify`, then runs the research lifecycle on the upload with every query sealed by `enclave-check seal-query`: publish, request, approve, a query under disclosure control and a budget, the same envelope again answered from the store at no charge, revoke; then requires `HTTP 404` for an approval retry and `403` for the query after it.
 8. Restarts `sim-attestation` with a debug image, an unlisted image digest and non-TDX hardware in turn, and requires `HTTP 503` each time; then restores the default claims and requires `HTTP 200`.
 9. Copies the vault out again and repeats stage 5's check, so a file the queries wrote fails the run.
+10. Restarts `enclave-api` with `RESEARCH_MIN_COHORT_SIZE=1`: a query sealed before the restart gets `409 reattest`, `enclave-check` fails check 5 and seals nothing, and key release refuses the loosened configuration (`HTTP 503`).
 
 ---
 
@@ -130,7 +132,7 @@ The production path is built by its own plan items, not by pointing the simulati
 
 ## 6. What the Simulation Proves — and What It Does Not
 
-* **What it proves in local Docker and CI:** the token format and claims, the RS256 verifier with its algorithm allowlist, issuer, audience, validity and nonce checks, the release policy (TDX, Confidential Space, debug disabled, `STABLE`, image digest), the key-set refetch after a simulator restart, single-use challenge nonces, HPKE key wrapping (`key-release-v1`) and once-per-query key sessions, end to end across isolated containers.
+* **What it proves in local Docker and CI:** the token format and claims, the RS256 verifier with its algorithm allowlist, issuer, audience, validity and nonce checks, the release policy (TDX, Confidential Space, debug disabled, `STABLE`, image digest), the key-set refetch after a simulator restart, single-use challenge nonces, HPKE key wrapping (`quackxide-key-release-v1`) and once-per-query key sessions, end to end across isolated containers.
 * **What it does not provide:**
   * Host memory encryption. In local Docker the host can read container memory. Protection from a compromised host exists only on Intel TDX hardware under Confidential Space.
   * Real hardware evidence: the TDX quote and its verification by Google are outside the simulation, and Google's own key set is not used.
