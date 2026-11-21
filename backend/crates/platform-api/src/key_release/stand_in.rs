@@ -21,13 +21,14 @@
 //!    session ([`QueryKeySession`]), opens the snapshot manifest and objects,
 //!    and drops the key as soon as decryption completes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -36,6 +37,7 @@ use platform_core::TenantId;
 use platform_crypto::{
     EnvelopeSuite, SecretBytes, SuitePolicy, TenantKeypair, hpke_seal_to_tenant,
 };
+use platform_enclave::config::BOUND_CONFIG_NAMES;
 use platform_enclave::simulated_token::TokenSigner;
 use platform_enclave::token::{
     JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError, TokenVerifier, nonces_from_bytes,
@@ -712,6 +714,10 @@ impl EnclaveKeyProvider for AttestedKeyProvider {
 struct TokenRequest {
     audience: String,
     nonces: Vec<String>,
+    /// The workload's bound configuration, which the simulator puts in
+    /// `submods.container.env` as Confidential Space's launcher would.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// The `sim-attestation` service: `POST /v1/token` signs a token for the
@@ -727,8 +733,21 @@ pub fn sim_attestation_router(signer: Arc<TokenSigner>) -> Router {
             "/v1/token",
             post(
                 |State(signer): State<Arc<TokenSigner>>, Json(req): Json<TokenRequest>| async move {
-                    let token = signer.sign(&req.audience, &req.nonces, Duration::from_secs(3600));
-                    Json(json!({ "token": token }))
+                    let lifetime = Duration::from_secs(3600);
+                    if req.env.is_empty() {
+                        let token = signer.sign(&req.audience, &req.nonces, lifetime);
+                        return Ok(Json(json!({ "token": token })));
+                    }
+                    if req
+                        .env
+                        .keys()
+                        .any(|name| !BOUND_CONFIG_NAMES.contains(&name.as_str()))
+                    {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    let signer = signer.with_env(req.env);
+                    let token = signer.sign(&req.audience, &req.nonces, lifetime);
+                    Ok(Json(json!({ "token": token })))
                 },
             ),
         )
