@@ -218,7 +218,8 @@ impl TokenVerifier {
                 .is_some_and(|kid| self.keys.contains_key(&kid))
     }
 
-    /// Verify `token` and require every one of `expected_nonces` in it.
+    /// Verify `token` and require its nonces to be exactly `expected_nonces`,
+    /// in order (ADR 0010 "Binding v2").
     pub fn verify(
         &self,
         token: &str,
@@ -265,7 +266,7 @@ impl TokenVerifier {
             Nonces::One(n) => vec![n],
             Nonces::Many(ns) => ns,
         };
-        if expected_nonces.is_empty() || !expected_nonces.iter().all(|n| nonces.contains(n)) {
+        if expected_nonces.is_empty() || nonces != expected_nonces {
             return Err(TokenError::Nonce);
         }
         if claims.hwmodel != HWMODEL_TDX {
@@ -514,8 +515,26 @@ mod tests {
             Duration::from_secs(600),
         );
         assert!(verifier().verify(&one, &[nonce()]).is_ok());
-        assert!(verifier().verify(&two, &[nonce()]).is_ok());
         assert!(verifier().verify(&two, &[nonce(), second]).is_ok());
+    }
+
+    #[test]
+    fn nonces_must_match_exactly_and_in_order() {
+        let (a, b, c) = (
+            nonce(),
+            URL_SAFE_NO_PAD.encode([8u8; 32]),
+            URL_SAFE_NO_PAD.encode([9u8; 32]),
+        );
+        let token = signer().sign(
+            SIMULATED_AUDIENCE,
+            &[a.clone(), b.clone()],
+            Duration::from_secs(600),
+        );
+        let verify = |expected: &[String]| verifier().verify(&token, expected).map(|_| ());
+        assert_eq!(verify(&[a.clone(), b.clone()]), Ok(()));
+        assert_eq!(verify(&[b.clone(), a.clone()]), Err(TokenError::Nonce));
+        assert_eq!(verify(std::slice::from_ref(&a)), Err(TokenError::Nonce));
+        assert_eq!(verify(&[a, b, c]), Err(TokenError::Nonce));
     }
 
     #[test]
