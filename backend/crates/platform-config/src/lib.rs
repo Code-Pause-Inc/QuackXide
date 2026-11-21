@@ -42,6 +42,12 @@ const MIB: u64 = 1024 * 1024;
 /// this many objects stays under the upload route's manifest bound.
 pub const MAX_QUERY_MAX_INPUT_OBJECTS: u64 = 256;
 
+/// Default `QUERY_TOTAL_MEMORY_MIB`: room for the default limits on the
+/// default number of concurrent queries (4 × 1480 MiB).
+pub const DEFAULT_QUERY_TOTAL_MEMORY_MIB: u64 = 8192;
+/// Largest `QUERY_TOTAL_MEMORY_MIB` accepted (1 TiB).
+pub const MAX_QUERY_TOTAL_MEMORY_MIB: u64 = 1_048_576;
+
 /// Deployment mode, from `APP_ENV` (ADR 0009). Unset or any value other
 /// than `development` means production: development paths must be asked
 /// for, never reached by omission.
@@ -131,7 +137,9 @@ pub struct EnclaveConfig {
     /// `QUERY_MAX_DECODED_MIB` (`1..=65536`, `1024`), `QUERY_MAX_RESULT_ROWS`
     /// (`1..=1000000`, `10000`) and `QUERY_MAX_RESULT_MIB` (`1..=256`, `4`).
     /// The cap on decrypted input is `DATASET_MAX_MIB`, the largest upload
-    /// (ADR 0012).
+    /// (ADR 0012). Together they must fit `QUERY_TOTAL_MEMORY_MIB`
+    /// (`1..=1048576`, `8192`): `QUERY_MAX_CONCURRENT` times
+    /// `QueryLimits::worst_case_bytes`, or startup is refused.
     pub query_limits: QueryLimits,
     /// `SIM_ATTESTATION_URL` — the simulated attestation service. Dev only;
     /// `platform_enclave::provider_for` reads the same key.
@@ -294,6 +302,10 @@ pub struct FeatureFlags {
     /// to run without valid SEV-SNP attestation. Defaults to true; only local
     /// development sets it false.
     pub tee_attestation_required: bool,
+    /// `FEATURE_ADMIN_CONNECTOR_TOGGLES` — the admin connector toggle route.
+    /// Defaults to false: the toggles are not in v1.0 (nothing reads them),
+    /// so the route answers 503 unless this is set.
+    pub admin_connector_toggles: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -528,16 +540,19 @@ impl PlatformConfig {
                 ),
             });
         }
+        let query_limits = query_limits(&get, &datasets)?;
+        check_query_memory(&get, raw_max_concurrent, &query_limits)?;
         let enclave = EnclaveConfig {
             key_release_url: get_nonempty(&get, "KEY_RELEASE_URL"),
             query_max_concurrent: raw_max_concurrent as usize,
-            query_limits: query_limits(&get, &datasets)?,
+            query_limits,
             sim_attestation_url: get_nonempty(&get, "SIM_ATTESTATION_URL"),
         };
 
         let features = FeatureFlags {
             zk: ZkMode::from_flag(parse_bool(&get, "FEATURE_ZK_ENABLED", true)?),
             tee_attestation_required: parse_bool(&get, "TEE_ATTESTATION_REQUIRED", true)?,
+            admin_connector_toggles: parse_bool(&get, "FEATURE_ADMIN_CONNECTOR_TOGGLES", false)?,
         };
 
         Ok(Self {
@@ -602,6 +617,36 @@ fn query_limits(
         )?,
         max_result_bytes: mib("QUERY_MAX_RESULT_MIB", defaults.max_result_bytes, 1..=256)?,
     })
+}
+
+/// `QUERY_TOTAL_MEMORY_MIB`: the memory the concurrent queries together may
+/// hold. Each limit is bounded on its own, so together they could promise
+/// more memory than the machine has; startup refuses limits whose worst
+/// case ([`QueryLimits::worst_case_bytes`]), times `QUERY_MAX_CONCURRENT`,
+/// is over it.
+fn check_query_memory(
+    get: &impl Fn(&str) -> Option<String>,
+    max_concurrent: u64,
+    limits: &QueryLimits,
+) -> Result<(), ConfigError> {
+    let total_mib = parse_bounded(
+        get,
+        "QUERY_TOTAL_MEMORY_MIB",
+        DEFAULT_QUERY_TOTAL_MEMORY_MIB,
+        1..=MAX_QUERY_TOTAL_MEMORY_MIB,
+    )?;
+    let worst_case = limits.worst_case_bytes().saturating_mul(max_concurrent);
+    if worst_case > total_mib * MIB {
+        return Err(ConfigError::Invalid {
+            key: "QUERY_TOTAL_MEMORY_MIB",
+            reason: format!(
+                "{max_concurrent} concurrent queries can hold up to {} MiB under the query \
+                 limits, more than {total_mib} MiB",
+                worst_case.div_ceil(MIB)
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn get_or(get: &impl Fn(&str) -> Option<String>, key: &str, default: &str) -> String {
@@ -889,6 +934,7 @@ mod tests {
         assert_eq!(cfg.auth.audience, "urn:platform:drive");
         assert!(cfg.features.zk.is_enabled());
         assert!(cfg.features.tee_attestation_required);
+        assert!(!cfg.features.admin_connector_toggles);
         assert_eq!(cfg.connectors.sync_interval_secs, 900);
         assert_eq!(cfg.research.min_cohort_size, 11);
         assert_eq!(cfg.research.default_query_budget, 100);
@@ -955,9 +1001,14 @@ mod tests {
     fn dataset_size_limit_is_bounded_and_fails_closed() {
         let cfg = PlatformConfig::from_source(source(&[])).expect("defaults");
         assert_eq!(cfg.datasets.max_bytes, 64 * 1024 * 1024);
+        // The queries' total is raised so that only this key's range is
+        // tested: at 512 MiB, four queries at the default limits need 11296.
         for (raw, mib) in [("1", 1), ("200", 200), ("512", 512)] {
-            let cfg =
-                PlatformConfig::from_source(source(&[("DATASET_MAX_MIB", raw)])).expect("in range");
+            let cfg = PlatformConfig::from_source(source(&[
+                ("DATASET_MAX_MIB", raw),
+                ("QUERY_TOTAL_MEMORY_MIB", "16384"),
+            ]))
+            .expect("in range");
             assert_eq!(cfg.datasets.max_bytes, mib * 1024 * 1024, "{raw}");
         }
         for invalid in ["0", "513", "-1", "64MiB", "1e3"] {
@@ -1044,6 +1095,41 @@ mod tests {
                 ),
                 "{key}={value} must be refused"
             );
+        }
+    }
+
+    #[test]
+    fn query_limits_must_fit_the_total_memory_together() {
+        let refused = |vars: &[(&str, &str)]| {
+            matches!(
+                PlatformConfig::from_source(source(vars)),
+                Err(ConfigError::Invalid {
+                    key: "QUERY_TOTAL_MEMORY_MIB",
+                    ..
+                })
+            )
+        };
+        // Every maximum is in range on its own. One query holding them all
+        // needs 16384 + 65536 + 3 × 512 + 2 × 256 = 83968 MiB, which fits
+        // the largest total; 64 of them do not.
+        let maxima = [
+            ("QUERY_MEMORY_MIB", "16384"),
+            ("QUERY_MAX_DECODED_MIB", "65536"),
+            ("DATASET_MAX_MIB", "512"),
+            ("QUERY_MAX_RESULT_MIB", "256"),
+            ("QUERY_TOTAL_MEMORY_MIB", "1048576"),
+        ];
+        let one = [maxima.as_slice(), &[("QUERY_MAX_CONCURRENT", "1")]].concat();
+        PlatformConfig::from_source(source(&one)).expect("one query fits");
+        let all = [maxima.as_slice(), &[("QUERY_MAX_CONCURRENT", "64")]].concat();
+        assert!(refused(&all), "64 queries do not fit");
+
+        // The defaults need 4 × 1480 MiB, exactly.
+        PlatformConfig::from_source(source(&[("QUERY_TOTAL_MEMORY_MIB", "5920")]))
+            .expect("the defaults fit");
+        assert!(refused(&[("QUERY_TOTAL_MEMORY_MIB", "5919")]));
+        for value in ["0", "1048577", "lots"] {
+            assert!(refused(&[("QUERY_TOTAL_MEMORY_MIB", value)]), "{value}");
         }
     }
 
@@ -1173,8 +1259,10 @@ mod tests {
         );
         assert!(cfg.enclave.key_release_url.is_none());
 
+        // Sixteen queries at the default limits need 23680 MiB.
         let cfg = PlatformConfig::from_source(source(&[
             ("QUERY_MAX_CONCURRENT", "16"),
+            ("QUERY_TOTAL_MEMORY_MIB", "32768"),
             ("KEY_RELEASE_URL", "http://127.0.0.1:8090"),
         ]))
         .expect("valid enclave config");

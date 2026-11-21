@@ -85,7 +85,8 @@ tower-http.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 # Dev-only, enabled by the `dev` feature: the seeded synthetic cohort that
-# `devstack` seals to its steward tenant at startup.
+# `devstack` seals to its steward tenant at startup, and that `seal-upload`
+# seals as a steward's upload for the simulated TEE.
 synth-data = { workspace = true, optional = true }
 
 [dev-dependencies]

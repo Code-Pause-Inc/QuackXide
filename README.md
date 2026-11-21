@@ -87,6 +87,7 @@ Every security decision, including denials, is written to a
 | `docs/PROJECT_SCOPE.md` | Release scope and definition of done |
 | `docs/V1_PLAN.md` | v1.0 plan: work items, order, and the issues they map to |
 | `docs/DATA_POLICY.md` | Synthetic and public data only |
+| `docs/BENCHMARKS.md` | Benchmarks: method, baselines and how to compare |
 | `docs/SIMULATED_TEE_GCP_GUIDE.md` | The simulated TEE and its production counterparts (Confidential Space on TDX, Cloud KMS) |
 | `docs/adr/` | Architecture decision records |
 
@@ -136,6 +137,9 @@ loads a wasm build of the backend's envelope code, which
 committed). It needs the `wasm32-unknown-unknown` target, which
 `rust-toolchain.toml` lists, and the `wasm-bindgen` CLI at the version
 `backend/Cargo.lock` pins. Rerun it after changing the envelope code.
+
+The drive works in current Chromium, Firefox and Safari (WebKit), which CI
+tests (`npm run test:browser`).
 
 ```sh
 cargo install --locked wasm-bindgen-cli --version 0.2.126   # once
@@ -236,10 +240,11 @@ locally across isolated networks (`public_net` and `internal: true`
 `enclave-api` starts with an empty vault and keeps its sealed snapshots in
 a directory on the `enclave_vault` volume (`STORAGE_LOCAL_DIR`, dev builds
 only). The test script uploads the steward's dataset with `seal-upload`'s
-body, and checks that the vault holds only ciphertext, besides the upload's
-plaintext record: its suite and the row cap and schema the steward
-declared. No GCS emulator is part of the stack: `fake-gcs-server` does not
-accept the uploads `object_store` 0.13 sends (#153).
+body. After the upload, and again after the queries, it checks that the
+vault holds only that upload: its object and manifest as ciphertext, and
+its plaintext record, which holds the suite and the row cap and schema the
+steward declared. No GCS emulator is part of the stack: `fake-gcs-server`
+does not accept the uploads `object_store` 0.13 sends (#153).
 
 The simulation runs production's evidence path (the token verifier, its
 release policy, key release through the stand-in, sealed queries) on any
@@ -320,7 +325,8 @@ production release (details in `docs/PROJECT_SCOPE.md`):
 * **Encrypted results** — results leave as JSON over TLS. Sealing them to the
   researcher's key and signing them in the enclave (P55) remain.
 * **Post-quantum cryptography** — target is X25519 + ML-KEM-768 and
-  Ed25519 + ML-DSA-65; current suites are X25519 and RS256.
+  Ed25519 + ML-DSA-65. Backend tenant envelopes are X-Wing (`HPK2`); the
+  browser is X25519 (`HPK1`, development only) and tokens are RS256.
 
 ## Contributing
 

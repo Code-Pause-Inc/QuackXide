@@ -63,6 +63,23 @@ impl Default for QueryLimits {
     }
 }
 
+impl QueryLimits {
+    /// The most memory one query can hold at once under these limits: its
+    /// operators' pool, its decoded table as the footers report it, three
+    /// copies of its input (the ciphertext, the plaintext the query service
+    /// keeps, and the engine's copy for the decoder) and two of its result
+    /// (the JSON and the rows parsed from it). Only the pool is enforced as
+    /// memory; the size limits bound the rest. `platform-config` refuses to
+    /// start when this, times the concurrent queries, exceeds
+    /// `QUERY_TOTAL_MEMORY_MIB`.
+    pub fn worst_case_bytes(&self) -> u64 {
+        self.memory_bytes
+            .saturating_add(self.max_decoded_bytes)
+            .saturating_add(self.max_input_bytes.saturating_mul(3))
+            .saturating_add(self.max_result_bytes.saturating_mul(2))
+    }
+}
+
 /// The limit a query exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryLimit {
@@ -97,5 +114,22 @@ impl QueryLimit {
 impl fmt::Display for QueryLimit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_worst_case_counts_every_copy_a_query_holds() {
+        // The pool, the decoded table, three copies of the input and two of
+        // the result: 256 + 1024 + 3 × 64 + 2 × 4 MiB.
+        assert_eq!(QueryLimits::default().worst_case_bytes(), 1480 * MIB);
+        let unbounded = QueryLimits {
+            max_decoded_bytes: u64::MAX,
+            ..QueryLimits::default()
+        };
+        assert_eq!(unbounded.worst_case_bytes(), u64::MAX);
     }
 }

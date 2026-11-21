@@ -25,19 +25,23 @@ use axum::Json;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
+use base64::Engine as _;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use platform_config::PlatformConfig;
-use platform_connectors::snapshot::{self, HeldDataset};
+use platform_connectors::snapshot::{self, HeldDataset, RecordedSuite};
 use platform_connectors::upload::{self, UploadCommitError, UploadError};
 use platform_core::{ConnectorSlug, DatasetKind, ObjectId, SnapshotVersion, TenantId};
-use platform_crypto::EnvelopeSuite;
-use platform_storage::StorageError;
+use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantPublicKey};
+use platform_storage::{StorageError, TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{ApiError, AppState, AuthedTenant, LIST_READ_CONCURRENCY, MAX_LISTED_OBJECTS};
+use crate::{
+    ApiError, AppState, AuthedTenant, B64, EnrollmentBody, LIST_READ_CONCURRENCY,
+    MAX_LISTED_OBJECTS,
+};
 
 /// The request body limit for uploads: the dataset size limit
 /// (`DATASET_MAX_MIB`) plus the most a body holds besides its object.
@@ -61,6 +65,30 @@ fn audit_refusal(steward: TenantId, dataset: &str, outcome: &str, reason: &str) 
         outcome,
         &format!("upload {stopped} dataset={dataset} reason={reason}"),
     );
+}
+
+/// The suite of the steward's enrolled key, or `None` when no key is
+/// enrolled. Enrollment is the only writer of the record and validates the
+/// key first, so a record that does not parse is a backend fault.
+async fn enrolled_suite(
+    state: &AppState,
+    steward: TenantId,
+) -> Result<Option<EnvelopeSuite>, ApiError> {
+    let stored = match state
+        .vault
+        .get(&TenantPaths::tenant_enrollment(steward))
+        .await
+    {
+        Ok(stored) => stored,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let key = serde_json::from_slice::<EnrollmentBody>(&stored)
+        .ok()
+        .and_then(|record| B64.decode(record.hpke_public_key_b64).ok())
+        .and_then(|raw| TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT).ok())
+        .ok_or(ApiError::Backend)?;
+    Ok(Some(key.suite()))
 }
 
 /// `PUT /api/v1/datasets/{dataset}` — store a browser-sealed upload as the
@@ -101,28 +129,89 @@ pub(crate) async fn put_dataset(
                 other => ApiError::MalformedUpload(other.message()),
             }
         })?;
+    // A frame of a suite this deployment refuses (HPK1 in production) could
+    // never be opened, so it is refused here rather than stored.
+    if SuitePolicy::for_env(state.config.env.is_production())
+        .check(upload.suite)
+        .is_err()
+    {
+        security_audit_event(
+            AuditKind::SuiteRefused,
+            Some(steward),
+            "denied",
+            "refused an upload sealed in a suite this deployment does not accept",
+        );
+        audit_refusal(steward, dataset.as_str(), "denied", "suite_refused");
+        return Err(ApiError::MalformedUpload("upload suite not accepted"));
+    }
+    // Neither does an upload in another suite than the enrolled key's open:
+    // every query would fail, and the commit would prune the snapshot that
+    // does. Without an enrollment, `commit_upload` compares with the current
+    // snapshot's suite instead. In
+    // development an HPK1 upload also needs a test key provider
+    // (`DevKeyProvider`, `MultiTenantDevKeyProvider`) to open: development
+    // key release (`key_release.rs`, `stand_in.rs`) is HPK2-only.
+    let enrolled = enrolled_suite(&state, steward).await.inspect_err(|_| {
+        audit_refusal(steward, dataset.as_str(), "failed", "enrollment_unreadable");
+    })?;
+    if enrolled.is_some_and(|suite| suite != upload.suite) {
+        security_audit_event(
+            AuditKind::SuiteRefused,
+            Some(steward),
+            "denied",
+            "refused an upload sealed in a suite other than the enrolled key's",
+        );
+        audit_refusal(
+            steward,
+            dataset.as_str(),
+            "denied",
+            "enrolled_suite_mismatch",
+        );
+        return Err(ApiError::MalformedUpload(
+            "upload suite does not match the enrolled key",
+        ));
+    }
 
-    let report = upload::commit_upload(&*state.vault, steward, &dataset, upload, SystemTime::now())
-        .await
-        .map_err(|err| {
-            let reason = err.reason();
-            let (outcome, refusal) = match err {
-                UploadCommitError::NotUploadDataset => ("denied", ApiError::NotFound),
-                UploadCommitError::VersionAhead => (
+    let report = upload::commit_upload(
+        &*state.vault,
+        steward,
+        &dataset,
+        upload,
+        enrolled.is_some(),
+        SystemTime::now(),
+    )
+    .await
+    .map_err(|err| {
+        let reason = err.reason();
+        let (outcome, refusal) = match err {
+            UploadCommitError::NotUploadDataset => ("denied", ApiError::NotFound),
+            UploadCommitError::VersionAhead => (
+                "denied",
+                ApiError::MalformedUpload("snapshot version is ahead of the server clock"),
+            ),
+            UploadCommitError::StaleVersion => ("denied", ApiError::StaleSnapshot),
+            UploadCommitError::SchemaMismatch => ("denied", ApiError::SchemaMismatch),
+            UploadCommitError::SuiteMismatch => {
+                security_audit_event(
+                    AuditKind::SuiteRefused,
+                    Some(steward),
                     "denied",
-                    ApiError::MalformedUpload("snapshot version is ahead of the server clock"),
-                ),
-                UploadCommitError::StaleVersion => ("denied", ApiError::StaleSnapshot),
-                UploadCommitError::SchemaMismatch => ("denied", ApiError::SchemaMismatch),
-                // The recorded schema is unknown, so nothing can be compared.
-                UploadCommitError::RecordUnreadable => ("failed", ApiError::Backend),
-                // The manifest is written last, so a failure before it leaves
-                // the current snapshot in place.
-                UploadCommitError::Storage(storage) => ("failed", ApiError::from(storage)),
-            };
-            audit_refusal(steward, dataset.as_str(), outcome, reason);
-            refusal
-        })?;
+                    "refused an upload sealed in a suite other than the dataset's current snapshot",
+                );
+                (
+                    "denied",
+                    ApiError::MalformedUpload("upload suite does not match the dataset"),
+                )
+            }
+            // The recorded schema is unknown, so nothing can be compared.
+            UploadCommitError::RecordUnreadable => ("failed", ApiError::Backend),
+            // The manifest is written last, so a failure before it leaves
+            // the current snapshot in place.
+            UploadCommitError::Storage(storage) => ("failed", ApiError::from(storage)),
+        };
+        audit_refusal(steward, dataset.as_str(), outcome, reason);
+        refusal
+    })?;
 
     Ok(Json(json!({
         "dataset": dataset,
@@ -149,8 +238,8 @@ struct DatasetEntry {
     /// When the current snapshot was written ([`written_at`]).
     written_at: String,
     /// The suite the snapshot's record names, or `None` if the record is
-    /// missing, malformed, or names a suite this build does not read, as a
-    /// query would refuse it.
+    /// missing at the current version, malformed, or names a suite this
+    /// build does not read, as a query would refuse it.
     suite: Option<&'static str>,
     object_count: usize,
     /// Total size of the current snapshot's objects as stored.
@@ -192,20 +281,54 @@ fn written_at(version: &SnapshotVersion) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// `held`, a dataset as listed, with the suite its record names. A missing
+/// record can mean that an upload or sync committed after the listing and
+/// pruned this snapshot, so the dataset is read again, once, with one
+/// listing of its own paths, and described as it is now: a newer snapshot
+/// with its record's suite, or at the same version, with no suite. `None`
+/// if the dataset is no longer held, so the listing still shows exactly the
+/// datasets held.
+async fn describe(
+    vault: &dyn VaultStore,
+    steward: TenantId,
+    held: HeldDataset,
+) -> Result<Option<DatasetEntry>, StorageError> {
+    match snapshot::recorded_suite(vault, steward, &held.slug, &held.version).await? {
+        RecordedSuite::Missing => {}
+        recorded => return Ok(Some(DatasetEntry::new(held, recorded.known()))),
+    }
+    let Some(current) = snapshot::held_dataset(vault, steward, &held.slug).await? else {
+        return Ok(None);
+    };
+    let suite = if current.version == held.version {
+        None
+    } else {
+        snapshot::recorded_suite(vault, steward, &current.slug, &current.version)
+            .await?
+            .known()
+    };
+    Ok(Some(DatasetEntry::new(current, suite)))
+}
+
 /// `GET /api/v1/datasets` — every research dataset the caller's tenant
 /// holds, by id: the datasets `snapshot::holds` is true for, which is the
 /// check publishing a listing makes. Each entry describes the current
 /// snapshot only: its version and write time, the objects stored at that
 /// version with their total ciphertext size, and the suite its record
 /// names. Nothing is opened, and objects of superseded snapshots or of
-/// uploads that have not committed are not counted. More than
-/// [`MAX_LISTED_OBJECTS`] datasets, or as many objects across them, is
-/// refused with 422 rather than listed in part. A storage failure is an
-/// error, never an empty list.
+/// uploads that have not committed are not counted. A snapshot replaced
+/// while the listing runs is described as the newer one ([`describe`]).
+/// More than [`MAX_LISTED_OBJECTS`] datasets, or as many objects across
+/// them, is refused with 422 rather than listed in part. A storage failure
+/// is an error, never an empty list.
 pub(crate) async fn list_datasets(
     State(state): State<AppState>,
     Extension(AuthedTenant(steward)): Extension<AuthedTenant>,
 ) -> Result<Json<DatasetListing>, ApiError> {
+    // This lists every path under the tenant's datasets, superseded
+    // snapshots awaiting pruning included, before the cap is checked: the
+    // cap bounds the response and the record reads, not that listing. The
+    // drive listing does the same; v1 has no pagination.
     let held = snapshot::held_datasets(&*state.vault, steward).await?;
     let objects: usize = held.iter().map(|dataset| dataset.objects.len()).sum();
     if held.len() > MAX_LISTED_OBJECTS || objects > MAX_LISTED_OBJECTS {
@@ -223,11 +346,9 @@ pub(crate) async fn list_datasets(
 
     let vault = &*state.vault;
     let datasets: Vec<DatasetEntry> = futures::stream::iter(held)
-        .map(|held| async move {
-            let suite = snapshot::recorded_suite(vault, steward, &held.slug, &held.version).await?;
-            Ok::<_, StorageError>(DatasetEntry::new(held, suite))
-        })
+        .map(|held| describe(vault, steward, held))
         .buffered(LIST_READ_CONCURRENCY)
+        .try_filter_map(|entry| async move { Ok(entry) })
         .try_collect()
         .await?;
     security_audit_event(

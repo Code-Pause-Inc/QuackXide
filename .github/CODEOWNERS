@@ -14,10 +14,21 @@
 /.github/                                      @AxolDad @abendrothj @angelina0i0
 /backend/deny.toml                             @AxolDad @abendrothj @angelina0i0
 
-# Authentication and the disclosure policy.
+# Authentication and the query engine: the plan gate, the disclosure
+# policy, decoding and the resource limits.
 /backend/crates/platform-auth/                 @AxolDad @angelina0i0 @will5526
-/backend/crates/quackxide-engine/src/policy.rs @AxolDad @angelina0i0 @will5526
-/backend/crates/quackxide-engine/src/disclosure.rs @AxolDad @angelina0i0 @will5526
+/backend/crates/quackxide-engine/src/          @AxolDad @angelina0i0 @will5526
+/backend/crates/quackxide-engine/tests/bypass.rs @AxolDad @angelina0i0 @will5526
+
+# The API's security decisions (auth middleware, query and key-release
+# paths, what production runs with) and grants and budgets.
+/backend/crates/platform-api/src/              @AxolDad @abendrothj @will5526
+/backend/crates/platform-api/tests/audit_coverage.rs @AxolDad @abendrothj @will5526
+/backend/crates/platform-tenancy/src/          @AxolDad @abendrothj @will5526
+
+# The threat model and design decisions.
+/docs/THREAT_MODEL.md                          @AxolDad @abendrothj @angelina0i0 @gabrielzubovsky @will5526
+/docs/adr/                                     @AxolDad @abendrothj @angelina0i0 @gabrielzubovsky @will5526
 
 # Maintainer only: who owns what, the attribution policy, and licensing.
 /.github/CODEOWNERS                            @AxolDad

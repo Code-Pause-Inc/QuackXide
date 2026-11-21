@@ -9,7 +9,7 @@
 //!   seal-upload --tenant <uuid> --public-key <base64> --dataset <upload_name> [--k <k>] > body
 //!
 //! `--public-key` is the steward's raw public key in standard base64, as
-//! `key-release`'s enrollment returns it. The cohort's groups are built
+//! `key-release`'s enrollment returns it; the upload is sealed in its suite. The cohort's groups are built
 //! around `--k` (default 11), so with `RESEARCH_MIN_COHORT_SIZE` set to it
 //! some are released and some suppressed. The sealing is
 //! `platform_api::dev::seal_cohort_upload`, which the API tests also run.
@@ -21,7 +21,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use platform_api::dev;
 use platform_core::{ConnectorSlug, DatasetKind, TenantId};
-use platform_crypto::TenantPublicKey;
+use platform_crypto::{SuitePolicy, TenantPublicKey};
 
 const USAGE: &str = "usage: seal-upload --tenant <uuid> --public-key <base64> \
                      --dataset <upload_name> [--k <k>] > body";
@@ -47,7 +47,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Args> {
                     .decode(value.trim())
                     .context("--public-key is not base64")?;
                 key = Some(
-                    TenantPublicKey::from_raw(&raw).context("--public-key is not a public key")?,
+                    // Either suite: the API refuses one its deployment does
+                    // not accept, as it would the browser's.
+                    TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT)
+                        .context("--public-key is not a public key")?,
                 );
             }
             "--dataset" => {
@@ -96,7 +99,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platform_crypto::TenantKeypair;
+    use platform_crypto::{EnvelopeSuite, TenantKeypair};
 
     /// `--tenant`, `--public-key` and `--dataset` with these values.
     fn flags(tenant: &str, key: &str, dataset: &str) -> Vec<String> {
@@ -113,7 +116,9 @@ mod tests {
     }
 
     fn tenant_and_key() -> (String, String) {
-        let key = TenantKeypair::generate().public_key().to_raw();
+        let key = TenantKeypair::generate(EnvelopeSuite::CURRENT)
+            .public_key()
+            .to_raw();
         (TenantId::generate().to_string(), B64.encode(key))
     }
 

@@ -17,9 +17,10 @@ uses [Semantic Versioning](https://semver.org/).
   runs the research lifecycle on it. The script also checks that an upload
   is refused without a token (401), outside the upload namespace (404) and
   at a stale version (409), that an approval retry after a revoke is
-  refused (404), and that the vault holds only `HPK1` envelopes and the
-  upload's record, whose row cap and schema are the ones the steward
-  declared. The compose stack no longer passes `DEMO_TENANT_*` to
+  refused (404), and, after the upload and again after the queries, that
+  the vault holds exactly the upload's object and manifest as `HPK1`
+  envelopes and its record, whose row cap and schema are the ones the
+  steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
   `enclave-api`. The API tests seal uploads with the same code
   (`platform_api::dev::seal_upload`), and CI checks that release builds
   cannot contain `seal-upload`.
@@ -31,13 +32,14 @@ uses [Semantic Versioning](https://semver.org/).
   ciphertext bytes of the objects stored at that version, and the suite
   its plaintext record names, all read without opening anything;
   superseded snapshots and uploads that have not committed are not
-  counted. The tenant comes from the token only. The route needs no query
-  service, refuses more than `MAX_LISTED_OBJECTS` (1000) datasets, or
-  objects across them, with 422, and answers a storage failure with 503
-  or 502, never an empty list; each listing is audited as `data.access`.
-  `platform_connectors::snapshot` gains `held_datasets` and
-  `recorded_suite`, and `TenantPaths` gains `connectors_root` and
-  `connector_of`.
+  counted, and a snapshot that an upload or sync replaces during the
+  listing is described as the new one. The tenant comes from the token
+  only. The route needs no query service, refuses more than
+  `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
+  and answers a storage failure with 503 or 502, never an empty list; each
+  listing is audited as `data.access`. `platform_connectors::snapshot`
+  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot
   manifest the browser also sealed, as the dataset's new snapshot
@@ -60,6 +62,27 @@ uses [Semantic Versioning](https://semver.org/).
   (`QueryError::DeclarationMismatch`, 502). `platform_crypto` gains
   `check_envelope_frame` and stable suite names (`EnvelopeSuite::id`),
   and `DevResearchStack` gains `register_key` and `with_vault`.
+* Browser timings (P73, #185). `npm run bench:browser`, a Vitest bench,
+  times `encryptPayload` at 4 KiB and 4 MiB and the wasm envelope module's
+  cold start (load plus first seal) in Chromium, Firefox and WebKit. It
+  reports p50 and p99 over batch means (each sample a batch of at least
+  50 ms); the cold start is one sample. The `browser` workflow writes them,
+  the runner's CPU and the module's size to each run's job summary, report
+  only.
+* Browser tests (#223 stage A). A vitest `browser` project runs the module
+  crypto worker, Web Crypto keys, the sealed HPKE device key, IndexedDB
+  persistence across a worker restart and a drive round trip in real
+  browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
+  The `browser` workflow runs Chromium on every pull request and Chromium,
+  Firefox and WebKit on `main` and nightly.
+* Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
+  key generation and envelope seal and open for `HPK1` and `HPK2` at 32 B,
+  4 KiB and 4 MiB, and a unit test pins each suite's envelope overhead
+  (52 and 1140 bytes). `cargo test` runs each benchmark once, so
+  `scripts/check.sh` fails on a broken one. The `bench` workflow runs them
+  on pull requests that touch `backend/` or `rust-toolchain.toml` and
+  reports only. `docs/BENCHMARKS.md` records the method and both suites'
+  numbers from one run.
 * Production mode (ADR 0009, P18). `APP_ENV` selects the mode: only
   `development` selects development, and unset, blank or unknown values
   are production. `APP_ENV` is read from the process environment before
@@ -81,6 +104,20 @@ uses [Semantic Versioning](https://semver.org/).
   Only `dev` builds have this backend: a release `platform-api` refuses to
   start with `STORAGE_LOCAL_DIR` set, which CI checks. No GCS emulator
   accepts `object_store` 0.13's uploads (#153).
+* Browser envelope open (P34 checkpoint B): `envelope-wasm` exports
+  `openEnvelope` and `publicKeyFromPrivateKey`, over the new
+  `platform_crypto::hpk1_open_with_private_key` and
+  `hpk1_public_key_from_private` (`HPK1` only until P36). The crypto
+  worker holds the device's HPKE private key as ADR 0007 describes: 32
+  random bytes, stored only encrypted under a non-extractable AES-256-GCM
+  seed key with AAD
+  `x25519-key-v1|{tenant}|{SHA-256 of the public key}`, decrypted just
+  before an open and zeroed after (`lib/crypto/devicekey.ts`). The Web
+  Crypto X25519 key, which could not open anything, is gone; device
+  records that hold one get a new key on the next init. `InitResult`'s
+  `x25519Supported` is now `hpkeKeyAvailable`. `fixtures/envelope/hpk1.json`
+  carries each recipient's test-only private key, and the browser tests
+  open every Rust-sealed vector.
 * `platform_enclave::token::TokenVerifier` verifies Confidential Space
   attestation tokens (ADR 0004, P47): RS256 against a key set passed in,
   with issuer, audience, validity (60 s clock-skew leeway), a required
@@ -169,7 +206,7 @@ uses [Semantic Versioning](https://semver.org/).
   token in an `HttpOnly` cookie, and the authorization-code + PKCE browser flow.
   `docs/ARCHITECTURE.md` gains the target authorization model and
   `docs/THREAT_MODEL.md` A3 and A4 list the new controls.
-* ADR 0007 (Proposed): the hybrid suite construction (HPKE with X-Wing,
+* ADR 0007 (Accepted): the hybrid suite construction (HPKE with X-Wing,
   frame `HPK2`), the libraries and what "established" means, browser
   storage for X-Wing seeds, v1 signature consumers, and no `HPK1`
   migration mode in v1.
@@ -219,6 +256,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* A follow-up access request's approval adds its query budget to the
+  existing grant instead of being dropped, and a retry of the same
+  approval adds nothing (`BudgetLedger::top_up_once`). A retry of an
+  approval whose grant was revoked and re-granted since is refused, so it
+  cannot add to the newer grant. A pending request for an unpublished
+  listing can no longer be approved (#96).
 * GCS emulator writes (`STORAGE_EMULATOR_HOST`) no longer ask the GCE
   metadata server for a credential: `object_store` 0.13 skips signing on
   reads only, so the emulator client now carries a placeholder credential.
@@ -260,9 +303,35 @@ uses [Semantic Versioning](https://semver.org/).
   refused with 400. Each status event is audited as `tenant.provisioned`:
   `ok` when applied, `denied` with `reason=stale` or `reason=canceled`
   when skipped, and `miss` for an unknown subscription.
+* Enrollment audits every refused key as `crypto.key_enrollment` denied: a
+  key of a suite the deployment refuses (also `crypto.suite_refused`) and a
+  key that is not valid base64, which emitted nothing.
+* `DevResearchStack::query_service` panics on a stack holding an `HPK1`
+  key, since key release is `HPK2`-only and every query would fail after
+  charging its budget; `query_service_with_attestation` still takes both.
 
 ### Security
 
+* The admin connector toggle route,
+  `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
+  (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
+  is `true`, which defaults to false: the toggles are not in v1.0 and
+  nothing reads them (`docs/PROJECT_SCOPE.md`).
+* Code-owner review covers the query engine's source, the API's source,
+  grants and budgets (`platform-tenancy`), the audit-coverage and bypass
+  tests, `docs/THREAT_MODEL.md` and `docs/adr/`. `scripts/check.sh` fails
+  when a `CODEOWNERS` pattern matches no tracked path.
+  `CONTRIBUTING.md` describes the review stages, Dependabot handling, and
+  how a vulnerability is fixed privately in a security advisory's fork.
+* `jsonwebtoken` 12, on `elliptic-curve` 0.14, removes `crypto-bigint`
+  0.5, so `backend/deny.toml` no longer ignores RUSTSEC-2026-0387.
+  `jsonwebtoken` 12 refuses an empty HMAC secret: minting with one fails,
+  and `JwtVerifier::hs256` built from one rejects every token.
+* `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
+  (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
+  fixed release) do not fail the dependency audit: they report
+  maintenance, not a vulnerability, and arrow, DataFusion 55 and
+  object_store 0.13 depend on these crates until they move off `chrono`.
 * Per-query resource limits (ADR 0013, proposed; P52;
   `platform_core::QueryLimits`, read by `platform-config`; each bounded,
   and an invalid value refuses startup).
@@ -277,14 +346,39 @@ uses [Semantic Versioning](https://semver.org/).
   (502). Every Parquet footer must fit `QUERY_MAX_DECODED_ROWS` and
   `QUERY_MAX_DECODED_MIB` before anything is decoded, and a result over
   `QUERY_MAX_RESULT_ROWS` or `QUERY_MAX_RESULT_MIB` is refused, never
-  truncated. Size limits answer 422 and memory exhaustion is no longer
-  reported as the caller's SQL error (400). Each refusal is an
+  truncated; without a disclosure policy the result streams and the query
+  stops at the first row over the limit. Every operator yields to the
+  runtime as it produces a batch, so the time limit stops a running plan
+  and the tasks running its partitions. Startup is refused when
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, decoded
+  table, three copies of its input and two of its result) exceeds
+  `QUERY_TOTAL_MEMORY_MIB` (default 8192). Size limits answer 422 and
+  memory exhaustion is no longer reported as the caller's SQL error
+  (400). Each refusal is an
   `engine.query` "denied" event naming the limit. A research query is
   charged before all of them, so each costs a unit (P54 decides the
   order). The slot is released and the decrypted blobs zeroized on every
   way out, including the time limit, cancellation and a panic.
   `EngineSettings` gains `limits`, and `wiring::engine_settings` builds
   the settings from configuration.
+* A gated query (ZK own-data or research) that runs out of its memory pool
+  or its time limit gets exactly the response of a disclosure-control
+  refusal: 422, "query rejected by disclosure control (see cohort-size
+  rules)", with the same headers, as `ApiError::GatedQueryLimit`. Both
+  limits can trip on rows that suppression withholds. Before this change,
+  their own 422 and 503 told a researcher which limit a withheld cohort
+  tripped (ADR 0013). The `engine.query` "denied" event still names the
+  limit, the operator-only metrics keep `query_limit` and
+  `query_timed_out`, and the other limits, and ungated queries, keep their
+  responses. Whether a query was refused, and how long the refusal took,
+  are still visible and recorded as a residual risk in
+  `docs/THREAT_MODEL.md`.
+* The secret scan reads every file's content whatever git attributes say:
+  `--text --no-textconv` stop `-diff`, `binary`, a textconv driver,
+  `.git/info/attributes`, a user's attributes file or a NUL byte from
+  hiding a credential, so the scan no longer needs git 2.41
+  (`GIT_ATTR_SOURCE`). Its selftest no longer reinitialises the repository
+  named by an exported `GIT_DIR`, as a git hook or `git rebase -x` sets.
 * A revoke, top-up or budget read of a grant that is unknown or not the
   caller's is audited as `denied`: `tenant.provisioned` for a revoke and
   `research.budget` for the others, with the caller's tenant and the grant
@@ -292,6 +386,37 @@ uses [Semantic Versioning](https://semver.org/).
   unchanged and the same in both cases. Grant events stay under
   `tenant.provisioned` (`docs/ARCHITECTURE.md`), and `audit_coverage.rs`
   now covers grants and budgets.
+* X25519 private keys and Diffie-Hellman results are zeroized on drop.
+  `hpke` holds them in `x25519-dalek` types, which wipe themselves only
+  with that crate's `zeroize` feature, and nothing turned it on, so every
+  `TenantKeypair` (the key-release stand-in's per-query sessions, the dev
+  key providers, `EnclaveIdentity`'s HPKE key) and each envelope's
+  ephemeral key, in the enclave and in the browser's envelope module, was
+  freed without being wiped. `hpke` 0.14 turns the feature on itself, a
+  test checks it for both suites' key types, and `TenantKeypair`
+  implements `ZeroizeOnDrop`.
+* Tenant envelopes use the hybrid post-quantum suite `HPK2` (ADR 0007, P35,
+  #187): HPKE with X-Wing (X25519 + ML-KEM-768), HKDF-SHA256 and
+  AES-256-GCM, frame `HPK2 || enc (1120) || ciphertext`, on `hpke` 0.14.1.
+  Enrollment and snapshot records name the key's suite, and the upload
+  route refuses a frame of a suite the deployment does not accept (`HPK1`
+  in production), other than the enrolled key's, or, with no enrolled key,
+  other than the current snapshot's with 422, each with a
+  `crypto.suite_refused` event; a development `HPK1` upload opens only
+  under the test key providers, since development key release is
+  `HPK2`-only. Production therefore refuses the browser's `HPK1`
+  enrollments and uploads until P36 (#186). Every key loader takes a suite
+  policy from `APP_ENV`: production refuses `HPK1` frames and X25519 keys
+  with a `crypto.suite_refused` audit event; development still accepts
+  them until the browser moves to `HPK2` (P36). Private keys are exported
+  as `magic || key`; the key-release stand-in holds only `HPK2` tenant
+  keys, whether enrolled over HTTP or inserted directly, and the enclave
+  accepts only `HPK2` released keys. A query refuses a snapshot whose
+  record names another suite than the tenant's key before any key is
+  released or budget charged, and opens its envelopes under the record's
+  suite.
+  X-Wing known-answer tests against `@noble/post-quantum` and frames sealed
+  by `hpke-js` pin interoperability. ADR 0007 is accepted.
 * `docs/THREAT_MODEL.md` and `docs/ARCHITECTURE.md` state that ZK mode on
   own-data queries (`POST /api/v1/query`) stops single-query row export
   only. That route has no query budget, so differencing across queries is

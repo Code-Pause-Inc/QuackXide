@@ -40,7 +40,11 @@ const AGG_SQL: &str =
 async fn publish_browse_request_approve_query_lifecycle() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     // Steward publishes a priced listing.
     let (status, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
@@ -135,7 +139,11 @@ async fn publish_browse_request_approve_query_lifecycle() {
 async fn denial_records_outcome_and_leaves_no_access() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     let listing_id = listing["listing_id"].as_str().expect("id").to_owned();
@@ -187,7 +195,11 @@ async fn catalog_scoping_and_input_bounds() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let outsider = TenantId::generate();
-    let app = marketplace_app(steward, TenantKeypair::generate()).await;
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
     let listing_id = listing["listing_id"].as_str().expect("id").to_owned();
@@ -286,7 +298,7 @@ async fn catalog_scoping_and_input_bounds() {
 async fn publishing_a_dataset_the_steward_does_not_hold_is_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let key = keypair.public_key();
     let app = common::upload_research_app(
         SECRET,
@@ -343,4 +355,65 @@ async fn publishing_a_dataset_the_steward_does_not_hold_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unpublish_is_the_stewards_alone_and_removes_the_listing() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let outsider = TenantId::generate();
+    let app = marketplace_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
+
+    let (_, listing) = post(&app, "/api/v1/catalog", &token_for(steward), PUBLISH_BODY).await;
+    let listing_id = listing["listing_id"].as_str().expect("id").to_owned();
+    let unpublish = |who: TenantId, id: String| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "DELETE",
+                &format!("/api/v1/catalog/{id}"),
+                &token_for(who),
+                None,
+            )
+            .await
+        }
+    };
+    let published_ids = || {
+        let app = app.clone();
+        async move {
+            let (status, catalog) =
+                call(&app, "GET", "/api/v1/catalog", &token_for(researcher), None).await;
+            assert_eq!(status, StatusCode::OK);
+            catalog["listings"]
+                .as_array()
+                .expect("listings")
+                .iter()
+                .map(|l| l["listing_id"].as_str().expect("id").to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Another tenant gets the same 404 as an unknown listing, and the
+    // listing stays published.
+    for who in [outsider, researcher] {
+        let (status, body) = unpublish(who, listing_id.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    for unknown in ["00000000-0000-4000-8000-000000000000", "not-a-listing"] {
+        let (status, body) = unpublish(steward, unknown.to_owned()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}: {body}");
+    }
+    assert_eq!(published_ids().await, std::slice::from_ref(&listing_id));
+
+    // The steward unpublishes, and the listing leaves the catalog index.
+    let (status, withdrawn) = unpublish(steward, listing_id.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{withdrawn}");
+    assert_eq!(withdrawn["listing_id"], listing_id.as_str());
+    assert_eq!(withdrawn["published"], false);
+    assert!(published_ids().await.is_empty());
 }

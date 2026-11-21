@@ -8,7 +8,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use platform_config::{PlatformConfig, Service};
 use platform_core::TenantId;
-use platform_crypto::{TenantKeypair, TenantPublicKey};
+use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 
@@ -101,12 +101,13 @@ fn demo_tenant(config: &PlatformConfig) -> anyhow::Result<(TenantId, TenantPubli
             let raw = B64
                 .decode(key_b64.trim())
                 .map_err(|e| anyhow::anyhow!("invalid DEMO_TENANT_PUBLIC_KEY_B64: {e}"))?;
-            let key = TenantPublicKey::from_raw(&raw)
-                .map_err(|e| anyhow::anyhow!("invalid tenant public key: {e}"))?;
+            let policy = SuitePolicy::for_env(config.env.is_production());
+            let key = TenantPublicKey::from_raw(&raw, policy)
+                .map_err(|e| anyhow::anyhow!("invalid DEMO_TENANT_PUBLIC_KEY_B64: {e}"))?;
             Ok((tenant, key))
         }
         _ => {
-            let keypair = TenantKeypair::generate();
+            let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
             let tenant = TenantId::generate();
             tracing::warn!(
                 "no DEMO_TENANT_* env set — using an EPHEMERAL keypair; the private key is \
@@ -114,5 +115,38 @@ fn demo_tenant(config: &PlatformConfig) -> anyhow::Result<(TenantId, TenantPubli
             );
             Ok((tenant, keypair.public_key()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_config(env: &'static str, key_b64: String) -> PlatformConfig {
+        PlatformConfig::from_source(move |k| match k {
+            "APP_ENV" => Some(env.to_owned()),
+            "DEMO_TENANT_ID" => Some("6f2c8a2e-1111-4222-8333-444455556666".to_owned()),
+            "DEMO_TENANT_PUBLIC_KEY_B64" => Some(key_b64.clone()),
+            _ => None,
+        })
+        .expect("config loads")
+    }
+
+    fn key_b64(suite: EnvelopeSuite) -> String {
+        B64.encode(TenantKeypair::generate(suite).public_key().to_raw())
+    }
+
+    // `build` refuses any production demo tenant first (`enforce_production`,
+    // so no `crypto.suite_refused` event is reachable); this is the second
+    // guard, should a caller reach the loader.
+    #[test]
+    fn production_refuses_a_classical_demo_key_and_accepts_a_hybrid_one() {
+        let hpk1 = demo_config("production", key_b64(EnvelopeSuite::Hpk1));
+        let err = demo_tenant(&hpk1).expect_err("HPK1 refused").to_string();
+        assert!(err.contains("DEMO_TENANT_PUBLIC_KEY_B64"), "{err}");
+        let hpk2 = demo_config("production", key_b64(EnvelopeSuite::Hpk2));
+        assert!(demo_tenant(&hpk2).is_ok());
+        let development = demo_config("development", key_b64(EnvelopeSuite::Hpk1));
+        assert!(demo_tenant(&development).is_ok());
     }
 }

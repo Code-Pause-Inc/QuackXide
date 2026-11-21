@@ -32,7 +32,7 @@ fn token_for(tenant: TenantId) -> String {
 /// The API and metrics routers over a QuickBooks sync sealed to `tenant`.
 async fn apps(tenant: TenantId) -> (Router, Router) {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let pipeline = EnclavePipeline::new(
         Arc::new(DevAttestation::allow_insecure_dev()),
         vault.clone(),

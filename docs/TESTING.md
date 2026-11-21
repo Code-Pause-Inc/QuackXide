@@ -17,6 +17,7 @@ except fuzzing; `CONTRIBUTING.md` lists what CI runs on each pull request.
 | Property tests (TypeScript) | `frontend/src/**/*.property.test.ts` (fast-check) | `frontend/src/lib/vault/wire.property.test.ts` |
 | Frontend unit tests | `frontend/src/**/*.test.ts` (vitest `node` project) | `frontend/src/lib/vault/wire.test.ts` |
 | Frontend component tests | `frontend/src/**/*.test.tsx` (vitest `dom` project, jsdom) | `frontend/src/components/DrivePanel.test.tsx` |
+| Browser tests | `frontend/src/**/*.browser.test.ts` (vitest `browser` project, Playwright) | `frontend/src/lib/crypto/worker.browser.test.ts` |
 | Fuzz targets | `backend/fuzz/fuzz_targets/` | `backend/fuzz/fuzz_targets/jwt_verify.rs` |
 
 ### Crate unit tests
@@ -110,11 +111,53 @@ input": round-trips, and "arbitrary input is never accepted". Rust uses
 
 ### Frontend tests
 
-`frontend/vite.config.ts` defines two vitest projects. The `node` project
+`frontend/vite.config.ts` defines three vitest projects. The `node` project
 runs `*.test.ts` and has no DOM. The `dom` project runs `*.test.tsx` under
 jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
-Neither project runs a real browser; see
+
+The `browser` project runs `*.browser.test.ts` in real headless browsers
+through Playwright, with nothing mocked: the module crypto worker, Web
+Crypto keys and IndexedDB. The worker loads the wasm envelope module (build
+it first with `scripts/build-wasm.sh`), but no browser test seals with it
+yet. It needs no backend. Failure screenshots and Playwright traces go to
+`frontend/.vitest/`, which the `browser` workflow keeps when a job fails. `npm test` does not run it;
+from `frontend/`:
+
+```sh
+npx playwright install chromium firefox webkit   # once
+npm run test:browser                              # Chromium
+BROWSERS=chromium,firefox,webkit npm run test:browser
+```
+
+The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
+
+### Browser timings
+
+`npm run bench:browser` (from `frontend/`) is a Vitest bench in the
+`browser` project (`src/lib/crypto/timings.browser.bench.ts`). It times
+chunk encryption (`encryptPayload` at 4 KiB and 4 MiB) and the wasm
+envelope module's cold start, the load plus the first seal, because V8
+compiles wasm functions on their first call. `BROWSERS=chromium,firefox,webkit`
+runs the other browsers, one after the other. `npm test` and
+`npm run test:browser` never run it: bench files have their own glob,
+`*.browser.bench.ts`, which only `vitest bench` reads.
+
+Browsers coarsen `performance.now()` (to 1 ms in Firefox and WebKit), so one
+call per sample would read as zero. Each sample is instead a batch of calls
+that lasts at least 50 ms, reported as its per-call mean, and the bench
+takes 64 samples. Vitest's bench reports p50 and p99 (tinybench has no p95)
+over those batch means, so a slow single call is averaged away; read them as
+the spread of the typical cost, not as per-call tail latency. The cold start
+is one sample per page, reported as one value. The timings run on the page's
+main thread, while the app does this work in the crypto worker.
+
+The numbers are report only. The `browser` workflow writes them from
+Vitest's JSON output, with the runner's CPU, the browser version and the
+module's raw and gzipped size, to each run's job summary: Chromium on pull
+requests, and Chromium, Firefox and WebKit on `main`, nightly and on demand.
+The step fails, without failing the run, if the bench run fails or prints no
+results. Recorded numbers belong in `docs/BENCHMARKS.md`.
 
 ### Envelope vectors
 
@@ -131,6 +174,11 @@ which fails when the file and its generator disagree; regenerate with
 wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
 enrollment cases through the enrollment route and the badly framed
 envelopes through the upload route.
+`hpk2-kem.json` (X-Wing known-answer values from `@noble/post-quantum`) and
+`hpk2-js-sealed.json` (`HPK2` frames sealed by `hpke-js`, plus negatives)
+come from implementations other than ours (ADR 0007); regenerate them with
+`node scripts/hpk2-vectors.mjs` from `frontend/`, and
+`backend/crates/platform-crypto/tests/hpk2_vectors.rs` checks them.
 
 ### Fuzz targets
 

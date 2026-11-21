@@ -107,6 +107,11 @@ impl DevResearchStack {
     /// `AppState::research` the same `Arc`), on the simulated TEE. Each query
     /// attests with a simulated token, and the in-process key-release
     /// stand-in releases the tenant's key only after that token verifies.
+    ///
+    /// Key release is `HPK2`-only, so a stack holding another suite's key
+    /// panics here instead of building a service whose every query would
+    /// be refused after charging its budget; use
+    /// [`Self::query_service_with_attestation`] for those keys.
     pub fn query_service(
         self,
         settings: EngineSettings,
@@ -129,7 +134,11 @@ impl DevResearchStack {
             policy,
         ));
         for (tenant, keypair) in &self.keys {
-            relying_party.insert_tenant_key(*tenant, keypair);
+            relying_party.insert_tenant_key(*tenant, keypair).unwrap_or_else(|_| {
+                panic!(
+                    "key release is HPK2-only; use query_service_with_attestation for {tenant}'s key"
+                )
+            });
         }
         let identity = Arc::new(EnclaveIdentity::generate());
         let keys = Arc::new(AttestedKeyProvider::new(
@@ -187,8 +196,9 @@ pub struct SealedUpload {
 
 /// Seals `parquet` and a manifest listing it to `key`, as the steward's
 /// browser does for `steward`'s upload of `dataset` at `version`, and frames
-/// them with a header declaring `schema` and `row_cap`. The object id is
-/// drawn here, as the browser draws it. Needs only the public key.
+/// them with a header declaring `schema` and `row_cap`, in the key's suite.
+/// The object id is drawn here, as the browser draws it. Needs only the
+/// public key.
 pub fn seal_upload(
     steward: TenantId,
     key: &TenantPublicKey,
@@ -198,14 +208,22 @@ pub fn seal_upload(
     schema: DeclaredSchema,
     row_cap: u64,
 ) -> anyhow::Result<SealedUpload> {
+    let suite = key.suite();
     let object = ObjectId::generate();
-    let sealed = hpke_seal_to_tenant(key, &object_info(&steward, dataset, &object), parquet)?;
+    let sealed = hpke_seal_to_tenant(
+        key,
+        &object_info(suite, &steward, dataset, &object),
+        parquet,
+    )?;
     let manifest = serde_json::to_vec(&SnapshotManifest {
         version: version.clone(),
         objects: vec![object],
     })?;
-    let manifest =
-        hpke_seal_to_tenant(key, &manifest_info(&steward, dataset, &version), &manifest)?;
+    let manifest = hpke_seal_to_tenant(
+        key,
+        &manifest_info(suite, &steward, dataset, &version),
+        &manifest,
+    )?;
     let header = UploadHeader {
         version: version.clone(),
         object,

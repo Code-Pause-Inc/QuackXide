@@ -51,8 +51,6 @@ pub const MAX_CHUNK_BODY_BYTES: usize = 5 * 1024 * 1024;
 const MIN_CHUNK_BODY_BYTES: usize = 28;
 const MAX_CHUNK_INDEX: u32 = 1 << 20;
 const GCM_IV_BYTES: usize = 12;
-/// HPKE suite recorded alongside an enrolled tenant key.
-const HPKE_SUITE: &str = "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -129,6 +127,9 @@ pub enum ApiError {
     ResearchUnavailable,
     /// Admin provisioning is not configured (503).
     ProvisioningUnavailable,
+    /// The admin connector toggles are off (`FEATURE_ADMIN_CONNECTOR_TOGGLES`)
+    /// (503).
+    ConnectorTogglesDisabled,
     /// No MoR webhook secret is configured, so no event can be verified (503).
     WebhookNotConfigured,
     /// Query refused by the enclave attestation gate.
@@ -158,8 +159,16 @@ pub enum ApiError {
     /// A query exceeded one of its resource limits (`QueryLimits`): no
     /// free plaintext slot within the wait (503 with `Retry-After`), the
     /// time limit (503), or a size limit on its input, decoding, memory or
-    /// result (422). Never reported as the caller's SQL error.
+    /// result (422). Never reported as the caller's SQL error. A gated
+    /// query's memory and time refusals are [`ApiError::GatedQueryLimit`]
+    /// instead.
     QueryLimit(QueryLimit),
+    /// A gated query (zero-knowledge or research) that exceeded its memory
+    /// or time limit. Whether either trips depends on rows that suppression
+    /// withholds, so the caller gets exactly the response of a
+    /// disclosure-control refusal (422). The `engine.query` audit event and
+    /// the metrics name the limit.
+    GatedQueryLimit(QueryLimit),
 }
 
 /// `Retry-After` on a transient storage failure. The storage client has
@@ -195,6 +204,7 @@ impl ApiError {
             ApiError::QueryUnavailable => "query_unavailable",
             ApiError::ResearchUnavailable => "research_unavailable",
             ApiError::ProvisioningUnavailable => "provisioning_unavailable",
+            ApiError::ConnectorTogglesDisabled => "connector_toggles_disabled",
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
             ApiError::QueryRejected(_) => "query_rejected",
@@ -206,8 +216,9 @@ impl ApiError {
             ApiError::StaleSnapshot => "stale_snapshot",
             ApiError::DatasetMismatch => "dataset_mismatch",
             ApiError::QueryLimit(QueryLimit::SlotWait) => "query_busy",
-            ApiError::QueryLimit(QueryLimit::Time) => "query_timed_out",
-            ApiError::QueryLimit(_) => "query_limit",
+            ApiError::QueryLimit(QueryLimit::Time)
+            | ApiError::GatedQueryLimit(QueryLimit::Time) => "query_timed_out",
+            ApiError::QueryLimit(_) | ApiError::GatedQueryLimit(_) => "query_limit",
         }
     }
 }
@@ -273,6 +284,10 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "provisioning not configured",
             ),
+            ApiError::ConnectorTogglesDisabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector toggles are not enabled",
+            ),
             ApiError::WebhookNotConfigured => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "webhook secret not configured",
@@ -307,6 +322,9 @@ impl IntoResponse for ApiError {
                 "stored dataset does not match its declared schema or row cap",
             ),
             ApiError::QueryLimit(limit) => query_limit_response(limit),
+            ApiError::GatedQueryLimit(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, query::DISCLOSURE_REFUSAL)
+            }
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
         response.extensions_mut().insert(metrics::Refusal(kind));
@@ -630,6 +648,10 @@ async fn admin_toggle_connector(
     Path((tenant_id, slug)): Path<(String, String)>,
     Json(body): Json<admin::ToggleConnectorRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Not in v1.0 (docs/PROJECT_SCOPE.md): nothing reads the toggles.
+    if !state.config.features.admin_connector_toggles {
+        return Err(ApiError::ConnectorTogglesDisabled);
+    }
     let provisioning = provisioning_service(&state)?;
     let tenant: TenantId = tenant_id
         .parse()
@@ -1082,35 +1104,62 @@ async fn delete_object(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentBody {
-    /// Base64 raw X25519 public key: the browser-generated tenant HPKE key.
+    /// Base64 raw tenant HPKE public key: X-Wing (`HPK2`, 1216 bytes), or
+    /// X25519 (`HPK1`, 32 bytes) in development only, until P36.
     pub hpke_public_key_b64: String,
 }
 
 /// Enroll the tenant's HPKE public key, which enclave pipelines use to seal
-/// connector data to the tenant. The key is validated as an X25519 point
-/// before storage, and every attempt is audited.
+/// connector data to the tenant. The key's length names its suite; the
+/// deployment's suite policy decides whether that suite is accepted, and the
+/// record stores the suite. Every attempt is audited.
 async fn put_enrollment(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
     Json(body): Json<EnrollmentBody>,
 ) -> Result<StatusCode, ApiError> {
     let public_key_b64 = body.hpke_public_key_b64.trim();
-    let raw = B64
-        .decode(public_key_b64)
-        .map_err(|_| ApiError::BadRequest("invalid base64 public key"))?;
-    if platform_crypto::TenantPublicKey::from_raw(&raw).is_err() {
+    let Ok(raw) = B64.decode(public_key_b64) else {
         security_audit_event(
             AuditKind::KeyEnrollment,
             Some(tenant),
             "denied",
-            "rejected malformed public key",
+            "rejected enrollment key that is not valid base64",
         );
-        return Err(ApiError::BadRequest("invalid public key"));
-    }
+        return Err(ApiError::BadRequest("invalid base64 public key"));
+    };
+    let policy = platform_crypto::SuitePolicy::for_env(state.config.env.is_production());
+    let key = match platform_crypto::TenantPublicKey::from_raw(&raw, policy) {
+        Ok(key) => key,
+        Err(platform_crypto::CryptoError::SuiteRefused) => {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(tenant),
+                "denied",
+                "refused enrollment key of a suite this deployment does not accept",
+            );
+            security_audit_event(
+                AuditKind::KeyEnrollment,
+                Some(tenant),
+                "denied",
+                "refused enrollment key of a suite this deployment does not accept",
+            );
+            return Err(ApiError::BadRequest("public key suite not accepted"));
+        }
+        Err(_) => {
+            security_audit_event(
+                AuditKind::KeyEnrollment,
+                Some(tenant),
+                "denied",
+                "rejected malformed public key",
+            );
+            return Err(ApiError::BadRequest("invalid public key"));
+        }
+    };
 
     let record = json!({
         "hpke_public_key_b64": public_key_b64,
-        "suite": HPKE_SUITE,
+        "suite": key.suite().name(),
     });
     let stored = serde_json::to_vec(&record).map_err(|_| ApiError::Backend)?;
     state

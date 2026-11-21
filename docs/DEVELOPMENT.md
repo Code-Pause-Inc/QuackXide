@@ -37,6 +37,10 @@ dependency tree. On a 12-core machine, a cold
 24 GB in `backend/target/`; expect longer on fewer cores, and keep that much
 disk free. Later builds are incremental.
 
+The browser's envelope code is a wasm32 build (`envelope-wasm`, built by
+`scripts/build-wasm.sh`). It enables getrandom 0.4's `wasm_js` feature for
+`crypto.getRandomValues`, so it needs no `--cfg getrandom_backend` flag.
+
 ## Everyday commands
 
 From `backend/`:
