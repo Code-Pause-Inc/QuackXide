@@ -37,6 +37,7 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+pub mod sealed;
 pub mod sweep;
 pub mod wiring;
 use admin::ProvisioningService;
@@ -563,27 +564,24 @@ async fn meta(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 #[derive(Debug, Deserialize)]
 struct AttestationQuery {
-    nonce_b64: Option<String>,
+    nonce: Option<String>,
 }
 
-/// `GET /api/v1/attestation` — public enclave attestation evidence bundle
-/// binding a caller-supplied 32-byte challenge nonce (`?nonce_b64=...`) and
-/// the enclave's ephemeral HPKE and result-signing public keys.
+/// `GET /api/v1/attestation?nonce=<base64url, 32 bytes>` — the evidence
+/// bundle (ADR 0010): a token binding the caller's challenge nonce and the
+/// enclave's key set. A missing or malformed nonce is refused, so no token is
+/// issued on a nonce the caller did not choose.
 async fn get_attestation(
     State(state): State<AppState>,
     Query(query): Query<AttestationQuery>,
 ) -> Result<Json<key_release::AttestationBundle>, ApiError> {
-    let nonce: [u8; 32] = match query.nonce_b64.as_deref() {
-        Some(raw_b64) => {
-            let decoded = B64
-                .decode(raw_b64.trim())
-                .map_err(|_| ApiError::BadRequest("invalid base64 attestation nonce"))?;
-            decoded
-                .try_into()
-                .map_err(|_| ApiError::BadRequest("attestation nonce must be 32 bytes"))?
-        }
-        None => platform_enclave::fresh_nonce(),
-    };
+    let nonce: [u8; 32] = query
+        .nonce
+        .as_deref()
+        .and_then(key_release::decode_b64url_32)
+        .ok_or(ApiError::BadRequest(
+            "attestation nonce must be 32 bytes of base64url",
+        ))?;
     let service = query_service(&state)?;
     let bundle = service.attestation_bundle(nonce).await?;
     Ok(Json(bundle))

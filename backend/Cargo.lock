@@ -2920,6 +2920,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-dsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f6d49c3f3f0e10e18ca975ffda66f8da0ec36521c1d911adcbc521bf0743f5c"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils",
+ "hybrid-array",
+ "module-lattice",
+ "pkcs8 0.11.0",
+ "shake",
+ "signature 3.0.0",
+ "zeroize",
+]
+
+[[package]]
 name = "ml-kem"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3455,9 +3471,11 @@ dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",
  "criterion",
+ "ed25519-dalek",
  "getrandom 0.4.3",
  "hmac 0.12.1",
  "hpke",
+ "ml-dsa",
  "proptest",
  "rand 0.8.7",
  "rand_chacha 0.10.0",
@@ -3682,6 +3700,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "criterion",
  "datafusion",
  "futures",
  "object_store",
@@ -3689,6 +3708,7 @@ dependencies = [
  "platform-core",
  "platform-crypto",
  "serde_json",
+ "synth-data",
  "thiserror",
  "tokio",
  "tracing",
@@ -5494,6 +5514,7 @@ version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

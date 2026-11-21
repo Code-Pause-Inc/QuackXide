@@ -121,7 +121,7 @@ exist.
 
 | Attack | Control | Status |
 | --- | --- | --- |
-| Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, frame `HPK2`, ADR 0007) | **Partial** — tenant envelopes are `HPK2` on the backend; the browser seals `HPK1` until P36 (#186), and the enclave's key-release key is X25519 until P85 (#176), so development key release wraps `HPK2` tenant keys classically |
+| Break X25519 key encapsulation | Hybrid X25519 + ML-KEM-768 (X-Wing in HPKE, frame `HPK2`, ADR 0007) | **Partial** — tenant envelopes and the enclave's request key are `HPK2` on the backend; the browser seals `HPK1` until P36 (#186) |
 | Forge signatures | Hybrid Ed25519 + ML-DSA-65, including platform tokens (ADR 0006, P37) | **To build** — current tokens use RS256 |
 | Silent downgrade to classical-only | Versioned framing (`HPK2`); every key loader takes a suite policy (except the raw `hpk1_*` loaders, the browser's `HPK1` path until P36), and a key opens only frames of its own suite. Production refuses `HPK1` frames and X25519 keys with `crypto.suite_refused`; there is no migration mode (ADR 0007) | **Built** — development (`APP_ENV=development`) still accepts `HPK1` until P36 removes it; production is the default when `APP_ENV` is unset |
 

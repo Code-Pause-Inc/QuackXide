@@ -1,6 +1,6 @@
 # 0005. Query and deployment topology
 
-* Status: Proposed
+* Status: Accepted (2026-11-14, with the P85 and P55 foundation)
 * Date: 2026-10-07
 
 ## Context

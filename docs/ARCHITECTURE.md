@@ -441,12 +441,17 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   In a `dev` build, when `KEY_RELEASE_URL` is configured,
   `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
   `KeyReleaseRelyingParty`: it fetches a single-use challenge nonce, binds
-  the nonce and its in-RAM `EnclaveIdentity` public keys into a 64-byte
-  `ReportDataBinding`, presents a simulated Confidential Space token
+  the nonce and its in-RAM `EnclaveIdentity` key set into 64 bytes (binding
+  v2, ADR 0010: the nonce, then a digest of its `HPK2` request key, both
+  result-signing keys and its configuration), presents a simulated
+  Confidential Space token
   carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
   key into a zeroize-on-drop `TenantKeypair` for the duration of that
   query. The relying party checks the token with the production verifier
-  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query,
+  (`platform_enclave::token`) against the `sim-attestation` key set, and
+  accepts only the enclave audience: the public evidence token
+  (`GET /api/v1/attestation`) carries the browser audience, so a caller who
+  fetched it cannot open key release. When `KEY_RELEASE_URL` is unset, the query,
   research-query and attestation endpoints fail closed with 503; research
   access (below) does not need key release. That relying party is the development and
   simulation stand-in (ADR 0004): it and its clients compile only with the
@@ -671,7 +676,7 @@ browser and signatures are still classical.
 
 | Use | Current | Target |
 | --- | --- | --- |
-| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The browser (`envelope-wasm`) and the enclave's key-release key are still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186; key-release key: P85, #176) |
+| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The enclave's request key is `HPK2` too. The browser (`envelope-wasm`) is still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186) |
 | Bulk encryption | AES-256-GCM | AES-256-GCM |
 | Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 for keys only an attested workload holds; tokens per ADR 0006 |
 
@@ -692,12 +697,11 @@ Migration rules:
   they are the browser's `HPK1` path and go away with P36 (#186). Tenant
   enrollment and the demo tenant build it from `APP_ENV` (ADR 0009):
   production accepts only `HPK2` keys, development also `HPK1`, so the
-  browser works until P36. The
-  key-release stand-in and released keys accept only `HPK2` in every mode;
-  the browser build and the enclave's key-release key accept only `HPK1`
-  until P36 and P85. A key opens only frames of its own suite, and a query
-  opens only a snapshot whose record names its key's suite. Refusals at
-  enrollment, upload, key release, query and open emit
+  browser works until P36. The enclave's request key, the key-release
+  stand-in and released keys accept only `HPK2` in every mode; the browser
+  build accepts only `HPK1` until P36. A key opens only frames of its own
+  suite, and a query opens only a snapshot whose record names its key's
+  suite. Refusals at enrollment, upload, key release, query and open emit
   `crypto.suite_refused`.
 * No silent downgrade: production refuses `HPK1` frames and X25519
   enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):
@@ -749,7 +753,8 @@ Rules, enforced by the capture tests:
    all appear in the stream. On the grant and research-query routes, input
    refused with 400 before any lookup (a malformed tenant id or slug, a
    zero top-up, a grant to oneself) is not audited: the check reads only
-   the request and the caller's own tenant id.
+   the request and the caller's own tenant id. The same holds for a
+   malformed attestation nonce on the unauthenticated attestation route.
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key

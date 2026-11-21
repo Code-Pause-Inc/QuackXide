@@ -33,6 +33,9 @@ pub const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 pub const MAX_TOKEN_LIFETIME_SECS: u64 = 3600;
 /// Audience of the simulated TEE's tokens.
 pub const SIMULATED_AUDIENCE: &str = "quackxide-enclave";
+/// Audience of the public evidence token (ADR 0010). Anyone can fetch that
+/// token, so it must differ from the audience key release verifies.
+pub const BROWSER_ATTESTATION_AUDIENCE: &str = "urn:platform:browser-attestation";
 
 const HWMODEL_TDX: &str = "GCP_INTEL_TDX";
 const SWNAME: &str = "CONFIDENTIAL_SPACE";

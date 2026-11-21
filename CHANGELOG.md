@@ -16,6 +16,28 @@ uses [Semantic Versioning](https://semver.org/).
   reports only. `docs/BENCHMARKS.md` records the baseline (about 50 MiB/s,
   a module peak of three times the payload, 31.8 KiB brotli-compressed)
   and the largest payload one seal can take (about 1.33 GiB).
+* The base for sealed research queries and results (ADR 0010; part of P85
+  and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
+  together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must
+  verify) and gains the `research_query` `info` string and the query
+  binding that `research_result` takes, pinned in `fixtures/envelope/hpk1.json`
+  and exposed by the wasm module. `platform-enclave`'s binding v2
+  (`EnclaveKeyBinding`) replaces the fixed 32-byte fields of
+  `ReportDataBinding` with labelled, length-prefixed values. The enclave's
+  key set (`EnclaveIdentity`) is an `HPK2` request key, whose private half
+  now exists in every build, and a result-signing key, with a `key_id`.
+  `GET /api/v1/attestation` takes the caller's nonce as `?nonce=` (32
+  bytes, base64url; 400 when missing or malformed, instead of a nonce the
+  server chose) and returns ADR 0010's evidence bundle, and the key-release
+  stand-in checks binding v2 and refuses a request key that is not `HPK2`
+  (audited as `crypto.suite_refused`). A key-release request carries every
+  bound value, the KMS public key included, with its byte fields in
+  base64url as ADR 0010 sets out. The sealed-query wire types are
+  defined, with result signatures (`SignatureWire`) a type apart from the
+  signing keys; nothing routes to them yet. The public evidence token carries
+  the audience `urn:platform:browser-attestation`, which key release
+  refuses, so a caller who fetches it cannot open key release.
+  ADR 0005 and ADR 0010 are accepted.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -26,7 +48,7 @@ uses [Semantic Versioning](https://semver.org/).
   is refused without a token (401), outside the upload namespace (404) and
   at a stale version (409), that an approval retry after a revoke is
   refused (404), and, after the upload and again after the queries, that
-  the vault holds exactly the upload's object and manifest as `HPK1`
+  the vault holds exactly the upload's object and manifest as `HPK2`
   envelopes and its record, whose row cap and schema are the ones the
   steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
   `enclave-api`. The API tests seal uploads with the same code
@@ -83,6 +105,14 @@ uses [Semantic Versioning](https://semver.org/).
   browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
   The `browser` workflow runs Chromium on every pull request and Chromium,
   Firefox and WebKit on `main` and nightly.
+* Engine query benchmarks and a regression check (P73, #185). Criterion
+  times two research-style queries in `quackxide-engine` over `synth-data`
+  tables of 10 000 to 1 000 000 rows. On pull requests the `bench` workflow
+  benchmarks the base commit and the head in one job, and
+  `scripts/bench-compare.sh` flags a benchmark whose whole 95 % interval is
+  more than 10 % slower as a warning in the job summary; the job fails only
+  when the comparison cannot run. `docs/BENCHMARKS.md` records the targets
+  for the hybrid suite and the engine.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   key generation and envelope seal and open for `HPK1` and `HPK2` at 32 B,
   4 KiB and 4 MiB, and a unit test pins each suite's envelope overhead
