@@ -287,7 +287,28 @@ pub async fn research_app(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let connector = ConnectorSlug::new("health").expect("slug");
+    research_app_for(
+        secret,
+        steward,
+        steward_keypair,
+        attestation,
+        require_attestation,
+        "health",
+    )
+    .await
+}
+
+/// As [`research_app`], with the cohorts sealed as the connector dataset
+/// `dataset` instead of `health`.
+pub async fn research_app_for(
+    secret: &str,
+    steward: TenantId,
+    steward_keypair: TenantKeypair,
+    attestation: Arc<dyn AttestationProvider>,
+    require_attestation: bool,
+    dataset: &str,
+) -> Router {
+    let connector = ConnectorSlug::new(dataset).expect("slug");
     let cohorts = cohorts_parquet();
     let mut stack = DevResearchStack::new();
     stack

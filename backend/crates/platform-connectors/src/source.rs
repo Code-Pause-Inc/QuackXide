@@ -427,4 +427,20 @@ mod tests {
         );
         assert!(!requested(&seen, "/data"));
     }
+
+    #[tokio::test]
+    async fn each_fixture_writes_the_columns_its_descriptor_lists() {
+        for source in [
+            FixtureSource::quickbooks_demo(),
+            FixtureSource::odoo_demo(),
+            FixtureSource::crm_demo(),
+        ] {
+            let source = source.expect("fixture");
+            let descriptor = source.descriptor();
+            assert!(!descriptor.columns.is_empty(), "{}", descriptor.slug);
+            for dataset in source.fetch(&ctx()).await.expect("fetch") {
+                assert_eq!(dataset.columns, descriptor.columns, "{}", descriptor.slug);
+            }
+        }
+    }
 }

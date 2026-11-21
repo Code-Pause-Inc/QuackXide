@@ -4,7 +4,33 @@
 use serde_json::Value;
 
 use crate::ConnectorError;
-use crate::dataset::{ColumnType, Dataset, FieldValue, col};
+use crate::dataset::{ColumnSpec, ColumnType, Dataset, FieldValue, col};
+
+/// The columns [`quickbooks_invoices`] writes, in order.
+pub const QUICKBOOKS_INVOICE_COLUMNS: &[ColumnSpec] = &[
+    col("id", ColumnType::Utf8),
+    col("customer", ColumnType::Utf8),
+    col("txn_date", ColumnType::Utf8),
+    col("currency", ColumnType::Utf8),
+    col("total", ColumnType::F64),
+    col("balance", ColumnType::F64),
+];
+
+/// The columns [`odoo_partners`] writes, in order.
+pub const ODOO_PARTNER_COLUMNS: &[ColumnSpec] = &[
+    col("id", ColumnType::I64),
+    col("name", ColumnType::Utf8),
+    col("email", ColumnType::Utf8),
+    col("is_company", ColumnType::Bool),
+];
+
+/// The columns [`crm_contacts`] writes, in order.
+pub const CRM_CONTACT_COLUMNS: &[ColumnSpec] = &[
+    col("id", ColumnType::Utf8),
+    col("name", ColumnType::Utf8),
+    col("email", ColumnType::Utf8),
+    col("stage", ColumnType::Utf8),
+];
 
 fn malformed(what: &str) -> ConnectorError {
     ConnectorError::MalformedPayload(what.to_owned())
@@ -48,17 +74,7 @@ pub fn quickbooks_invoices(payload: &Value) -> Result<Dataset, ConnectorError> {
         .and_then(Value::as_array)
         .ok_or_else(|| malformed("missing QueryResponse.Invoice array"))?;
 
-    let mut dataset = Dataset::new(
-        "invoices",
-        vec![
-            col("id", ColumnType::Utf8),
-            col("customer", ColumnType::Utf8),
-            col("txn_date", ColumnType::Utf8),
-            col("currency", ColumnType::Utf8),
-            col("total", ColumnType::F64),
-            col("balance", ColumnType::F64),
-        ],
-    );
+    let mut dataset = Dataset::new("invoices", QUICKBOOKS_INVOICE_COLUMNS.to_vec());
 
     for invoice in invoices {
         dataset.push_row(vec![
@@ -80,15 +96,7 @@ pub fn odoo_partners(payload: &Value) -> Result<Dataset, ConnectorError> {
         .and_then(Value::as_array)
         .ok_or_else(|| malformed("missing result array"))?;
 
-    let mut dataset = Dataset::new(
-        "partners",
-        vec![
-            col("id", ColumnType::I64),
-            col("name", ColumnType::Utf8),
-            col("email", ColumnType::Utf8),
-            col("is_company", ColumnType::Bool),
-        ],
-    );
+    let mut dataset = Dataset::new("partners", ODOO_PARTNER_COLUMNS.to_vec());
 
     for partner in partners {
         let id = partner
@@ -112,15 +120,7 @@ pub fn crm_contacts(payload: &Value) -> Result<Dataset, ConnectorError> {
         .and_then(Value::as_array)
         .ok_or_else(|| malformed("missing contacts array"))?;
 
-    let mut dataset = Dataset::new(
-        "contacts",
-        vec![
-            col("id", ColumnType::Utf8),
-            col("name", ColumnType::Utf8),
-            col("email", ColumnType::Utf8),
-            col("stage", ColumnType::Utf8),
-        ],
-    );
+    let mut dataset = Dataset::new("contacts", CRM_CONTACT_COLUMNS.to_vec());
 
     for contact in contacts {
         dataset.push_row(vec![
