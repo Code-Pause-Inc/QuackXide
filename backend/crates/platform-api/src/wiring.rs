@@ -81,7 +81,10 @@ pub async fn build_state(config: PlatformConfig) -> anyhow::Result<AppState> {
         tracing::warn!("JWT_HS256_SECRET unset — drive routes will refuse with 503 (fail closed)");
     }
 
-    let attestation = platform_enclave::provider_for(config.features.tee_attestation_required);
+    let attestation = platform_enclave::provider_for(
+        config.features.tee_attestation_required,
+        config.enclave.attested_env.clone(),
+    );
     if !config.features.tee_attestation_required {
         maybe_seed_demo_fixture(&config, &vault, &attestation).await?;
     }
@@ -179,9 +182,9 @@ fn key_release_query_service(
         require_attestation = config.features.tee_attestation_required,
         "enclave key-release path configured"
     );
-    // The configuration the simulated provider reports in each token, read
-    // from the same environment (`platform_enclave::provider_for`).
-    let config_digest = platform_enclave::config::config_digest(|name| std::env::var(name).ok());
+    // The configuration the provider reports in each token (`provider_for`).
+    let env = &config.enclave.attested_env;
+    let config_digest = platform_enclave::config::config_digest(|name| env.get(name).cloned());
     let identity = Arc::new(EnclaveIdentity::with_metadata(None, config_digest));
     let keys = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
@@ -267,11 +270,47 @@ mod tests {
 
     // Production never seeds the fixture (it refuses the simulated TEE this
     // runs under, so no `crypto.suite_refused` event is reachable); the
+    /// The enclave's key set binds the configuration the platform enforces,
+    /// from the config, not from whatever the process environment holds.
+    #[tokio::test]
+    async fn the_key_set_binds_the_configs_attested_env() {
+        let config = PlatformConfig::from_source(|k| match k {
+            "APP_ENV" => Some("development".to_owned()),
+            "TEE_ATTESTATION_REQUIRED" => Some("false".to_owned()),
+            "RESEARCH_MIN_COHORT_SIZE" => Some("5".to_owned()),
+            _ => None,
+        })
+        .expect("config");
+        let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+        let research = Arc::new(ResearchService::from_config(
+            ResearchStores::in_memory(),
+            vault.clone(),
+            &config.research,
+        ));
+        let service = key_release_query_service(
+            &config,
+            "http://127.0.0.1:1",
+            &vault,
+            platform_enclave::provider_for(false, config.enclave.attested_env.clone()),
+            &research,
+        )
+        .expect("service");
+        let env = &config.enclave.attested_env;
+        assert_eq!(
+            env.get("RESEARCH_MIN_COHORT_SIZE").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            service.identity().binding().config_digest,
+            platform_enclave::config::config_digest(|n| env.get(n).cloned())
+        );
+    }
+
     // suite policy is the second guard, should a caller reach the loader.
     #[tokio::test]
     async fn production_refuses_to_seed_a_demo_fixture_for_a_classical_key() {
         let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-        let attestation = platform_enclave::provider_for(false);
+        let attestation = platform_enclave::provider_for(false, Default::default());
         let config = demo_config("production", platform_crypto::EnvelopeSuite::Hpk1);
         let err = maybe_seed_demo_fixture(&config, &vault, &attestation)
             .await
