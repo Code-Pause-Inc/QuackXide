@@ -104,7 +104,7 @@ SHA-256( "attestation-binding-v2"
 | `signing-ml-dsa-65` | encoded public key |
 | `kms-public-key` | KMS public key; empty until P50 |
 | `tls-spki-sha256` | 32 bytes; empty until P67 |
-| `config-digest` | SHA-256 over the configuration names compiled into the image and the browser module (the names P50's release condition pins), in compiled order, each set name as `u16 len(name) ‖ name ‖ u32 len(value) ‖ value`; a name that is not set is left out |
+| `config-digest` | SHA-256 over the configuration names compiled into the image and the browser module (the names P50's release condition pins), in compiled order, each set name as `u16 len(name) ‖ name ‖ u32 len(value) ‖ value`; a value is trimmed, and a name that is not set, or set to an empty value, is left out (the platform reads an empty value as unset) |
 
 Every length prefix in this record is an unsigned integer, big-endian,
 counting bytes.
@@ -119,7 +119,13 @@ then checks that configuration by policy, as ADR 0005 decides: it reads
 the same compiled names from the token and refuses a value that loosens a
 control. `TEE_ATTESTATION_REQUIRED` and `FEATURE_ZK_ENABLED` must be
 absent or `true`, and `RESEARCH_MIN_COHORT_SIZE` absent or at least the
-compiled-in floor (P54). P14's policy may require more, never less. No
+compiled-in floor (P54). P14's policy may require more, never less. A
+development build, which runs on the simulated TEE, compiles in the
+simulator's policy instead: `TEE_ATTESTATION_REQUIRED` may be `false`,
+since simulated tokens never satisfy required attestation, and the floor is
+2, the size the simulated-TEE script's cohorts are built around. The key
+release stand-in holds the same policy, so a loosened deployment gets no
+keys either (ADR 0005). No
 expected digest is published or compared: one frontend image serves every
 deployment, so there is no trusted place to publish one.
 
@@ -186,7 +192,10 @@ wasm32 in the P34 browser module. In order, it checks:
 Any failure stops the query with an error naming the failed check, and
 nothing is sent. Browser JavaScript cannot see the TLS key, so
 `tls-spki-sha256` is checked by P85's command-line checker, not the
-browser.
+browser. That checker (`enclave-check`) reports the TLS key binding as not
+checked until P67 binds a key, and a release build of it compiles in no
+trust anchors until P49 and P50 publish them: whoever runs it supplies the
+issuer, the key-set URL (over `https`) and the image digests.
 
 ### Sealed request
 

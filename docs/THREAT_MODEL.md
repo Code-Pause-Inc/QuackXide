@@ -88,7 +88,9 @@ could then decrypt; policy changes and break-glass access are audited
 | Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false`. Production mode, the default unless `APP_ENV=development` is set in the process environment, refuses to start when `TEE_ATTESTATION_REQUIRED=false`, `SIM_ATTESTATION_URL` or `KEY_RELEASE_URL` is set, so production refuses these by default (ADR 0009); `APP_ENV=development` re-enables them (see residual risks) | Built, tested (CI `release build has no dev binaries`; `platform-api/tests/startup.rs`) |
 | Obtain a dataset's key for a query | Cloud KMS unwraps the dataset's data key only for the attested workload, per query, with nothing cached (ADR 0004); the steward's private key never leaves their browser | Seam built (`EnclaveKeyProvider`); **production key release to build** — returns 503 until then |
 | Authorize a modified image | The KMS key and its release policy live in a separate key project that no deployment identity administers (ADR 0004) | **Residual risk** for the key project's administrator — see below |
-| Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** — results currently leave as JSON over TLS |
+| Read queries at the API edge | The researcher's client checks the enclave's evidence (ADR 0010's five checks: Google's signature, the platform claims, the image digest, its own challenge, and the binding of the enclave's keys and bound configuration) and seals each research query to the attested request key; only the enclave opens it. A loosened bound configuration (attestation or ZK off, k below the floor) fails the check, and key release refuses it too (ADR 0005) | Built, tested (`platform_enclave::evidence`, `sealed_research_query.rs`, `enclave_check.rs`, the simulated-TEE script); the browser's own check is #239 |
+| Replay a researcher's sealed query to spend their budget | Each request nonce is recorded per key set just before the charge; the same envelope again gets the stored response uncharged, another envelope under the nonce is refused | Built, tested (`sealed_research_query.rs`) |
+| Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** (P55) — results currently leave as JSON over TLS |
 | Swap or replay ciphertext between objects | HPKE `info` / AES-GCM AAD bind tenant, object, role, and chunk | Built, tested |
 
 ### A3. External attacker
@@ -223,7 +225,21 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   minutes ahead of the server's clock), and, in a plaintext record beside
   each snapshot, the envelope suite and the steward's declared row cap and
   schema: column names and type families (ADR 0012). A connector
-  snapshot's record holds only its suite.
+  snapshot's record holds only its suite. For a sealed research query it
+  sees the grant id, sent in the clear so the enclave can open the frame,
+  and the sealed request's length, which bounds the SQL's.
+* **The served client and its checker.** The checks run in code the
+  server delivers, so an operator who changes the served bundle can skip
+  them. `enclave-check` lets anyone check a deployment from outside; it
+  does not yet check the TLS key binding (P67) or the served bundle's
+  digest (P49), and a release build of it compiles in no trust anchors
+  until P49 and P50 publish them, so whoever runs it supplies the issuer,
+  key-set URL and image digests.
+* **Configuration bound so far.** Attestation binds
+  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED` and
+  `RESEARCH_MIN_COHORT_SIZE`. `RESEARCH_DEFAULT_QUERY_BUDGET`,
+  `JWT_ISSUER` and `JWT_AUDIENCE`, which ADR 0005 also names, are not bound
+  yet.
 * **Forged or rolled-back snapshots.** Connector objects, uploaded objects
   and snapshot manifests are sealed to the tenant's public key, which binds
   them to tenant, dataset and object or version but does not authenticate
