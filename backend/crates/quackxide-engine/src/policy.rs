@@ -8,10 +8,12 @@
 //! row. Joins, set operations, windows, grouping sets (`ROLLUP`, `CUBE`,
 //! `GROUPING SETS`), sorts or limits below the aggregate, `DISTINCT`,
 //! `VALUES`, subquery expressions, and aggregates that return member values
-//! (`array_agg`, `string_agg`, `first_value`, …) are refused rather than
-//! analysed. Grouping sets put subtotal rows beside group rows, so one
-//! result could be differenced to recover a suppressed cohort. The `COUNT(*) AS n` and minimum-cohort
-//! gates in [`crate::disclosure`] apply on top of this one.
+//! (`min`, `max`, `array_agg`, `string_agg`, `first_value`, …) are refused
+//! rather than analysed. Grouping sets put subtotal rows beside group rows,
+//! so one result could be differenced to recover a suppressed cohort; `min`
+//! and `max` return one row's value however large the cohort (ADR 0015).
+//! The `COUNT(*) AS n` and minimum-cohort gates in [`crate::disclosure`]
+//! apply on top of this one.
 //!
 //! [`expressions_cannot_fail`] adds a third check on the analyzed plan:
 //! every expression must be one that cannot fail at runtime, so a query's
@@ -33,8 +35,9 @@ use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext
 use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Operator};
 use datafusion::physical_expr::create_physical_expr;
 
-/// Aggregates that return one summary value per group.
-pub const PERMITTED_AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
+/// Aggregates that return one summary value per group. Not `min` or `max`:
+/// each returns one row's value, whatever the cohort size (ADR 0015).
+pub const PERMITTED_AGGREGATES: &[&str] = &["count", "sum", "avg"];
 
 /// True when the plan's output is a single permitted aggregation over whole
 /// table columns, so no raw value can reach the result.

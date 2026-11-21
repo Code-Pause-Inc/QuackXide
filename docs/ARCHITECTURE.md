@@ -490,14 +490,16 @@ Three enforcement layers at one choke point, all in code:
   table scan, optionally filtered or column-renamed (nothing else may sit
   below the aggregate, so it reads every matching row), feeding exactly
   one `Aggregate` with plain `GROUP BY`, with only projection, filter,
-  sort, and limit above it. Aggregates are limited to `COUNT`, `SUM`,
-  `AVG`, `MIN`, and `MAX` over plain columns, and `n` must be a genuine
-  `COUNT(*)`. Joins, set operations, window functions, grouping sets
-  (`ROLLUP`, `CUBE`, `GROUPING SETS`), sorts or limits below the aggregate,
-  subquery expressions, table functions, `VALUES`, computed aggregate
-  arguments, and value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`,
-  `FIRST_VALUE`) are refused — each can inflate a cohort count, single out
-  an individual, or put a subtotal beside its parts in one result.
+  sort, and limit above it. Aggregates are limited to `COUNT`, `SUM` and
+  `AVG` over plain columns, and `n` must be a genuine `COUNT(*)`. Joins,
+  set operations, window functions, grouping sets (`ROLLUP`, `CUBE`,
+  `GROUPING SETS`), sorts or limits below the aggregate, subquery
+  expressions, table functions, `VALUES`, computed aggregate arguments,
+  and value-returning aggregates (`MIN`, `MAX`, `ARRAY_AGG`, `STRING_AGG`,
+  `FIRST_VALUE`) are refused, wherever they appear, `HAVING` and
+  `ORDER BY` included — each can inflate a cohort count, single out an
+  individual, or put a subtotal beside its parts in one result. `MIN` and
+  `MAX` return one row's value however large the cohort (ADR 0015).
   After type coercion, every expression must also be one that cannot fail
   at runtime (`policy::expressions_cannot_fail`, ADR 0011): comparisons,
   boolean logic, `IN`, `LIKE` with a pattern of at most 1,000 characters,

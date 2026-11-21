@@ -592,6 +592,18 @@ async fn researcher_cannot_egress_raw_rows_or_skip_count() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // MAX returns one row's value, however large the cohort → 422 (ADR 0015).
+    let (status, _) = post(
+        &app,
+        "/api/v1/research/query",
+        &rtoken,
+        &format!(
+            r#"{{"steward_tenant":"{steward}","connector":"health","sql":"SELECT COUNT(*) AS n, MAX(age) AS oldest FROM health"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 /// A query whose expression fails only on the rare cohort's row gets the
