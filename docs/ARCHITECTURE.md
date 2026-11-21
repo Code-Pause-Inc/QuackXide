@@ -884,7 +884,9 @@ Rules, enforced by the capture tests:
    budget reads of unknown, foreign and malformed grant ids, and sealed
    research queries refused (an unsupported version, an unknown key set, a
    frame that does not open, a reused nonce), each an `auth.decision`
-   naming its reason.
+   naming its reason, and key release refusing a deployment's configuration
+   (a digest the token does not carry, or a loosened control), each a
+   `crypto.key_release` denial naming its reason.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on
