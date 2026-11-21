@@ -1,4 +1,31 @@
-// Research portal API client: catalog, access requests, grants, and budgets.
+// Research portal API client: catalog, access requests, grants, budgets,
+// and the steward's stored datasets.
+
+import type { DeclaredColumn } from "../datasets/schema";
+
+/** One dataset the steward holds, as `GET /api/v1/datasets` describes its
+ *  current snapshot: what storage holds, never its contents. */
+export interface DatasetView {
+  dataset: string;
+  version: string;
+  /** When the snapshot was written (RFC 3339). */
+  written_at: string;
+  /** The suite its record names; null when the record is unreadable. */
+  suite: string | null;
+  /** For an upload: the declared row cap and schema; null for a
+   *  connector's dataset or an unreadable record. */
+  row_cap: number | null;
+  schema: DeclaredColumn[] | null;
+  object_count: number;
+  ciphertext_bytes: number;
+  objects: string[];
+}
+
+export interface DatasetListingView {
+  datasets: DatasetView[];
+  /** The largest object an upload may store, in ciphertext bytes. */
+  dataset_max_bytes: number;
+}
 
 export interface ListingView {
   listing_id: string;
@@ -155,6 +182,18 @@ export class ResearchClient {
 
   async catalog(): Promise<CatalogView> {
     return this.get<CatalogView>("/api/v1/catalog", "the dataset catalog");
+  }
+
+  /** The datasets the caller's tenant holds, and the upload size limit. */
+  async datasets(): Promise<DatasetListingView> {
+    const response = await fetch(this.url("/api/v1/datasets"), { headers: this.headers() });
+    if (response.status === 401) throw new Error("not authenticated");
+    if (response.status === 422) throw new Error("too many datasets to list");
+    if (response.status === 502 || response.status === 503) {
+      throw new Error(`storage is unavailable (${response.status}); try again later`);
+    }
+    if (!response.ok) throw new Error(`failed to load your datasets (${response.status})`);
+    return (await response.json()) as DatasetListingView;
   }
 
   async grants(): Promise<GrantView[]> {

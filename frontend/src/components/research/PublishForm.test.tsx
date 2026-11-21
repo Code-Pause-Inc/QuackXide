@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import PublishForm from "./PublishForm";
@@ -6,13 +6,15 @@ import PublishForm from "./PublishForm";
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 2000;
 
-function setup(busy = false) {
+const STORED = ["health", "upload_cohorts"];
+
+function setup(busy = false, datasets = STORED) {
   const user = userEvent.setup();
   const onPublish = vi.fn();
-  render(<PublishForm busy={busy} currency="USD" onPublish={onPublish} />);
+  render(<PublishForm busy={busy} currency="USD" datasets={datasets} onPublish={onPublish} />);
   const field = (placeholder: RegExp) => screen.getByPlaceholderText(placeholder);
   const inputs = {
-    connector: field(/connector slug/),
+    connector: screen.getByLabelText("Dataset"),
     title: field(/listing title/),
     description: field(/description/),
     fee: field(/license fee \(USD\)/),
@@ -22,6 +24,10 @@ function setup(busy = false) {
   const fill = async (values: Partial<Record<keyof typeof inputs, string>>) => {
     for (const [key, value] of Object.entries(values)) {
       const input = inputs[key as keyof typeof inputs];
+      if (key === "connector") {
+        await user.selectOptions(input, value ?? "");
+        continue;
+      }
       await user.clear(input);
       if (value) {
         await user.click(input);
@@ -47,7 +53,6 @@ describe("PublishForm", () => {
     const { user, fill, publish, onPublish } = setup();
     await fill({
       ...valid,
-      connector: "  health  ",
       title: "  Cohort outcomes ",
       description: " Aggregates ",
     });
@@ -69,9 +74,7 @@ describe("PublishForm", () => {
   });
 
   it.each([
-    ["an uppercase slug", { connector: "Health" }],
-    ["a slug with spaces", { connector: "health data" }],
-    ["a slug over 64 characters", { connector: "a".repeat(65) }],
+    ["no dataset", { connector: "" }],
     ["a blank title", { title: "   " }],
     ["a fee with three decimals", { fee: "1.234" }],
     ["a negative fee", { fee: "-5" }],
@@ -84,10 +87,26 @@ describe("PublishForm", () => {
     expect(publish()).toBeDisabled();
   });
 
-  it("accepts a 64-character slug and a zero allowance", async () => {
-    const { fill, publish } = setup();
-    await fill({ ...valid, connector: "a".repeat(64), queries: "0" });
-    expect(publish()).toBeEnabled();
+  it("offers exactly the stored datasets", () => {
+    setup();
+    const options = within(screen.getByLabelText("Dataset")).getAllByRole("option");
+    expect(options.map((o) => o.getAttribute("value"))).toEqual(["", ...STORED]);
+  });
+
+  it("publishes an uploaded dataset with a zero allowance", async () => {
+    const { user, fill, publish, onPublish } = setup();
+    await fill({ ...valid, connector: "upload_cohorts", queries: "0" });
+    await user.click(publish());
+    expect(onPublish).toHaveBeenCalledWith(
+      expect.objectContaining({ connector: "upload_cohorts", grant_budget: 0 }),
+    );
+  });
+
+  it("with no stored datasets, says to upload one and stays disabled", async () => {
+    const { fill, publish } = setup(false, []);
+    await fill({ title: valid.title, fee: valid.fee, rate: valid.rate });
+    expect(screen.getByText(/upload a dataset first/)).toBeInTheDocument();
+    expect(publish()).toBeDisabled();
   });
 
   it("caps the title and description lengths", async () => {

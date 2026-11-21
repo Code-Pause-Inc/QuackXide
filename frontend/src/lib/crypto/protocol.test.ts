@@ -51,6 +51,57 @@ describe("parseWorkerRequest", () => {
   });
 });
 
+describe("parseWorkerRequest: dataset uploads", () => {
+  const file = new File(["PAR1"], "cohort.parquet");
+  const upload = {
+    id: 9,
+    op: "uploadDataset",
+    file,
+    dataset: "upload_cohorts",
+    schema: [
+      { name: "condition", type: "string" },
+      { name: "age", type: "int64" },
+    ],
+    rowCap: 7,
+    currentVersion: null,
+    maxBytes: 1024,
+  };
+
+  it("accepts a well-formed upload, keeping only the declared fields", () => {
+    const withExtras = {
+      ...upload,
+      extra: "x",
+      schema: upload.schema.map((c) => ({ ...c })),
+      currentVersion: `01700000000000000000-${"a".repeat(32)}`,
+    };
+    expect(parseWorkerRequest(withExtras)).toEqual({
+      ...upload,
+      currentVersion: `01700000000000000000-${"a".repeat(32)}`,
+    });
+  });
+
+  it.each([
+    ["no file", { file: undefined }],
+    ["a name, not a file", { file: "cohort.parquet" }],
+    ["a dataset outside the upload namespace", { dataset: "health" }],
+    ["a dataset id with a slash", { dataset: "upload_a/b" }],
+    ["a dataset id over 64 bytes", { dataset: `upload_${"x".repeat(58)}` }],
+    ["no schema", { schema: undefined }],
+    ["an empty schema", { schema: [] }],
+    ["an unknown type", { schema: [{ name: "a", type: "utf8" }] }],
+    ["an extra column field", { schema: [{ name: "a", type: "int64", nullable: true }] }],
+    ["a duplicate column", { schema: [{ name: "a", type: "int64" }, { name: "a", type: "date" }] }],
+    ["a row cap of zero", { rowCap: 0 }],
+    ["a fractional row cap", { rowCap: 1.5 }],
+    ["a row cap over 2^53 - 1", { rowCap: 2 ** 53 }],
+    ["a malformed version", { currentVersion: "1700000000" }],
+    ["no size limit", { maxBytes: undefined }],
+    ["a zero size limit", { maxBytes: 0 }],
+  ])("rejects %s", (_what, change) => {
+    expect(parseWorkerRequest({ ...upload, ...change })).toBeNull();
+  });
+});
+
 function b64url(value: unknown): string {
   return btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }

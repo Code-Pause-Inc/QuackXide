@@ -174,11 +174,30 @@ which fails when the file and its generator disagree; regenerate with
 wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
 enrollment cases through the enrollment route and the badly framed
 envelopes through the upload route.
+`hpk1-browser-upload.json` is a whole upload body sealed by the browser's
+upload code (`WRITE_UPLOAD_VECTORS=1 npx vitest run --project node
+src/lib/crypto/datasetUpload.vectors.test.ts` from `frontend/`), which
+`platform-api/tests/dataset_upload_api.rs` stores through the upload route
+and queries.
 `hpk2-kem.json` (X-Wing known-answer values from `@noble/post-quantum`) and
 `hpk2-js-sealed.json` (`HPK2` frames sealed by `hpke-js`, plus negatives)
 come from implementations other than ours (ADR 0007); regenerate them with
 `node scripts/hpk2-vectors.mjs` from `frontend/`, and
 `backend/crates/platform-crypto/tests/hpk2_vectors.rs` checks them.
+
+### Parquet schema vectors
+
+`fixtures/parquet/` holds small synthetic Parquet files whose schema the
+steward's browser and the enclave must read alike (ADR 0014), and
+`schema-vectors.json` what each side does with each: the schema both
+declare, or why each refuses. The generator is in
+`backend/crates/quackxide-engine/tests/parquet_schema_vectors.rs`; rerun it
+with `cargo test -p quackxide-engine --test parquet_schema_vectors --locked
+-- --ignored` after changing a case. That test runs the enclave's own
+declared-schema check on the files and fails when the JSON and the
+generator disagree; `frontend/src/lib/datasets/footer.test.ts` checks the
+browser's footer reader against the same files. Add a vector whenever a
+writer turns up a schema the two could read differently.
 
 ### Fuzz targets
 

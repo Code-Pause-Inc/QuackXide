@@ -1,10 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { brand } from "../../config/brand";
+import type { DatasetUploadFields } from "../../lib/crypto/protocol";
+import { DriveWorkerClient } from "../../lib/crypto/workerClient";
+import { readFooterInWorker } from "../../lib/datasets/footerClient";
 import { errorMessage } from "../../lib/format";
 import {
   type AccessRequestView,
   type BudgetView,
   type CatalogView,
+  type DatasetListingView,
   type GrantView,
   type ListingView,
   ResearchClient,
@@ -13,6 +17,8 @@ import {
   shortId,
   tenantFromJwt,
 } from "../../lib/research/client";
+import DatasetList from "./DatasetList";
+import DatasetUploadForm from "./DatasetUploadForm";
 import IssuedGrantRow from "./IssuedGrantRow";
 import RequestRow from "./RequestRow";
 import PublishForm from "./PublishForm";
@@ -34,6 +40,10 @@ interface PortalData {
    *  that failed to load. */
   unfunded: Set<string>;
   requests: AccessRequestView[];
+  /** The steward's stored datasets; null when they failed to load, which
+   *  `datasetsError` explains. */
+  datasets: DatasetListingView | null;
+  datasetsError: string | null;
 }
 
 function findListing(
@@ -53,12 +63,30 @@ export default function ResearchPortal() {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [showPublishForm, setShowPublishForm] = useState(false);
+  const [showUploadForm, setShowUploadForm] = useState(false);
+  const [uploadTarget, setUploadTarget] = useState("");
+  /** The crypto worker that seals uploads, started on the first one. */
+  const workerRef = useRef<DriveWorkerClient | null>(null);
+
+  useEffect(() => () => workerRef.current?.terminate(), []);
 
   const me = useMemo(() => tenantFromJwt(token), [token]);
   const client = () => new ResearchClient(brand.apiBaseUrl, token);
 
+  /** Seal and upload in the crypto worker, under this portal's token. */
+  const uploadDataset = async (fields: DatasetUploadFields) => {
+    workerRef.current ??= new DriveWorkerClient();
+    await workerRef.current.setSession(token);
+    return workerRef.current.uploadDataset(fields);
+  };
+
   const refresh = async () => {
     const c = client();
+    // A listing that fails leaves the rest of the portal usable.
+    const datasets = c.datasets().then(
+      (listing) => ({ listing, error: null }),
+      (err: unknown) => ({ listing: null, error: errorMessage(err, "failed to load your datasets") }),
+    );
     const [catalog, grants, requests] = await Promise.all([
       c.catalog(),
       c.grants(),
@@ -81,7 +109,16 @@ export default function ResearchPortal() {
       if (budget) budgets[grantId] = budget;
       else if (budget === null) unfunded.add(grantId);
     }
-    setData({ catalog, grants, budgets, unfunded, requests });
+    const stored = await datasets;
+    setData({
+      catalog,
+      grants,
+      budgets,
+      unfunded,
+      requests,
+      datasets: stored.listing,
+      datasetsError: stored.error,
+    });
   };
 
   const connect = async () => {
@@ -463,6 +500,52 @@ export default function ResearchPortal() {
             className={`px-6 py-5 ${incomingPending.length > 0 || unfinishedApprovals.length > 0 ? "border-t border-slate-100" : ""}`}
           >
             <div className="flex items-center justify-between">
+              <SectionLabel>Stored datasets</SectionLabel>
+              <button
+                type="button"
+                onClick={() => {
+                  setUploadTarget("");
+                  setShowUploadForm(!showUploadForm);
+                }}
+                disabled={!data.datasets}
+                className={quietBtnCls}
+              >
+                {showUploadForm ? "Close" : "Upload a dataset"}
+              </button>
+            </div>
+            {data.datasetsError && (
+              <p role="alert" className="mt-3 text-xs text-rose-600">
+                Your datasets could not be loaded: {data.datasetsError}
+              </p>
+            )}
+            {data.datasets && showUploadForm && (
+              <DatasetUploadForm
+                key={uploadTarget}
+                datasets={data.datasets.datasets}
+                maxBytes={data.datasets.dataset_max_bytes}
+                initialDataset={uploadTarget}
+                readFooter={(file) => readFooterInWorker(file)}
+                onUpload={uploadDataset}
+                onUploaded={() => {
+                  refresh().catch((err: unknown) =>
+                    setError(errorMessage(err, "failed to reload the portal")),
+                  );
+                }}
+              />
+            )}
+            {data.datasets && (
+              <DatasetList
+                datasets={data.datasets.datasets}
+                onReupload={(dataset) => {
+                  setUploadTarget(dataset);
+                  setShowUploadForm(true);
+                }}
+              />
+            )}
+          </div>
+
+          <div className="border-t border-slate-100 px-6 py-5">
+            <div className="flex items-center justify-between">
               <SectionLabel>Published listings</SectionLabel>
               <button
                 type="button"
@@ -476,6 +559,7 @@ export default function ResearchPortal() {
               <PublishForm
                 busy={busy === "publish"}
                 currency={data.catalog.currency}
+                datasets={data.datasets?.datasets.map((d) => d.dataset) ?? []}
                 onPublish={(body) =>
                   act("publish", () => client().publishListing(body)).then(
                     (ok) => ok && setShowPublishForm(false),

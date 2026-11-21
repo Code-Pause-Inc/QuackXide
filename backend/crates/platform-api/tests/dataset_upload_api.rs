@@ -157,6 +157,76 @@ async fn an_upload_is_stored_sealed_and_queryable() {
     assert_eq!(rows["suppressed_rows"], 1);
 }
 
+/// The upload the browser's own code sealed
+/// (`fixtures/envelope/hpk1-browser-upload.json`, written by
+/// `frontend/src/lib/crypto/datasetUpload.vectors.test.ts`): stored through
+/// the route, its object and manifest open with the backend's open path and
+/// its declared schema and row cap match the Parquet in the enclave.
+#[tokio::test]
+async fn a_browser_sealed_upload_opens_in_the_enclave() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures");
+    let read = |path: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(fixtures.join(path)).expect("read fixture"))
+            .expect("json")
+    };
+    let vector = read("envelope/hpk1-browser-upload.json");
+    let recipients = read("envelope/hpk1.json");
+    let recipient = recipients["recipients"]
+        .as_array()
+        .expect("recipients")
+        .iter()
+        .find(|r| r["name"] == vector["recipient"])
+        .expect("the vector's recipient");
+    let seed = recipient["seed_utf8"].as_str().expect("seed");
+    let keypair = TenantKeypair::derive(platform_crypto::EnvelopeSuite::Hpk1, seed.as_bytes());
+    assert_eq!(
+        B64.encode(keypair.public_key().to_raw()),
+        recipient["public_b64"].as_str().expect("public key")
+    );
+    let tenant: TenantId = vector["tenant"]
+        .as_str()
+        .expect("tenant")
+        .parse()
+        .expect("id");
+    assert_eq!(vector["dataset"], DATASET);
+    let body = B64
+        .decode(vector["body_b64"].as_str().expect("body"))
+        .expect("base64");
+
+    // The browser declared exactly what the engine reads from the file.
+    let parsed = parse_upload_body(Bytes::from(body.clone()), u64::MAX).expect("a valid body");
+    assert_eq!(parsed.header.schema, cohorts_schema());
+    assert_eq!(parsed.header.row_cap, 7);
+    assert_eq!(parsed.suite, platform_crypto::EnvelopeSuite::Hpk1);
+
+    let vault = in_memory();
+    let app = common::upload_research_app_with_config(
+        SECRET,
+        common::development_config(),
+        vec![(tenant, keypair)],
+        vault,
+    );
+    let token = token_for(tenant);
+    let (status, stored) = put_upload(&app, Some(&token), DATASET, body).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    assert_eq!(stored["version"], vector["version"]);
+    assert_eq!(stored["object"], vector["object"]);
+    assert_eq!(stored["suite"], "HPK1");
+
+    // A query opens the manifest and the object under the upload bindings
+    // and checks the declaration: 6 "flu", the single row suppressed.
+    let query = serde_json::json!({ "connector": DATASET, "sql": COUNT_SQL }).to_string();
+    let (status, rows) = common::post_query(&app, Some(&token), &query).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["object_count"], 1);
+    assert_eq!(rows["rows"][0]["condition"], "flu");
+    assert_eq!(rows["rows"][0]["n"], 6);
+    assert_eq!(rows["suppressed_rows"], 1);
+}
+
 /// The body `seal-upload` writes for `scripts/test-simulated-tee.sh`: a
 /// synthetic cohort declared as the enclave finds it.
 #[tokio::test]
@@ -909,8 +979,9 @@ async fn re_enrolling_in_another_suite_lets_the_next_upload_replace_the_snapshot
 
 // ── The dataset listing ──
 
-/// What a tenant that holds no dataset is sent.
-const EMPTY_LISTING: &[u8] = br#"{"datasets":[]}"#;
+/// What a tenant that holds no dataset is sent, with the default
+/// `DATASET_MAX_MIB` of 64.
+const EMPTY_LISTING: &[u8] = br#"{"datasets":[],"dataset_max_bytes":67108864}"#;
 
 /// `GET /api/v1/datasets`, as `token` if given.
 async fn list_datasets(app: &Router, token: Option<&str>) -> (StatusCode, HeaderMap, Vec<u8>) {
@@ -974,9 +1045,18 @@ async fn the_listing_shows_each_upload_as_the_current_snapshot() {
         u128::try_from(written_at.timestamp_millis()).expect("after 1970"),
         first.version.unix_nanos() / 1_000_000
     );
-    // Nothing else, such as the declared schema from the record.
-    assert_eq!(entry.as_object().expect("an object").len(), 7, "{entry}");
-    assert!(!entry.to_string().contains("condition"), "{entry}");
+    // What the steward declared, from the record, which a re-upload must
+    // declare again; and nothing else.
+    assert_eq!(entry["row_cap"], 7);
+    assert_eq!(entry["schema"], serde_json::json!(cohorts_schema()));
+    assert_eq!(
+        entry["schema"],
+        serde_json::json!([
+            { "name": "condition", "type": "string" },
+            { "name": "age", "type": "int64" },
+        ])
+    );
+    assert_eq!(entry.as_object().expect("an object").len(), 9, "{entry}");
 
     // A re-upload replaces it: still one dataset, at the new snapshot.
     let second = cohorts_upload(steward.tenant, &steward.key, DATASET, Some(&first.version));
@@ -1171,6 +1251,10 @@ async fn synced_and_seeded_datasets_are_listed_as_publishing_sees_them() {
     );
     assert_eq!(entries[0]["object_count"], stored.object_count);
     assert_eq!(entries[0]["ciphertext_bytes"], stored.total_bytes);
+    // A connector declares nothing; the upload declares its schema.
+    assert_eq!(entries[0]["row_cap"], serde_json::Value::Null);
+    assert_eq!(entries[0]["schema"], serde_json::Value::Null);
+    assert_eq!(entries[1]["schema"], serde_json::json!(cohorts_schema()));
 
     // Every listed dataset is one its steward may publish, and no other.
     for id in ids {
@@ -1200,6 +1284,9 @@ async fn a_dataset_whose_record_is_unreadable_is_listed_without_a_suite() {
         let entries = listed(&app, &steward.token).await;
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["suite"], serde_json::Value::Null);
+        // Nor what it declared: the record that held it is not readable.
+        assert_eq!(entries[0]["row_cap"], serde_json::Value::Null);
+        assert_eq!(entries[0]["schema"], serde_json::Value::Null);
         assert_eq!(entries[0]["version"], sealed.version.as_str());
         assert_eq!(entries[0]["objects"], object_ids(&[sealed.object]));
         assert!(publishable(&app, &steward, DATASET).await);
@@ -1223,6 +1310,23 @@ async fn listing_without_an_access_token_is_401() {
     let token = common::rs256_token(TokenType::Access, false);
     let (status, _, body) = list_datasets(&app, Some(&token)).await;
     assert_eq!((status, body.as_slice()), (StatusCode::OK, EMPTY_LISTING));
+}
+
+#[tokio::test]
+async fn the_listing_gives_the_configured_upload_size_limit() {
+    let app = build_app(AppState {
+        config: Arc::new(config_with_max_mib(3)),
+        ..app_state(SECRET, in_memory())
+    });
+    let (steward, _) = steward();
+    let (status, _, body) = list_datasets(&app, Some(&steward.token)).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (
+            StatusCode::OK,
+            br#"{"datasets":[],"dataset_max_bytes":3145728}"#.as_slice()
+        )
+    );
 }
 
 #[tokio::test]

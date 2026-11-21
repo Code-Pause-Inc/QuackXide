@@ -18,7 +18,7 @@
 //! Readers find the current snapshot from manifest paths alone, without
 //! opening anything: [`holds`] for one dataset, and [`held_datasets`] and
 //! [`held_dataset`] for a tenant's datasets, decide it with one function,
-//! and [`recorded_suite`] reads a snapshot's plaintext record.
+//! and [`read_record`] reads a snapshot's plaintext record.
 //!
 //! The manifest is sealed to the tenant and bound to tenant, dataset and
 //! version, so it cannot be moved between them. HPKE seals to a public key,
@@ -29,7 +29,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
-use platform_core::{ConnectorSlug, DatasetKind, ObjectId, SnapshotVersion, TenantId};
+use platform_core::{
+    ConnectorSlug, DatasetKind, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
+};
 use platform_crypto::{EnvelopeSuite, TenantPublicKey, hpke_seal_to_tenant};
 use platform_storage::{
     SnapshotRecord, StorageError, TenantPaths, VaultEntry, VaultPath, VaultStore,
@@ -216,13 +218,22 @@ pub async fn held_dataset(
     Ok(describe_held(tenant, slug.clone(), &entries))
 }
 
-/// What a snapshot's plaintext record says about its envelope suite, read
-/// without opening anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordedSuite {
+/// What a valid record says: the snapshot's envelope suite and, for an
+/// upload, the row cap and schema the steward declared (`None` for a
+/// connector's snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownRecord {
+    pub suite: EnvelopeSuite,
+    pub row_cap: Option<u64>,
+    pub schema: Option<DeclaredSchema>,
+}
+
+/// What a snapshot's plaintext record says, read without opening anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recorded {
     /// A valid record (ADR 0012): well formed, written for this snapshot,
     /// and naming a suite this build reads.
-    Known(EnvelopeSuite),
+    Known(KnownRecord),
     /// A record that is malformed, written for another snapshot, or names a
     /// suite this build does not read. A query refuses the snapshot.
     Unreadable,
@@ -231,33 +242,39 @@ pub enum RecordedSuite {
     Missing,
 }
 
-impl RecordedSuite {
-    /// The suite a valid record names.
-    pub fn known(self) -> Option<EnvelopeSuite> {
+impl Recorded {
+    /// What a valid record says.
+    pub fn known(self) -> Option<KnownRecord> {
         match self {
-            Self::Known(suite) => Some(suite),
+            Self::Known(record) => Some(record),
             Self::Unreadable | Self::Missing => None,
         }
     }
 }
 
-/// What the record of `tenant`'s snapshot `version` of `slug` says about
-/// its suite. Reads only the record; a storage failure is an error.
-pub async fn recorded_suite(
+/// What the record of `tenant`'s snapshot `version` of `slug` says. Reads
+/// only the record; a storage failure is an error.
+pub async fn read_record(
     vault: &dyn VaultStore,
     tenant: TenantId,
     slug: &ConnectorSlug,
     version: &SnapshotVersion,
-) -> Result<RecordedSuite, StorageError> {
+) -> Result<Recorded, StorageError> {
     match vault
         .get(&TenantPaths::connector_record(tenant, slug, version))
         .await
     {
         Ok(bytes) => Ok(SnapshotRecord::parse(&bytes, version)
             .ok()
-            .and_then(|record| EnvelopeSuite::from_id(&record.suite).ok())
-            .map_or(RecordedSuite::Unreadable, RecordedSuite::Known)),
-        Err(StorageError::NotFound) => Ok(RecordedSuite::Missing),
+            .and_then(|record| {
+                Some(KnownRecord {
+                    suite: EnvelopeSuite::from_id(&record.suite).ok()?,
+                    row_cap: record.row_cap,
+                    schema: record.schema,
+                })
+            })
+            .map_or(Recorded::Unreadable, Recorded::Known)),
+        Err(StorageError::NotFound) => Ok(Recorded::Missing),
         Err(err) => Err(err),
     }
 }
@@ -788,7 +805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recorded_suite_reads_only_a_valid_record() {
+    async fn read_record_reads_only_a_valid_record() {
         let vault = ObjectStoreVault::new_in_memory();
         let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
         let key = keypair.public_key();
@@ -797,35 +814,65 @@ mod tests {
         let mut writer = SnapshotWriter::begin(&vault, tenant, &key, health.clone());
         writer.put("rows", b"parquet").await.expect("put");
         let version = writer.commit().await.expect("commit");
+        // A connector's record names only its suite.
         assert_eq!(
-            recorded_suite(&vault, tenant, &health, &version)
+            read_record(&vault, tenant, &health, &version)
                 .await
                 .expect("read"),
-            RecordedSuite::Known(EnvelopeSuite::CURRENT)
+            Recorded::Known(KnownRecord {
+                suite: EnvelopeSuite::CURRENT,
+                row_cap: None,
+                schema: None,
+            })
+        );
+
+        // An upload's record also gives what the steward declared.
+        let path = TenantPaths::connector_record(tenant, &health, &version);
+        let declared = format!(
+            r#"{{"version":"{version}","suite":"HPK2","row_cap":12,"schema":[{{"name":"n","type":"int64"}}]}}"#
+        );
+        vault.put(&path, declared.into()).await.expect("put");
+        let schema = DeclaredSchema::new(vec![platform_core::DeclaredColumn {
+            name: "n".into(),
+            column_type: platform_core::ColumnType::Int64,
+        }])
+        .expect("schema");
+        assert_eq!(
+            read_record(&vault, tenant, &health, &version)
+                .await
+                .expect("read")
+                .known(),
+            Some(KnownRecord {
+                suite: EnvelopeSuite::Hpk2,
+                row_cap: Some(12),
+                schema: Some(schema),
+            })
         );
 
         // A record that is malformed, written for another snapshot, or names
-        // a suite this build does not read names no suite.
-        let path = TenantPaths::connector_record(tenant, &health, &version);
+        // a suite this build does not read says nothing.
         let other = SnapshotVersion::generate();
         for stored in [
             Bytes::from_static(b"not json"),
             Bytes::from(format!(r#"{{"version":"{other}","suite":"HPK1"}}"#)),
             Bytes::from(format!(r#"{{"version":"{version}","suite":"HPK9"}}"#)),
+            Bytes::from(format!(
+                r#"{{"version":"{version}","suite":"HPK9","row_cap":12,"schema":[{{"name":"n","type":"int64"}}]}}"#
+            )),
         ] {
             vault.put(&path, stored.clone()).await.expect("put");
-            let recorded = recorded_suite(&vault, tenant, &health, &version)
+            let recorded = read_record(&vault, tenant, &health, &version)
                 .await
                 .expect("read");
-            assert_eq!(recorded, RecordedSuite::Unreadable, "{stored:?}");
+            assert_eq!(recorded, Recorded::Unreadable, "{stored:?}");
             assert_eq!(recorded.known(), None);
         }
         // A missing record is told apart: a newer commit may have pruned it.
         vault.delete(&path).await.expect("delete");
-        let recorded = recorded_suite(&vault, tenant, &health, &version)
+        let recorded = read_record(&vault, tenant, &health, &version)
             .await
             .expect("read");
-        assert_eq!(recorded, RecordedSuite::Missing);
+        assert_eq!(recorded, Recorded::Missing);
         assert_eq!(recorded.known(), None);
     }
 

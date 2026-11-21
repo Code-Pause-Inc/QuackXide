@@ -8,6 +8,31 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Steward dataset upload in the browser (ADR 0014, P40): the research
+  portal's stewardship panel lists the steward's stored datasets from
+  `GET /api/v1/datasets` (id, object count, ciphertext size, suite, write
+  time) and uploads a Parquet file. A worker of its own reads only the
+  file's footer, with hyparquet's Thrift decoder (hyparquet 1.33.1, MIT, a
+  new runtime dependency), and declares each column's name and type family
+  by the rules of the enclave's Parquet reader, embedded Arrow schema
+  included; it refuses a file the enclave could not read or declare, a
+  schema unlike the dataset's recorded one, and a file over the upload
+  limit, before anything is sealed. The crypto worker's new `uploadDataset`
+  operation refuses unless the tenant's enrolled key is the device's own,
+  seals the object and the snapshot manifest under the session's tenant
+  (`HPK1`), and sends the upload body; 401 and 403 are shown clearly. The
+  form says that column names and types are stored in plaintext. The
+  publish form picks from the stored datasets instead of taking a slug.
+  `GET /api/v1/datasets` now gives each upload's declared `row_cap` and
+  `schema` and the upload size limit (`dataset_max_bytes`).
+  `fixtures/parquet/` holds Parquet schema vectors that the browser and the
+  enclave's own check read alike, and
+  `fixtures/envelope/hpk1-browser-upload.json` an upload body sealed by the
+  browser, which the backend stores and queries. `docs/BENCHMARKS.md`
+  records the upload timed at the 64 MiB limit in a real browser (about
+  0.6 s of browser work on an Apple M4, most of it the seal), with a
+  proposed target.
+
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -38,7 +63,7 @@ uses [Semantic Versioning](https://semver.org/).
   `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
   and answers a storage failure with 503 or 502, never an empty list; each
   listing is audited as `data.access`. `platform_connectors::snapshot`
-  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  gains `held_datasets`, `held_dataset` and `read_record`, and
   `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot

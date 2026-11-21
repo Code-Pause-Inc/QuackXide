@@ -10,6 +10,7 @@ import { HttpVault } from "../vault/httpVault";
 import { LocalVault } from "../vault/localVault";
 import type { VaultClient } from "../vault/types";
 import { generateMasterKey, keyFingerprint } from "./core";
+import { uploadDataset } from "./datasetUpload";
 import { createDeviceHpkeKey } from "./devicekey";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
 import { loadDeviceKeys, saveDeviceKeys, type DeviceKeys } from "./keystore";
@@ -154,10 +155,26 @@ async function context(id?: number): Promise<DriveContext> {
   };
 }
 
+/** A dataset upload seals to the device's existing key and never creates
+ *  one: key setup belongs to the drive's first-run acknowledgement. */
+async function existingKeys(): Promise<DeviceKeys | null> {
+  if (deviceKeys?.hpke) return deviceKeys;
+  return (await ensuring)?.keys ?? (await loadDeviceKeys());
+}
+
 async function dispatch(req: WorkerRequest): Promise<unknown> {
   switch (req.op) {
     case "session":
       return handleSession(req.token);
+    case "uploadDataset":
+      return uploadDataset(
+        {
+          keys: await existingKeys(),
+          session: session ? { token: session.token, claims: { ...session.claims } } : null,
+          apiBaseUrl: resolveBrand(import.meta.env).apiBaseUrl.replace(/\/$/, ""),
+        },
+        req,
+      );
     case "init":
       return handleInit();
     case "upload":

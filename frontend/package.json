@@ -15,6 +15,7 @@
     "bench:browser": "vitest bench --project 'browser*' --reporter=default --reporter=json --outputFile.json=.vitest/bench.json"
   },
   "dependencies": {
+    "hyparquet": "1.33.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
