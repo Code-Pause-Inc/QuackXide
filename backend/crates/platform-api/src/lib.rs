@@ -37,6 +37,7 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+mod research_replay;
 pub mod sealed;
 pub mod sweep;
 pub mod wiring;
@@ -109,6 +110,7 @@ struct ListEntry {
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub enum ApiError {
     Unauthorized,
     Forbidden,
