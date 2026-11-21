@@ -57,9 +57,11 @@ key that opens the data.
 
 1. **Ingress.** Drive files are encrypted in the browser (Web Crypto,
    non-extractable keys, AES-256-GCM). A steward uploads a research
-   dataset as Parquet sealed in the browser to the steward's HPKE key
-   (`PUT /api/v1/datasets/{dataset}`); each upload replaces the dataset's
-   snapshot, and its size is capped by `DATASET_MAX_MIB`.
+   dataset from the research portal as Parquet sealed in the browser to
+   the steward's HPKE key (`PUT /api/v1/datasets/{dataset}`); the browser
+   first reads only the file's footer to declare its schema, refusing a
+   file the enclave could not read (ADR 0014). Each upload replaces the
+   dataset's snapshot, and its size is capped by `DATASET_MAX_MIB`.
    `GET /api/v1/datasets` lists the steward's stored datasets as
    ciphertext: object ids and sizes, suite and upload time. Connector
    pipelines sync external sources into attested enclave memory, shape

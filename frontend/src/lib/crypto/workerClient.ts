@@ -2,7 +2,9 @@
 // responses so UI code never touches postMessage.
 
 import { resolveVaultConfig } from "../../config/vault";
+import type { DatasetUploadResult } from "./datasetUpload";
 import type {
+  DatasetUploadFields,
   DownloadResult,
   DriveFileSummary,
   InitResult,
@@ -95,5 +97,10 @@ export class DriveWorkerClient {
 
   remove(objectId: string): Promise<{ objectId: string }> {
     return this.call<{ objectId: string }>({ op: "remove", objectId });
+  }
+
+  /** Seal a Parquet file in the worker and upload it as a dataset. */
+  uploadDataset(fields: DatasetUploadFields): Promise<DatasetUploadResult> {
+    return this.call<DatasetUploadResult>({ op: "uploadDataset", ...fields });
   }
 }
