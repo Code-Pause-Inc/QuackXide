@@ -195,8 +195,9 @@ async fn the_same_nonce_with_another_envelope_is_refused() {
     let (status, _) = query(&app, researcher, &sealer.body(&grant_id, 1, AGG_SQL)).await;
     assert_eq!(status, StatusCode::OK);
     // Sealing again draws a new ephemeral key, so the frame differs.
-    let (status, _) = query(&app, researcher, &sealer.body(&grant_id, 1, AGG_SQL)).await;
+    let (status, refusal) = query(&app, researcher, &sealer.body(&grant_id, 1, AGG_SQL)).await;
     assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refusal, json!({ "error": "nonce_used" }));
     assert_eq!(remaining(&app, steward, &grant_id).await, 99);
 }
 
@@ -282,8 +283,11 @@ async fn replay_after_revoke_is_refused() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// A refused charge spends nothing, so its nonce is not kept: an exhausted
+/// grant cannot grow the replay store, and after a top-up the same request
+/// runs.
 #[tokio::test]
-async fn a_refused_charge_is_stored() {
+async fn a_refused_charge_is_not_recorded() {
     let (app, steward, researcher, grant_id) = granted(1).await;
     let sealer = Sealer::new(&app, researcher, steward).await;
     let (status, _) = query(&app, researcher, &sealer.body(&grant_id, 1, AGG_SQL)).await;
@@ -291,6 +295,15 @@ async fn a_refused_charge_is_stored() {
     let refused = sealer.body(&grant_id, 2, AGG_SQL);
     let (status, _) = query(&app, researcher, &refused).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    let (status, _) = query(&app, researcher, &refused).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/grants/{grant_id}/budget"),
+        &token_for(steward),
+        r#"{"additional":1}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = query(&app, researcher, &refused).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(remaining(&app, steward, &grant_id).await, 0);
 }

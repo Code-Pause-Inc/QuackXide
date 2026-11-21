@@ -233,13 +233,16 @@ budget:
 | Frame does not open, or plaintext malformed | 400 |
 | `recipient_key` differs from the researcher's enrolled key | 403 |
 | Grant missing, revoked, or not `grant_id` | as today |
-| `request_nonce` already recorded with another envelope, its query still running, or its stored response expired | 409 |
+| `request_nonce` already recorded with another envelope, its query still running, or its stored response expired | 409, `nonce_used`, `query_running` or `response_expired` |
 
 Replay protection and retries: each key set keeps its recorded nonces in
 memory. A nonce is inserted, atomically and only if absent, immediately
 before the budget charge (wherever P54 places it), with the SHA-256 of its
-envelope, and stays recorded whatever follows. Once the query finishes,
-its signed response is stored with it.
+envelope. It stays recorded whatever follows, unless the charge is refused:
+a refused charge spends nothing, so its nonce is dropped and the same
+request can be sent again. Every recorded nonce was charged a unit, which
+bounds the store. Once the query finishes, its signed response is stored
+with it.
 
 * A request whose nonce and envelope digest match a recorded entry gets
   the stored response again, with no new charge, so a client that lost a
@@ -247,9 +250,9 @@ its signed response is stored with it.
   result is sealed to the researcher.
 * The same nonce with a different envelope is refused with 409, and so is
   a retry while the first query is still running.
-* A query that ended in an error stores that error response. The client
-  retries under a new nonce, and whether that is charged again follows
-  P54's budget order.
+* A query that ended in an error after its charge stores that error
+  response, replayed unchanged. The client retries under a new nonce, and
+  whether that is charged again follows P54's budget order.
 
 A stored response is dropped one token lifetime (an hour) after it is
 stored, since a client retries within its session, which lasts at most

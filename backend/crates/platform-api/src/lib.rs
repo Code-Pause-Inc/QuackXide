@@ -141,6 +141,15 @@ pub enum ApiError {
     /// A sealed research query names a key set the enclave no longer holds:
     /// the client attests again and re-sends (409, ADR 0010).
     Reattest,
+    /// The sealed query's request nonce came with another envelope before:
+    /// re-seal under a new nonce (409).
+    NonceUsed,
+    /// The query under this request nonce is still running: send the same
+    /// request again later (409).
+    QueryRunning,
+    /// The stored response for this request nonce has expired: re-seal
+    /// under a new nonce (409).
+    ResponseExpired,
     /// Query rejected by the zero-knowledge policy gate.
     QueryRejected(&'static str),
     /// Research query refused: the grant's query budget is spent. The
@@ -215,6 +224,9 @@ impl ApiError {
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
             ApiError::Reattest => "reattest",
+            ApiError::NonceUsed => "nonce_used",
+            ApiError::QueryRunning => "query_running",
+            ApiError::ResponseExpired => "response_expired",
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
             ApiError::ListTooLarge => "list_too_large",
@@ -305,8 +317,12 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "enclave attestation unavailable",
             ),
-            // The browser matches this message to attest again (#239).
+            // The browser matches these messages to attest again, re-seal or
+            // wait (#239).
             ApiError::Reattest => (StatusCode::CONFLICT, "reattest"),
+            ApiError::NonceUsed => (StatusCode::CONFLICT, "nonce_used"),
+            ApiError::QueryRunning => (StatusCode::CONFLICT, "query_running"),
+            ApiError::ResponseExpired => (StatusCode::CONFLICT, "response_expired"),
             ApiError::QueryRejected(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::BudgetExhausted => (
                 StatusCode::TOO_MANY_REQUESTS,
