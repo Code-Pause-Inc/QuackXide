@@ -312,6 +312,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* Zero-knowledge and research queries release a `SUM` or `AVG` as null
+  when one or two rows dominate it: when the group's absolute values,
+  less the two largest, total under *p*% of the largest, so that anyone
+  who knows the second-largest would learn the largest to within *p*%
+  (the p% rule, ADR 0015, proposed; P58). The mask is applied inside the
+  plan, directly above the aggregate, so `HAVING`, `ORDER BY` and derived
+  columns read the masked value, and the hidden aggregates it uses never
+  reach the result. The row keeps `n` and its other cells, and
+  `suppressed_rows` still counts only rows below *k*. *p* is
+  `RESEARCH_DOMINANCE_PERCENT`: 10 when unset; a value that is not a whole
+  number refuses startup, and 0 refuses every zero-knowledge and research
+  query. A sum over fewer than three non-null values is masked unless
+  they are all zero. `SUM` and `AVG` with `DISTINCT`, or over an
+  interval, are refused.
 * `MIN` and `MAX` are refused in zero-knowledge and research queries,
   wherever they appear, `HAVING` and `ORDER BY` included (ADR 0015,
   proposed; P57). Each returns one row's value however large the cohort:

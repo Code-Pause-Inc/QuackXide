@@ -9,8 +9,8 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use platform_core::ZkMode;
 use quackxide_engine::{
-    EngineSettings, MinCountThreshold, QueryError, QueryLimit, QueryLimits, QueryScope,
-    blind_index_hex,
+    EngineSettings, MinCountThreshold, PercentRule, QueryError, QueryLimit, QueryLimits,
+    QueryScope, blind_index_hex,
 };
 
 const CUSTOMER_KEY: &[u8] = b"tenant-42/customer/index-key";
@@ -114,7 +114,7 @@ async fn blind_index_miss_returns_nothing() {
 #[tokio::test]
 async fn zk_mode_permits_aggregates_but_blocks_row_egress() {
     let mut scope = scope(ZkMode::Enabled);
-    scope.set_disclosure(Arc::new(MinCountThreshold { k: 2 }));
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: 2 }), PercentRule { p: 10 });
 
     // Aggregate query is allowed.
     let ok = scope
@@ -363,7 +363,7 @@ async fn suppressed_rows_do_not_count_toward_the_row_limit() {
             ..QueryLimits::default()
         },
     );
-    scope.set_disclosure(Arc::new(MinCountThreshold { k: 2 }));
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: 2 }), PercentRule { p: 10 });
     let rows = scope
         .sql_json("SELECT currency, COUNT(*) AS n FROM invoices GROUP BY currency")
         .await

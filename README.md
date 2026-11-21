@@ -71,8 +71,9 @@ key that opens the data.
 3. **Query.** Apache DataFusion runs inside the enclave over transiently
    decrypted Parquet. A logical-plan allowlist admits only simple aggregate
    queries; each must carry a genuine `COUNT(*) AS n`, and cohorts below
-   `RESEARCH_MIN_COHORT_SIZE` are suppressed. Blind indexes support
-   equality search without decryption.
+   `RESEARCH_MIN_COHORT_SIZE` are suppressed. A sum or mean that one or
+   two rows dominate is released as null (`RESEARCH_DOMINANCE_PERCENT`).
+   Blind indexes support equality search without decryption.
 4. **Research access.** A steward grants a researcher a finite query
    budget, spent before execution and never refunded. Research queries
    pass the same gate.

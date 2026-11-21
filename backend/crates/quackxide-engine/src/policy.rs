@@ -12,8 +12,10 @@
 //! rather than analysed. Grouping sets put subtotal rows beside group rows,
 //! so one result could be differenced to recover a suppressed cohort; `min`
 //! and `max` return one row's value however large the cohort (ADR 0015).
-//! The `COUNT(*) AS n` and minimum-cohort gates in [`crate::disclosure`]
-//! apply on top of this one.
+//! `SUM` and `AVG` take no `DISTINCT`: the p% rule ([`crate::dominance`])
+//! weighs each row as one contribution, not each distinct value. The
+//! `COUNT(*) AS n` and minimum-cohort gates in [`crate::disclosure`] and
+//! the p% rule apply on top of this one.
 //!
 //! [`expressions_cannot_fail`] adds a third check on the analyzed plan:
 //! every expression must be one that cannot fail at runtime, so a query's
@@ -252,10 +254,12 @@ fn is_grouping_set(expr: &Expr) -> bool {
 }
 
 /// A permitted function over plain columns or literals, with no `FILTER`
-/// or ordering, so it cannot be narrowed to a subset of its group.
+/// or ordering, so it cannot be narrowed to a subset of its group, and no
+/// `DISTINCT` on a sum or mean.
 fn is_permitted_aggregate(expr: &Expr) -> bool {
     aggregate_call(expr).is_some_and(|agg| {
         PERMITTED_AGGREGATES.contains(&agg.func.name())
+            && !(agg.params.distinct && crate::dominance::is_masked(agg))
             && agg.params.filter.is_none()
             && agg.params.order_by.is_empty()
             && agg

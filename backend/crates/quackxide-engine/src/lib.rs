@@ -12,7 +12,8 @@
 //!   the engine never sees plaintext.
 //! * **In-enclave analytics**: SQL over the decrypted frames, which live only
 //!   for the scope's lifetime. In `ZkMode::Enabled` the [`policy`] gate
-//!   restricts results to aggregates, and [`disclosure`] requires a genuine
+//!   restricts results to aggregates, [`dominance`] masks sums and means
+//!   that one or two rows dominate, and [`disclosure`] requires a genuine
 //!   `COUNT(*) AS n` and suppresses cohorts below the minimum size.
 //!
 //! A scope enforces its share of the [`QueryLimits`]: the Parquet footers
@@ -30,12 +31,14 @@ use arrow::datatypes::{DataType, Schema};
 use bytes::Bytes;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{DataFusionError, exec_err};
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::SchedulingType;
@@ -51,10 +54,12 @@ use url::Url;
 
 pub mod blind;
 pub mod disclosure;
+pub mod dominance;
 pub mod policy;
 
 pub use blind::blind_index_hex;
 pub use disclosure::{DisclosurePolicy, MinCountThreshold};
+pub use dominance::PercentRule;
 pub use platform_core::{QueryLimit, QueryLimits};
 
 #[derive(Debug, thiserror::Error)]
@@ -168,7 +173,7 @@ pub struct QueryScope {
     ctx: SessionContext,
     settings: EngineSettings,
     tables: Vec<String>,
-    disclosure: Option<Arc<dyn DisclosurePolicy>>,
+    disclosure: Option<(Arc<dyn DisclosurePolicy>, PercentRule)>,
     /// Rows withheld by disclosure control in the most recent query.
     last_suppressed_rows: AtomicUsize,
 }
@@ -190,11 +195,12 @@ impl QueryScope {
         }
     }
 
-    /// Attach a result-egress disclosure policy. Required in
-    /// `ZkMode::Enabled`; attaching one also activates the aggregate-only
-    /// and `COUNT(*) AS n` plan requirements.
-    pub fn set_disclosure(&mut self, policy: Arc<dyn DisclosurePolicy>) {
-        self.disclosure = Some(policy);
+    /// Attach disclosure control: `rule` masks dominated sums and means
+    /// inside the plan ([`dominance`]), and `policy` runs on the result
+    /// before egress. Required in `ZkMode::Enabled`; attaching it also
+    /// activates the aggregate-only and `COUNT(*) AS n` plan requirements.
+    pub fn set_disclosure(&mut self, policy: Arc<dyn DisclosurePolicy>, rule: PercentRule) {
+        self.disclosure = Some((policy, rule));
     }
 
     pub fn last_suppressed_rows(&self) -> usize {
@@ -321,14 +327,16 @@ impl QueryScope {
         Ok(usize::try_from(rows).unwrap_or(usize::MAX))
     }
 
-    /// Run SQL over the registered frames. In `ZkMode::Enabled`, or with a
-    /// disclosure policy attached, the plan must pass the aggregate-only
-    /// allowlist and carry a genuine `COUNT(*) AS n`, a disclosure policy is
-    /// required, and results pass through it before egress. A result with
-    /// more rows than [`QueryLimits::max_result_rows`] after disclosure
-    /// control is refused, as is a query whose operators run out of the
-    /// scope's memory pool. Without a disclosure policy the result is
-    /// refused as soon as it passes the row limit, and the plan stops.
+    /// Run SQL over the registered frames. In `ZkMode::Enabled`, or with
+    /// disclosure control attached, the plan must pass the aggregate-only
+    /// allowlist and carry a genuine `COUNT(*) AS n`, disclosure control is
+    /// required, sums and means that one or two rows dominate are masked
+    /// inside the plan ([`dominance`]), and results pass through the
+    /// disclosure policy before egress. A result with more rows than
+    /// [`QueryLimits::max_result_rows`] after disclosure control is
+    /// refused, as is a query whose operators run out of the scope's memory
+    /// pool. Without a disclosure policy the result is refused as soon as
+    /// it passes the row limit, and the plan stops.
     ///
     /// Dropping the returned future stops the plan at its next batch
     /// boundary: every operator yields to the runtime as it produces batches
@@ -361,20 +369,11 @@ impl QueryScope {
                 return Err(QueryError::ZkPolicy);
             }
             disclosure::verify_count_column(df.logical_plan())?;
-            // Coercion inserts casts that can fail, so check the analyzed plan
-            // (ADR 0011).
-            let state = self.ctx.state();
-            let analyzed = state
-                .analyzer()
-                .execute_and_check(df.logical_plan().clone(), state.config_options(), |_, _| {})
-                .map_err(|err| datafusion_error(ExecutionStage::Plan, &err))?;
-            if !policy::expressions_cannot_fail(&analyzed) {
-                return Err(QueryError::ZkPolicy);
-            }
+            self.check_expressions(df.logical_plan())?;
         }
-        let disclosure = match (&self.disclosure, gated) {
-            (Some(policy), _) => Some(policy),
-            (None, false) => None,
+        let (df, disclosure) = match (&self.disclosure, gated) {
+            (Some((policy, rule)), _) => (self.mask_dominated(df, *rule)?, Some(policy)),
+            (None, false) => (df, None),
             (None, true) => {
                 return Err(QueryError::Disclosure(
                     "zero-knowledge mode requires a disclosure policy".into(),
@@ -418,6 +417,32 @@ impl QueryScope {
             return Err(QueryError::LimitExceeded(QueryLimit::ResultRows));
         }
         Ok(batches)
+    }
+
+    /// Refuses a plan holding an expression that can fail at runtime (ADR
+    /// 0011). Coercion inserts casts that can fail, so the check runs on the
+    /// analyzed plan.
+    fn check_expressions(&self, plan: &LogicalPlan) -> Result<(), QueryError> {
+        let state = self.ctx.state();
+        let analyzed = state
+            .analyzer()
+            .execute_and_check(plan.clone(), state.config_options(), |_, _| {})
+            .map_err(|err| datafusion_error(ExecutionStage::Plan, &err))?;
+        if policy::expressions_cannot_fail(&analyzed) {
+            Ok(())
+        } else {
+            Err(QueryError::ZkPolicy)
+        }
+    }
+
+    /// `df` with its dominated sums and means masked (ADR 0015). A rule
+    /// below 1% refuses the query, and what the rewrite adds is held to the
+    /// same expression check as the caller's SQL.
+    fn mask_dominated(&self, df: DataFrame, rule: PercentRule) -> Result<DataFrame, QueryError> {
+        let rule = rule.check()?;
+        let plan = dominance::mask_dominated(df.into_unoptimized_plan(), rule)?;
+        self.check_expressions(&plan)?;
+        Ok(DataFrame::new(self.ctx.state(), plan))
     }
 
     /// Run a query and serialize its result rows to JSON. A result whose
