@@ -734,11 +734,6 @@ pub fn sim_attestation_router(signer: Arc<TokenSigner>) -> Router {
             "/v1/token",
             post(
                 |State(signer): State<Arc<TokenSigner>>, Json(req): Json<TokenRequest>| async move {
-                    let lifetime = Duration::from_secs(3600);
-                    if req.env.is_empty() {
-                        let token = signer.sign(&req.audience, &req.nonces, lifetime);
-                        return Ok(Json(json!({ "token": token })));
-                    }
                     if req
                         .env
                         .keys()
@@ -746,8 +741,11 @@ pub fn sim_attestation_router(signer: Arc<TokenSigner>) -> Router {
                     {
                         return Err(StatusCode::BAD_REQUEST);
                     }
-                    let signer = signer.with_env(req.env);
-                    let token = signer.sign(&req.audience, &req.nonces, lifetime);
+                    let token = signer.with_env(req.env).sign(
+                        &req.audience,
+                        &req.nonces,
+                        Duration::from_secs(3600),
+                    );
                     Ok(Json(json!({ "token": token })))
                 },
             ),

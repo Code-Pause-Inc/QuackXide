@@ -4,7 +4,11 @@
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match platform_api::checker::run(&args, &reqwest::Client::new()).await {
+    let result = match platform_api::checker::client() {
+        Ok(http) => platform_api::checker::run(&args, &http).await,
+        Err(err) => Err(err),
+    };
+    match result {
         Ok(out) => println!("{out}"),
         Err(err) => {
             eprintln!("{err}");

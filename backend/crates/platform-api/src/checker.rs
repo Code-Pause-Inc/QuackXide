@@ -32,6 +32,27 @@ const USAGE: &str = "usage:
 trust: --issuer <iss> --jwks-url <url> --image-digest <sha256:...> (repeatable);
        required, over https, in a release build";
 
+/// The flags each command takes; any other is refused, so a misspelt trust
+/// flag cannot fall back to the defaults unnoticed.
+const VERIFY_FLAGS: &[&str] = &["--api", "--issuer", "--jwks-url", "--image-digest"];
+const SEAL_QUERY_FLAGS: &[&str] = &[
+    "--api",
+    "--issuer",
+    "--jwks-url",
+    "--image-digest",
+    "--researcher",
+    "--grant",
+    "--steward",
+    "--connector",
+    "--recipient-key",
+    "--nonce",
+    "--sql",
+];
+
+/// The largest response body the checker reads: a bundle or a key set is a
+/// few tens of KiB (`MAX_TOKEN_BYTES` caps the token at 16 KiB).
+const MAX_FETCH_BYTES: usize = 256 * 1024;
+
 /// Who signs attestation tokens and which images are allowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trust {
@@ -55,16 +76,16 @@ fn dev_trust() -> Trust {
 struct Flags(Vec<(String, String)>);
 
 impl Flags {
-    fn parse(args: &[String]) -> Result<Self, String> {
+    fn parse(args: &[String], allowed: &[&str]) -> Result<Self, String> {
         let mut pairs = Vec::new();
         let mut it = args.iter();
         while let Some(flag) = it.next() {
+            if !allowed.contains(&flag.as_str()) {
+                return Err(format!("unexpected {flag}\n{USAGE}"));
+            }
             let value = it
                 .next()
                 .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))?;
-            if !flag.starts_with("--") {
-                return Err(format!("unexpected {flag}\n{USAGE}"));
-            }
             if flag != "--image-digest" && pairs.iter().any(|(f, _)| f == flag) {
                 return Err(format!("{flag} given twice"));
             }
@@ -208,21 +229,50 @@ async fn attest(
     Ok((bundle, verified))
 }
 
+/// The HTTP client the binary uses: `https` only in a release build, on
+/// redirects too, so "over `https`" holds past the first hop.
+pub fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .https_only(!cfg!(feature = "dev"))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))
+}
+
+/// GET `url` as JSON, reading at most [`MAX_FETCH_BYTES`] of it.
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<T, String> {
-    let response = http
+    let too_large = || {
+        format!(
+            "{url} returned more than {MAX_FETCH_BYTES} bytes, larger than any bundle or key set"
+        )
+    };
+    let mut response = http
         .get(url)
         .timeout(Duration::from_secs(10))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|_| format!("{url} is unreachable or refused"))?;
-    response
-        .json()
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_FETCH_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| format!("{url} did not return the expected JSON"))
+        .map_err(|_| format!("{url} broke off its response"))?
+    {
+        if body.len() + chunk.len() > MAX_FETCH_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| format!("{url} did not return the expected JSON"))
 }
 
 /// Run `enclave-check` with `args` (without the program name). `Ok` is what
@@ -241,7 +291,12 @@ async fn run_with(
     defaults: Option<Trust>,
 ) -> Result<String, String> {
     let (command, rest) = args.split_first().ok_or_else(|| USAGE.to_owned())?;
-    let flags = Flags::parse(rest)?;
+    let allowed: &[&str] = match command.as_str() {
+        "verify" => VERIFY_FLAGS,
+        "seal-query" => SEAL_QUERY_FLAGS,
+        _ => &[],
+    };
+    let flags = Flags::parse(rest, allowed)?;
     match command.as_str() {
         "verify" => {
             let api = flags.require("--api")?;
@@ -319,7 +374,7 @@ mod tests {
     }
 
     fn release_trust(list: &[&str]) -> Result<Trust, String> {
-        let flags = Flags::parse(&args(list)).unwrap();
+        let flags = Flags::parse(&args(list), VERIFY_FLAGS).unwrap();
         let api = flags
             .get("--api")
             .unwrap_or("https://api.example")
@@ -381,7 +436,8 @@ mod tests {
             jwks_url: "http://sim/jwks".to_owned(),
             image_digests: vec!["sha256:sim".to_owned()],
         };
-        let flags = Flags::parse(&args(&["--jwks-url", "http://other/jwks"])).unwrap();
+        let flags =
+            Flags::parse(&args(&["--jwks-url", "http://other/jwks"]), VERIFY_FLAGS).unwrap();
         let trust = trust_from(&flags, "http://api", Some(defaults)).unwrap();
         assert_eq!(trust.issuer, "urn:sim");
         assert_eq!(trust.jwks_url, "http://other/jwks");
@@ -390,7 +446,40 @@ mod tests {
 
     #[test]
     fn a_flag_given_twice_is_refused() {
-        assert!(Flags::parse(&args(&["--api", "a", "--api", "b"])).is_err());
+        assert!(Flags::parse(&args(&["--api", "a", "--api", "b"]), VERIFY_FLAGS).is_err());
+    }
+
+    /// A misspelt trust flag must not fall back to the defaults unnoticed.
+    #[test]
+    fn an_unknown_flag_is_refused() {
+        let err = Flags::parse(&args(&["--api", "a", "--imagedigest", "x"]), VERIFY_FLAGS)
+            .err()
+            .expect("refused");
+        assert!(err.contains("--imagedigest"), "{err}");
+        assert!(Flags::parse(&args(&["--sql", "q"]), VERIFY_FLAGS).is_err());
+        assert!(Flags::parse(&args(&["--sql", "q"]), SEAL_QUERY_FLAGS).is_ok());
+    }
+
+    /// A hostile endpoint cannot make the checker buffer an unbounded body.
+    #[tokio::test]
+    async fn an_oversized_response_is_refused() {
+        let body = "x".repeat(MAX_FETCH_BYTES + 1);
+        let router = axum::Router::new().route(
+            "/big",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/big", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let err = fetch_json::<serde_json::Value>(&reqwest::Client::new(), &url)
+            .await
+            .unwrap_err();
+        assert!(err.contains("larger"), "{err}");
     }
 
     /// An `HPK1` request key is refused even when the bundle is otherwise
