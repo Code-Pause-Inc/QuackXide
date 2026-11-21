@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Browser envelope seal benchmark (P34 checkpoint A, #171).
+  `scripts/bench-wasm-seal.sh` seals synthetic Parquet from `synth-data`
+  at about 1 MiB, 100 MiB and 1 GiB with the wasm module in a Chromium
+  worker and reports seal time, the module's peak memory, module load time
+  and bundle size. The `bench` workflow's `wasm-seal` job runs it and
+  reports only. `docs/BENCHMARKS.md` records the baseline (about 50 MiB/s,
+  a module peak of three times the payload, 31.8 KiB brotli-compressed)
+  and the largest payload one seal can take (about 1.33 GiB).
 * The base for sealed research queries and results (ADR 0010; part of P85
   and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
   together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must

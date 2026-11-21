@@ -12,6 +12,7 @@
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run --project node --project dom",
     "test:browser": "vitest run --project 'browser*'",
+    "bench:seal": "vitest run --project seal",
     "bench:browser": "vitest bench --project 'browser*' --reporter=default --reporter=json --outputFile.json=.vitest/bench.json"
   },
   "dependencies": {

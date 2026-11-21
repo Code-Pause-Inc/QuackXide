@@ -49,6 +49,9 @@ Every pull request runs:
   job summary; a benchmark significantly more than 10 % slower is flagged
   as a warning, and the job fails only when the comparison cannot run (not
   a required check);
+* when the browser envelope module or `backend/` changes, the wasm envelope
+  seal in Chromium (`docs/BENCHMARKS.md`), in the job summary (report only,
+  never fails on the numbers);
 * the browser tests (`npm run test:browser`) in Chromium. Pushes to `main`
   and a nightly run add Firefox and WebKit.
 
