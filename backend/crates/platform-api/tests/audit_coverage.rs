@@ -13,7 +13,9 @@ use axum::Router;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
-use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
+use platform_api::query::{
+    ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider, ResearchRequest,
+};
 use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
@@ -1780,7 +1782,10 @@ async fn resource_limit_refusals_are_audited() {
     let research_sql = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency";
     assert!(
         service
-            .research_query(researcher, steward, &connector, research_sql)
+            .research_query(
+                researcher,
+                ResearchRequest::plain(steward, connector.clone(), research_sql)
+            )
             .await
             .is_err()
     );

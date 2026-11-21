@@ -6,9 +6,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use platform_core::{ConnectorSlug, TenantId};
-use platform_crypto::{
-    CryptoError, EnvelopeSuite, ResultSignature, SuitePolicy, TenantPublicKey, info,
-};
+use platform_crypto::{CryptoError, EnvelopeSuite, ResultSignature, SuitePolicy, info};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -79,7 +77,6 @@ pub(crate) struct OpenedQuery {
     pub connector: ConnectorSlug,
     pub sql: Zeroizing<String>,
     pub request_nonce: [u8; 32],
-    pub recipient_key: TenantPublicKey,
     pub grant_id: String,
     /// SHA-256 of the sealed frame, which the replay store records.
     pub envelope_digest: [u8; 32],
@@ -112,9 +109,10 @@ pub(crate) fn open_sealed(
         .map_err(|_| DOES_NOT_OPEN)?;
     let plaintext = SealedQueryPlaintext::parse(opened.expose())?;
     let request_nonce = plaintext.request_nonce_bytes()?;
-    // Either suite until the browser seals with HPK2 (P36); matching the
-    // enrolled key is P55's (ADR 0010 "Recipient key", "No downgrade").
-    let recipient_key = plaintext
+    // Only checked here: P55 keeps it, matches it to the enrolled key and
+    // seals the result to it. Either suite until the browser seals with HPK2
+    // (P36; ADR 0010 "Recipient key", "No downgrade").
+    plaintext
         .recipient_key
         .to_public_key(SuitePolicy::DEVELOPMENT)
         .map_err(|_| ApiError::BadRequest("malformed recipient key"))?;
@@ -129,7 +127,6 @@ pub(crate) fn open_sealed(
         connector,
         sql: plaintext.sql,
         request_nonce,
-        recipient_key,
         grant_id: request.grant_id.clone(),
         envelope_digest: Sha256::digest(&frame).into(),
     })

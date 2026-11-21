@@ -42,9 +42,7 @@ pub mod sealed;
 pub mod sweep;
 pub mod wiring;
 use admin::ProvisioningService;
-use query::{
-    ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
-};
+use query::{ConnectorQueryService, GrantRequest, QueryRequest, ResearchRequest, TopUpRequest};
 use research::ResearchService;
 
 /// 4 MiB plaintext chunk + GCM tag + IV prefix, with headroom.
@@ -762,22 +760,51 @@ async fn list_grants(
     Ok(Json(research.list_grants(tenant).await?))
 }
 
+/// `POST /api/v1/research/query`'s body: sealed to the enclave (ADR 0010),
+/// or, only in `dev` builds, the plaintext query. A release build does not
+/// compile the plaintext shape, whatever its configuration.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResearchQueryBody {
+    Sealed(sealed::SealedQueryRequest),
+    #[cfg(feature = "dev")]
+    Plain(query::ResearchQueryRequest),
+}
+
 async fn run_research_query(
     State(state): State<AppState>,
     Extension(AuthedTenant(researcher)): Extension<AuthedTenant>,
-    Json(req): Json<ResearchQueryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Json(body): Json<ResearchQueryBody>,
+) -> Result<Response, ApiError> {
     let service = query_service(&state)?;
-    let steward: TenantId = req
-        .steward_tenant
-        .parse()
-        .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
-    let connector = ConnectorSlug::new(&req.connector)
-        .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
-    let result = service
-        .research_query(researcher, steward, &connector, &req.sql)
-        .await?;
-    Ok(Json(result))
+    let response = match body {
+        ResearchQueryBody::Sealed(request) => {
+            let opened = sealed::open_sealed(service.identity(), researcher, &request)?;
+            service
+                .run_detached(researcher, ResearchRequest::from(opened))
+                .await?
+        }
+        #[cfg(feature = "dev")]
+        ResearchQueryBody::Plain(request) => {
+            let steward: TenantId = request
+                .steward_tenant
+                .parse()
+                .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
+            let connector = ConnectorSlug::new(&request.connector)
+                .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
+            service
+                .research_query(
+                    researcher,
+                    ResearchRequest::plain(steward, connector, &request.sql),
+                )
+                .await?
+        }
+    };
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        response.expose().to_vec(),
+    )
+        .into_response())
 }
 
 // ── Drive ────────────────────────────────────────────────────────────────────

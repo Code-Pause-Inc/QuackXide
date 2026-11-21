@@ -8,8 +8,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use axum::http::header;
-use axum::response::{IntoResponse, Response};
 use platform_crypto::SecretBytes;
 
 use crate::ApiError;
@@ -31,19 +29,6 @@ impl Clone for StoredOutcome {
         match self {
             Self::Ok(body) => Self::Ok(SecretBytes::new(body.expose().to_vec())),
             Self::Err(err) => Self::Err(err.clone()),
-        }
-    }
-}
-
-impl IntoResponse for StoredOutcome {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Ok(body) => (
-                [(header::CONTENT_TYPE, "application/json")],
-                body.expose().to_vec(),
-            )
-                .into_response(),
-            Self::Err(err) => err.into_response(),
         }
     }
 }
