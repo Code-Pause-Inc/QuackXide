@@ -1,16 +1,20 @@
 //! Wire types for sealed research queries and results (ADR 0010 "Sealed
 //! request" and "Sealed and signed result"). Byte fields are base64url
-//! without padding, and unknown fields are refused. P85 and P55 give them
-//! behaviour; nothing routes to them yet.
+//! without padding, and unknown fields are refused. [`open_sealed`] opens a
+//! sealed query inside the enclave; the sealed result is P55's.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use platform_crypto::{CryptoError, ResultSignature};
+use platform_core::{ConnectorSlug, TenantId};
+use platform_crypto::{
+    CryptoError, EnvelopeSuite, ResultSignature, SuitePolicy, TenantPublicKey, info,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::ApiError;
-use crate::key_release::{KeyWire, decode_b64url_32};
+use crate::key_release::{EnclaveIdentity, KeyWire, decode_b64url_32};
 
 /// `POST /api/v1/research/query`'s sealed body. `grant_id` is in the clear,
 /// because the enclave needs `info` before it can open `envelope`.
@@ -67,6 +71,68 @@ impl SealedQueryPlaintext {
             "request nonce must be 32 bytes of base64url",
         ))
     }
+}
+
+/// A sealed query, opened and parsed inside the enclave.
+pub(crate) struct OpenedQuery {
+    pub steward: TenantId,
+    pub connector: ConnectorSlug,
+    pub sql: Zeroizing<String>,
+    pub request_nonce: [u8; 32],
+    pub recipient_key: TenantPublicKey,
+    pub grant_id: String,
+    /// SHA-256 of the sealed frame, which the replay store records.
+    pub envelope_digest: [u8; 32],
+}
+
+/// Open `request` as `researcher` sent it, in ADR 0010's order: the version,
+/// then the key set (409 `reattest`), then the frame under
+/// `research_query(suite, researcher, grant_id)`, then its plaintext. Every
+/// failure after the key set is a 400.
+pub(crate) fn open_sealed(
+    identity: &EnclaveIdentity,
+    researcher: TenantId,
+    request: &SealedQueryRequest,
+) -> Result<OpenedQuery, ApiError> {
+    const DOES_NOT_OPEN: ApiError = ApiError::BadRequest("sealed query does not open");
+    if request.version != 1 {
+        return Err(ApiError::BadRequest("unsupported sealed query version"));
+    }
+    if request.key_id != identity.key_id() {
+        return Err(ApiError::Reattest);
+    }
+    let frame = URL_SAFE_NO_PAD
+        .decode(&request.envelope)
+        .map_err(|_| DOES_NOT_OPEN)?;
+    let suite = EnvelopeSuite::of_envelope(&frame).map_err(|_| DOES_NOT_OPEN)?;
+    let info = info::research_query(suite, &researcher.to_string(), &request.grant_id)
+        .map_err(|_| DOES_NOT_OPEN)?;
+    let opened = identity
+        .open_request(&info, &frame)
+        .map_err(|_| DOES_NOT_OPEN)?;
+    let plaintext = SealedQueryPlaintext::parse(opened.expose())?;
+    let request_nonce = plaintext.request_nonce_bytes()?;
+    // Either suite until the browser seals with HPK2 (P36); matching the
+    // enrolled key is P55's (ADR 0010 "Recipient key", "No downgrade").
+    let recipient_key = plaintext
+        .recipient_key
+        .to_public_key(SuitePolicy::DEVELOPMENT)
+        .map_err(|_| ApiError::BadRequest("malformed recipient key"))?;
+    let steward = plaintext
+        .steward_tenant
+        .parse()
+        .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
+    let connector = ConnectorSlug::new(&plaintext.connector)
+        .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
+    Ok(OpenedQuery {
+        steward,
+        connector,
+        sql: plaintext.sql,
+        request_nonce,
+        recipient_key,
+        grant_id: request.grant_id.clone(),
+        envelope_digest: Sha256::digest(&frame).into(),
+    })
 }
 
 /// A successful sealed research response: the sealed result and both
@@ -256,6 +322,204 @@ mod tests {
                 plaintext(bad).request_nonce_bytes(),
                 Err(ApiError::BadRequest(_))
             ));
+        }
+    }
+
+    mod open {
+        use platform_core::TenantId;
+        use platform_crypto::{EnvelopeSuite, TenantKeypair, hpke_seal_to_tenant, info};
+        use sha2::{Digest, Sha256};
+
+        use super::*;
+        use crate::key_release::EnclaveIdentity;
+
+        const GRANT: &str = "11111111-2222-4333-8444-555555555555";
+
+        fn plaintext(steward: TenantId) -> Value {
+            let recipient = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+            json!({
+                "steward_tenant": steward.to_string(),
+                "connector": "health",
+                "sql": "SELECT condition, COUNT(*) AS n FROM health GROUP BY condition",
+                "request_nonce": URL_SAFE_NO_PAD.encode([6u8; 32]),
+                "recipient_key": KeyWire::from_public_key(&recipient),
+            })
+        }
+
+        /// `body` sealed to `identity` as `researcher` would seal it under
+        /// `grant`.
+        fn seal(
+            identity: &EnclaveIdentity,
+            researcher: TenantId,
+            grant: &str,
+            body: &Value,
+        ) -> SealedQueryRequest {
+            let info = info::research_query(EnvelopeSuite::Hpk2, &researcher.to_string(), grant)
+                .expect("info");
+            let frame = hpke_seal_to_tenant(
+                &identity.request_public_key(),
+                &info,
+                &serde_json::to_vec(body).expect("json"),
+            )
+            .expect("seal");
+            SealedQueryRequest {
+                version: 1,
+                key_id: identity.key_id().to_owned(),
+                grant_id: grant.to_owned(),
+                envelope: URL_SAFE_NO_PAD.encode(frame),
+            }
+        }
+
+        fn bad_request(result: Result<OpenedQuery, ApiError>) -> bool {
+            matches!(result, Err(ApiError::BadRequest(_)))
+        }
+
+        #[test]
+        fn a_sealed_query_opens() {
+            let identity = EnclaveIdentity::generate();
+            let (researcher, steward) = (TenantId::generate(), TenantId::generate());
+            let request = seal(&identity, researcher, GRANT, &plaintext(steward));
+            let opened = open_sealed(&identity, researcher, &request)
+                .ok()
+                .expect("opens");
+            assert_eq!(opened.steward, steward);
+            assert_eq!(opened.connector.as_str(), "health");
+            assert!(opened.sql.starts_with("SELECT condition"));
+            assert_eq!(opened.request_nonce, [6u8; 32]);
+            assert_eq!(opened.grant_id, GRANT);
+            let frame = URL_SAFE_NO_PAD.decode(&request.envelope).unwrap();
+            assert_eq!(
+                opened.envelope_digest,
+                <[u8; 32]>::from(Sha256::digest(frame))
+            );
+        }
+
+        #[test]
+        fn an_unknown_key_id_asks_to_reattest() {
+            let identity = EnclaveIdentity::generate();
+            let researcher = TenantId::generate();
+            let stale = SealedQueryRequest {
+                key_id: "stale".to_owned(),
+                envelope: "!!".to_owned(),
+                ..seal(
+                    &identity,
+                    researcher,
+                    GRANT,
+                    &plaintext(TenantId::generate()),
+                )
+            };
+            assert!(matches!(
+                open_sealed(&identity, researcher, &stale),
+                Err(ApiError::Reattest)
+            ));
+        }
+
+        #[test]
+        fn version_2_is_refused() {
+            let identity = EnclaveIdentity::generate();
+            let researcher = TenantId::generate();
+            let request = SealedQueryRequest {
+                version: 2,
+                ..seal(
+                    &identity,
+                    researcher,
+                    GRANT,
+                    &plaintext(TenantId::generate()),
+                )
+            };
+            assert!(bad_request(open_sealed(&identity, researcher, &request)));
+        }
+
+        #[test]
+        fn another_enclaves_frame_does_not_open() {
+            let (identity, other) = (EnclaveIdentity::generate(), EnclaveIdentity::generate());
+            let researcher = TenantId::generate();
+            let request = SealedQueryRequest {
+                key_id: identity.key_id().to_owned(),
+                ..seal(&other, researcher, GRANT, &plaintext(TenantId::generate()))
+            };
+            assert!(bad_request(open_sealed(&identity, researcher, &request)));
+        }
+
+        #[test]
+        fn another_researchers_envelope_does_not_open() {
+            let identity = EnclaveIdentity::generate();
+            let request = seal(
+                &identity,
+                TenantId::generate(),
+                GRANT,
+                &plaintext(TenantId::generate()),
+            );
+            assert!(bad_request(open_sealed(
+                &identity,
+                TenantId::generate(),
+                &request
+            )));
+        }
+
+        #[test]
+        fn another_grant_id_does_not_open() {
+            let identity = EnclaveIdentity::generate();
+            let researcher = TenantId::generate();
+            let request = SealedQueryRequest {
+                grant_id: "66666666-7777-4888-9999-000000000000".to_owned(),
+                ..seal(
+                    &identity,
+                    researcher,
+                    GRANT,
+                    &plaintext(TenantId::generate()),
+                )
+            };
+            assert!(bad_request(open_sealed(&identity, researcher, &request)));
+        }
+
+        #[test]
+        fn nonce_must_be_32_bytes() {
+            let identity = EnclaveIdentity::generate();
+            let researcher = TenantId::generate();
+            for len in [31, 33] {
+                let mut body = plaintext(TenantId::generate());
+                body["request_nonce"] = json!(URL_SAFE_NO_PAD.encode(vec![6u8; len]));
+                let request = seal(&identity, researcher, GRANT, &body);
+                assert!(
+                    bad_request(open_sealed(&identity, researcher, &request)),
+                    "{len}"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_fields_are_refused() {
+            let identity = EnclaveIdentity::generate();
+            let researcher = TenantId::generate();
+            let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+            let mislabelled = json!({
+                "suite": "HPK2",
+                "public_key": URL_SAFE_NO_PAD.encode(hpk1.to_raw()),
+            });
+            let cases = [
+                (
+                    "recipient_key",
+                    json!({ "suite": "HPK3", "public_key": "cGs" }),
+                ),
+                (
+                    "recipient_key",
+                    json!({ "suite": "HPK2", "public_key": "cGs" }),
+                ),
+                ("recipient_key", mislabelled),
+                ("steward_tenant", json!("not-a-tenant")),
+                ("connector", json!("Not A Slug")),
+                ("extra", json!(1)),
+            ];
+            for (field, value) in cases {
+                let mut body = plaintext(TenantId::generate());
+                body[field] = value;
+                let request = seal(&identity, researcher, GRANT, &body);
+                assert!(
+                    bad_request(open_sealed(&identity, researcher, &request)),
+                    "{field}"
+                );
+            }
         }
     }
 }
