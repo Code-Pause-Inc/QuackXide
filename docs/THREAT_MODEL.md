@@ -54,7 +54,8 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | Inflated cohort counts (self-joins, `UNION ALL`, `UNNEST`, table functions) | Plan allowlist: one table scan under one aggregate; joins and set operations refused | Built, tested (`tests/bypass.rs`) |
 | Inflated cohort counts through storage (repeated connector syncs or steward re-uploads leaving every row several times) | A query reads one committed snapshot per dataset, and a re-upload replaces the snapshot rather than adding to it; a manifest that lists an object twice fails closed ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md), [ADR 0012](adr/0012-steward-dataset-upload.md)) | Built, tested (`query_api.rs`, `pipeline_e2e.rs`, `dataset_upload_api.rs`) |
 | Singling out one person inside a large group (`SUM(CASE WHEN id = …)`, computed columns, subquery expressions) | Aggregate arguments must be plain columns; subquery expressions refused | Built, tested |
-| Value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) | Aggregate allowlist: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Built, tested |
+| Value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) | Aggregate allowlist: `COUNT`, `SUM`, `AVG` | Built, tested |
+| One person's value through an extreme (`MAX(salary)` over *k* or more rows; `WHERE salary < <that max>` for the next value; an id range to say whose) | `MIN` and `MAX` refused wherever they appear, `HAVING` and `ORDER BY` included ([ADR 0015](adr/0015-refuse-min-max-and-mask-dominated-sums.md)) | Built, tested (`tests/bypass.rs`) |
 | Overlapping groups in one result (`ROLLUP`, `CUBE`, `GROUPING SETS`: a subtotal minus its published groups reveals a suppressed cohort) | Plan allowlist refuses grouping sets ([ADR 0002](adr/0002-refuse-grouping-sets-and-positional-subsets.md)) | Built, tested (`tests/bypass.rs`) |
 | Picking rows by position below the aggregate (`ORDER BY … LIMIT`/`OFFSET` in a subquery or CTE) | Plan allowlist: only filters and column renames below the aggregate | Built, tested (`tests/bypass.rs`) |
 | Running statements before the gate (`CREATE TABLE … AS`, `DROP TABLE`, `SET`, `PREPARE`) | Statements are refused before planning finishes, so nothing runs ahead of the plan gate | Built, tested (`tests/bypass.rs`) |
@@ -205,10 +206,19 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   on the input and the decoded dataset depend only on the dataset, and the
   result limits only on the rows released. Each probe costs a research
   query one unit; own-data queries have no budget (see above).
-* **Extreme values.** `MIN` and `MAX` over a cohort of at least *k* still
-  return one individual's actual value. This is standard for aggregate
-  release; removing them from the allowlist, or applying a dominance rule,
-  is a policy decision.
+* **Extreme values.** `MIN` and `MAX` are refused (ADR 0015). A `SUM`
+  over a cohort of at least *k* still comes close to one person's value
+  when one or two people hold most of the total, and so does `AVG`, which
+  is `SUM / n` with `n` released: on the bypass fixture, the total salary
+  of the one `ceo` and the six `eng` rows is 94% the `ceo`'s. The p% rule
+  that masks such a total is decided (ADR 0015) and to build (P58). It
+  will protect one released total at a time: two totals whose cohorts
+  differ by one person still give that person's value (overlapping-query
+  differencing, above).
+* **Rows, not people.** The cohort threshold counts rows, and so will the
+  p% rule. A dataset in which one person has several rows (visits,
+  transactions) must be prepared one row per person; otherwise a cohort
+  of *k* rows can hold fewer than *k* people.
 * **Browser private keys during an open.** The envelope suite's KEM is not
   in Web Crypto, so the device's HPKE private key is decrypted in the crypto
   worker and copied into wasm memory for each open. Both copies are zeroed

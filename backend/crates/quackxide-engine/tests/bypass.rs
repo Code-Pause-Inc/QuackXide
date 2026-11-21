@@ -8,6 +8,11 @@
 //! label, or small-cohort salary. `CASES` target the research gate,
 //! `ZK_CASES` the own-data query endpoint.
 //!
+//! `MIN` and `MAX` are refused wherever they appear: each returns one row's
+//! value however large the cohort (ADR 0015). Cases written for another
+//! check use `SUM` or `AVG`, so they reach that check instead of stopping
+//! at the aggregate allowlist.
+//!
 //! `leak()` checks each released row on its own, so it cannot see a leak
 //! that needs two rows of one result (a subtotal beside its parts). Any
 //! accepted shape whose groups overlap is therefore a defect; grouping sets
@@ -70,7 +75,7 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("group_count", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept", Rows(2)),
     ("count_one", "SELECT dept, COUNT(1) AS n FROM people GROUP BY dept", Rows(2)),
     ("total_count", "SELECT COUNT(*) AS n FROM people", Rows(1)),
-    ("sum_avg_min_max", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s, AVG(salary) AS a, MIN(salary) AS lo, MAX(salary) AS hi FROM people GROUP BY dept", Rows(2)),
+    ("sum_avg", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s, AVG(salary) AS a FROM people GROUP BY dept", Rows(2)),
     ("where", "SELECT dept, COUNT(*) AS n FROM people WHERE salary < 9000 GROUP BY dept", Rows(2)),
     ("having", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING COUNT(*) > 0", Rows(2)),
     ("order_limit", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY n DESC, dept LIMIT 1", Rows(1)),
@@ -136,7 +141,7 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("window_over_aggregate", "SELECT dept, COUNT(*) AS n, LAG(MAX(salary)) OVER (ORDER BY dept) AS prev FROM people GROUP BY dept", Rejected),
     ("window_below_aggregate", "SELECT dept, COUNT(*) AS n FROM (SELECT dept, COUNT(*) OVER () AS c FROM people) t GROUP BY dept", Rejected),
     // Grouping that isolates individuals.
-    ("group_by_id", "SELECT id, COUNT(*) AS n, MAX(salary) AS s FROM people GROUP BY id", Rows(0)),
+    ("group_by_id", "SELECT id, COUNT(*) AS n, SUM(salary) AS s FROM people GROUP BY id", Rows(0)),
     ("group_by_unique_expr", "SELECT id || dept AS k, COUNT(*) AS n FROM people GROUP BY id || dept", Rows(0)),
     ("group_by_salary", "SELECT salary, COUNT(*) AS n FROM people GROUP BY salary", Rows(0)),
     ("group_by_substr_id", "SELECT SUBSTR(id, 2, 2) AS k, COUNT(*) AS n FROM people GROUP BY SUBSTR(id, 2, 2)", Rejected),
@@ -157,16 +162,16 @@ const CASES: &[(&str, &str, Expect)] = &[
     // Sub-cohort isolation inside a large group.
     ("case_in_sum", "SELECT COUNT(*) AS n, SUM(CASE WHEN id = 'p15' THEN salary ELSE 0 END) AS s FROM people", Rejected),
     ("case_in_max", "SELECT COUNT(*) AS n, MAX(CASE WHEN dept = 'legal' THEN salary END) AS s FROM people", Rejected),
-    ("filter_on_value", "SELECT COUNT(*) AS n, MAX(salary) FILTER (WHERE dept = 'ceo') AS s FROM people", Rejected),
+    ("filter_on_value", "SELECT COUNT(*) AS n, SUM(salary) FILTER (WHERE dept = 'ceo') AS s FROM people", Rejected),
     ("arith_isolation", "SELECT COUNT(*) AS n, SUM(salary * CAST(id = 'p15' AS BIGINT)) AS s FROM people", Rejected),
-    ("computed_below", "SELECT COUNT(*) AS n, MAX(s) AS s FROM (SELECT CASE WHEN id = 'p15' THEN salary END AS s FROM people) t", Rejected),
+    ("computed_below", "SELECT COUNT(*) AS n, SUM(s) AS s FROM (SELECT CASE WHEN id = 'p15' THEN salary END AS s FROM people) t", Rejected),
     ("computed_label_below", "SELECT COUNT(*) AS n, MAX(d) AS d FROM (SELECT CASE WHEN dept = 'ceo' THEN dept END AS d FROM people) t", Rejected),
     ("array_agg", "SELECT dept, COUNT(*) AS n, ARRAY_AGG(id) AS ids FROM people GROUP BY dept", Rejected),
     ("string_agg", "SELECT COUNT(*) AS n, STRING_AGG(dept, ',') AS d FROM people", Rejected),
     ("first_value", "SELECT COUNT(*) AS n, FIRST_VALUE(dept ORDER BY salary DESC) AS d FROM people", Rejected),
     // HAVING tricks.
     ("having_small", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING COUNT(*) < 5", Rows(0)),
-    ("having_value", "SELECT dept, COUNT(*) AS n, MAX(salary) AS s FROM people GROUP BY dept HAVING MAX(salary) > 5000", Rows(0)),
+    ("having_value", "SELECT dept, COUNT(*) AS n, AVG(salary) AS s FROM people GROUP BY dept HAVING AVG(salary) > 5000", Rows(0)),
     ("having_subquery", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING (SELECT MAX(salary) FROM people WHERE dept = 'ceo') > 9000", Rejected),
     // Spoofed n.
     ("literal_n", "SELECT dept, 9999 AS n FROM people GROUP BY dept", Rejected),
@@ -198,15 +203,35 @@ const CASES: &[(&str, &str, Expect)] = &[
     ("inner_group_by_id", "SELECT d, COUNT(*) AS n FROM (SELECT id, MAX(dept) AS d FROM people GROUP BY id) t GROUP BY d", Rejected),
     // Sort or limit below the aggregate: only filters and column renames may
     // sit under it, so the aggregate always reads every matching row.
-    ("limit_below_min", "SELECT COUNT(*) AS n, MIN(salary) AS lo FROM (SELECT * FROM people ORDER BY salary DESC LIMIT 5) t", Rejected),
-    ("limit_below_cte", "WITH top AS (SELECT * FROM people ORDER BY salary DESC LIMIT 5) SELECT COUNT(*) AS n, MIN(salary) AS lo FROM top", Rejected),
-    ("offset_below_max", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM (SELECT * FROM people ORDER BY id LIMIT 5 OFFSET 10) t", Rejected),
-    ("plain_limit_below", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM (SELECT * FROM people LIMIT 5) t", Rejected),
+    ("limit_below_sum", "SELECT COUNT(*) AS n, SUM(salary) AS s FROM (SELECT * FROM people ORDER BY salary DESC LIMIT 5) t", Rejected),
+    ("limit_below_cte", "WITH top AS (SELECT * FROM people ORDER BY salary DESC LIMIT 5) SELECT COUNT(*) AS n, SUM(salary) AS s FROM top", Rejected),
+    ("offset_below_sum", "SELECT COUNT(*) AS n, SUM(salary) AS s FROM (SELECT * FROM people ORDER BY id LIMIT 5 OFFSET 10) t", Rejected),
+    ("plain_limit_below", "SELECT COUNT(*) AS n, SUM(salary) AS s FROM (SELECT * FROM people LIMIT 5) t", Rejected),
     // A sort with no limit selects no rows; DataFusion drops it while planning.
     ("sort_only_below", "SELECT dept, COUNT(*) AS n FROM (SELECT * FROM people ORDER BY salary) t GROUP BY dept", Rows(2)),
-    // Min/max leakage via ordering.
-    ("min_rare_first", "SELECT dept, COUNT(*) AS n, MIN(salary) AS lo FROM people GROUP BY dept ORDER BY lo DESC LIMIT 1", Rows(0)),
-    ("max_rare_first", "SELECT dept, COUNT(*) AS n, MAX(salary) AS hi FROM people GROUP BY dept ORDER BY n ASC LIMIT 2", Rows(0)),
+    // Ordering above the aggregate cannot bring a suppressed cohort forward.
+    ("rare_first_by_value", "SELECT dept, COUNT(*) AS n, AVG(salary) AS a FROM people GROUP BY dept ORDER BY a DESC LIMIT 1", Rows(0)),
+    ("rare_first_by_count", "SELECT dept, COUNT(*) AS n, AVG(salary) AS a FROM people GROUP BY dept ORDER BY n ASC LIMIT 2", Rows(0)),
+    // Extreme values (ADR 0015): MIN and MAX return one row's value however
+    // large the cohort (9001 is the one `ceo`'s salary).
+    ("min_max", "SELECT dept, COUNT(*) AS n, MIN(salary) AS lo, MAX(salary) AS hi FROM people GROUP BY dept", Rejected),
+    ("max_total", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM people", Rejected),
+    ("max_text", "SELECT COUNT(*) AS n, MAX(id) AS top FROM people", Rejected),
+    ("min_text_per_group", "SELECT dept, COUNT(*) AS n, MIN(id) AS lo FROM people GROUP BY dept", Rejected),
+    ("max_distinct", "SELECT dept, COUNT(*) AS n, MAX(DISTINCT salary) AS hi FROM people GROUP BY dept", Rejected),
+    ("max_renamed_below", "SELECT COUNT(*) AS n, MAX(s) AS hi FROM (SELECT salary AS s FROM people) t", Rejected),
+    ("max_in_subquery", "SELECT dept, n, hi FROM (SELECT dept, COUNT(*) AS n, MAX(salary) AS hi FROM people GROUP BY dept) t", Rejected),
+    ("max_in_cte", "WITH c AS (SELECT COUNT(*) AS n, MAX(salary) AS hi FROM people) SELECT n, hi FROM c", Rejected),
+    // The walk: filtering below the previous answer gives the next value.
+    ("max_walk", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM people WHERE salary < 9001", Rejected),
+    ("min_walk", "SELECT COUNT(*) AS n, MIN(salary) AS lo FROM people WHERE salary > 100", Rejected),
+    // Id ranges say whose value it is: p10-p14 gives 7002, p11-p15 9001.
+    ("max_id_range", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM people WHERE id BETWEEN 'p11' AND 'p15'", Rejected),
+    ("max_id_from", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM people WHERE id >= 'p11'", Rejected),
+    // Used without being released: each answers one bit per query, enough
+    // to bisect a released group's top salary.
+    ("max_in_having", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING MAX(salary) > 104", Rejected),
+    ("min_in_order_by", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY MIN(salary) DESC LIMIT 1", Rejected),
     // CTEs.
     ("cte_rows", "WITH r AS (SELECT id, salary FROM people) SELECT * FROM r", Rejected),
     ("cte_join", "WITH r AS (SELECT dept FROM people) SELECT a.dept, COUNT(*) AS n FROM r a CROSS JOIN r b GROUP BY a.dept", Rejected),
@@ -223,16 +248,21 @@ const ZK_CASES: &[(&str, &str, Expect)] = &[
     ("where_having_order_limit", "SELECT dept, COUNT(*) AS n FROM people WHERE salary > 0 GROUP BY dept HAVING COUNT(*) > 1 ORDER BY n DESC LIMIT 2", Rows(2)),
     ("subquery_alias", "SELECT dept, n, s FROM (SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people GROUP BY dept) t WHERE s > 0", Rows(2)),
     ("count_distinct", "SELECT COUNT(*) AS n, COUNT(DISTINCT dept) AS d FROM people", Rows(1)),
-    ("rare_cohort_suppressed", "SELECT dept, COUNT(*) AS n, MAX(salary) AS hi FROM people WHERE dept IN ('ceo', 'legal') GROUP BY dept", Rows(0)),
-    ("group_by_id", "SELECT id, COUNT(*) AS n, MAX(salary) AS s FROM people GROUP BY id", Rows(0)),
-    ("group_by_id_per_column", "SELECT id, COUNT(*) AS n, MAX(dept) AS d FROM people GROUP BY id", Rows(0)),
+    ("rare_cohort_suppressed", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept IN ('ceo', 'legal') GROUP BY dept", Rows(0)),
+    ("group_by_id", "SELECT id, COUNT(*) AS n, SUM(salary) AS s FROM people GROUP BY id", Rows(0)),
+    // Extreme values (ADR 0015).
+    ("group_by_id_per_column", "SELECT id, COUNT(*) AS n, MAX(dept) AS d FROM people GROUP BY id", Rejected),
+    ("max_salary", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM people", Rejected),
+    ("max_id", "SELECT COUNT(*) AS n, MAX(id) AS top FROM people", Rejected),
+    ("min_walk", "SELECT COUNT(*) AS n, MIN(salary) AS lo FROM people WHERE salary > 101", Rejected),
+    ("max_in_having", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING MAX(salary) > 200", Rejected),
     ("group_by_unique_expr", "SELECT id || '/' || dept AS k, COUNT(*) AS n FROM people GROUP BY id || '/' || dept", Rows(0)),
     ("group_by_id_and_value", "SELECT id, salary, COUNT(*) AS n FROM people GROUP BY id, salary", Rows(0)),
     ("rollup_complement", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept <> 'legal' GROUP BY ROLLUP(dept)", Rejected),
     ("grouping_sets", "SELECT dept, COUNT(*) AS n, MAX(salary) AS hi FROM people GROUP BY GROUPING SETS ((dept), ())", Rejected),
     ("cube_in_subquery", "SELECT dept, n FROM (SELECT dept, COUNT(*) AS n FROM people GROUP BY CUBE(dept)) t", Rejected),
-    ("limit_below_max", "SELECT COUNT(*) AS n, MAX(salary) AS hi FROM (SELECT * FROM people ORDER BY id LIMIT 5) t", Rejected),
-    ("offset_below_min", "WITH w AS (SELECT * FROM people ORDER BY salary LIMIT 5 OFFSET 10) SELECT COUNT(*) AS n, MIN(salary) AS lo FROM w", Rejected),
+    ("limit_below_sum", "SELECT COUNT(*) AS n, SUM(salary) AS s FROM (SELECT * FROM people ORDER BY id LIMIT 5) t", Rejected),
+    ("offset_below_avg", "WITH w AS (SELECT * FROM people ORDER BY salary LIMIT 5 OFFSET 10) SELECT COUNT(*) AS n, AVG(salary) AS a FROM w", Rejected),
     ("missing_n", "SELECT dept, SUM(salary) AS s FROM people GROUP BY dept", Rejected),
     ("missing_n_by_id", "SELECT id, MAX(salary) AS s FROM people GROUP BY id", Rejected),
     ("spoofed_n", "SELECT id, 9999 AS n, MAX(salary) AS s FROM people GROUP BY id", Rejected),
@@ -307,14 +337,16 @@ const ERROR_PROBES: &[(&str, &str)] = &[
     ("where_float_to_int", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CAST(salary AS DOUBLE) / (CASE WHEN {P} THEN 0.0 ELSE 1.0 END) AS BIGINT) > 0 GROUP BY dept"),
     ("where_to_decimal", "SELECT dept, COUNT(*) AS n FROM people WHERE CAST(CASE WHEN {P} THEN salary ELSE 1 END AS DECIMAL(3,0)) > 0 GROUP BY dept"),
     ("group_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept, salary / (CASE WHEN {P} THEN 0 ELSE 1 END)"),
-    ("having_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING 1 / (CASE WHEN MAX(salary) > {T} AND COUNT(*) = 1 THEN 0 ELSE 1 END) > 0"),
-    ("outer_div", "SELECT dept, COUNT(*) AS n, 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END) AS x FROM people GROUP BY dept"),
-    ("outer_cast", "SELECT dept, COUNT(*) AS n, CAST(CASE WHEN MAX(salary) > {T} THEN 'x' ELSE '1' END AS BIGINT) AS x FROM people GROUP BY dept"),
-    ("order_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY 1 / (CASE WHEN MAX(salary) > {T} THEN 0 ELSE 1 END)"),
+    // `AVG(salary) > {T}` holds for the `ceo` group at 9000 and for none at
+    // 9500, as `MAX` did; `MAX` would stop at the aggregate allowlist.
+    ("having_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING 1 / (CASE WHEN AVG(salary) > {T} AND COUNT(*) = 1 THEN 0 ELSE 1 END) > 0"),
+    ("outer_div", "SELECT dept, COUNT(*) AS n, 1 / (CASE WHEN AVG(salary) > {T} THEN 0 ELSE 1 END) AS x FROM people GROUP BY dept"),
+    ("outer_cast", "SELECT dept, COUNT(*) AS n, CAST(CASE WHEN AVG(salary) > {T} THEN 'x' ELSE '1' END AS BIGINT) AS x FROM people GROUP BY dept"),
+    ("order_by_div", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY 1 / (CASE WHEN AVG(salary) > {T} THEN 0 ELSE 1 END)"),
     ("ratio_over_zero_rows", "SELECT COUNT(*) AS n, SUM(salary) / COUNT(*) AS m FROM people WHERE {P}"),
     // A constant is evaluated as a scalar, where negating i64::MIN fails.
     ("where_negate_min_literal", "SELECT dept, COUNT(*) AS n FROM people WHERE CASE WHEN {P} THEN -(-9223372036854775807 - 1) ELSE 0 END > 0 GROUP BY dept"),
-    ("outer_negate_min_literal", "SELECT dept, COUNT(*) AS n, CASE WHEN MAX(salary) > {T} THEN -(-9223372036854775807 - 1) ELSE 0 END AS x FROM people GROUP BY dept"),
+    ("outer_negate_min_literal", "SELECT dept, COUNT(*) AS n, CASE WHEN AVG(salary) > {T} THEN -(-9223372036854775807 - 1) ELSE 0 END AS x FROM people GROUP BY dept"),
     // Merging projections puts the inner literal under the outer minus, so
     // `-m` runs on i64::MIN as a scalar, and only for groups that exist.
     ("subquery_negate_min", "SELECT dept, n, -m AS x FROM (SELECT dept, COUNT(*) AS n, -9223372036854775807 - 1 AS m FROM people WHERE {P} GROUP BY dept) t"),

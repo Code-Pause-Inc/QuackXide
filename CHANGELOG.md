@@ -312,6 +312,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `MIN` and `MAX` are refused in zero-knowledge and research queries,
+  wherever they appear, `HAVING` and `ORDER BY` included (ADR 0015,
+  proposed; P57). Each returns one row's value however large the cohort:
+  one query gave the highest salary in a dataset, filtering below it gave
+  the next, and an id range said whose it was. Ranges come from counts
+  over bands (`salary / 1000 AS band`) and the centre from `AVG`;
+  ungated queries keep `MIN` and `MAX`. ADR 0015 also decides the p% rule
+  that P58 applies to `SUM` and `AVG`.
 * The admin connector toggle route,
   `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
   (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`

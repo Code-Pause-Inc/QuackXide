@@ -251,17 +251,20 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     let (status, body) = post_query(
         &app,
         Some(&token),
-        r#"{"connector":"quickbooks","sql":"SELECT id, COUNT(*) AS n, MAX(total) AS t FROM quickbooks GROUP BY id"}"#,
+        r#"{"connector":"quickbooks","sql":"SELECT id, COUNT(*) AS n, SUM(total) AS t FROM quickbooks GROUP BY id"}"#,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["row_count"], 0);
     assert_eq!(body["suppressed_rows"], 3);
 
-    // Aggregates without a genuine cohort size are rejected with 422.
+    // Aggregates without a genuine cohort size, and MIN or MAX, which
+    // return one row's value whatever the cohort size (ADR 0015), are
+    // rejected with 422.
     for sql in [
-        "SELECT id, MAX(total) AS t FROM quickbooks GROUP BY id",
+        "SELECT id, SUM(total) AS t FROM quickbooks GROUP BY id",
         "SELECT id, 9999 AS n FROM quickbooks GROUP BY id",
+        "SELECT COUNT(*) AS n, MAX(total) AS t FROM quickbooks",
     ] {
         let body = serde_json::json!({ "connector": "quickbooks", "sql": sql }).to_string();
         let (status, _) = post_query(&app, Some(&token), &body).await;
