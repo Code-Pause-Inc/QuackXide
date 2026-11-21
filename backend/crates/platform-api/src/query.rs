@@ -813,7 +813,19 @@ impl ConnectorQueryService {
                     Begin::New(guard) => Some(guard),
                     Begin::Stored(StoredOutcome::Ok(body)) => return Ok(body),
                     Begin::Stored(StoredOutcome::Err(err)) => return Err(err),
-                    Begin::Refused(refusal) => return Err(refusal),
+                    Begin::Refused(refusal) => {
+                        security_audit_event(
+                            AuditKind::AuthDecision,
+                            Some(researcher),
+                            "denied",
+                            &format!(
+                                "sealed research query refused reason={} steward={steward} \
+                             connector={connector}",
+                                refusal.kind()
+                            ),
+                        );
+                        return Err(refusal);
+                    }
                 }
             }
         };

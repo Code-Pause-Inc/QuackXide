@@ -6,22 +6,14 @@
 //! envelope under a used nonce is refused.
 mod common;
 
-use std::sync::Arc;
-
 use axum::Router;
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use platform_api::dev::DevResearchStack;
-use platform_api::key_release::{AttestationBundle, KeyWire};
-use platform_api::research::{ResearchService, ResearchStores};
-use platform_api::{AppState, build_app};
-use platform_core::{ConnectorSlug, TenantId, ZkMode};
-use platform_crypto::{EnvelopeSuite, TenantKeypair, hpke_seal_to_tenant, info};
-use quackxide_engine::{EngineSettings, QueryLimits};
+use platform_core::TenantId;
 use serde_json::{Value, json};
 
-use common::{call, post};
+use common::{Sealer, call, post};
 
 const SECRET: &str = "sealed-research-itest-secret";
 const AGG_SQL: &str =
@@ -31,46 +23,11 @@ fn token_for(tenant: TenantId) -> String {
     common::token_for(SECRET, tenant)
 }
 
-/// The steward's sealed `health` dataset (k = 5) behind the simulated
-/// enclave, whose evidence bundle carries the request key.
-async fn app(steward: TenantId) -> Router {
-    let connector = ConnectorSlug::new("health").expect("slug");
-    let mut stack = DevResearchStack::new();
-    stack
-        .commit_snapshot(
-            steward,
-            TenantKeypair::generate(EnvelopeSuite::Hpk2),
-            &connector,
-            "cohorts",
-            &common::cohorts_parquet(),
-        )
-        .await
-        .expect("commit");
-    let vault = stack.vault();
-    let research = Arc::new(ResearchService::new(
-        ResearchStores::in_memory(),
-        vault.clone(),
-        5,
-        100,
-    ));
-    let settings = EngineSettings {
-        zk: ZkMode::Disabled,
-        max_concurrent_queries: 4,
-        limits: QueryLimits::default(),
-    };
-    let service = stack.query_service(settings, research.clone());
-    build_app(AppState {
-        research: Some(research),
-        query: Some(Arc::new(service)),
-        ..common::app_state(SECRET, vault)
-    })
-}
-
 /// A steward, a researcher granted `budget` units on `health`, the app and
 /// the grant id.
 async fn granted(budget: u64) -> (Router, TenantId, TenantId, String) {
     let (steward, researcher) = (TenantId::generate(), TenantId::generate());
-    let app = app(steward).await;
+    let app = common::sealed_research_app(SECRET, steward).await;
     let (status, grant) = post(
         &app,
         "/api/v1/grants",
@@ -83,68 +40,6 @@ async fn granted(budget: u64) -> (Router, TenantId, TenantId, String) {
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
     let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
     (app, steward, researcher, grant_id)
-}
-
-async fn bundle(app: &Router) -> AttestationBundle {
-    let (status, body) = call(
-        app,
-        "GET",
-        &format!("/api/v1/attestation?nonce={}", B64URL.encode([5u8; 32])),
-        "",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "bundle: {body}");
-    serde_json::from_value(body).expect("bundle")
-}
-
-/// A sealed request body, as the researcher's browser builds it.
-struct Sealer {
-    bundle: AttestationBundle,
-    researcher: TenantId,
-    steward: TenantId,
-}
-
-impl Sealer {
-    async fn new(app: &Router, researcher: TenantId, steward: TenantId) -> Self {
-        Self {
-            bundle: bundle(app).await,
-            researcher,
-            steward,
-        }
-    }
-
-    fn body(&self, grant_id: &str, nonce: u8, sql: &str) -> String {
-        let recipient = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
-        let plaintext = json!({
-            "steward_tenant": self.steward.to_string(),
-            "connector": "health",
-            "sql": sql,
-            "request_nonce": B64URL.encode([nonce; 32]),
-            "recipient_key": KeyWire::from_public_key(&recipient),
-        });
-        let request_key = self
-            .bundle
-            .request_key
-            .to_public_key(platform_crypto::SuitePolicy::only(EnvelopeSuite::Hpk2))
-            .expect("request key");
-        let info =
-            info::research_query(EnvelopeSuite::Hpk2, &self.researcher.to_string(), grant_id)
-                .expect("info");
-        let frame = hpke_seal_to_tenant(
-            &request_key,
-            &info,
-            &serde_json::to_vec(&plaintext).expect("json"),
-        )
-        .expect("seal");
-        json!({
-            "version": 1,
-            "key_id": self.bundle.key_id,
-            "grant_id": grant_id,
-            "envelope": B64URL.encode(frame),
-        })
-        .to_string()
-    }
 }
 
 async fn query(app: &Router, researcher: TenantId, body: &str) -> (StatusCode, Value) {
