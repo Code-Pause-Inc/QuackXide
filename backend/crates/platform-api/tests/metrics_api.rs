@@ -18,7 +18,7 @@ use platform_core::{TenantId, ZkMode};
 use platform_crypto::TenantKeypair;
 use platform_enclave::DevAttestation;
 use platform_storage::{ObjectStoreVault, VaultStore};
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use tower::ServiceExt;
 
 const SECRET: &str = "metrics-itest-secret";
@@ -32,7 +32,7 @@ fn token_for(tenant: TenantId) -> String {
 /// The API and metrics routers over a QuickBooks sync sealed to `tenant`.
 async fn apps(tenant: TenantId) -> (Router, Router) {
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let pipeline = EnclavePipeline::new(
         Arc::new(DevAttestation::allow_insecure_dev()),
         vault.clone(),
@@ -53,6 +53,7 @@ async fn apps(tenant: TenantId) -> (Router, Router) {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );

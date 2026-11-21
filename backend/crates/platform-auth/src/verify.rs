@@ -23,10 +23,12 @@ pub struct JwtVerifier {
 
 impl JwtVerifier {
     /// Dev/self-hosted only: the server holds the signing secret, so host
-    /// compromise yields mint-any-tenant capability.
+    /// compromise yields mint-any-tenant capability. An empty secret yields a
+    /// verifier with no key, which rejects every token.
     pub fn hs256(secret: &str, issuer: &str, audience: &str) -> Self {
         Self {
-            keys: VerifyKey::Shared(DecodingKey::from_secret(secret.as_bytes())),
+            keys: DecodingKey::from_secret(secret.as_bytes())
+                .map_or_else(|_| VerifyKey::ByKid(HashMap::new()), VerifyKey::Shared),
             validation: validation_for(Algorithm::HS256, issuer, audience),
         }
     }
@@ -120,6 +122,20 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_hs256_secret_mints_nothing_and_verifies_nothing() {
+        let tenant = TenantId::generate();
+        assert_eq!(
+            mint_token("", ISS, AUD, tenant, "user-1", 3600),
+            Err(AuthError::MintFailed)
+        );
+        let token = mint_token("secret", ISS, AUD, tenant, "user-1", 3600).expect("mint");
+        assert_eq!(
+            JwtVerifier::hs256("", ISS, AUD).verify(&token),
+            Err(AuthError::TokenRejected)
+        );
+    }
+
+    #[test]
     fn hs256_admin_claim_round_trips_and_defaults_off() {
         let tenant = TenantId::generate();
         let verifier = JwtVerifier::hs256("secret", ISS, AUD);
@@ -184,7 +200,7 @@ mod tests {
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(b"secret").expect("key"),
         )
         .expect("encode");
         assert_eq!(
@@ -197,7 +213,7 @@ mod tests {
         encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(b"secret").expect("key"),
         )
         .expect("encode")
     }
@@ -388,7 +404,7 @@ mod tests {
         let forged = encode(
             &header,
             &claims,
-            &EncodingKey::from_secret(n_b64.as_bytes()),
+            &EncodingKey::from_secret(n_b64.as_bytes()).expect("key"),
         )
         .expect("encode");
 

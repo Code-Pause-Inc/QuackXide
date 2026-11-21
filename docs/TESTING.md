@@ -65,8 +65,9 @@ taking the file's secret), the request helpers (`send`, `send_with_headers`,
 `send_json`, `call`, `post`, `post_query`), the app builders (`app_state`,
 `synced_vault`, `research_app`, `upload_research_app`), the steward upload
 helpers (`sealed_upload` and `cohorts_upload` seal a body as the browser
-does, `put_upload` sends it, `next_version` picks a newer snapshot
-version), and `FlakyVault`, an in-memory vault that
+does, with `platform_api::dev::seal_upload`, which the `seal-upload` tool
+of the simulated TEE also runs; `put_upload` sends it, `next_version`
+picks a newer snapshot version), and `FlakyVault`, an in-memory vault that
 fails the operations chosen in `Faults` with a transient (`outage`) or
 permanent (`misconfigured`) storage error. Use them rather than writing new ones, and add a helper
 there when a second file needs it. Tests that need RS256 tokens use its
@@ -128,13 +129,40 @@ npm run test:browser                              # Chromium
 BROWSERS=chromium,firefox,webkit npm run test:browser
 ```
 
-The `bench` project runs `*.browser.bench.ts` in headless Chromium: the
+The `seal` project runs `*.browser.perf.ts` in headless Chromium: the
 wasm envelope seal benchmark, which needs generated data, so run it through
-`scripts/bench-wasm-seal.sh` (`docs/BENCHMARKS.md`). Neither `npm test` nor
-`npm run test:browser` runs it.
+`scripts/bench-wasm-seal.sh` (`docs/BENCHMARKS.md`). `npm test`,
+`npm run test:browser` and `npm run bench:browser` never run it.
 
 The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
+
+### Browser timings
+
+`npm run bench:browser` (from `frontend/`) is a Vitest bench in the
+`browser` project (`src/lib/crypto/timings.browser.bench.ts`). It times
+chunk encryption (`encryptPayload` at 4 KiB and 4 MiB) and the wasm
+envelope module's cold start, the load plus the first seal, because V8
+compiles wasm functions on their first call. `BROWSERS=chromium,firefox,webkit`
+runs the other browsers, one after the other. `npm test` and
+`npm run test:browser` never run it: bench files have their own glob,
+`*.browser.bench.ts`, which only `vitest bench` reads.
+
+Browsers coarsen `performance.now()` (to 1 ms in Firefox and WebKit), so one
+call per sample would read as zero. Each sample is instead a batch of calls
+that lasts at least 50 ms, reported as its per-call mean, and the bench
+takes 64 samples. Vitest's bench reports p50 and p99 (tinybench has no p95)
+over those batch means, so a slow single call is averaged away; read them as
+the spread of the typical cost, not as per-call tail latency. The cold start
+is one sample per page, reported as one value. The timings run on the page's
+main thread, while the app does this work in the crypto worker.
+
+The numbers are report only. The `browser` workflow writes them from
+Vitest's JSON output, with the runner's CPU, the browser version and the
+module's raw and gzipped size, to each run's job summary: Chromium on pull
+requests, and Chromium, Firefox and WebKit on `main`, nightly and on demand.
+The step fails, without failing the run, if the bench run fails or prints no
+results. Recorded numbers belong in `docs/BENCHMARKS.md`.
 
 ### Envelope vectors
 
@@ -151,6 +179,11 @@ which fails when the file and its generator disagree; regenerate with
 wasm module, and `platform-api/tests/envelope_vectors.rs` runs the
 enrollment cases through the enrollment route and the badly framed
 envelopes through the upload route.
+`hpk2-kem.json` (X-Wing known-answer values from `@noble/post-quantum`) and
+`hpk2-js-sealed.json` (`HPK2` frames sealed by `hpke-js`, plus negatives)
+come from implementations other than ours (ADR 0007); regenerate them with
+`node scripts/hpk2-vectors.mjs` from `frontend/`, and
+`backend/crates/platform-crypto/tests/hpk2_vectors.rs` checks them.
 
 ### Fuzz targets
 

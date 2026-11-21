@@ -1,9 +1,10 @@
 //! Steward dataset uploads (ADR 0012).
 //!
 //! A steward's browser seals a Parquet file to the steward's key, under
-//! `steward-upload-v1|{tenant}|{dataset}|{object}`, and a manifest listing
-//! it, under `tenant-snapshot-manifest-v1|{tenant}|{dataset}|{version}`, and
-//! sends both in one body with a plaintext header. The upload route holds no
+//! `steward-upload-v{n}|{tenant}|{dataset}|{object}`, and a manifest listing
+//! it, under `tenant-snapshot-manifest-v{n}|{tenant}|{dataset}|{version}`
+//! (`v1` for `HPK1`, `v2` for `HPK2`), and sends both in one body with a
+//! plaintext header. The upload route holds no
 //! key and opens neither; only a query does, inside the enclave. The route
 //! checks what it can (lengths, envelope frames, the header) and
 //! [`commit_upload`] stores the upload as a new snapshot of the dataset, so
@@ -254,6 +255,10 @@ pub enum UploadCommitError {
     /// recorded schema is unknown (fail closed).
     #[error("the current snapshot's record is missing or malformed")]
     RecordUnreadable,
+    /// With no enrolled key to name the suite, the upload's suite differs
+    /// from the current snapshot's, which no key could then open both of.
+    #[error("upload suite differs from the dataset's current snapshot")]
+    SuiteMismatch,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -267,6 +272,7 @@ impl UploadCommitError {
             UploadCommitError::StaleVersion => "stale_version",
             UploadCommitError::SchemaMismatch => "schema_mismatch",
             UploadCommitError::RecordUnreadable => "record_unreadable",
+            UploadCommitError::SuiteMismatch => "snapshot_suite_mismatch",
             UploadCommitError::Storage(_) => "storage",
         }
     }
@@ -287,6 +293,9 @@ pub struct UploadReport {
 /// new snapshot does not list is pruned, including an object that an earlier
 /// attempt at the same version left. The first upload creates the dataset.
 /// A later one must carry a newer version and the schema already recorded.
+/// With no key `enrolled` for the tenant it must also use the suite already
+/// recorded; an enrolled key's suite is checked by the caller, and may
+/// differ from the previous snapshot's (a re-enrollment in another suite).
 /// A version keeps the first record stored for it and commits once, so an
 /// upload is stale if another write committed its version first, or stored
 /// a record for it that differs from the upload's. A retry of an attempt
@@ -298,6 +307,7 @@ pub async fn commit_upload(
     tenant: TenantId,
     dataset: &ConnectorSlug,
     upload: UploadBody,
+    enrolled: bool,
     now: SystemTime,
 ) -> Result<UploadReport, UploadCommitError> {
     if dataset.kind() != DatasetKind::Upload {
@@ -321,19 +331,22 @@ pub async fn commit_upload(
             return Err(UploadCommitError::StaleVersion);
         }
         let record_path = TenantPaths::connector_record(tenant, dataset, &current);
-        let recorded = match vault.get(&record_path).await {
-            Ok(bytes) => SnapshotRecord::parse(&bytes, &current)
-                .ok()
-                .and_then(|record| record.schema),
+        let record = match vault.get(&record_path).await {
+            Ok(bytes) => SnapshotRecord::parse(&bytes, &current).ok(),
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(err.into()),
         };
-        match recorded {
-            None => return Err(UploadCommitError::RecordUnreadable),
-            Some(recorded) if recorded != header.schema => {
-                return Err(UploadCommitError::SchemaMismatch);
-            }
-            Some(_) => {}
+        let Some(record) = record else {
+            return Err(UploadCommitError::RecordUnreadable);
+        };
+        let Some(recorded) = record.schema else {
+            return Err(UploadCommitError::RecordUnreadable);
+        };
+        if recorded != header.schema {
+            return Err(UploadCommitError::SchemaMismatch);
+        }
+        if !enrolled && record.suite != suite.id() {
+            return Err(UploadCommitError::SuiteMismatch);
         }
     }
 
@@ -437,10 +450,15 @@ mod tests {
     }
 
     impl Fixture {
+        /// Sealed as the browser seals until P36: `HPK1`.
         fn new() -> Self {
+            Self::sealed_under(EnvelopeSuite::Hpk1)
+        }
+
+        fn sealed_under(suite: EnvelopeSuite) -> Self {
             Self {
                 tenant: TenantId::generate(),
-                keypair: TenantKeypair::generate(),
+                keypair: TenantKeypair::generate(suite),
                 dataset: ConnectorSlug::new("upload_cohorts").expect("slug"),
             }
         }
@@ -456,7 +474,7 @@ mod tests {
             let object = ObjectId::generate();
             let sealed = hpke_seal_to_tenant(
                 &key,
-                &object_info(&self.tenant, &self.dataset, &object),
+                &object_info(key.suite(), &self.tenant, &self.dataset, &object),
                 parquet,
             )
             .expect("seal object");
@@ -467,7 +485,7 @@ mod tests {
             .expect("manifest");
             let manifest = hpke_seal_to_tenant(
                 &key,
-                &manifest_info(&self.tenant, &self.dataset, version),
+                &manifest_info(key.suite(), &self.tenant, &self.dataset, version),
                 &manifest,
             )
             .expect("seal manifest");
@@ -486,7 +504,15 @@ mod tests {
             body: Vec<u8>,
         ) -> Result<UploadReport, UploadCommitError> {
             let parsed = parse_upload_body(body.into(), MAX).expect("parse");
-            commit_upload(vault, self.tenant, &self.dataset, parsed, SystemTime::now()).await
+            commit_upload(
+                vault,
+                self.tenant,
+                &self.dataset,
+                parsed,
+                false,
+                SystemTime::now(),
+            )
+            .await
         }
     }
 
@@ -551,9 +577,16 @@ mod tests {
         };
         let relabel = |envelope: &[u8]| {
             let mut out = envelope.to_vec();
-            out[..4].copy_from_slice(b"HPK2");
+            out[..4].copy_from_slice(b"HPK9");
             out
         };
+        // The same upload sealed under the other suite, for mixed-suite bodies.
+        let (_, manifest_hpk2, object_hpk2) =
+            parts(&Fixture::sealed_under(EnvelopeSuite::Hpk2).body(
+                &version_at(0),
+                cohort_schema(),
+                b"parquet bytes",
+            ));
         let object_id = header_json["object"].as_str().expect("id").to_owned();
 
         let cases: Vec<(&str, Vec<u8>, UploadError)> = vec![
@@ -689,6 +722,16 @@ mod tests {
                 frame(b"DSU1", &header, &manifest, &object[..20]),
                 UploadError::BadObject,
             ),
+            (
+                "HPK1 manifest with an HPK2 object",
+                frame(b"DSU1", &header, &manifest, &object_hpk2),
+                UploadError::BadObject,
+            ),
+            (
+                "HPK2 manifest with an HPK1 object",
+                frame(b"DSU1", &header, &manifest_hpk2, &object),
+                UploadError::BadObject,
+            ),
         ];
         for (name, body, expected) in cases {
             let err = parse_upload_body(body.into(), MAX).expect_err(name);
@@ -742,64 +785,70 @@ mod tests {
 
     #[tokio::test]
     async fn an_upload_is_stored_as_a_snapshot_that_opens() {
-        let vault = ObjectStoreVault::new_in_memory();
-        let fixture = Fixture::new();
-        let version = version_at(0);
-        let report = fixture
-            .commit(
-                &vault,
-                fixture.body(&version, cohort_schema(), b"parquet bytes"),
-            )
-            .await
-            .expect("commit");
-        assert_eq!(report.version, version);
-        assert_eq!(report.suite, EnvelopeSuite::Hpk1);
+        // The browser seals HPK1 until P36; the route stores either suite.
+        for suite in [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2] {
+            let vault = ObjectStoreVault::new_in_memory();
+            let fixture = Fixture::sealed_under(suite);
+            let version = version_at(0);
+            let report = fixture
+                .commit(
+                    &vault,
+                    fixture.body(&version, cohort_schema(), b"parquet bytes"),
+                )
+                .await
+                .expect("commit");
+            assert_eq!(report.version, version);
+            assert_eq!(report.suite, suite);
 
-        let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
-        let mut expected = vec![
-            TenantPaths::connector_snapshot_object(tenant, dataset, &version, report.object),
-            TenantPaths::connector_record(tenant, dataset, &version),
-            TenantPaths::connector_manifest(tenant, dataset, &version),
-        ]
-        .into_iter()
-        .map(|path| path.as_str().to_owned())
-        .collect::<Vec<_>>();
-        expected.sort();
-        assert_eq!(stored(&vault, tenant).await, expected);
+            let (tenant, dataset) = (fixture.tenant, &fixture.dataset);
+            let mut expected = vec![
+                TenantPaths::connector_snapshot_object(tenant, dataset, &version, report.object),
+                TenantPaths::connector_record(tenant, dataset, &version),
+                TenantPaths::connector_manifest(tenant, dataset, &version),
+            ]
+            .into_iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(stored(&vault, tenant).await, expected);
 
-        let record = vault
-            .get(&TenantPaths::connector_record(tenant, dataset, &version))
-            .await
-            .expect("record");
-        let record = SnapshotRecord::parse(&record, &version).expect("parse");
-        assert_eq!(record.suite, "HPK1");
-        assert_eq!(record.row_cap, Some(7));
-        assert_eq!(record.schema, Some(cohort_schema()));
+            let record = vault
+                .get(&TenantPaths::connector_record(tenant, dataset, &version))
+                .await
+                .expect("record");
+            let record = SnapshotRecord::parse(&record, &version).expect("parse");
+            assert_eq!(record.suite, suite.id());
+            assert_eq!(record.row_cap, Some(7));
+            assert_eq!(record.schema, Some(cohort_schema()));
 
-        // The steward's key opens both envelopes under the bindings the
-        // query path uses.
-        let object = vault
-            .get(&TenantPaths::connector_snapshot_object(
-                tenant,
-                dataset,
-                &version,
-                report.object,
-            ))
-            .await
-            .expect("object");
-        let opened = fixture
-            .keypair
-            .open_envelope(&object_info(&tenant, dataset, &report.object), &object)
-            .expect("open object");
-        assert_eq!(opened.expose(), b"parquet bytes");
-        let manifest = vault
-            .get(&TenantPaths::connector_manifest(tenant, dataset, &version))
-            .await
-            .expect("manifest");
-        fixture
-            .keypair
-            .open_envelope(&manifest_info(&tenant, dataset, &version), &manifest)
-            .expect("open manifest");
+            // The steward's key opens both envelopes under the bindings the
+            // query path uses.
+            let object = vault
+                .get(&TenantPaths::connector_snapshot_object(
+                    tenant,
+                    dataset,
+                    &version,
+                    report.object,
+                ))
+                .await
+                .expect("object");
+            let opened = fixture
+                .keypair
+                .open_envelope(
+                    &object_info(suite, &tenant, dataset, &report.object),
+                    &object,
+                )
+                .expect("open object");
+            assert_eq!(opened.expose(), b"parquet bytes");
+            let manifest = vault
+                .get(&TenantPaths::connector_manifest(tenant, dataset, &version))
+                .await
+                .expect("manifest");
+            fixture
+                .keypair
+                .open_envelope(&manifest_info(suite, &tenant, dataset, &version), &manifest)
+                .expect("open manifest");
+        }
     }
 
     #[tokio::test]
@@ -1070,6 +1119,7 @@ mod tests {
             fixture.tenant,
             &connector,
             parsed,
+            false,
             SystemTime::now(),
         )
         .await

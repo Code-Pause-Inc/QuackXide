@@ -10,6 +10,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
 use platform_api::{AppState, build_app};
+use platform_config::PlatformConfig;
 use platform_core::TenantId;
 use platform_storage::{ObjectStoreVault, VaultStore};
 use platform_tenancy::{InMemoryTenantRegistry, TenantRegistry};
@@ -27,17 +28,35 @@ fn build_with_vault(
     with_billing: bool,
     vault: Arc<dyn VaultStore>,
 ) -> (Router, Arc<dyn TenantRegistry>) {
+    let config = if with_billing {
+        config_with_mor_secret(PADDLE_SECRET)
+    } else {
+        common::default_config()
+    };
+    build_with_config(config, vault)
+}
+
+/// Billing configured and the connector toggle route switched on.
+fn build_with_toggles() -> (Router, Arc<dyn TenantRegistry>) {
+    let config = PlatformConfig::from_source(|k| match k {
+        "MOR_WEBHOOK_SECRET" => Some(PADDLE_SECRET.to_owned()),
+        "FEATURE_ADMIN_CONNECTOR_TOGGLES" => Some("true".to_owned()),
+        _ => None,
+    })
+    .expect("config");
+    build_with_config(config, Arc::new(ObjectStoreVault::new_in_memory()))
+}
+
+fn build_with_config(
+    config: PlatformConfig,
+    vault: Arc<dyn VaultStore>,
+) -> (Router, Arc<dyn TenantRegistry>) {
     let registry: Arc<dyn TenantRegistry> =
         Arc::new(InMemoryTenantRegistry::new(default_connector_slugs()));
     let provisioning = Some(Arc::new(ProvisioningService::new(
         registry.clone(),
         vault.clone(),
     )));
-    let config = if with_billing {
-        config_with_mor_secret(PADDLE_SECRET)
-    } else {
-        common::default_config()
-    };
     let app = build_app(AppState {
         config: Arc::new(config),
         provisioning,
@@ -290,7 +309,7 @@ async fn admin_endpoints_require_admin_claim() {
 
 #[tokio::test]
 async fn admin_can_list_tenants_and_toggle_connectors() {
-    let (app, registry) = build(true);
+    let (app, registry) = build_with_toggles();
     let admin_token = common::admin_token(SECRET);
 
     // Provision one tenant via webhook.
@@ -399,8 +418,36 @@ async fn marker_write_failure_does_not_undo_provisioning() {
 }
 
 #[tokio::test]
-async fn toggling_connector_for_unknown_tenant_is_404() {
+async fn connector_toggles_are_off_by_default_and_change_nothing() {
     let (app, _) = build(true);
+    assert_eq!(provision_via_webhook(&app).await, StatusCode::OK);
+    let (_, json) = send_json(&app, "GET", "/admin/tenants", &[admin_auth()], Vec::new()).await;
+    let tenant = json["tenants"][0]["tenant_id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+
+    // A known tenant and an unknown one alike: refused before any lookup.
+    for target in [tenant.clone(), TenantId::generate().to_string()] {
+        let (status, json) = send_json(
+            &app,
+            "POST",
+            &format!("/admin/tenants/{target}/connectors/quickbooks"),
+            &[admin_auth(), json_header()],
+            br#"{"enabled":true}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "json: {json}");
+        assert_eq!(json["error"], "connector toggles are not enabled");
+    }
+
+    let (_, json) = send_json(&app, "GET", "/admin/tenants", &[admin_auth()], Vec::new()).await;
+    assert_eq!(json["tenants"][0]["connectors"]["quickbooks"], false);
+}
+
+#[tokio::test]
+async fn toggling_connector_for_unknown_tenant_is_404() {
+    let (app, _) = build_with_toggles();
     let (status, _) = send_json(
         &app,
         "POST",

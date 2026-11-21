@@ -162,14 +162,14 @@ Browser crypto worker                API (Axum)                                 
 ─────────────────────                ──────────                                   ────────────
 Parquet file (device only)
 seal object to steward key
-  steward-upload-v1|t|ds|obj
+  steward-upload-v1|t|ds|obj           (-v2 under HPK2)
 seal manifest {version, [obj]}
-  tenant-snapshot-manifest-v1|t|ds|v
+  tenant-snapshot-manifest-v1|t|ds|v   (-v2 under HPK2)
 header: version, obj, row cap,
   declared schema ──────────TLS────▶ PUT /api/v1/datasets/{ds}
                                      authn (JWT); tenant from the token only
                                      ds in the upload_ namespace?    ──no──▶ 404
-                                     size, framing, header           ──bad─▶ 413 / 422
+                                     size, framing, header, suite    ──bad─▶ 413 / 422
                                      newer version, same schema?     ──no──▶ 409 / 422
                                      object ────────────────────────────────────▶ tenants/{t}/connectors/{ds}/snapshots/{v}/{obj}.parquet
                                      record: suite, row cap, schema ────────────▶ tenants/{t}/connectors/{ds}/records/{v}.json
@@ -197,7 +197,17 @@ header: version, obj, row cap,
   (`DATASET_MAX_MIB`, default 64, refused at startup when out of range).
   The parser (`platform_connectors::upload`, fuzzed) checks every length
   before reading past it, bounds the header, and requires both envelopes
-  to be complete frames of one suite it reads (`HPK1`). A declared schema
+  to be complete frames of one suite it reads (`HPK1` or `HPK2`). The route
+  then refuses an upload whose suite the deployment does not accept
+  (`HPK1` in production, 422) or that differs from the suite of the
+  tenant's enrolled key (422), since neither could ever open; each is also
+  a `crypto.suite_refused` event. With no enrolled key to name the suite,
+  `commit_upload` refuses (422) an upload whose suite differs from the
+  current snapshot's, the same way; with one, a previous snapshot in
+  another suite does not block it, so re-enrolling in `HPK2` (P36) lets the
+  next upload replace an `HPK1` snapshot. In development an `HPK1` upload opens only under the test
+  key providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`):
+  development key release is `HPK2`-only. A declared schema
   unlike the dataset's recorded one is refused (422). Every refusal after
   authentication, except a malformed dataset id (400), is an audited
   `data.access` denial with a fixed reason.
@@ -218,10 +228,27 @@ header: version, obj, row cap,
   a suite this build does not read (502).
 * **Catalog registration.** A steward can publish a listing only for a
   dataset it holds, one with a committed snapshot ("Research access").
+* **Listing.** `GET /api/v1/datasets` lists every dataset the caller's
+  tenant holds, connectors' and uploads' alike: exactly the ones it may
+  publish (`platform_connectors::snapshot::held_datasets` decides "holds"
+  with the same function as `holds`). Each entry describes the current
+  snapshot only, from storage and the plaintext record, opening nothing:
+  its version and write time, the ids, count and total ciphertext bytes
+  of the objects stored at that version, and the suite the record names
+  (`null` if the record is missing at the current version, malformed or
+  names a suite this build does not read). Superseded snapshots and
+  uploads that have not committed are not counted. If a snapshot's record
+  is gone when it is read, because an upload or sync committed during the
+  listing and pruned it, the dataset is read again, once, and described
+  as it is then; a dataset no longer held is left out. More than 1000
+  datasets (`MAX_LISTED_OBJECTS`), or objects across them, is refused
+  with 422 rather than listed in part, and a storage failure is an error
+  (503 or 502), never an empty list. Each listing is a `data.access`
+  event.
 
-The route needs only the vault and the configuration, so it works where
-the query service is not configured. The browser half (sealing and the
-upload form) is not built yet (P40).
+Both routes need only the vault and the configuration, so they work
+where the query service is not configured. The browser half (sealing and
+the upload form) is not built yet (P40).
 
 The operator can see the tenant id, the dataset name, the object id, the
 snapshot versions and their times, ciphertext lengths, the suite, and the
@@ -272,10 +299,10 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   are what disclosure control relies on. Parse errors carry line numbers,
   never line content.
 * **Envelope binding**: the HPKE `info` string is
-  `tenant-envelope-v1|{tenant}|{slug}|{object}` — an envelope replayed under
-  a different object id does not open (tested). Framing is versioned
-  (`HPK1 || encapped_key || ciphertext`) so cipher suites can migrate
-  without redesigning storage.
+  `tenant-envelope-v2|{tenant}|{slug}|{object}` (`-v1` for `HPK1`) — an
+  envelope replayed under a different object id does not open (tested).
+  Framing is versioned (`magic || encapped_key || ciphertext`, magic `HPK2`
+  or `HPK1`) and the pipeline seals in the tenant key's suite.
 * **Snapshots** ([ADR 0003](adr/0003-connector-data-as-versioned-snapshots.md)):
   every sync is a full sync, so each one writes a complete snapshot under
   a new time-ordered version, then a plaintext record naming its suite,
@@ -286,8 +313,8 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
   would inflate cohort counts past *k*) and a sync that stops partway
   changes nothing a query sees. Superseded snapshots, records included,
   are deleted after the commit. The manifest's HPKE `info` is
-  `tenant-snapshot-manifest-v1|{tenant}|{slug}|{version}`. Steward uploads
-  share this layout and code (section 2).
+  `tenant-snapshot-manifest-v2|{tenant}|{slug}|{version}` (`-v1` for
+  `HPK1`). Steward uploads share this layout and code (section 2).
 * **Scheduler**: fixed-cadence `SyncScheduler`; one job's failure never
   aborts siblings. On SIGTERM or Ctrl-C it lets the sync in flight commit
   and starts no more. The `connector-worker` binary runs fixture jobs
@@ -298,16 +325,22 @@ OAuth2 ──────────▶ fetch → normalize → Arrow/Parquet (
 ### 4. Query (zero-trust analytics)
 
 ```
-POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapshot
-   (JWT tenant)        (gate_execution)       tenants/{t}/connectors/{slug}/manifests/*
+POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none within the wait ⇒ 503)
+   (JWT tenant)        (gate_execution)       ── from here within the time limit (⇒ 503; ZK: 422) ──
+                                              newest committed snapshot
+                                              tenants/{t}/connectors/{slug}/manifests/*
                                               its record (no record ⇒ 502)
+                                              its objects within the input limits? (no ⇒ 422)
                                               │
                           key released into enclave (EnclaveKeyProvider)
                           open HPKE envelopes (info by dataset kind) → Parquet in RAM
                           upload: schema and row cap as declared? (no ⇒ 502)
+                          footers within the decode limits? (no ⇒ 422)
                                               │
                           QueryScope: DataFusion SQL over decrypted frames
+                          fixed memory pool, no disk (pool exhausted ⇒ 422; ZK: as disclosure)
                           ZkMode::Enabled → plan allowlist + cohort threshold
+                          result within its row and byte limits? (no ⇒ 422)
                           zeroize blobs; Drop releases Arrow frames
                                               │
                                         JSON result rows
@@ -323,14 +356,68 @@ POST /api/v1/query ──▶ attestation gate ──▶ newest committed snapsho
   the MemTables built from decrypted Parquet; `Drop` deregisters them and
   releases the Arrow frames. Decrypted Parquet bytes live in zeroizing
   buffers and are wiped on every exit path, including errors.
-* **Bounded plaintext.** `max_concurrent_queries` caps how many queries
-  hold decrypted data at once; further queries wait for a slot, and a limit
-  of zero refuses with 503.
-* **The snapshot as written.** Before any key is released, the query reads
-  the newest snapshot's plaintext record; a snapshot without a valid one
-  fails closed (502), as does a manifest that lists a missing object.
-  Objects open under their dataset kind's binding: `tenant-envelope-v1`
-  for a connector's, `steward-upload-v1` for an upload's. For an upload,
+* **Bounded plaintext.** `max_concurrent_queries` (`QUERY_MAX_CONCURRENT`)
+  caps how many queries hold decrypted data at once, and a limit of zero
+  refuses with 503. A query waits at most `QUERY_SLOT_WAIT_SECS` for a slot,
+  then gets 503 with `Retry-After`, a refusal distinct from the 503 of a
+  query service that is not wired. From taking its slot through
+  decryption, decoding, execution and serialization it runs within
+  `QUERY_TIMEOUT_SECS`; on expiry the work is dropped and the query gets
+  503, or a gated query the disclosure-control 422 (see "Resource limits"
+  below). Every operator yields to the runtime as it produces a batch, so a
+  running plan stops at its next batch boundary, on the tasks running its
+  partitions too. One operator step between batches runs to its end first:
+  a nested-loop join compares a probe batch with its whole build side,
+  which the memory pool bounds. However a query ends (a result, an error,
+  the time limit, the caller going away, or a panic unwinding, which the
+  release profile does), the decrypted blobs are zeroized and the slot is
+  released.
+* **Resource limits** ([ADR 0013](adr/0013-per-query-resource-limits.md)).
+  `platform_core::QueryLimits`, read by `platform-config`, where each value
+  is bounded and an invalid one refuses startup (`backend/.env.example`
+  lists them). Together they must fit `QUERY_TOTAL_MEMORY_MIB`:
+  `QUERY_MAX_CONCURRENT` times one query's worst case (its pool, its
+  decoded table, three copies of its input and two of its result), or
+  startup is refused. Before any key is released,
+  the objects stored at the snapshot's version must fit
+  `QUERY_MAX_INPUT_OBJECTS` and, in ciphertext bytes, `DATASET_MAX_MIB`, the
+  upload limit, so every stored upload stays queryable; a sealed manifest
+  over the upload route's 16 KiB bound fails closed (502). Both input
+  limits are checked again on what the manifest lists, cumulatively, before
+  each object is opened. `QueryScope` reads every Parquet footer before it
+  decodes anything: the rows and uncompressed bytes they report must fit
+  `QUERY_MAX_DECODED_ROWS` and `QUERY_MAX_DECODED_MIB`, since DataFusion's
+  memory pool does not track the decoded table, and decoded rows are counted
+  again. Decoding is synchronous, so these limits also bound the one stretch
+  the time limit cannot interrupt. A footer's uncompressed sizes understate
+  columns that dictionary or run-length encoding shrinks, so the decoded
+  table can take more memory than `QUERY_MAX_DECODED_MIB`; the row limit
+  holds regardless. Operators run in a pool of `QUERY_MEMORY_MIB` with
+  DataFusion's disk manager disabled, so a sort or aggregation that runs out
+  fails the query instead of spilling decrypted rows to a temporary file. A
+  result with more rows than `QUERY_MAX_RESULT_ROWS` after disclosure
+  control, or more JSON than `QUERY_MAX_RESULT_MIB`, is refused, never
+  truncated. The pool does not track the rows collected for a result, so
+  without a disclosure policy the result streams and the query stops at
+  the first row over the limit; with one, suppression sees the whole
+  aggregate, whose groups the pool held. Each size limit is refused with 422 and a message of its own,
+  never the 400 of SQL that cannot run, and each limit refusal is an
+  `engine.query` "denied" event naming the limit. A research query is
+  charged before all of them (see "Rate level" below). In a gated query
+  (ZK own-data or research), running out of memory or time can depend on
+  rows that suppression withholds. Both refusals get exactly the response
+  of a disclosure-control refusal (422), and only the audit event names
+  the limit.
+* **The snapshot as written.** Before any key is released or budget
+  charged, the query reads the newest snapshot's plaintext record (a
+  research query reads it before its charge, then again, with the snapshot
+  then current, once it holds a slot); a snapshot without a valid one
+  fails closed (502), as does one whose record names another suite than
+  the tenant's key (502, `crypto.suite_refused`) and a manifest that lists
+  a missing object. Objects open under the
+  record's suite and their dataset kind's binding: `tenant-envelope-v2`
+  for a connector's, `steward-upload-v2` for an upload's (`-v1` under
+  `HPK1`), so an envelope of another suite fails to open. For an upload,
   `QueryScope::register_parquet_declared` checks each object's schema
   and the rows its footer reports against what the steward declared before
   decoding, and the decoded rows after; a mismatch is refused with 502
@@ -383,7 +470,9 @@ upload; the **researcher** may run aggregate queries but never read rows.
 Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403 + audit
                  attestation gate
+                 snapshot record: valid, names the key's suite?  ──no──▶ 502 + audit
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
+                 slot, time and size limits as in Query, gated (charged)  ──no──▶ 503 / 422 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
                  QueryScope, ZkMode FORCED Enabled:
                      plan gate: aggregate-only (no row egress)
@@ -424,10 +513,13 @@ Three enforcement layers at one choke point, all in code:
 * **Rate level** (`platform_tenancy::BudgetLedger`): each research query
   spends one unit of the grant's budget, charged after the attestation gate
   (infrastructure failures never cost the researcher) and before execution,
-  with no refunds — probing the plan gate costs budget. Exhaustion returns
-  429 with a `research.budget` event. Spend is monotonic per grant id;
-  re-granting cannot reset it. The `cost` parameter is the seam for a
-  sensitivity-scaled or privacy-loss (ε) accountant.
+  with no refunds — probing the plan gate costs budget. A refusal by a
+  resource limit, including no plaintext slot within the wait, also comes
+  after the charge and costs the unit; P54 decides whether that order
+  stays. Exhaustion returns 429 with a `research.budget` event. Spend is
+  monotonic per grant id; re-granting cannot reset it. The `cost`
+  parameter is the seam for a sensitivity-scaled or privacy-loss (ε)
+  accountant.
 
 Grants (`platform_tenancy::GrantRegistry`) are steward-scoped, revocable by
 the granting steward only, and do not expire. A grant covers one dataset of
@@ -462,7 +554,8 @@ publishing a listing — title, description, license fee, compute rate,
 included budget, prices in integer cents — is the steward's opt-in to
 discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
-its tenant (`platform_connectors::snapshot::holds`). Researchers file
+its tenant (`platform_connectors::snapshot::holds`), so the steward's
+dataset listing (section 2) shows exactly what it can publish. Researchers file
 access requests (idempotent while pending); approval mints the grant
 through the same code path as a direct grant, and adds its query budget
 to the grant once, keyed by the request: a follow-up request tops up a
@@ -537,7 +630,7 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-config | Env → `PlatformConfig` (brand/server/storage/research/dataset size) | Hardcoded brand strings |
 | platform-telemetry | JSON tracing init, `SECURITY_AUDIT_EVENT` emitter | Secrets/customer content in events |
 | platform-crypto | AEAD seal/open, HPKE suite pin, envelope frame check and suite names, envelope `info` strings, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
-| envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and `info` strings, for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys, the drive KEK or file keys; I/O or logging |
+| envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and open, public-key derivation and `info` strings, for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys beyond one open or derivation (zeroized before returning), the drive KEK or file keys; I/O or logging |
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait, the plaintext `SnapshotRecord` | Raw-string storage paths |
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
@@ -556,7 +649,8 @@ traits; durable backends replace them without touching call sites.
 * All primitives come from RustCrypto (`aes-gcm`, `hmac`, `sha2`,
   `rsa`) and the `hpke` crate; TOTP is RFC 6238 over the existing HMAC stack
   and is tested against the RFC's own vectors.
-* Suites are pinned at single seams (one `TenantKem` type alias, one
+* Suites are pinned at single seams (one `EnvelopeSuite` enum, whose
+  `CURRENT` is the suite new keys and envelopes use, and one
   `JwtVerifier` construction site) and encrypted framing is versioned, so
   algorithm migration is a code change plus a version bump — not a storage
   redesign.
@@ -572,11 +666,12 @@ traits; durable backends replace them without touching call sites.
 
 The release target is hybrid post-quantum cryptography, so ciphertext
 stored today stays protected against a future quantum adversary ("harvest
-now, decrypt later"). The current suites are classical.
+now, decrypt later"). Tenant envelopes are hybrid on the backend; the
+browser and signatures are still classical.
 
 | Use | Current | Target |
 | --- | --- | --- |
-| Key encapsulation (envelopes, enrollment) | X25519 (DHKEM, HKDF-SHA256), frame `HPK1` | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2` |
+| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The browser (`envelope-wasm`) and the enclave's key-release key are still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186; key-release key: P85, #176) |
 | Bulk encryption | AES-256-GCM | AES-256-GCM |
 | Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 for keys only an attested workload holds; tokens per ADR 0006 |
 
@@ -590,12 +685,23 @@ Migration rules:
 * Established implementations only, as ADR 0007 defines the term
   (RustCrypto, `hpke`, and Web Crypto where the browser supports the
   algorithm). No invented primitives.
-* The suite changes at the existing seams — `TenantKem`, the `JwtVerifier`
-  construction site, the browser crypto core — with a new frame version
-  alongside `HPK1`.
-* No silent downgrade: a reader configured for the hybrid suite refuses
-  classical-only envelopes and signatures. v1 has no migration mode
-  (ADR 0007): nothing has been sealed under `HPK1` outside development.
+* The suite changes at the existing seams — `EnvelopeSuite` (add a suite
+  and move `CURRENT`), the `JwtVerifier` construction site, the browser
+  crypto core — with a new frame version alongside `HPK1`.
+* Every key loader takes a `SuitePolicy`, except the raw `hpk1_*` loaders:
+  they are the browser's `HPK1` path and go away with P36 (#186). Tenant
+  enrollment and the demo tenant build it from `APP_ENV` (ADR 0009):
+  production accepts only `HPK2` keys, development also `HPK1`, so the
+  browser works until P36. The
+  key-release stand-in and released keys accept only `HPK2` in every mode;
+  the browser build and the enclave's key-release key accept only `HPK1`
+  until P36 and P85. A key opens only frames of its own suite, and a query
+  opens only a snapshot whose record names its key's suite. Refusals at
+  enrollment, upload, key release, query and open emit
+  `crypto.suite_refused`.
+* No silent downgrade: production refuses `HPK1` frames and X25519
+  enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):
+  nothing has been sealed under `HPK1` outside development.
 
 The work is tracked in `docs/PROJECT_SCOPE.md`; the threat it closes is A4
 in `docs/THREAT_MODEL.md`.
@@ -609,16 +715,17 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `audit_kind` | Emitted on |
 | --- | --- |
 | `service.start` | API or connector-worker boot |
-| `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied) |
+| `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied; every refusal, a suite refusal included, is a denial) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
 | `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
 | `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
-| `engine.query` | Every confidential query, with metering fields |
+| `engine.query` | Every confidential query, with metering fields, and each refusal by a resource limit ("denied", with `limit=<name>`) |
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+| `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope, upload or snapshot record whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
 kind of their own: a grant is the steward provisioning access to its own
@@ -646,8 +753,10 @@ Rules, enforced by the capture tests:
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key
-   enrollment (ok + denied), query attestation + execution (ok + failed),
-   provisioning, steward uploads (ok, committed, pruned, denied),
+   enrollment (ok + denied), suite refusals (enrollment and open), query
+   attestation + execution (ok + failed), query refusals by each kind of
+   resource limit (denied), provisioning, steward uploads (ok, committed,
+   pruned, denied), the dataset listing (ok + denied over its cap),
    connector snapshot commit and prune, the research catalog (ok +
    denied): publish and its refusal, request, approval and its retry, deny,
    and the refused retry and deny, and research grants and budgets (ok +
@@ -713,8 +822,9 @@ the simulated TEE set `APP_ENV=development`.
 
 The `dev` Cargo feature is separate: it decides which development code is
 compiled at all (`devstack`, `devtoken`, `key-release`, `query-demo`,
-`sim-attestation`, the simulated token provider). Release builds omit it;
-production mode refuses development configuration in any build.
+`seal-upload`, `sim-attestation`, the simulated token provider). Release
+builds omit it; production mode refuses development configuration in any
+build.
 
 The frontend's release build (`npm run build:release`, `vite build --mode
 release`, run by `release.yml`) fails unless `VITE_VAULT_MODE` is `http` and

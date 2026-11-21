@@ -69,7 +69,7 @@ jobs:
             lscpu | grep -E '^(Model name|CPU\(s\)):'
             rustc -V
             cargo tree --locked -p platform-crypto -e normal --prefix none \
-              | grep -E '^(hpke|aes-gcm|x25519-dalek|curve25519-dalek) v' | awk '{print $1, $2}' | sort -u
+              | grep -E '^(hpke|aes-gcm|x25519-dalek|curve25519-dalek|x-wing|ml-kem) v' | awk '{print $1, $2}' | sort -u
           } | tee "$RUNNER_TEMP/machine.txt"
           cargo bench -p platform-crypto --bench hpke --locked -- --noplot | tee "$RUNNER_TEMP/bench.txt"
       - name: Summary

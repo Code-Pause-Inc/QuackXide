@@ -1773,6 +1773,7 @@ The first draft's single hybrid-suite issue is split into a suite ADR (P17, with
 - The admin control-plane marker (`backend/crates/platform-api/src/admin.rs:43-45`, written on provisioning but never read back) is either used to rehydrate the registry on startup or removed with its comment.
 - If the store is a server, a CI job runs the durable tests against the real service on Linux.
 - README "Status" ("Durability") is updated.
+- Upload commits are serialized per dataset. `platform_connectors::upload::commit_upload` reads the newest snapshot record (schema and suite checks) and then writes with no lock or conditional write, so two concurrent uploads to one dataset can both pass the checks and the newer wins. A durable backend needs a per-dataset conditional write, or the process a per-dataset lock. The upload route likewise reads the enrolled key's suite before `commit_upload` runs, and passes it only whether a key is enrolled, so an enrollment that changes in between goes unseen (development only, the one mode that accepts two suites).
 
 **Where.** `backend/crates/platform-tenancy/src/` (new backend modules), `backend/crates/platform-api/src/main.rs`, `backend/crates/platform-config/src/lib.rs`, `backend/.env.example`, `.github/workflows/ci.yml` (if a service job is needed), `README.md`.
 

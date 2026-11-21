@@ -1,23 +1,25 @@
 //! Audit-coverage contract: every security-relevant flow (key enrollment,
 //! TEE attestation, provisioning, data access including misses and denials,
-//! the research catalog, research grants and budgets) emits its
-//! SECURITY_AUDIT_EVENT record.
+//! the research catalog, research grants and budgets, and queries refused
+//! by a resource limit) emits its SECURITY_AUDIT_EVENT record.
 
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
-use platform_api::query::{ConnectorQueryService, DevKeyProvider};
+use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
 use platform_api::research::{ResearchService, ResearchStores};
-use platform_api::{AppState, build_app};
+use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
 use platform_connectors::source::FixtureSource;
 use platform_core::{ConnectorSlug, ObjectId, TenantId, ZkMode};
-use platform_crypto::TenantKeypair;
+use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair};
 use platform_enclave::simulated_token::{
     SIMULATED_IMAGE_DIGEST, SimulatedClaims, SimulatedTokenProvider, TokenSigner,
 };
@@ -26,7 +28,7 @@ use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{ObjectStoreVault, TenantPaths, VaultStore};
 use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
 
@@ -70,7 +72,7 @@ async fn full_app_with_attestation(
     attestation: Arc<dyn AttestationProvider>,
     require_attestation: bool,
 ) -> Router {
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let vault = synced_vault(tenant, &keypair, 1).await;
     let config = Arc::new(common::config_with_mor_secret(PADDLE_SECRET));
     // The configured `k` and default budget, as the binary wires them.
@@ -87,6 +89,7 @@ async fn full_app_with_attestation(
         EngineSettings {
             zk,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         require_attestation,
     )
@@ -155,6 +158,123 @@ async fn data_access_hits_misses_and_auth_denials_are_audited() {
     );
 }
 
+/// PUT an X25519 (`HPK1`) public key to the enrollment route of `app`.
+async fn enroll_x25519(app: &Router, token: &str) -> StatusCode {
+    use base64::Engine as _;
+    let raw = TenantKeypair::generate(EnvelopeSuite::Hpk1)
+        .public_key()
+        .to_raw();
+    let body = serde_json::json!({
+        "hpke_public_key_b64": base64::engine::general_purpose::STANDARD.encode(raw),
+    });
+    send(
+        app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(token), json_header()],
+        body.to_string().into_bytes(),
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn x25519_enrollment_is_refused_in_production_and_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    // The default config is production (APP_ENV unset, ADR 0009).
+    let app = build_app(common::app_state(
+        SECRET,
+        Arc::new(ObjectStoreVault::new_in_memory()),
+    ));
+    assert_eq!(
+        enroll_x25519(&app, &token_for(tenant)).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+    // Monitoring on `crypto.key_enrollment` sees the refusal too.
+    assert_tenant_event(
+        &capture,
+        "crypto.key_enrollment",
+        "denied",
+        tenant,
+        "refused enrollment key of a suite this deployment does not accept",
+    );
+}
+
+#[tokio::test]
+async fn an_enrollment_key_that_is_not_base64_is_refused_and_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let app = build_app(common::app_state(
+        SECRET,
+        Arc::new(ObjectStoreVault::new_in_memory()),
+    ));
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token_for(tenant)), json_header()],
+        br#"{"hpke_public_key_b64":"not base64!"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_tenant_event(
+        &capture,
+        "crypto.key_enrollment",
+        "denied",
+        tenant,
+        "rejected enrollment key that is not valid base64",
+    );
+}
+
+#[tokio::test]
+async fn x25519_enrollment_is_accepted_in_development() {
+    let tenant = TenantId::generate();
+    let mut state = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let token = token_for(tenant);
+    assert_eq!(enroll_x25519(&app, &token).await, StatusCode::NO_CONTENT);
+    let (status, stored) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&stored).expect("json");
+    assert_eq!(parsed["suite"], "DHKEM(X25519,HKDF-SHA256)+AES-256-GCM");
+}
+
+#[tokio::test]
+async fn envelope_of_another_suite_is_refused_and_audited() {
+    use platform_api::query::EnclaveKeyProvider as _;
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1);
+    let envelope =
+        platform_crypto::hpke_seal_to_tenant(&hpk1.public_key(), b"info", b"rows").expect("seal");
+    let provider = DevKeyProvider::new(tenant, TenantKeypair::generate(EnvelopeSuite::Hpk2));
+    assert!(
+        provider
+            .open_envelope(tenant, b"info", &envelope)
+            .await
+            .is_err()
+    );
+    assert!(
+        capture.contains("crypto.suite_refused", "denied"),
+        "{:?}",
+        capture.events()
+    );
+}
+
 #[tokio::test]
 async fn key_enrollment_handshake_is_audited_and_validated() {
     let capture = AuditCapture::install();
@@ -162,8 +282,8 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
     let app = full_app(tenant, ZkMode::Disabled).await;
     let token = token_for(tenant);
 
-    // A real X25519 public key enrolls.
-    let keypair = TenantKeypair::generate();
+    // A real X-Wing public key enrolls, recorded with its suite.
+    let keypair = TenantKeypair::generate(EnvelopeSuite::Hpk2);
     let key_b64 = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(keypair.public_key().to_raw())
@@ -190,6 +310,7 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
     assert_eq!(status, StatusCode::OK);
     let parsed: serde_json::Value = serde_json::from_slice(&stored).expect("json");
     assert_eq!(parsed["hpke_public_key_b64"], key_b64);
+    assert_eq!(parsed["suite"], "X-Wing+HKDF-SHA256+AES-256-GCM");
 
     // Malformed keys are rejected — and the rejection is audited.
     let (status, _) = send(
@@ -494,7 +615,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT);
     let snp = sim(SimulatedClaims::default());
 
     let pipeline = EnclavePipeline::new(snp.clone(), vault.clone(), false);
@@ -512,7 +633,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         sim_signer().issuer(),
         sim_policy(),
     ));
-    rp.insert_tenant_key(tenant, &keypair);
+    rp.insert_tenant_key(tenant, &keypair).expect("HPK2 key");
     let ok_provider = Arc::new(AttestedKeyProvider::new(
         Arc::new(EnclaveIdentity::generate()),
         snp.clone(),
@@ -525,6 +646,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );
@@ -565,6 +687,7 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
         EngineSettings {
             zk: ZkMode::Disabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         false,
     );
@@ -843,7 +966,7 @@ async fn research_catalog_is_audited() {
     let app = common::research_app(
         SECRET,
         steward,
-        TenantKeypair::generate(),
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
         dev_attestation(),
         false,
     )
@@ -1200,7 +1323,7 @@ async fn refused_grant_id_requests_are_audited() {
 async fn dataset_upload_is_audited() {
     let capture = AuditCapture::install();
     let steward = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     let key = keypair.public_key();
     let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
     let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());
@@ -1338,10 +1461,72 @@ fn object_bytes(body: &[u8]) -> usize {
 }
 
 #[tokio::test]
+async fn dataset_listing_is_audited() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = build_app(app_state(SECRET, vault.clone()));
+    let token = token_for(steward);
+    let cap = platform_api::MAX_LISTED_OBJECTS;
+    let version = common::next_version(None);
+
+    // Listings of no dataset, one, and one more than the cap.
+    let mut statuses = Vec::new();
+    for held in [0, 1, cap + 1] {
+        for i in 0..held {
+            let dataset = ConnectorSlug::new(&format!("upload_{i}")).expect("slug");
+            vault
+                .put(
+                    &TenantPaths::connector_manifest(steward, &dataset, &version),
+                    Bytes::from_static(b"sealed"),
+                )
+                .await
+                .expect("put");
+        }
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/api/v1/datasets",
+            &[bearer(&token)],
+            Vec::new(),
+        )
+        .await;
+        statuses.push(status);
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::UNPROCESSABLE_ENTITY
+        ]
+    );
+    for count in [0, 1] {
+        assert_tenant_event(
+            &capture,
+            "data.access",
+            "ok",
+            steward,
+            &format!("list_datasets count={count}"),
+        );
+    }
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        &format!(
+            "list_datasets datasets={} objects=0 exceeds cap={cap}",
+            cap + 1
+        ),
+    );
+}
+
+#[tokio::test]
 async fn connector_snapshot_commit_and_prune_are_audited() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
     // Two syncs: the second commits and prunes the first.
     let _vault = synced_vault(tenant, &keypair, 2).await;
     let events = capture.events();
@@ -1369,5 +1554,300 @@ async fn production_mode_refusal_is_audited_without_values() {
     assert!(
         !format!("{events:?}").contains("audit-refusal-secret"),
         "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_in_another_suite_than_the_enrolled_key_is_audited() {
+    let capture = AuditCapture::install();
+    let mut state = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let steward = TenantId::generate();
+    let token = token_for(steward);
+    let enrolled = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    assert_eq!(
+        common::enroll_key(&app, &token, &enrolled).await,
+        StatusCode::NO_CONTENT
+    );
+    let other = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+    let sealed = common::cohorts_upload(steward, &other, "upload_cohorts", None);
+    let (status, _) = common::put_upload(&app, Some(&token), "upload_cohorts", sealed.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert_tenant_event(
+        &capture,
+        "crypto.suite_refused",
+        "denied",
+        steward,
+        "refused an upload sealed in a suite other than the enrolled key's",
+    );
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        "upload refused dataset=upload_cohorts reason=enrolled_suite_mismatch",
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_enrollment_record_is_audited_on_upload() {
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let key = keypair.public_key();
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let app = common::upload_research_app(SECRET, vec![(steward, keypair)], vault.clone());
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(steward),
+            Bytes::from_static(b"not an enrollment record"),
+        )
+        .await
+        .expect("put");
+    let sealed = common::cohorts_upload(steward, &key, "upload_cohorts", None);
+    let (status, _) = common::put_upload(
+        &app,
+        Some(&token_for(steward)),
+        "upload_cohorts",
+        sealed.body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "failed",
+        steward,
+        "upload failed dataset=upload_cohorts reason=enrollment_unreadable",
+    );
+}
+
+#[tokio::test]
+async fn an_upload_in_another_suite_than_the_snapshot_is_audited() {
+    let capture = AuditCapture::install();
+    let mut state = common::app_state(SECRET, Arc::new(ObjectStoreVault::new_in_memory()));
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let steward = TenantId::generate();
+    let token = token_for(steward);
+    let hpk2 = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    let first = common::cohorts_upload(steward, &hpk2, "upload_cohorts", None);
+    let (status, _) = common::put_upload(&app, Some(&token), "upload_cohorts", first.body).await;
+    assert_eq!(status, StatusCode::OK);
+    let hpk1 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+    let second = common::cohorts_upload(steward, &hpk1, "upload_cohorts", Some(&first.version));
+    let (status, _) = common::put_upload(&app, Some(&token), "upload_cohorts", second.body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert_tenant_event(
+        &capture,
+        "crypto.suite_refused",
+        "denied",
+        steward,
+        "refused an upload sealed in a suite other than the dataset's current snapshot",
+    );
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "denied",
+        steward,
+        "upload refused dataset=upload_cohorts reason=snapshot_suite_mismatch",
+    );
+}
+
+/// Holds each key open for `hold` before the dev provider opens it.
+struct SlowKeys {
+    inner: DevKeyProvider,
+    hold: Duration,
+}
+
+#[async_trait]
+impl EnclaveKeyProvider for SlowKeys {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        self.inner.key_suite(tenant)
+    }
+
+    async fn open_envelope(
+        &self,
+        tenant: TenantId,
+        info: &[u8],
+        envelope: &[u8],
+    ) -> Result<SecretBytes, ApiError> {
+        tokio::time::sleep(self.hold).await;
+        self.inner.open_envelope(tenant, info, envelope).await
+    }
+}
+
+/// A query service (ZK off) over one QuickBooks sync for `tenant`, with
+/// `limits` and `max_concurrent_queries` slots, holding each key open for
+/// `hold`.
+async fn limited_query_service(
+    tenant: TenantId,
+    max_concurrent_queries: usize,
+    limits: QueryLimits,
+    hold: Duration,
+) -> ConnectorQueryService {
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let keys = SlowKeys {
+        inner: DevKeyProvider::new(tenant, keypair),
+        hold,
+    };
+    ConnectorQueryService::new(
+        vault,
+        Arc::new(keys),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries,
+            limits,
+        },
+        false,
+    )
+}
+
+/// Every resource-limit refusal, wherever in the query it happens, is one
+/// `engine.query` denial naming the limit, with the caller's tenant and no
+/// SQL text. The paused clock runs the waits without real time.
+#[tokio::test(start_paused = true)]
+async fn resource_limit_refusals_are_audited() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let sql = "SELECT currency, SUM(total) AS revenue FROM quickbooks GROUP BY currency";
+    // Each open is held this long: two outlast a one-second limit and fit
+    // the default time limit.
+    let hold = Duration::from_secs(20);
+    let defaults = QueryLimits::default();
+
+    // A result limit in the engine, then an input limit before key release.
+    for limits in [
+        QueryLimits {
+            max_result_rows: 1,
+            ..defaults
+        },
+        QueryLimits {
+            max_input_bytes: 1,
+            ..defaults
+        },
+    ] {
+        let service = limited_query_service(tenant, 4, limits, Duration::ZERO).await;
+        assert!(service.query(tenant, &connector, sql).await.is_err());
+    }
+    // The time limit, while a key opens.
+    let limits = QueryLimits {
+        timeout: Duration::from_secs(1),
+        ..defaults
+    };
+    let timed = limited_query_service(tenant, 1, limits, hold).await;
+    assert!(timed.query(tenant, &connector, sql).await.is_err());
+    // The wait for the only slot, which another query holds.
+    let limits = QueryLimits {
+        slot_wait: Duration::from_secs(1),
+        ..defaults
+    };
+    let busy = limited_query_service(tenant, 1, limits, hold).await;
+    let (first, second) = tokio::join!(busy.query(tenant, &connector, sql), async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        busy.query(tenant, &connector, sql).await
+    });
+    assert!(first.is_ok() && second.is_err());
+
+    // A research query refused after its charge.
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        Arc::new(ObjectStoreVault::new_in_memory()),
+        2,
+        100,
+    ));
+    assert!(
+        research
+            .grant(steward, researcher, &connector, Some(10))
+            .await
+            .is_ok()
+    );
+    let limits = QueryLimits {
+        max_result_rows: 0,
+        ..defaults
+    };
+    let service = limited_query_service(steward, 4, limits, Duration::ZERO)
+        .await
+        .with_research(research);
+    let research_sql = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency";
+    assert!(
+        service
+            .research_query(researcher, steward, &connector, research_sql)
+            .await
+            .is_err()
+    );
+
+    let events = capture.events();
+    let denied: Vec<_> = events
+        .iter()
+        .filter(|e| e.audit_kind == "engine.query" && e.outcome == "denied")
+        .collect();
+    let details: Vec<&str> = denied.iter().map(|e| e.detail.as_str()).collect();
+    assert_eq!(
+        details,
+        [
+            "connector=quickbooks limit=result_rows zk=false".to_owned(),
+            "connector=quickbooks limit=input_bytes zk=false".to_owned(),
+            "connector=quickbooks limit=time zk=false".to_owned(),
+            "connector=quickbooks limit=slot_wait zk=false".to_owned(),
+            format!(
+                "research steward={steward} connector=quickbooks limit=result_rows \
+                 budget_remaining=9"
+            ),
+        ],
+        "{events:?}"
+    );
+    let tenants: Vec<String> = denied.iter().map(|e| e.tenant_id.clone()).collect();
+    let mut expected = vec![tenant.to_string(); 4];
+    expected.push(researcher.to_string());
+    assert_eq!(tenants, expected);
+    for event in &events {
+        assert!(
+            !event.detail.contains("SELECT") && !event.detail.contains("revenue"),
+            "{event:?}"
+        );
+    }
+}
+
+/// A snapshot no key can be released for is refused before any key release,
+/// with a `data.access` failure naming why.
+#[tokio::test]
+async fn a_snapshot_with_no_releasable_key_is_audited() {
+    let capture = AuditCapture::install();
+    let owner = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let vault = synced_vault(owner, &keypair, 1).await;
+    // The provider holds a key, but another tenant's.
+    let keys = DevKeyProvider::new(TenantId::generate(), keypair);
+    let service = ConnectorQueryService::new(
+        vault,
+        Arc::new(keys),
+        dev_attestation(),
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
+        },
+        false,
+    );
+    let connector = ConnectorSlug::new("quickbooks").expect("slug");
+    let refused = service
+        .query(owner, &connector, "SELECT COUNT(*) AS n FROM quickbooks")
+        .await;
+    assert!(matches!(refused, Err(ApiError::Backend)));
+    assert_tenant_event(
+        &capture,
+        "data.access",
+        "failed",
+        owner,
+        "no tenant key can be released to open the snapshot",
     );
 }

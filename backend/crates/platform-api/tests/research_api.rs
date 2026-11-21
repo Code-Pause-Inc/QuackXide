@@ -22,13 +22,14 @@ use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{AppState, build_app};
 use platform_core::{ConnectorSlug, TenantId, ZkMode};
 
-use platform_crypto::TenantKeypair;
+use platform_config::PlatformConfig;
+use platform_crypto::{EnvelopeSuite, TenantKeypair};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_tenancy::{
     BudgetError, BudgetLedger, BudgetState, DatasetGrant, GrantOutcome, GrantRegistry,
     InMemoryBudgetLedger, InMemoryGrantRegistry, TenancyError,
 };
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 
 use common::{call, dev_attestation, post};
 
@@ -69,7 +70,11 @@ const AGG_SQL: &str =
 async fn granted_researcher_gets_disclosure_controlled_aggregates() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     // Steward grants the researcher access to the health connector.
     let (status, grant) = post(
@@ -102,20 +107,22 @@ async fn granted_researcher_gets_disclosure_controlled_aggregates() {
     assert_eq!(body["budget_remaining"], 99);
 }
 
-#[tokio::test]
-async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
+/// The steward uploads a cohort sealed in `suite` under `config`, and a
+/// granted researcher queries it.
+async fn researcher_queries_an_uploaded_dataset(suite: EnvelopeSuite, config: PlatformConfig) {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let keypair = TenantKeypair::generate();
+    let keypair = TenantKeypair::generate(suite);
     let key = keypair.public_key();
-    let app = common::upload_research_app(
+    let app = common::upload_research_app_with_config(
         SECRET,
+        config,
         vec![(steward, keypair)],
         Arc::new(platform_storage::ObjectStoreVault::new_in_memory()),
     );
 
-    // The steward's browser seals the cohort and uploads it; nothing else
-    // seeds the dataset.
+    // The steward seals the cohort and uploads it; nothing else seeds the
+    // dataset.
     let upload = common::cohorts_upload(steward, &key, "upload_cohorts", None);
     let (status, body) = common::put_upload(
         &app,
@@ -154,10 +161,50 @@ async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
 }
 
 #[tokio::test]
+async fn granted_researcher_queries_a_dataset_uploaded_through_the_route() {
+    researcher_queries_an_uploaded_dataset(EnvelopeSuite::CURRENT, common::default_config()).await;
+}
+
+/// The browser seals `HPK1` until P36, which only development accepts.
+#[tokio::test]
+async fn granted_researcher_queries_an_hpk1_dataset_uploaded_in_development() {
+    researcher_queries_an_uploaded_dataset(EnvelopeSuite::Hpk1, common::development_config()).await;
+}
+
+/// Key release is `HPK2`-only: an `HPK1` key registered for it would make
+/// every query fail after charging its budget, so building the service fails.
+#[test]
+#[should_panic(expected = "key release is HPK2-only")]
+fn the_release_path_refuses_a_stack_holding_an_hpk1_key() {
+    let mut stack = DevResearchStack::new();
+    stack.register_key(
+        TenantId::generate(),
+        TenantKeypair::generate(EnvelopeSuite::Hpk1),
+    );
+    let vault = stack.vault();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault,
+        5,
+        100,
+    ));
+    let settings = EngineSettings {
+        zk: ZkMode::Disabled,
+        max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
+    };
+    stack.query_service(settings, research);
+}
+
+#[tokio::test]
 async fn budget_exhausts_and_steward_top_up_restores_access() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     // Explicit two-query allocation.
     let (status, grant) = post(
@@ -214,8 +261,13 @@ async fn refused_attestation_charges_no_budget() {
     for provider in providers {
         let steward = TenantId::generate();
         let researcher = TenantId::generate();
-        let app =
-            research_app_with_attestation(steward, TenantKeypair::generate(), provider, true).await;
+        let app = research_app_with_attestation(
+            steward,
+            TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+            provider,
+            true,
+        )
+        .await;
 
         // The grant check runs before the gate, so the refusal needs a grant.
         let (status, grant) = post(
@@ -253,11 +305,72 @@ async fn refused_attestation_charges_no_budget() {
     }
 }
 
+/// A snapshot sealed before the steward's key moved to `HPK2` (record and
+/// envelopes `HPK1`) can never open: the query is refused before its budget
+/// is charged.
+#[tokio::test]
+async fn a_snapshot_the_key_cannot_open_charges_no_budget() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let vault: Arc<dyn platform_storage::VaultStore> =
+        Arc::new(platform_storage::ObjectStoreVault::new_in_memory());
+    let connector = ConnectorSlug::new("health").expect("slug");
+    DevResearchStack::with_vault(vault.clone())
+        .commit_snapshot(
+            steward,
+            TenantKeypair::generate(EnvelopeSuite::Hpk1),
+            &connector,
+            "cohorts",
+            &common::cohorts_parquet(),
+        )
+        .await
+        .expect("commit");
+    let app = common::upload_research_app(
+        SECRET,
+        vec![(steward, TenantKeypair::generate(EnvelopeSuite::Hpk2))],
+        vault,
+    );
+
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+
+    let (status, body) = post(
+        &app,
+        "/api/v1/research/query",
+        &token_for(researcher),
+        &format!(r#"{{"steward_tenant":"{steward}","connector":"health","sql":"{AGG_SQL}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+
+    let (status, budget) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/grants/{grant_id}/budget"),
+        &token_for(researcher),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(budget["spent"], 0, "budget: {budget}");
+}
+
 #[tokio::test]
 async fn rejected_queries_still_consume_budget() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, grant) = post(
         &app,
@@ -298,7 +411,11 @@ async fn budget_is_visible_to_parties_only_and_steward_controls_top_up() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let outsider = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, grant) = post(
         &app,
@@ -355,7 +472,11 @@ async fn budget_is_visible_to_parties_only_and_steward_controls_top_up() {
 async fn ungranted_research_query_is_forbidden() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     // No grant created.
     let (status, _) = post(
@@ -372,7 +493,11 @@ async fn ungranted_research_query_is_forbidden() {
 async fn revoked_grant_blocks_further_queries() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
 
     let (_, grant) = post(
         &app,
@@ -419,7 +544,11 @@ async fn revoked_grant_blocks_further_queries() {
 async fn researcher_cannot_egress_raw_rows_or_skip_count() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     post(
         &app,
         "/api/v1/grants",
@@ -471,7 +600,11 @@ async fn researcher_cannot_egress_raw_rows_or_skip_count() {
 async fn error_probe_gets_the_same_refusal_whatever_the_data() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     post(
         &app,
         "/api/v1/grants",
@@ -498,7 +631,11 @@ async fn error_probe_gets_the_same_refusal_whatever_the_data() {
 #[tokio::test]
 async fn cannot_grant_to_self() {
     let steward = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     let (status, _) = post(
         &app,
         "/api/v1/grants",
@@ -577,7 +714,7 @@ async fn queries_outside_the_granted_dataset_are_forbidden() {
     let steward = TenantId::generate();
     let other_steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let grant_id = grant_health(&app, steward, researcher).await;
     let (status, body) = research_query(&app, researcher, steward).await;
     assert_eq!(status, StatusCode::OK, "query: {body}");
@@ -613,7 +750,7 @@ async fn nonexistent_or_revoked_dataset_gets_the_same_refusal_as_an_ungranted_on
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let revoked_researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let revoked_id = grant_health(&app, steward, revoked_researcher).await;
     let (status, _) = call(
         &app,
@@ -658,7 +795,7 @@ async fn unknown_and_foreign_grant_ids_get_the_same_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let outsider = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let grant_id = grant_health(&app, steward, researcher).await;
     let unknown_id = TenantId::generate().to_string();
 
@@ -711,7 +848,7 @@ async fn unknown_and_foreign_grant_ids_get_the_same_404() {
 async fn revoked_grant_still_answers_its_steward() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let grant_id = grant_health(&app, steward, researcher).await;
 
@@ -743,7 +880,7 @@ async fn revoked_grant_still_answers_its_steward() {
 async fn cannot_reset_budget_spend_by_regranting() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let grant = |budget: u64| {
         format!(
@@ -957,6 +1094,7 @@ async fn research_app_with_stores(
     let settings = EngineSettings {
         zk: ZkMode::Disabled, // research mode forces ZK on regardless
         max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
     };
     let research = Arc::new(ResearchService::new(stores, vault.clone(), 5, 100));
     let service = stack.query_service(settings, research.clone());
@@ -1025,7 +1163,12 @@ async fn approval_retried_after_a_budget_failure_converges() {
         budgets: Arc::new(FailFirstOpen::default()),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1058,7 +1201,12 @@ async fn deny_after_a_failed_approval_is_refused() {
         grants: Arc::new(FailFirstCreate::default()),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let uri = |action: &str| format!("/api/v1/research/requests/{request_id}/{action}");
@@ -1092,7 +1240,11 @@ async fn approval_retry_by_a_non_steward_is_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let outsider = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
     let (status, _) = post(&app, &approve, &token_for(steward), "{}").await;
@@ -1118,7 +1270,11 @@ async fn approval_retry_by_a_non_steward_is_404() {
 async fn approval_retry_after_a_revoke_is_refused() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1171,7 +1327,12 @@ async fn half_finished_approval_retry_after_a_revoke_is_refused() {
         budgets: Arc::new(FailFirstOpen::default()),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1202,7 +1363,12 @@ async fn approval_retry_racing_a_revoke_is_refused() {
         grants: Arc::new(RevokeDuringRetry::default()),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1232,7 +1398,11 @@ async fn approval_retry_racing_a_revoke_is_refused() {
 async fn approval_retry_with_a_different_budget_is_refused() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1267,7 +1437,12 @@ async fn approval_retry_after_a_budget_failure_keeps_the_approved_budget() {
         budgets: Arc::new(FailFirstOpen::default()),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
@@ -1286,7 +1461,11 @@ async fn approval_retry_after_a_budget_failure_keeps_the_approved_budget() {
 async fn approving_a_denied_request_is_404() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(
+        steward,
+        TenantKeypair::generate(platform_crypto::EnvelopeSuite::CURRENT),
+    )
+    .await;
     let request_id = pending_request(&app, steward, researcher).await;
     let uri = |action: &str| format!("/api/v1/research/requests/{request_id}/{action}");
 
@@ -1305,7 +1484,7 @@ async fn approving_a_denied_request_is_404() {
 async fn follow_up_approval_adds_its_budget_to_the_grant() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let listing_id = publish(&app, steward).await;
 
@@ -1348,7 +1527,7 @@ async fn approving_a_request_for_an_unpublished_listing_is_404() {
     let capture = platform_telemetry::capture::AuditCapture::install();
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let app = research_app(steward, TenantKeypair::generate()).await;
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
     let listing_id = publish(&app, steward).await;
     let request_id = request_listing(&app, &listing_id, researcher).await;
@@ -1396,7 +1575,12 @@ async fn stale_approval_retry_after_a_revoke_and_regrant_adds_nothing() {
         budgets: Arc::new(FailFirstOpen::default()),
         ..ResearchStores::in_memory()
     };
-    let app = research_app_with_stores(steward, TenantKeypair::generate(), stores).await;
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
     let stoken = token_for(steward);
     let listing_id = publish(&app, steward).await;
     let approve = |id: &str| format!("/api/v1/research/requests/{id}/approve");

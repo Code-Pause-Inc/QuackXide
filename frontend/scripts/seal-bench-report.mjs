@@ -1,5 +1,5 @@
 // Markdown report for scripts/bench-wasm-seal.sh: the module's size in the
-// built bundle, and the load and seal figures seal.browser.bench.ts wrote.
+// built bundle, and the load and seal figures seal.browser.perf.ts wrote.
 //
 //   node scripts/seal-bench-report.mjs <bench-data dir> <dist dir>
 

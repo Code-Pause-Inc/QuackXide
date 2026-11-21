@@ -1,5 +1,5 @@
 // Benchmark worker for the wasm envelope seal (docs/BENCHMARKS.md, "Browser
-// envelope seal"). Loaded only by seal.browser.bench.ts, never by the app:
+// envelope seal"). Loaded only by seal.browser.perf.ts, never by the app:
 // it is a dedicated module worker running envelope.ts as the crypto worker
 // does, without the crypto worker's keys, vault or protocol. It seals
 // synthetic data to a throwaway key.

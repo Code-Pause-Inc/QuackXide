@@ -63,8 +63,8 @@ export async function sealToTenant(
   return envelope.buffer as ArrayBuffer;
 }
 
-/** Open a framed envelope with a raw private key under `info`; the suite
- *  comes from the frame magic. `privateKey` is overwritten with zeros
+/** Open an `HPK1` envelope with a raw X25519 private key under `info`; an
+ *  `HPK2` frame is refused until P36. `privateKey` is overwritten with zeros
  *  before this returns, whether or not the open succeeds. Rejects on
  *  tamper, wrong recipient, wrong `info` or an unknown frame. */
 export async function openWithPrivateKey(

@@ -13,6 +13,16 @@
 //! hardware-attested enclave whose RAM the operator cannot read. The dev
 //! providers here hold keys in ordinary process memory and are for local use
 //! only.
+//!
+//! Every query runs within its [`QueryLimits`](platform_core::QueryLimits):
+//! a bounded wait for a plaintext slot, input sized before any key is
+//! released, and one time limit over everything that holds plaintext. Each
+//! refusal is an [`ApiError::QueryLimit`] with an `engine.query` "denied"
+//! event naming the limit. A research query is charged before any of them,
+//! so each costs a unit, as a plan-gate refusal does (P54 decides the order).
+//! A gated query's memory and time refusals depend on rows that suppression
+//! withholds, so the caller gets them as a disclosure-control refusal
+//! ([`ApiError::GatedQueryLimit`]); only the audit event names the limit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,8 +32,11 @@ use bytes::Bytes;
 use platform_connectors::snapshot::{
     SnapshotManifest, manifest_info, newest_manifest, object_info,
 };
-use platform_core::{ConnectorSlug, DatasetKind, DeclaredSchema, TenantId};
-use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair};
+use platform_connectors::upload::MAX_MANIFEST_BYTES;
+use platform_core::{
+    ConnectorSlug, DatasetKind, DeclaredSchema, QueryLimit, SnapshotVersion, TenantId,
+};
+use platform_crypto::{CryptoError, EnvelopeSuite, SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
@@ -66,6 +79,14 @@ impl<P: EnclaveKeyProvider + ?Sized> QueryKeySession for DelegatingKeySession<'_
 /// dev-only `key_release::AttestedKeyProvider`.
 #[async_trait]
 pub trait EnclaveKeyProvider: Send + Sync {
+    /// The suite of any key this provider would release for `tenant`, which
+    /// a snapshot's record must name, or `None` if it can release none for
+    /// `tenant`. Read before any key is released, so a snapshot the key can
+    /// never open is refused first. It releases nothing to answer: a
+    /// provider whose keys are held elsewhere answers with the one suite it
+    /// releases, and a tenant with no key there fails at release instead.
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite>;
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -87,6 +108,27 @@ pub trait EnclaveKeyProvider: Send + Sync {
     }
 }
 
+/// Open `envelope` with `tenant`'s `keypair`. A frame of another suite than
+/// the key's is audited as `crypto.suite_refused` before the generic error.
+pub(crate) fn open_tenant_envelope(
+    keypair: &TenantKeypair,
+    tenant: TenantId,
+    info: &[u8],
+    envelope: &[u8],
+) -> Result<SecretBytes, ApiError> {
+    keypair.open_envelope(info, envelope).map_err(|e| {
+        if matches!(e, CryptoError::SuiteMismatch) {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(tenant),
+                "denied",
+                "refused an envelope whose suite does not match the tenant key",
+            );
+        }
+        ApiError::Backend
+    })
+}
+
 /// DEV ONLY: holds one tenant keypair in process memory, which defeats the
 /// zero-trust boundary. For local development and tests.
 pub struct DevKeyProvider {
@@ -105,6 +147,10 @@ impl DevKeyProvider {
 
 #[async_trait]
 impl EnclaveKeyProvider for DevKeyProvider {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        (tenant == self.tenant).then(|| self.keypair.suite())
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
@@ -114,9 +160,7 @@ impl EnclaveKeyProvider for DevKeyProvider {
         if tenant != self.tenant {
             return Err(ApiError::Backend);
         }
-        self.keypair
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        open_tenant_envelope(&self.keypair, tenant, info, envelope)
     }
 }
 
@@ -139,17 +183,18 @@ impl MultiTenantDevKeyProvider {
 
 #[async_trait]
 impl EnclaveKeyProvider for MultiTenantDevKeyProvider {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        self.keys.get(&tenant).map(TenantKeypair::suite)
+    }
+
     async fn open_envelope(
         &self,
         tenant: TenantId,
         info: &[u8],
         envelope: &[u8],
     ) -> Result<SecretBytes, ApiError> {
-        self.keys
-            .get(&tenant)
-            .ok_or(ApiError::Backend)?
-            .open_envelope(info, envelope)
-            .map_err(|_| ApiError::Backend)
+        let keypair = self.keys.get(&tenant).ok_or(ApiError::Backend)?;
+        open_tenant_envelope(keypair, tenant, info, envelope)
     }
 }
 
@@ -174,6 +219,10 @@ pub struct ConnectorQueryService {
     plaintext_slots: Semaphore,
     /// Time spent waiting for a plaintext slot, exported as a metric.
     plaintext_wait: Histogram,
+    /// Replaces the disclosure threshold in this crate's unit tests, which
+    /// make the engine panic mid-query. Not compiled into any other build.
+    #[cfg(test)]
+    disclosure_for_tests: Option<Arc<dyn DisclosurePolicy>>,
 }
 
 /// Budget units one research query consumes.
@@ -203,6 +252,8 @@ impl ConnectorQueryService {
             require_attestation,
             research: None,
             min_cohort: platform_config::DEFAULT_MIN_COHORT_SIZE,
+            #[cfg(test)]
+            disclosure_for_tests: None,
         }
     }
 
@@ -264,6 +315,10 @@ impl ConnectorQueryService {
     }
 
     fn threshold(&self) -> Arc<dyn DisclosurePolicy> {
+        #[cfg(test)]
+        if let Some(policy) = &self.disclosure_for_tests {
+            return policy.clone();
+        }
         Arc::new(MinCountThreshold {
             k: i64::try_from(self.min_cohort).unwrap_or(i64::MAX),
         })
@@ -331,18 +386,22 @@ impl ConnectorQueryService {
         .is_ok()
     }
 
-    /// Wait for a plaintext slot. Hold the permit until the decrypted blobs
-    /// are dropped. A limit of zero refuses rather than waiting forever.
+    /// Wait for a plaintext slot, at most `QueryLimits::slot_wait`. Hold the
+    /// permit until the decrypted blobs are dropped. A limit of zero
+    /// refuses rather than waiting forever, and no slot within the wait is
+    /// [`QueryLimit::SlotWait`] (503), not the missing wiring that
+    /// `QueryUnavailable` reports.
     async fn plaintext_slot(&self) -> Result<SemaphorePermit<'_>, ApiError> {
         if self.settings.max_concurrent_queries == 0 {
             return Err(ApiError::QueryUnavailable);
         }
         // Records the wait however it ends, including a cancelled query.
         let _wait = crate::metrics::Timer::start(self.plaintext_wait.clone());
-        self.plaintext_slots
-            .acquire()
-            .await
-            .map_err(|_| ApiError::QueryUnavailable)
+        let acquire = self.plaintext_slots.acquire();
+        match tokio::time::timeout(self.settings.limits.slot_wait, acquire).await {
+            Ok(permit) => permit.map_err(|_| ApiError::QueryUnavailable),
+            Err(_) => Err(ApiError::QueryLimit(QueryLimit::SlotWait)),
+        }
     }
 
     /// The plaintext-slot wait histogram, for registering with the metrics.
@@ -369,22 +428,18 @@ impl ConnectorQueryService {
         }
     }
 
-    /// Decrypt `owner`'s current snapshot of `dataset` to plaintext Parquet:
-    /// the objects listed by the newest manifest, and nothing else, so
-    /// repeated or interrupted writes never add rows. Objects open under the
-    /// `info` of the dataset's kind (ADR 0012). The snapshot's plaintext
-    /// record is read before any key is released and must name a suite this
-    /// build reads, and an upload's declared schema and row cap come back
-    /// for the engine to check. The blobs
-    /// zeroize on drop, so an error partway through wipes the objects
-    /// already opened.
-    async fn decrypt_dataset(
+    /// `owner`'s current snapshot of `dataset`, from the newest manifest's
+    /// path and the snapshot's plaintext record, opening nothing. The record
+    /// must name the suite of `owner`'s key, or the snapshot could never
+    /// open. An upload's declared schema and row cap come back for the
+    /// engine to check. `None` if no snapshot is committed.
+    async fn current_snapshot(
         &self,
         owner: TenantId,
         dataset: &ConnectorSlug,
-    ) -> Result<DecryptedDataset, ApiError> {
-        let Some((version, path)) = newest_manifest(&*self.vault, owner, dataset).await? else {
-            return Ok(DecryptedDataset::default());
+    ) -> Result<Option<CurrentSnapshot>, ApiError> {
+        let Some((version, manifest)) = newest_manifest(&*self.vault, owner, dataset).await? else {
+            return Ok(None);
         };
 
         let record = match self
@@ -392,12 +447,13 @@ impl ConnectorQueryService {
             .get(&TenantPaths::connector_record(owner, dataset, &version))
             .await
         {
-            Ok(bytes) => SnapshotRecord::parse(&bytes, &version)
-                .ok()
-                .filter(|record| EnvelopeSuite::from_id(&record.suite).is_ok()),
+            Ok(bytes) => SnapshotRecord::parse(&bytes, &version).ok(),
             Err(StorageError::NotFound) => None,
             Err(other) => return Err(other.into()),
         };
+        let suite = record
+            .as_ref()
+            .and_then(|record| EnvelopeSuite::from_id(&record.suite).ok());
         // Every committed snapshot has a record; an upload's must carry
         // what its steward declared.
         let declared = match (dataset.kind(), record) {
@@ -412,7 +468,7 @@ impl ConnectorQueryService {
             ) => Some(Some((schema, row_cap))),
             _ => None,
         };
-        let Some(declared) = declared else {
+        let (Some(suite), Some(declared)) = (suite, declared) else {
             security_audit_event(
                 AuditKind::DataAccess,
                 Some(owner),
@@ -421,10 +477,92 @@ impl ConnectorQueryService {
             );
             return Err(ApiError::Backend);
         };
+        let Some(key_suite) = self.keys.key_suite(owner) else {
+            security_audit_event(
+                AuditKind::DataAccess,
+                Some(owner),
+                "failed",
+                "no tenant key can be released to open the snapshot",
+            );
+            return Err(ApiError::Backend);
+        };
+        if key_suite != suite {
+            security_audit_event(
+                AuditKind::SuiteRefused,
+                Some(owner),
+                "denied",
+                "refused a snapshot whose record names another suite than the tenant key",
+            );
+            return Err(ApiError::Backend);
+        }
+        Ok(Some(CurrentSnapshot {
+            version,
+            manifest,
+            suite,
+            declared,
+        }))
+    }
+
+    /// Decrypt `owner`'s current snapshot of `dataset` to plaintext Parquet:
+    /// the objects listed by the newest manifest, and nothing else, so
+    /// repeated or interrupted writes never add rows. The snapshot is
+    /// resolved here ([`Self::current_snapshot`]), under the caller's slot,
+    /// so a re-upload that commits while the query waits is read rather
+    /// than the version it pruned. Every envelope opens under the `info` of
+    /// the record's suite and the dataset's kind (ADR 0012), so one of
+    /// another suite fails to open. The blobs zeroize on drop, so an error
+    /// partway through wipes the objects already opened.
+    ///
+    /// Before any key is released, the objects stored at the snapshot's
+    /// version must fit `QueryLimits::max_input_objects` and
+    /// `max_input_bytes` (ciphertext bytes) and the sealed manifest must
+    /// fit the upload route's manifest bound. Both input limits are checked
+    /// again on what the manifest lists, cumulatively, before each object
+    /// is opened.
+    async fn decrypt_dataset(
+        &self,
+        owner: TenantId,
+        dataset: &ConnectorSlug,
+    ) -> Result<DecryptedDataset, ApiError> {
+        let Some(CurrentSnapshot {
+            version,
+            manifest: path,
+            suite,
+            declared,
+        }) = self.current_snapshot(owner, dataset).await?
+        else {
+            return Ok(DecryptedDataset::default());
+        };
+
+        // Sized from storage alone. Objects at this version that the
+        // manifest does not list (left by an attempt that stopped) count
+        // too, so this can only overstate the input.
+        let limits = &self.settings.limits;
+        let stored = self
+            .vault
+            .usage(&TenantPaths::connector_snapshot_prefix(
+                owner, dataset, &version,
+            ))
+            .await?;
+        if stored.object_count > limits.max_input_objects {
+            return Err(ApiError::QueryLimit(QueryLimit::InputObjects));
+        }
+        if stored.total_bytes > limits.max_input_bytes {
+            return Err(ApiError::QueryLimit(QueryLimit::InputBytes));
+        }
+        let envelope = self.snapshot_part(owner, &path).await?;
+        if envelope.len() > MAX_MANIFEST_BYTES {
+            security_audit_event(
+                AuditKind::DataAccess,
+                Some(owner),
+                "failed",
+                "snapshot manifest is larger than any writer seals one",
+            );
+            return Err(ApiError::Backend);
+        }
 
         let key_session = self.keys.begin_query_session(owner).await?;
-        let envelope = self.snapshot_part(owner, &path).await?;
-        let info = manifest_info(&owner, dataset, &version);
+        let info = manifest_info(suite, &owner, dataset, &version);
         let plaintext = key_session.open_envelope(&info, &envelope).await?;
         let manifest = serde_json::from_slice::<SnapshotManifest>(plaintext.expose())
             .ok()
@@ -439,16 +577,78 @@ impl ConnectorQueryService {
             );
             return Err(ApiError::Backend);
         };
+        if u64::try_from(manifest.objects.len()).unwrap_or(u64::MAX) > limits.max_input_objects {
+            return Err(ApiError::QueryLimit(QueryLimit::InputObjects));
+        }
 
         let mut blobs = Vec::with_capacity(manifest.objects.len());
+        let mut input_bytes = 0u64;
         for object in &manifest.objects {
             let path = TenantPaths::connector_snapshot_object(owner, dataset, &version, *object);
             let envelope = self.snapshot_part(owner, &path).await?;
-            let info = object_info(&owner, dataset, object);
+            input_bytes =
+                input_bytes.saturating_add(u64::try_from(envelope.len()).unwrap_or(u64::MAX));
+            if input_bytes > limits.max_input_bytes {
+                return Err(ApiError::QueryLimit(QueryLimit::InputBytes));
+            }
+            let info = object_info(suite, &owner, dataset, object);
             let plaintext = key_session.open_envelope(&info, &envelope).await?;
             blobs.push(plaintext);
         }
         Ok(DecryptedDataset { blobs, declared })
+    }
+
+    /// Take a plaintext slot, then decrypt `owner`'s current snapshot of
+    /// `dataset` and run `sql` over it within `QueryLimits::timeout`. On
+    /// expiry the work is dropped: the blobs are zeroized and the slot is
+    /// released, as they are on every other way out, including the caller
+    /// dropping this future or a panic unwinding through it. Decoding is
+    /// synchronous, so the decode limits bound the one stretch the timer
+    /// cannot interrupt.
+    async fn decrypt_and_run(
+        &self,
+        owner: TenantId,
+        dataset: &ConnectorSlug,
+        settings: EngineSettings,
+        disclosure: Option<Arc<dyn DisclosurePolicy>>,
+        sql: &str,
+    ) -> Result<Ran, Stopped> {
+        let _slot = self
+            .plaintext_slot()
+            .await
+            .map_err(Stopped::before_engine)?;
+        let timeout = settings.limits.timeout;
+        let work = async {
+            let decrypted = self
+                .decrypt_dataset(owner, dataset)
+                .await
+                .map_err(Stopped::before_engine)?;
+            let objects = decrypted.blobs.len();
+            if objects == 0 {
+                return Ok(Ran {
+                    objects,
+                    rows: Value::Array(Vec::new()),
+                    suppressed: 0,
+                });
+            }
+            let (rows, suppressed) = run_scoped(settings, disclosure, dataset, decrypted, sql)
+                .await
+                .map_err(|err| Stopped {
+                    err,
+                    objects: Some(objects),
+                })?;
+            Ok(Ran {
+                objects,
+                rows,
+                suppressed,
+            })
+        };
+        match tokio::time::timeout(timeout, work).await {
+            Ok(ran) => ran,
+            Err(_elapsed) => Err(Stopped::before_engine(ApiError::QueryLimit(
+                QueryLimit::Time,
+            ))),
+        }
     }
 
     pub async fn query(
@@ -458,12 +658,26 @@ impl ConnectorQueryService {
         sql: &str,
     ) -> Result<Value, ApiError> {
         let tee_platform = platform_label(self.gate(tenant, "query").await?);
-        let _slot = self.plaintext_slot().await?;
-        let dataset = self.decrypt_dataset(tenant, connector).await?;
-        let object_count = dataset.blobs.len();
         let zk_mode = self.settings.zk.is_enabled();
+        let disclosure = zk_mode.then(|| self.threshold());
+        let ran = self
+            .decrypt_and_run(tenant, connector, self.settings.clone(), disclosure, sql)
+            .await
+            .map_err(|stopped| {
+                let err = stopped.audit(
+                    tenant,
+                    &format!("connector={connector}"),
+                    &format!("zk={zk_mode}"),
+                );
+                if zk_mode { gated_refusal(err) } else { err }
+            })?;
+        let Ran {
+            objects: object_count,
+            rows,
+            suppressed,
+        } = ran;
 
-        if dataset.blobs.is_empty() {
+        if object_count == 0 {
             security_audit_event(
                 AuditKind::QueryExecuted,
                 Some(tenant),
@@ -475,21 +689,6 @@ impl ConnectorQueryService {
                 "zk_mode": zk_mode, "tee_platform": tee_platform,
             }));
         }
-
-        let disclosure = zk_mode.then(|| self.threshold());
-        let result = run_scoped(self.settings.clone(), disclosure, connector, dataset, sql).await;
-        let (rows, suppressed) = match result {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                security_audit_event(
-                    AuditKind::QueryExecuted,
-                    Some(tenant),
-                    "failed",
-                    &format!("connector={connector} objects={object_count} zk={zk_mode}"),
-                );
-                return Err(err);
-            }
-        };
         let row_count = rows.as_array().map(Vec::len).unwrap_or(0);
         security_audit_event(
             AuditKind::QueryExecuted,
@@ -539,9 +738,14 @@ impl ConnectorQueryService {
 
         let tee_platform = platform_label(self.gate(researcher, "research query").await?);
 
+        // The snapshot's record is checked before the charge, so a snapshot
+        // the steward's key can never open costs no budget. Only a check:
+        // the query reads the snapshot that is current once it holds a slot.
+        self.current_snapshot(steward, connector).await?;
+
         // Budget charge — after the attestation gate so operator
         // infrastructure failures never burn researcher budget, but before
-        // any data is touched: an accepted query consumes budget even if the
+        // any data is opened: an accepted query consumes budget even if the
         // plan gate later rejects it, so probing the aggregate-only boundary
         // costs budget. Charges are not refunded.
         let budget = match research.charge(&grant.grant_id, RESEARCH_QUERY_COST).await {
@@ -567,13 +771,39 @@ impl ConnectorQueryService {
         };
 
         // The steward's key is released into the enclave to decrypt their
-        // data. A dataset that does not match its declaration is refused
-        // after this charge (ADR 0012; P54 decides whether that stays).
-        let _slot = self.plaintext_slot().await?;
-        let dataset = self.decrypt_dataset(steward, connector).await?;
-        let object_count = dataset.blobs.len();
+        // data. A dataset that does not match its declaration, and every
+        // resource-limit refusal from the slot wait on, are refused after
+        // this charge (ADR 0012; P54 decides whether that stays). Research
+        // mode always enforces aggregate-only and disclosure control.
+        let research_settings = EngineSettings {
+            zk: platform_core::ZkMode::Enabled,
+            ..self.settings.clone()
+        };
+        let ran = self
+            .decrypt_and_run(
+                steward,
+                connector,
+                research_settings,
+                Some(self.threshold()),
+                sql,
+            )
+            .await
+            // Still charged, so the failed or refused attempt appears in the
+            // meter. Research mode is always gated.
+            .map_err(|stopped| {
+                gated_refusal(stopped.audit(
+                    researcher,
+                    &format!("research steward={steward} connector={connector}"),
+                    &format!("budget_remaining={}", budget.remaining()),
+                ))
+            })?;
+        let Ran {
+            objects: object_count,
+            rows,
+            suppressed,
+        } = ran;
 
-        if dataset.blobs.is_empty() {
+        if object_count == 0 {
             security_audit_event(
                 AuditKind::QueryExecuted,
                 Some(researcher),
@@ -590,36 +820,6 @@ impl ConnectorQueryService {
                 "budget_remaining": budget.remaining(), "tee_platform": tee_platform,
             }));
         }
-
-        // Research mode always enforces aggregate-only and disclosure control.
-        let mut research_settings = self.settings.clone();
-        research_settings.zk = platform_core::ZkMode::Enabled;
-        let outcome = run_scoped(
-            research_settings,
-            Some(self.threshold()),
-            connector,
-            dataset,
-            sql,
-        )
-        .await;
-
-        let (rows, suppressed) = match outcome {
-            Ok(v) => v,
-            Err(err) => {
-                // Still charged, so the failed attempt appears in the meter.
-                security_audit_event(
-                    AuditKind::QueryExecuted,
-                    Some(researcher),
-                    "failed",
-                    &format!(
-                        "research steward={steward} connector={connector} \
-                         objects={object_count} budget_remaining={}",
-                        budget.remaining()
-                    ),
-                );
-                return Err(err);
-            }
-        };
         let row_count = rows.as_array().map(Vec::len).unwrap_or(0);
 
         // Billing meters research access from this audit record.
@@ -664,12 +864,70 @@ fn platform_label(platform: platform_enclave::TeePlatform) -> &'static str {
 /// path (error, early return, or cancellation) leaves plaintext behind.
 type DecryptedObjects = Vec<SecretBytes>;
 
+/// A committed snapshot whose record [`ConnectorQueryService::current_snapshot`]
+/// has checked, not yet opened.
+struct CurrentSnapshot {
+    version: SnapshotVersion,
+    /// The path of its sealed manifest.
+    manifest: VaultPath,
+    /// The suite its record names, which is the tenant key's.
+    suite: EnvelopeSuite,
+    declared: Option<(DeclaredSchema, u64)>,
+}
+
 /// A dataset's decrypted current snapshot and, for an upload, the schema
 /// and row cap its steward declared for it.
 #[derive(Default)]
 struct DecryptedDataset {
     blobs: DecryptedObjects,
     declared: Option<(DeclaredSchema, u64)>,
+}
+
+/// A query that ran: the objects it decrypted (none for a dataset with no
+/// snapshot), its rows, and how many rows disclosure control withheld.
+struct Ran {
+    objects: usize,
+    rows: Value,
+    suppressed: usize,
+}
+
+/// Why a query stopped once it passed the attestation gate.
+struct Stopped {
+    err: ApiError,
+    /// The objects decrypted when the engine failed or refused the query;
+    /// `None` when it stopped before the engine ran.
+    objects: Option<usize>,
+}
+
+impl Stopped {
+    fn before_engine(err: ApiError) -> Self {
+        Self { err, objects: None }
+    }
+
+    /// Records the stop as `engine.query` and returns the error: "denied"
+    /// naming the limit for a resource-limit refusal, wherever it came
+    /// from; "failed" with the object count when the engine failed; and
+    /// nothing for another failure before the engine ran, which the check
+    /// that failed records if it is a security decision. `subject` names
+    /// the dataset and `context` ends the record.
+    fn audit(self, actor: TenantId, subject: &str, context: &str) -> ApiError {
+        match (&self.err, self.objects) {
+            (ApiError::QueryLimit(limit), _) => security_audit_event(
+                AuditKind::QueryExecuted,
+                Some(actor),
+                "denied",
+                &format!("{subject} limit={limit} {context}"),
+            ),
+            (_, Some(objects)) => security_audit_event(
+                AuditKind::QueryExecuted,
+                Some(actor),
+                "failed",
+                &format!("{subject} objects={objects} {context}"),
+            ),
+            (_, None) => {}
+        }
+        self.err
+    }
 }
 
 /// Run `sql` over a decrypted dataset in a fresh scope, registered as the
@@ -699,14 +957,34 @@ async fn run_scoped(
     Ok((rows, scope.last_suppressed_rows()))
 }
 
+/// The message of a disclosure-control refusal (422), which a gated query's
+/// memory and time refusals share.
+pub(crate) const DISCLOSURE_REFUSAL: &str =
+    "query rejected by disclosure control (see cohort-size rules)";
+
+/// What the caller of a gated query (zero-knowledge or research) sees for
+/// `err`, once the audit event has named it. Whether a query runs out of
+/// its memory pool or its time depends on every row it reads, including
+/// cohorts that suppression withholds, so those two refusals are answered
+/// as a disclosure-control refusal ([`ApiError::GatedQueryLimit`]). The
+/// other limits keep their responses: the slot wait reads no data, the
+/// input and decode limits depend only on the dataset, and the result
+/// limits only on the rows released.
+fn gated_refusal(err: ApiError) -> ApiError {
+    match err {
+        ApiError::QueryLimit(limit @ (QueryLimit::Memory | QueryLimit::Time)) => {
+            ApiError::GatedQueryLimit(limit)
+        }
+        other => other,
+    }
+}
+
 fn map_query_error(err: QueryError) -> ApiError {
     match err {
         QueryError::ZkPolicy => {
             ApiError::QueryRejected("row-level egress is not permitted in zero-knowledge mode")
         }
-        QueryError::Disclosure(_) => {
-            ApiError::QueryRejected("query rejected by disclosure control (see cohort-size rules)")
-        }
+        QueryError::Disclosure(_) => ApiError::QueryRejected(DISCLOSURE_REFUSAL),
         QueryError::StatementNotAllowed => {
             ApiError::QueryRejected("only read-only queries are permitted")
         }
@@ -715,6 +993,8 @@ fn map_query_error(err: QueryError) -> ApiError {
         QueryError::Parquet(_) | QueryError::Serialize(_) => ApiError::Backend,
         // The stored data, not the caller's query, is at fault.
         QueryError::DeclarationMismatch(_) => ApiError::DatasetMismatch,
+        // A resource limit, never the caller's SQL error.
+        QueryError::LimitExceeded(limit) => ApiError::QueryLimit(limit),
     }
 }
 
@@ -754,6 +1034,19 @@ pub struct ResearchQueryRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::FutureExt;
+    use parquet::arrow::ArrowWriter;
+    use platform_connectors::snapshot::SnapshotWriter;
+    use platform_core::{ObjectId, QueryLimits, ZkMode};
+    use platform_crypto::hpke_seal_to_tenant;
+    use platform_enclave::DevAttestation;
+    use platform_storage::ObjectStoreVault;
+    use quackxide_engine::disclosure::DisclosureOutcome;
+
     use super::*;
 
     #[test]
@@ -762,5 +1055,123 @@ mod tests {
         // an error path would leave the data in freed memory.
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<DecryptedObjects>();
+        // Each opened envelope, the manifest's included, until it is kept.
+        assert_zeroize_on_drop::<SecretBytes>();
+        // The private key a query's key session or a dev key provider
+        // holds.
+        assert_zeroize_on_drop::<TenantKeypair>();
+    }
+
+    /// The input-object limit is reached before the manifest bound: a
+    /// manifest listing the most objects configuration allows still fits,
+    /// so a manifest over the bound never comes from a writer.
+    #[test]
+    fn a_manifest_at_the_object_limit_fits_the_manifest_bound() {
+        let tenant = TenantId::generate();
+        let dataset = ConnectorSlug::new("upload_widest").expect("slug");
+        let version = SnapshotVersion::generate();
+        let objects = (0..platform_config::MAX_QUERY_MAX_INPUT_OBJECTS)
+            .map(|_| ObjectId::generate())
+            .collect();
+        let manifest = SnapshotManifest {
+            version: version.clone(),
+            objects,
+        };
+        // Under either suite: HPK2's encapsulated key is the larger.
+        for suite in [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2] {
+            let sealed = hpke_seal_to_tenant(
+                &TenantKeypair::generate(suite).public_key(),
+                &manifest_info(suite, &tenant, &dataset, &version),
+                &serde_json::to_vec(&manifest).expect("json"),
+            )
+            .expect("seal");
+            assert!(
+                sealed.len() <= MAX_MANIFEST_BYTES,
+                "{suite:?}: {} bytes",
+                sealed.len()
+            );
+        }
+    }
+
+    /// A disclosure policy that panics, standing in for a panic anywhere in
+    /// the engine once the dataset is decrypted and registered.
+    struct Panics;
+
+    impl DisclosurePolicy for Panics {
+        fn apply(&self, _: Vec<RecordBatch>) -> Result<DisclosureOutcome, QueryError> {
+            panic!("disclosure policy panicked");
+        }
+    }
+
+    /// A one-slot ZK query service over a committed `cohorts` snapshot.
+    async fn one_slot_service() -> (ConnectorQueryService, TenantId, ConnectorSlug) {
+        let tenant = TenantId::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+        let dataset = ConnectorSlug::new("cohorts").expect("slug");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("condition", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(["flu", "flu", "flu"])),
+                Arc::new(Int64Array::from(vec![30, 40, 50])),
+            ],
+        )
+        .expect("batch");
+        let mut parquet = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut parquet, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+        let public_key = keypair.public_key();
+        let mut snapshot = SnapshotWriter::begin(&*vault, tenant, &public_key, dataset.clone());
+        snapshot.put("cohorts", &parquet).await.expect("put");
+        snapshot.commit().await.expect("commit");
+
+        let service = ConnectorQueryService::new(
+            vault,
+            Arc::new(DevKeyProvider::new(tenant, keypair)),
+            Arc::new(DevAttestation::allow_insecure_dev()),
+            EngineSettings {
+                zk: ZkMode::Enabled,
+                max_concurrent_queries: 1,
+                limits: QueryLimits::default(),
+            },
+            false,
+        )
+        .with_min_cohort(2);
+        (service, tenant, dataset)
+    }
+
+    const COHORT_SQL: &str = "SELECT condition, COUNT(*) AS n FROM cohorts GROUP BY condition";
+
+    /// A panic in the engine unwinds through the query: the plaintext slot
+    /// is released and the decrypted blobs are dropped (and zeroized, by
+    /// type) on the way out, so the next query runs.
+    #[tokio::test]
+    async fn a_panic_in_the_engine_releases_the_slot() {
+        let (mut service, tenant, dataset) = one_slot_service().await;
+        service.disclosure_for_tests = Some(Arc::new(Panics));
+        let unwound = std::panic::AssertUnwindSafe(service.query(tenant, &dataset, COHORT_SQL))
+            .catch_unwind()
+            .await;
+        assert!(unwound.is_err(), "the policy must have panicked");
+
+        service.disclosure_for_tests = None;
+        let rows = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.query(tenant, &dataset, COHORT_SQL),
+        )
+        .await
+        .expect("the only slot was released")
+        .map_err(|_| "query failed")
+        .expect("next query");
+        assert_eq!(
+            rows["rows"],
+            serde_json::json!([{ "condition": "flu", "n": 3 }])
+        );
     }
 }

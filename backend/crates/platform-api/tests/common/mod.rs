@@ -24,19 +24,17 @@ use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
-use platform_connectors::snapshot::{SnapshotManifest, manifest_info, object_info};
 use platform_connectors::source::FixtureSource;
-use platform_connectors::upload::{UploadHeader, encode_upload_body};
 use platform_core::{
     ColumnType, ConnectorSlug, DeclaredColumn, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
     ZkMode,
 };
-use platform_crypto::{TenantKeypair, TenantPublicKey, hpke_seal_to_tenant};
+use platform_crypto::{TenantKeypair, TenantPublicKey};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
 };
-use quackxide_engine::EngineSettings;
+use quackxide_engine::{EngineSettings, QueryLimits};
 use sha2::Sha256;
 use tower::ServiceExt;
 
@@ -208,6 +206,12 @@ pub fn default_config() -> PlatformConfig {
     PlatformConfig::from_source(|_| None).expect("config")
 }
 
+/// Config with `APP_ENV=development`, where `HPK1` keys are still accepted.
+pub fn development_config() -> PlatformConfig {
+    PlatformConfig::from_source(|k| (k == "APP_ENV").then(|| "development".to_owned()))
+        .expect("config")
+}
+
 /// Config with the merchant-of-record webhook secret set.
 pub fn config_with_mor_secret(secret: &str) -> PlatformConfig {
     PlatformConfig::from_source(|k| match k {
@@ -301,6 +305,7 @@ pub async fn research_app(
         EngineSettings {
             zk: ZkMode::Disabled, // research mode forces ZK on regardless
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         research.clone(),
         attestation,
@@ -356,15 +361,12 @@ pub fn next_version(after: Option<&SnapshotVersion>) -> SnapshotVersion {
 }
 
 /// What a steward's browser sends to upload one dataset.
-pub struct SealedUpload {
-    pub version: SnapshotVersion,
-    pub object: ObjectId,
-    pub body: Vec<u8>,
-}
+pub use platform_api::dev::SealedUpload;
 
 /// Seals `parquet` and a manifest listing it to `key`, as the browser does
 /// for `steward`'s upload of `dataset`, and frames them with a header
-/// declaring `schema` and `row_cap`.
+/// declaring `schema` and `row_cap`: `platform_api::dev::seal_upload`, which
+/// the `seal-upload` tool runs too.
 pub fn sealed_upload(
     steward: TenantId,
     key: &TenantPublicKey,
@@ -375,31 +377,8 @@ pub fn sealed_upload(
     row_cap: u64,
 ) -> SealedUpload {
     let slug = ConnectorSlug::new(dataset).expect("slug");
-    let object = ObjectId::generate();
-    let sealed = hpke_seal_to_tenant(key, &object_info(&steward, &slug, &object), parquet)
-        .expect("seal object");
-    let manifest = SnapshotManifest {
-        version: version.clone(),
-        objects: vec![object],
-    };
-    let manifest = hpke_seal_to_tenant(
-        key,
-        &manifest_info(&steward, &slug, &version),
-        &serde_json::to_vec(&manifest).expect("manifest json"),
-    )
-    .expect("seal manifest");
-    let header = UploadHeader {
-        version: version.clone(),
-        object,
-        row_cap,
-        schema,
-    };
-    let body = encode_upload_body(&header, &manifest, &sealed).expect("encode");
-    SealedUpload {
-        version,
-        object,
-        body,
-    }
+    platform_api::dev::seal_upload(steward, key, &slug, version, parquet, schema, row_cap)
+        .expect("seal upload")
 }
 
 /// [`sealed_upload`] of [`cohorts_parquet`] with its schema and row count.
@@ -441,11 +420,39 @@ pub async fn put_upload(
     .await
 }
 
+/// `PUT /api/v1/drive/enrollment` of `key`, as `token`.
+pub async fn enroll_key(app: &Router, token: &str, key: &TenantPublicKey) -> StatusCode {
+    use base64::Engine as _;
+    let body = serde_json::json!({
+        "hpke_public_key_b64": base64::engine::general_purpose::STANDARD.encode(key.to_raw()),
+    });
+    send(
+        app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(token), json_header()],
+        body.to_string().into_bytes(),
+    )
+    .await
+    .0
+}
+
 /// An app over `vault` where each steward's key is held for queries but no
 /// data exists until it is uploaded, with the research layer (k=5, default
 /// budget 100) on the development attestation.
 pub fn upload_research_app(
     secret: &str,
+    stewards: Vec<(TenantId, TenantKeypair)>,
+    vault: Arc<dyn VaultStore>,
+) -> Router {
+    upload_research_app_with_config(secret, default_config(), stewards, vault)
+}
+
+/// As [`upload_research_app`], under `config`: `development_config()` for
+/// stewards whose keys are `HPK1`.
+pub fn upload_research_app_with_config(
+    secret: &str,
+    config: PlatformConfig,
     stewards: Vec<(TenantId, TenantKeypair)>,
     vault: Arc<dyn VaultStore>,
 ) -> Router {
@@ -463,12 +470,14 @@ pub fn upload_research_app(
         EngineSettings {
             zk: ZkMode::Enabled,
             max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
         },
         research.clone(),
         dev_attestation(),
         false,
     );
     build_app(AppState {
+        config: Arc::new(config),
         research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)

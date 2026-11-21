@@ -99,12 +99,13 @@ without key release:
 * `version`: the snapshot it describes; a record naming another is
   refused;
 * `suite`: the envelope suite of its objects and manifest, by a stable
-  name (`EnvelopeSuite::id`, today `HPK1`);
+  name (`EnvelopeSuite::id`: `HPK1` or `HPK2`);
 * for an upload only, `row_cap` and `schema`: what the steward declared.
 
 A query refuses a snapshot without a valid record (502). A valid record
-names a suite this build reads (`EnvelopeSuite::from_id`), so an unknown
-suite fails closed before any key is released. P39 reads the suite from
+names a suite this build reads (`EnvelopeSuite::from_id`) and the suite
+of the tenant's key, so either mismatch fails closed before any key is
+released or budget charged. P39 reads the suite from
 the record and the write time from the version, without opening
 anything.
 
@@ -150,10 +151,11 @@ can carry several objects.
 
 | Envelope | Sealed by | `info` |
 | --- | --- | --- |
-| Object | Browser | `steward-upload-v1\|{tenant}\|{slug}\|{object}` |
-| Manifest | Browser | `tenant-snapshot-manifest-v1\|{tenant}\|{slug}\|{version}` |
+| Object | Browser | `steward-upload-v{n}\|{tenant}\|{slug}\|{object}` |
+| Manifest | Browser | `tenant-snapshot-manifest-v{n}\|{tenant}\|{slug}\|{version}` |
 
-Under the hybrid suite these become `-v2` (ADR 0007).
+`{n}` follows the suite (ADR 0007): 1 for `HPK1`, 2 for `HPK2`. The
+browser seals `HPK1` until P36, which production refuses.
 
 * **Tenant:** the session's verified `tid`. The route stores the upload
   only under the tenant in the token, so a body sealed for another tenant
@@ -197,7 +199,11 @@ works where the query service is not configured. The body:
 against the bytes left before reading past it. Both envelopes must be
 complete frames of one suite this build reads
 (`platform_crypto::check_envelope_frame`: a known magic and at least the
-encapsulated key and tag). The parser lives outside `platform-api`, so
+encapsulated key and tag). The route then checks the suite against the
+deployment's policy and the tenant's enrolled key, if any (the table
+below). In development an `HPK1` upload opens only under the test key
+providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`), because
+development key release is `HPK2`-only. The parser lives outside `platform-api`, so
 the `upload_body` fuzz target does not build DataFusion.
 
 The route has its own body limit: `DATASET_MAX_MIB` plus the most a body
@@ -219,10 +225,14 @@ not what the API stores.
 | Dataset id outside the upload namespace | 404 | denied, `not_upload_dataset` |
 | Body or object over the limit | 413 | denied, `too_large` |
 | Malformed body, header, or envelope frame | 422 | denied, with the reason |
+| Frame of a suite the deployment refuses (`HPK1` in production, ADR 0007) | 422 | denied, `suite_refused`, and `crypto.suite_refused` |
+| Frame of another suite than the tenant's enrolled key | 422 | denied, `enrolled_suite_mismatch`, and `crypto.suite_refused` |
+| With no enrolled key, frame of another suite than the current snapshot's | 422 | denied, `snapshot_suite_mismatch`, and `crypto.suite_refused` |
 | Version more than five minutes ahead | 422 | denied, `version_ahead` |
 | Declared schema unlike the recorded one | 422 | denied, `schema_mismatch` |
 | Version not newer than the current one, or another write committed it or recorded it differently first | 409 | denied, `stale_version` |
 | Current record unreadable | 502 | failed, `record_unreadable` |
+| Enrolled key record unreadable | 502 | failed, `enrollment_unreadable` |
 | Storage failure | 503 or 502 | failed, `storage` |
 
 An upload outside the upload namespace is 404 rather than 403, since the

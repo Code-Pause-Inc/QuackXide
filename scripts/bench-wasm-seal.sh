@@ -3,7 +3,7 @@
 # bench-wasm-seal.sh — the browser envelope seal benchmark (docs/BENCHMARKS.md,
 # "Browser envelope seal"). Builds the wasm module and the frontend, generates
 # synthetic Parquet with synth-data into frontend/bench-data/ (git-ignored),
-# seals it in Chromium's worker (`npm run bench:browser`) and prints a
+# seals it in Chromium's worker (`npm run bench:seal`) and prints a
 # Markdown report: bundle size, module load time, seal time and peak memory.
 #
 # Needs what scripts/build-wasm.sh needs, frontend dependencies (`npm ci`) and
@@ -40,7 +40,7 @@ for spec in "1 MiB:$SMALL_ROWS:30" "100 MiB:$MEDIUM_ROWS:5" "1 GiB:$LARGE_ROWS:3
 done
 printf '{"loads":%d,"files":[%s]}\n' "$LOADS" "$(IFS=,; echo "${files[*]}")" >"$DATA/manifest.json"
 
-(cd "$ROOT/frontend" && npm run bench:browser >&2)
+(cd "$ROOT/frontend" && npm run bench:seal >&2)
 
 {
     lscpu | grep -E '^(Model name|CPU\(s\)):' | sed 's/  */ /g'

@@ -98,6 +98,37 @@ the repository's supply-chain posture. Tagged releases are built from
   the change they describe, and add a line to `CHANGELOG.md` under
   "Unreleased".
 
+## Reviews
+
+`main` requires one approval, a code owner's review for paths in
+`.github/CODEOWNERS`, approval from someone other than the last pusher,
+resolved review threads, and passing required checks. A push dismisses
+earlier approvals. Pull requests merge through the merge queue, which runs
+the required checks on each one against the latest `main`, so nobody needs
+to update a branch by hand.
+
+* **Two stages.** A core-team peer reviews first: correctness, tests and
+  docs. A code owner then reviews the code-owned paths.
+* **The peer is not an author.** The approving peer authored no commits in
+  the pull request; a pair partner's approval does not count toward the
+  peer stage.
+* **Code owners comment, they do not push.** A push to someone else's
+  branch makes the pusher the last pusher, and their approval stops
+  counting.
+* **Security changes stay small,** so the code-owned part can be reviewed
+  on its own.
+* **ADR numbers are reserved in the issue** before drafting starts, so
+  parallel ADR pull requests do not collide.
+* **Dependabot.** One person per weekly batch, on the rota in #29:
+  * reviews and merges the grouped minor and patch updates once CI passes,
+    and asks Dependabot to update a pull request with a
+    `@dependabot rebase` comment, never the "Update branch" button, which
+    would make them the last pusher;
+  * leaves `actions` updates, which touch the code-owned `.github/`, for a
+    code owner after a peer approval;
+  * does not merge a major-version update, alone or inside a group; it goes
+    to the owning stream's primary reviewer, and the maintainer decides.
+
 ## Credit
 
 Add yourself to `CONTRIBUTORS.md` in your first pull request, under
@@ -111,6 +142,24 @@ Participation is governed by `CODE_OF_CONDUCT.md`.
 ## Security issues
 
 Do not open a public issue for a vulnerability. Follow `SECURITY.md`.
+
+To fix a vulnerability privately, whoever found it:
+
+1. The maintainer opens a draft repository security advisory, adds the
+   person fixing it as a collaborator, and writes the problem and what
+   done means in the advisory's description.
+2. The fix is made in the advisory's temporary private fork, in one pull
+   request to its `main`.
+3. Required checks do not run in a temporary private fork, so the pull
+   request carries the local output of `scripts/check.sh`, `cargo deny
+   check` (from `backend/`) and `npm audit --omit=dev --audit-level=high`
+   (from `frontend/`), and a second core-team member reviews it in the
+   fork.
+4. The maintainer merges it from the advisory. That merge does not apply
+   the `main` ruleset, so the maintainer then confirms that the `ci` run
+   on the push to `main` passes, and fixes any failure at once.
+5. The advisory is published when the fix merges, and the reporter is
+   credited in `CHANGELOG.md`.
 
 ## License
 
