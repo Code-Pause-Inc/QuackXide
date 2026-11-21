@@ -1215,6 +1215,54 @@ mod tests {
         }
     }
 
+    /// The bound-configuration policy reads each value as this crate does:
+    /// what loads as on passes, what loads as off loosens a control, and
+    /// what fails to load is unreadable (ADR 0010, `platform_enclave::config`).
+    #[test]
+    fn the_attestation_policy_reads_values_as_config_does() {
+        use platform_enclave::config::{ConfigPolicy, ConfigRefused};
+        for raw in [
+            "1", "true", "TRUE", "on", "yes", "0", "false", "off", "no", "maybe", "", "  ",
+        ] {
+            let pairs = [("FEATURE_ZK_ENABLED", raw)];
+            let policy = ConfigPolicy::RELEASE.check(source(&pairs));
+            match PlatformConfig::from_source(source(&pairs)) {
+                Ok(cfg) if cfg.features.zk.is_enabled() => assert_eq!(policy, Ok(()), "{raw:?}"),
+                Ok(_) => assert_eq!(
+                    policy,
+                    Err(ConfigRefused::Loosens("FEATURE_ZK_ENABLED")),
+                    "{raw:?}"
+                ),
+                Err(_) => assert_eq!(
+                    policy,
+                    Err(ConfigRefused::Unreadable("FEATURE_ZK_ENABLED")),
+                    "{raw:?}"
+                ),
+            }
+        }
+        for raw in ["11", "+11", " 11 ", "10", "11.0", "0x0b", ""] {
+            let pairs = [("RESEARCH_MIN_COHORT_SIZE", raw)];
+            let policy = ConfigPolicy::RELEASE.check(source(&pairs));
+            match PlatformConfig::from_source(source(&pairs)) {
+                Ok(cfg) if cfg.research.min_cohort_size >= DEFAULT_MIN_COHORT_SIZE => {
+                    assert_eq!(policy, Ok(()), "{raw:?}")
+                }
+                Ok(_) => assert!(matches!(policy, Err(ConfigRefused::Loosens(_))), "{raw:?}"),
+                Err(_) => assert!(
+                    matches!(policy, Err(ConfigRefused::Unreadable(_))),
+                    "{raw:?}"
+                ),
+            }
+        }
+        let absent = PlatformConfig::from_source(source(&[])).expect("defaults load");
+        assert!(absent.features.zk.is_enabled() && absent.features.tee_attestation_required);
+        assert_eq!(ConfigPolicy::RELEASE.check(source(&[])), Ok(()));
+        assert_eq!(
+            ConfigPolicy::RELEASE.min_cohort_floor,
+            DEFAULT_MIN_COHORT_SIZE
+        );
+    }
+
     #[test]
     fn invalid_boolean_is_a_hard_error() {
         let err = PlatformConfig::from_source(source(&[("FEATURE_ZK_ENABLED", "maybe")]))
