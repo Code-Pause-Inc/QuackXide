@@ -72,9 +72,10 @@ if grep -rn "Confidential Drive" "$ROOT/backend/crates" "$ROOT/frontend/src" 2>/
 fi
 
 echo "== data guard: data files live only in fixtures/ (docs/DATA_POLICY.md) =="
+# A fixtures/ directory at any depth, the repository's top-level one included.
 if git -C "$ROOT" ls-files \
     | grep -iE '\.(csv|tsv|parquet|ndjson|jsonl|xlsx?|sav|dta|sas7bdat|xpt|rds|rdata|feather|arrow|avro|orc|vcf|bam|cram|fastq|dcm|hl7|sqlite|db)$' \
-    | grep -v '/fixtures/'; then
+    | grep -vE '(^|/)fixtures/'; then
     echo "FAIL: data file outside a fixtures/ directory"
     exit 1
 fi
