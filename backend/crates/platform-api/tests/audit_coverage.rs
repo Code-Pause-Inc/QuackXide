@@ -30,7 +30,10 @@ use platform_telemetry::capture::AuditCapture;
 use platform_tenancy::InMemoryTenantRegistry;
 use quackxide_engine::{EngineSettings, QueryLimits};
 
-use common::{app_state, bearer, call, dev_attestation, json_header, post, send, synced_vault};
+use common::{
+    app_state, assert_event, bearer, call, dev_attestation, grant_body, json_header, post, send,
+    synced_vault,
+};
 
 const SECRET: &str = "audit-itest-secret";
 const PADDLE_SECRET: &str = "pdl_ntfset_audit_secret";
@@ -1002,6 +1005,11 @@ async fn research_catalog_is_audited() {
     let (status, _) = post(&app, &deny, &stoken, "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // A direct grant of the now-active grant is refused.
+    let regrant = format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#);
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &regrant).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
     // A retry that names a different budget is refused.
     let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":7}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1011,6 +1019,23 @@ async fn research_catalog_is_audited() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = post(&app, &approve, &stoken, "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Re-granting the revoked grant tops its budget up, and so does a
+    // follow-up approval; each is audited as a budget top-up.
+    let (status, regranted) =
+        post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 4)).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regranted}");
+    let regrant_limit = regranted["budget"]["limit"].as_u64().expect("limit");
+    let (status, follow_up) = post(&app, &request_uri, &rtoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "request: {follow_up}");
+    let follow_up_id = follow_up["request_id"].as_str().expect("request id");
+    let follow_up_approve = format!("/api/v1/research/requests/{follow_up_id}/approve");
+    let (status, approved) = post(&app, &follow_up_approve, &stoken, r#"{"query_budget":3}"#).await;
+    assert_eq!(status, StatusCode::OK, "follow-up: {approved}");
+    assert_eq!(approved["grant"]["budget"]["limit"], regrant_limit + 3);
+    // Retrying the follow-up adds nothing, so it audits nothing.
+    let (status, _) = post(&app, &follow_up_approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK);
 
     // A fresh request, denied normally.
     let (status, fresh) = post(&app, &request_uri, &rtoken, "{}").await;
@@ -1078,16 +1103,39 @@ async fn research_catalog_is_audited() {
         "denied",
         &format!("approve refused request={last_id} researcher={researcher} reason=unpublished"),
     );
-}
-
-/// Asserts an event of `kind` with this outcome and exactly this detail.
-fn assert_event(capture: &AuditCapture, kind: &str, outcome: &str, detail: &str) {
-    let events = capture.events();
-    assert!(
-        events
-            .iter()
-            .any(|e| e.audit_kind == kind && e.outcome == outcome && e.detail == detail),
-        "no {kind} {outcome} event {detail:?} in {events:?}"
+    assert_event(
+        &capture,
+        "tenant.provisioned",
+        "denied",
+        &format!(
+            "grant refused researcher={researcher} connector=health grant={grant_id} reason=already_granted"
+        ),
+    );
+    assert_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        &format!("reactivated researcher={researcher} connector=health grant={grant_id}"),
+    );
+    assert_event(
+        &capture,
+        "research.budget",
+        "ok",
+        &format!("top_up grant={grant_id} added=4 limit={regrant_limit}"),
+    );
+    assert_event(
+        &capture,
+        "research.budget",
+        "ok",
+        &format!(
+            "top_up grant={grant_id} added=3 limit={}",
+            regrant_limit + 3
+        ),
+    );
+    assert_eq!(
+        count_outcome(&capture, "research.budget", "ok"),
+        2,
+        "a retried follow-up adds nothing and audits nothing"
     );
 }
 
