@@ -3,6 +3,8 @@
 //! and the policy a verifier holds them to. No environment access here: the
 //! browser module computes the same from a verified token.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 
 /// The configuration names bound into attestation, in digest order.
@@ -18,6 +20,15 @@ fn bound_value(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<S
     lookup(name)
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+/// The bound names that are set, with their values as the platform reads
+/// them: what a workload reports in its token.
+pub fn bound_env(lookup: impl Fn(&str) -> Option<String>) -> BTreeMap<String, String> {
+    BOUND_CONFIG_NAMES
+        .iter()
+        .filter_map(|name| bound_value(&lookup, name).map(|v| ((*name).to_owned(), v)))
+        .collect()
 }
 
 /// ADR 0010's `config-digest`: SHA-256 over each set bound name, in order, as
@@ -154,6 +165,19 @@ mod tests {
         assert_eq!(
             config_digest(env(&[("RESEARCH_MIN_COHORT_SIZE", " 11 ")])),
             config_digest(env(&[("RESEARCH_MIN_COHORT_SIZE", "11")])),
+        );
+    }
+
+    #[test]
+    fn bound_env_keeps_only_set_bound_names() {
+        let reported = bound_env(env(&[
+            ("RESEARCH_MIN_COHORT_SIZE", " 2 "),
+            ("FEATURE_ZK_ENABLED", ""),
+            ("PATH", "/bin"),
+        ]));
+        assert_eq!(
+            reported.into_iter().collect::<Vec<_>>(),
+            [("RESEARCH_MIN_COHORT_SIZE".to_owned(), "2".to_owned())]
         );
     }
 

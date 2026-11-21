@@ -911,6 +911,63 @@ fn released_hpk1_key_is_refused_and_audited() {
     );
 }
 
+/// The simulator stands in for Confidential Space's launcher: a token carries
+/// the bound configuration the workload reports, in `submods.container.env`.
+#[tokio::test]
+async fn the_simulator_carries_the_reported_env() {
+    let sim = Arc::new(TokenSigner::generate(
+        SIM_ISSUER,
+        SimulatedClaims::default(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = sim_attestation_router(sim.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let env =
+        std::collections::BTreeMap::from([("RESEARCH_MIN_COHORT_SIZE".to_owned(), "2".to_owned())]);
+    let provider = SimulatedTokenProvider::from_url(&base, SIM_ISSUER, policy())
+        .with_workload_env(env.clone());
+    let nonce = [4u8; 32];
+    let evidence = provider.produce_browser_evidence(&nonce).await.unwrap();
+    let verifier = TokenVerifier::new(
+        &sim.jwks(),
+        SIM_ISSUER,
+        BROWSER_ATTESTATION_AUDIENCE,
+        policy(),
+    )
+    .unwrap();
+    let expected = nonces_from_bytes(&nonce).unwrap();
+    let verified = verifier.verify(&evidence.token, &expected).unwrap();
+    assert_eq!(verified.container_env(), &env);
+    server.abort();
+}
+
+/// Only bound configuration names can be reported to the simulator.
+#[tokio::test]
+async fn sim_token_route_refuses_unbound_names() {
+    let sim = Arc::new(TokenSigner::generate(
+        SIM_ISSUER,
+        SimulatedClaims::default(),
+    ));
+    let body = serde_json::json!({
+        "audience": BROWSER_ATTESTATION_AUDIENCE,
+        "nonces": [B64URL.encode([1u8; 32])],
+        "env": { "PATH": "/bin" },
+    });
+    let response = sim_attestation_router(sim)
+        .oneshot(
+            Request::post("/v1/token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn http_sim_attestation_service_serves_tokens_and_keys_end_to_end() {
     // The sim-attestation service over HTTP, as in the compose stack.
