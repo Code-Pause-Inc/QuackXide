@@ -19,8 +19,9 @@
 //! At startup it creates a steward and a researcher tenant, commits a seeded
 //! synthetic cohort (`synth-data`, built around `RESEARCH_MIN_COHORT_SIZE` so
 //! groups fall on both sides of it) as the steward's `health` snapshot,
-//! publishes a catalog listing for it, and prints an HS256 token for each
-//! role. It always uses its own in-memory vault and dev providers, so it
+//! publishes a catalog listing for it with a data dictionary of the cohort's
+//! columns, and prints an HS256 token for each role. It always uses its own
+//! in-memory vault and dev providers, so it
 //! ignores `STORAGE_BUCKET`, `KEY_RELEASE_URL` and `TEE_ATTESTATION_REQUIRED`;
 //! it serves no metrics listener, and the admin routes answer 503.
 //!
@@ -34,7 +35,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use platform_api::dev::{self, DevResearchStack};
-use platform_api::research::{PublishListingRequest, ResearchService, ResearchStores};
+use platform_api::research::{
+    DataDictionaryRequest, DictionaryColumnRequest, PublishListingRequest, ResearchService,
+    ResearchStores,
+};
 use platform_api::{AppState, build_apps, wiring};
 use platform_auth::JwtVerifier;
 use platform_config::PlatformConfig;
@@ -172,6 +176,38 @@ fn synthetic_cohort(min_cohort: u64) -> anyhow::Result<(Zeroizing<Vec<u8>>, usiz
     Ok((Zeroizing::new(parquet), rows))
 }
 
+/// The cohort's data dictionary: every column of the synthetic schema, typed
+/// as the engine reads it, with a note on what it holds.
+fn cohort_dictionary() -> anyhow::Result<DataDictionaryRequest> {
+    let columns = SchemaName::Cohort
+        .arrow_schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            let column_type = quackxide_engine::column_type_of(field.data_type())
+                .with_context(|| format!("cohort column {} has no type family", field.name()))?;
+            Ok(DictionaryColumnRequest {
+                name: field.name().clone(),
+                column_type,
+                description: cohort_column_note(field.name()).to_owned(),
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(DataDictionaryRequest { columns })
+}
+
+/// What a cohort column holds (`synth_data::cohort`).
+fn cohort_column_note(column: &str) -> &'static str {
+    match column {
+        "person_id" => "Invented person id, one row per person",
+        "email" => "Invented address on the reserved example domain",
+        "condition" => "Condition group; some fall below the minimum cohort size",
+        "age" => "Age in years, 18 to 90",
+        "cost_cents" => "Cost of care, in cents",
+        _ => "",
+    }
+}
+
 /// Publishes the steward's catalog listing for the cohort and returns its id.
 async fn publish_listing_for(
     research: &ResearchService,
@@ -185,6 +221,7 @@ async fn publish_listing_for(
         license_fee_cents: 0,
         compute_rate_cents: 0,
         grant_budget: None,
+        data_dictionary: Some(cohort_dictionary()?),
     };
     let listing = research
         .publish_listing(steward, connector, &request)

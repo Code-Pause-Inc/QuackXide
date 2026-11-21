@@ -15,6 +15,8 @@
 use platform_core::ConnectorSlug;
 use serde::Serialize;
 
+use crate::dataset::ColumnSpec;
+
 pub mod dataset;
 pub mod mappers;
 pub mod ndjson;
@@ -74,6 +76,10 @@ pub struct ConnectorDescriptor {
     pub display_name: &'static str,
     pub kind: ConnectorKind,
     pub auth: AuthScheme,
+    /// The columns its mapper writes, in order, and so the shape of its
+    /// dataset: what a listing's data dictionary starts from. Empty for a
+    /// connector with no mapper.
+    pub columns: &'static [ColumnSpec],
 }
 
 /// Built-in connector catalog.
@@ -84,13 +90,21 @@ pub fn catalog() -> Vec<ConnectorDescriptor> {
             "QuickBooks",
             ConnectorKind::Accounting,
             AuthScheme::OAuth2AuthorizationCode,
+            mappers::QUICKBOOKS_INVOICE_COLUMNS,
         ),
-        ("odoo", "Odoo", ConnectorKind::Erp, AuthScheme::ApiKey),
+        (
+            "odoo",
+            "Odoo",
+            ConnectorKind::Erp,
+            AuthScheme::ApiKey,
+            mappers::ODOO_PARTNER_COLUMNS,
+        ),
         (
             "generic_crm",
             "Generic CRM",
             ConnectorKind::Crm,
             AuthScheme::OAuth2AuthorizationCode,
+            mappers::CRM_CONTACT_COLUMNS,
         ),
         // Slugs are storage-path segments: renaming one orphans stored data.
         (
@@ -98,15 +112,19 @@ pub fn catalog() -> Vec<ConnectorDescriptor> {
             "Research Extract",
             ConnectorKind::Health,
             AuthScheme::OAuth2ClientCredentials,
+            &[],
         ),
     ]
     .into_iter()
-    .map(|(slug, display_name, kind, auth)| ConnectorDescriptor {
-        slug: ConnectorSlug::new(slug).expect("built-in slugs are valid by construction"),
-        display_name,
-        kind,
-        auth,
-    })
+    .map(
+        |(slug, display_name, kind, auth, columns)| ConnectorDescriptor {
+            slug: ConnectorSlug::new(slug).expect("built-in slugs are valid by construction"),
+            display_name,
+            kind,
+            auth,
+            columns,
+        },
+    )
     .collect()
 }
 

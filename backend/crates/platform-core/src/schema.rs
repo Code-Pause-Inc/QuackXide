@@ -50,9 +50,16 @@ pub struct DeclaredColumn {
     pub column_type: ColumnType,
 }
 
+/// Whether `name` is a column name a declared schema, or a published data
+/// dictionary, may hold: 1..=[`MAX_COLUMN_NAME_BYTES`] bytes with no
+/// control characters.
+pub fn is_column_name(name: &str) -> bool {
+    (1..=MAX_COLUMN_NAME_BYTES).contains(&name.len()) && !name.chars().any(char::is_control)
+}
+
 /// A validated, ordered list of columns: 1..=[`MAX_DECLARED_COLUMNS`]
-/// columns, each name 1..=[`MAX_COLUMN_NAME_BYTES`] bytes with no control
-/// characters, and no name twice. Deserializing validates too.
+/// columns, each name one [`is_column_name`] accepts, and no name twice.
+/// Deserializing validates too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<DeclaredColumn>", into = "Vec<DeclaredColumn>")]
 pub struct DeclaredSchema(Vec<DeclaredColumn>);
@@ -65,9 +72,7 @@ impl DeclaredSchema {
         let mut seen = std::collections::HashSet::with_capacity(columns.len());
         for column in &columns {
             let name = column.name.as_str();
-            let name_ok = (1..=MAX_COLUMN_NAME_BYTES).contains(&name.len())
-                && !name.chars().any(char::is_control);
-            if !name_ok || !seen.insert(name) {
+            if !is_column_name(name) || !seen.insert(name) {
                 return Err(CoreError::InvalidDeclaredSchema);
             }
         }

@@ -1,4 +1,14 @@
-// Research portal API client: catalog, access requests, grants, and budgets.
+// Research portal API client: catalog, access requests, grants, budgets,
+// and the connector columns a listing's data dictionary starts from.
+
+import type { ColumnType, DictionaryColumn } from "./dictionary";
+
+/** How to query a listed dataset: its SQL table name, quoted where SQL
+ *  needs it, and the columns its steward described (maybe none). */
+export interface DataDictionaryView {
+  table: string;
+  columns: DictionaryColumn[];
+}
 
 export interface ListingView {
   listing_id: string;
@@ -9,9 +19,18 @@ export interface ListingView {
   license_fee_cents: number;
   compute_rate_cents: number;
   grant_budget: number;
+  data_dictionary: DataDictionaryView;
   published: boolean;
   created_at_iso: string;
   updated_at_iso: string;
+}
+
+/** A built-in connector and the columns its mapper writes. */
+export interface ConnectorView {
+  slug: string;
+  display_name: string;
+  kind: string;
+  columns: { name: string; type: ColumnType }[];
 }
 
 export interface CatalogView {
@@ -119,6 +138,8 @@ export interface PublishListingBody {
   license_fee_cents: number;
   compute_rate_cents: number;
   grant_budget?: number;
+  /** Replaces the listing's columns; the API names the table. */
+  data_dictionary: { columns: DictionaryColumn[] };
 }
 
 export interface ResolvedRequestView {
@@ -155,6 +176,16 @@ export class ResearchClient {
 
   async catalog(): Promise<CatalogView> {
     return this.get<CatalogView>("/api/v1/catalog", "the dataset catalog");
+  }
+
+  /** The built-in connectors with their columns, for pre-filling a
+   *  connector dataset's data dictionary. */
+  async connectors(): Promise<ConnectorView[]> {
+    const body = await this.get<{ connectors: ConnectorView[] }>(
+      "/api/v1/connectors",
+      "connector columns",
+    );
+    return body.connectors;
   }
 
   async grants(): Promise<GrantView[]> {

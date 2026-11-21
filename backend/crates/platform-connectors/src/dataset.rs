@@ -14,13 +14,26 @@ pub enum ColumnType {
     Bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl ColumnType {
+    /// The type family a declared schema, or a listing's data dictionary,
+    /// names for the Parquet column `parquet_out` writes for this type.
+    pub fn family(self) -> platform_core::ColumnType {
+        match self {
+            ColumnType::Utf8 => platform_core::ColumnType::String,
+            ColumnType::I64 => platform_core::ColumnType::Int64,
+            ColumnType::F64 => platform_core::ColumnType::Float64,
+            ColumnType::Bool => platform_core::ColumnType::Boolean,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnSpec {
     pub name: &'static str,
     pub ty: ColumnType,
 }
 
-pub fn col(name: &'static str, ty: ColumnType) -> ColumnSpec {
+pub const fn col(name: &'static str, ty: ColumnType) -> ColumnSpec {
     ColumnSpec { name, ty }
 }
 

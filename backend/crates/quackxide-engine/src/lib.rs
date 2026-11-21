@@ -30,7 +30,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
 use bytes::Bytes;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::{DataFusionError, exec_err};
+use datafusion::common::{DataFusionError, TableReference, exec_err};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
@@ -44,6 +44,7 @@ use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::SchedulingType;
 use datafusion::physical_plan::{ExecutionPlan, replace_children_if_necessary};
 use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
+use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -212,7 +213,8 @@ impl QueryScope {
     }
 
     /// Decode in-enclave decrypted Parquet and register it as `table`.
-    /// Returns the row count.
+    /// Returns the row count. The table's name is exactly `table`, never
+    /// parsed as SQL, so a query names it as [`sql_table_name`] writes it.
     pub fn register_parquet(&mut self, table: &str, parquet: &[u8]) -> Result<usize, QueryError> {
         self.register_parquet_many(table, std::slice::from_ref(&parquet))
     }
@@ -320,8 +322,10 @@ impl QueryScope {
         let schema = schema.expect("non-empty blobs yield a schema");
         let mem = MemTable::try_new(schema, partitions)
             .map_err(|_| QueryError::Execution(ExecutionStage::LoadTable))?;
+        // A bare reference keeps the name as given: parsing it as SQL would
+        // lowercase it, and would cut `a--b` short at the comment marker.
         self.ctx
-            .register_table(table, Arc::new(mem))
+            .register_table(TableReference::bare(table), Arc::new(mem))
             .map_err(|_| QueryError::Execution(ExecutionStage::LoadTable))?;
         self.tables.push(table.to_owned());
         Ok(usize::try_from(rows).unwrap_or(usize::MAX))
@@ -459,7 +463,9 @@ impl QueryScope {
 impl Drop for QueryScope {
     fn drop(&mut self) {
         for table in &self.tables {
-            let _ = self.ctx.deregister_table(table.as_str());
+            let _ = self
+                .ctx
+                .deregister_table(TableReference::bare(table.as_str()));
         }
     }
 }
@@ -474,6 +480,33 @@ fn matches_declared(actual: &Schema, declared: &DeclaredSchema) -> bool {
             field.name() == &column.name
                 && column_type_of(field.data_type()) == Some(column.column_type)
         })
+}
+
+/// How a query names the table [`QueryScope`] registers as `table`: the name
+/// itself where SQL reads it unquoted as that name, otherwise double-quoted,
+/// with any `"` inside doubled.
+///
+/// Unquoted, a name must be a plain identifier (a lowercase letter or `_`,
+/// then lowercase letters, digits and `_`), since SQL lowercases unquoted
+/// names, and not a keyword. A research dataset is named by its slug, so
+/// `health` stays `health`, while `crm-2`, `2026_cohorts` and `select` become
+/// `"crm-2"`, `"2026_cohorts"` and `"select"`. Quoting a name that does not
+/// need it changes nothing, so every word the SQL parser knows as a keyword
+/// is quoted, reserved or not.
+pub fn sql_table_name(table: &str) -> String {
+    let mut bytes = table.bytes();
+    let plain = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    let keyword = ALL_KEYWORDS
+        .iter()
+        .any(|keyword| keyword.eq_ignore_ascii_case(table));
+    if plain && !keyword {
+        table.to_owned()
+    } else {
+        format!("\"{}\"", table.replace('"', "\"\""))
+    }
 }
 
 /// The declared type family an Arrow type belongs to, if any.

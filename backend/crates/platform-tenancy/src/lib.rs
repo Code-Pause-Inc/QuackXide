@@ -18,8 +18,8 @@ pub mod catalog;
 pub mod grants;
 pub use budget::{BudgetError, BudgetLedger, BudgetState, InMemoryBudgetLedger};
 pub use catalog::{
-    AccessRequest, CatalogError, CatalogRegistry, DatasetListing, InMemoryCatalogRegistry,
-    ListingDetails, RequestStatus,
+    AccessRequest, CatalogError, CatalogRegistry, DataDictionary, DatasetListing, DictionaryColumn,
+    InMemoryCatalogRegistry, ListingDetails, RequestStatus,
 };
 pub use grants::{DatasetGrant, GrantOutcome, GrantRegistry, InMemoryGrantRegistry};
 
