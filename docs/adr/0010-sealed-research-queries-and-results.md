@@ -118,8 +118,8 @@ shows the workload read the configuration the token reports. The browser
 then checks that configuration by policy, as ADR 0005 decides: it reads
 the same compiled names from the token and refuses a value that loosens a
 control. `TEE_ATTESTATION_REQUIRED` and `FEATURE_ZK_ENABLED` must be
-absent or `true`, and `RESEARCH_MIN_COHORT_SIZE` absent or at least the
-compiled-in floor (P54). P14's policy may require more, never less. A
+absent or a value the platform reads as true, and
+`RESEARCH_MIN_COHORT_SIZE` absent or at least the compiled-in floor (P54). P14's policy may require more, never less. A
 development build, which runs on the simulated TEE, compiles in the
 simulator's policy instead: `TEE_ATTESTATION_REQUIRED` may be `false`,
 since simulated tokens never satisfy required attestation, and the floor is
