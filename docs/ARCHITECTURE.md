@@ -569,11 +569,30 @@ reads only to check that a steward holds a dataset before publishing it.
 
 **Catalog** (`platform_tenancy::CatalogRegistry`, frontend Research tab):
 publishing a listing — title, description, license fee, compute rate,
-included budget, prices in integer cents — is the steward's opt-in to
-discoverability. It is refused (404, a `research.catalog` denial) for a
+included budget, prices in integer cents, and a data dictionary — is the
+steward's opt-in to discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`), so the steward's
-dataset listing (section 2) shows exactly what it can publish. Researchers file
+dataset listing (section 2) shows exactly what it can publish.
+
+The data dictionary is how a researcher learns to query a dataset, since
+`DESCRIBE` is refused and every query costs a unit. It holds the SQL table
+name, which the API derives from the slug and double-quotes where SQL
+needs it (`health`, `"2026-cohorts"`; `quackxide_engine::sql_table_name`;
+`QueryScope` registers the table under exactly the slug), and the columns
+the steward describes, each a name, a type family and an optional
+description. The server cannot read the columns without decrypting, so
+the steward declares them, and nothing checks them against the data. The
+API refuses more than 512 columns, a name a declared schema could not
+hold or one given twice, or a description over 500 characters (400), and
+a dictionary not of that shape (422); a re-publish replaces the columns.
+`GET /api/v1/connectors` gives the columns each built-in connector's
+mapper writes, which the publish form starts a connector dataset's
+dictionary from; an upload's are entered by hand. The portal shows the
+dictionary on every listing and each authorized dataset, with a
+`SELECT COUNT(*) AS n` example over the table name.
+
+Researchers file
 access requests (idempotent while pending); approval mints the grant
 through the same code path as a direct grant, and adds its query budget
 to the grant once, keyed by the request: a follow-up request tops up a
@@ -652,10 +671,10 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait, the plaintext `SnapshotRecord` | Raw-string storage paths |
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
-| platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out, dataset snapshots (commit, prune, "holds"), the upload body parser and writer | Plaintext persistence |
-| platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
+| platform-connectors | Connector catalog with each mapper's columns, OAuth2 grants, NDJSON bounds, Parquet-out, dataset snapshots (commit, prune, "holds"), the upload body parser and writer | Plaintext persistence |
+| platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory), listings' data dictionaries | Disclosure decisions |
 | platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |
-| quackxide-engine | `QueryScope` RAII, declared-shape check, plan gate, p% rule, disclosure policies | Customer-facing naming |
+| quackxide-engine | `QueryScope` RAII, declared-shape check, plan gate, p% rule, disclosure policies, SQL table names | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
 | synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |
 

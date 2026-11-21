@@ -228,7 +228,11 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   minutes ahead of the server's clock), and, in a plaintext record beside
   each snapshot, the envelope suite and the steward's declared row cap and
   schema: column names and type families (ADR 0012). A connector
-  snapshot's record holds only its suite.
+  snapshot's record holds only its suite. A published listing's data
+  dictionary, the columns its steward describes (names, type families
+  and free-text descriptions), is readable by every signed-in tenant as
+  well as the operator. It is what the steward chose to publish, and
+  nothing checks that a description holds no data values.
 * **Forged or rolled-back snapshots.** Connector objects, uploaded objects
   and snapshot manifests are sealed to the tenant's public key, which binds
   them to tenant, dataset and object or version but does not authenticate

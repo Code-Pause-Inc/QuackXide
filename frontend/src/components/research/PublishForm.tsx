@@ -1,19 +1,35 @@
 import { useState } from "react";
-import { dollarsToCents, type PublishListingBody } from "../../lib/research/client";
+import {
+  type ConnectorView,
+  dollarsToCents,
+  type PublishListingBody,
+} from "../../lib/research/client";
+import {
+  type DictionaryColumn,
+  connectorPrefill,
+  dictionaryProblem,
+  sameColumns,
+} from "../../lib/research/dictionary";
+import DictionaryEditor from "./DictionaryEditor";
 import { inputCls, primaryBtnCls } from "./styles";
 
 const CONNECTOR_SLUG = /^[a-z0-9_-]{1,64}$/;
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 2000;
 
-/** Publishes (or re-publishes) a priced dataset listing. */
+/** Publishes (or re-publishes) a priced dataset listing with its data
+ *  dictionary. A connector dataset's dictionary starts from the columns its
+ *  connector's mapper writes; any other dataset's is entered by hand. */
 export default function PublishForm({
   busy,
   currency,
+  connectors = [],
   onPublish,
 }: {
   busy: boolean;
   currency: string;
+  /** The built-in connectors and their columns (`GET /api/v1/connectors`). */
+  connectors?: ConnectorView[];
   onPublish: (body: PublishListingBody) => void;
 }) {
   const [connector, setConnector] = useState("");
@@ -22,6 +38,17 @@ export default function PublishForm({
   const [fee, setFee] = useState("");
   const [rate, setRate] = useState("");
   const [queries, setQueries] = useState("");
+  const [columns, setColumns] = useState<DictionaryColumn[]>([]);
+
+  const prefill = connectorPrefill(connectors, connector.trim());
+  /** Columns that are empty or still the pre-fill follow the dataset;
+   *  once the steward edits them they stay. */
+  const chooseDataset = (value: string) => {
+    const untouched =
+      columns.length === 0 || (prefill !== null && sameColumns(columns, prefill.columns));
+    setConnector(value);
+    if (untouched) setColumns(connectorPrefill(connectors, value.trim())?.columns ?? []);
+  };
 
   const feeCents = dollarsToCents(fee);
   const rateCents = dollarsToCents(rate);
@@ -35,7 +62,8 @@ export default function PublishForm({
     title.trim().length <= TITLE_MAX &&
     feeCents !== null &&
     rateCents !== null &&
-    queriesOk;
+    queriesOk &&
+    dictionaryProblem(columns) === null;
 
   return (
     <div className="mt-3 space-y-2 rounded-lg bg-slate-50 p-3 ring-1 ring-slate-100">
@@ -43,7 +71,7 @@ export default function PublishForm({
         <input
           className={inputCls}
           value={connector}
-          onChange={(ev) => setConnector(ev.target.value)}
+          onChange={(ev) => chooseDataset(ev.target.value)}
           placeholder="dataset (connector slug, e.g. health)"
         />
         <input
@@ -81,6 +109,16 @@ export default function PublishForm({
           placeholder="included queries (default)"
         />
       </div>
+      <DictionaryEditor
+        columns={columns}
+        onChange={setColumns}
+        source={prefill?.source ?? null}
+        onUseSource={
+          prefill && !sameColumns(columns, prefill.columns)
+            ? () => setColumns(prefill.columns)
+            : undefined
+        }
+      />
       <div className="flex justify-end">
         <button
           type="button"
@@ -95,6 +133,12 @@ export default function PublishForm({
               license_fee_cents: feeCents,
               compute_rate_cents: rateCents,
               ...(queriesNum !== undefined ? { grant_budget: queriesNum } : {}),
+              data_dictionary: {
+                columns: columns.map((column) => ({
+                  ...column,
+                  description: column.description.trim(),
+                })),
+              },
             })
           }
           className={primaryBtnCls}

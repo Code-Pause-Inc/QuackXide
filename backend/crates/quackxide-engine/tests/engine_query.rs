@@ -10,7 +10,7 @@ use parquet::arrow::ArrowWriter;
 use platform_core::ZkMode;
 use quackxide_engine::{
     EngineSettings, MinCountThreshold, PercentRule, QueryError, QueryLimit, QueryLimits,
-    QueryScope, blind_index_hex,
+    QueryScope, blind_index_hex, sql_table_name,
 };
 
 const CUSTOMER_KEY: &[u8] = b"tenant-42/customer/index-key";
@@ -159,6 +159,94 @@ async fn disabled_zk_mode_allows_row_level_queries() {
 async fn querying_unregistered_table_errors() {
     let scope = scope(ZkMode::Disabled);
     assert!(scope.sql("SELECT * FROM missing").await.is_err());
+}
+
+// ── Table names (a dataset's slug, as its data dictionary shows it) ──
+
+/// A gated scope with the invoices registered as `table`.
+fn gated_scope_named(table: &str) -> QueryScope {
+    let mut scope = QueryScope::new(EngineSettings {
+        zk: ZkMode::Enabled,
+        max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
+    });
+    scope
+        .register_parquet(table, &invoices_parquet())
+        .expect("register");
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: 2 }), PercentRule { p: 10 });
+    scope
+}
+
+#[test]
+fn table_names_are_quoted_only_where_sql_needs_it() {
+    for (table, sql) in [
+        ("health", "health"),
+        ("upload_cohorts", "upload_cohorts"),
+        ("_x9", "_x9"),
+        ("crm-2", r#""crm-2""#),
+        ("2026_cohorts", r#""2026_cohorts""#),
+        ("upload_2026-q1", r#""upload_2026-q1""#),
+        ("a--b", r#""a--b""#),
+        ("select", r#""select""#),
+        ("order", r#""order""#),
+        ("user", r#""user""#),
+        ("Health", r#""Health""#),
+        (r#"say "hi""#, r#""say ""hi""""#),
+    ] {
+        assert_eq!(sql_table_name(table), sql, "{table}");
+    }
+}
+
+#[tokio::test]
+async fn every_slug_is_queried_by_its_sql_table_name() {
+    for table in [
+        "health",
+        "crm-2",
+        "2026-cohort",
+        "2026_cohorts",
+        "upload_2026-q1",
+        "a--b",
+        "select",
+        "order",
+        "group",
+        "table",
+        "values",
+        "lateral",
+        "unnest",
+        "user",
+        "_x9",
+    ] {
+        let rows = gated_scope_named(table)
+            .sql_json(&format!(
+                "SELECT COUNT(*) AS n FROM {}",
+                sql_table_name(table)
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{table}: {err}"));
+        assert_eq!(rows, serde_json::json!([{ "n": 3 }]), "{table}");
+    }
+}
+
+#[tokio::test]
+async fn a_slug_that_is_not_an_identifier_needs_its_quotes() {
+    // Unquoted, each reads as something else: a subtraction, a number, or
+    // `a` followed by a comment.
+    for table in [
+        "crm-2",
+        "2026-cohort",
+        "2026_cohorts",
+        "upload_2026-q1",
+        "a--b",
+    ] {
+        let scope = gated_scope_named(table);
+        assert!(
+            scope
+                .sql(&format!("SELECT COUNT(*) AS n FROM {table}"))
+                .await
+                .is_err(),
+            "{table} unquoted"
+        );
+    }
 }
 
 #[tokio::test]

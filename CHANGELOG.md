@@ -8,6 +8,24 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Data dictionary on published listings (P59): a catalog listing carries
+  `data_dictionary`, the dataset's SQL table name and the columns its
+  steward describes (name, type family and an optional description), so a
+  researcher can write a query without spending budget to learn the
+  schema. The API derives the table name from the slug, double-quoted
+  where SQL needs it (`health`, `"2026-cohorts"`), and
+  `POST /api/v1/catalog` takes the columns in `data_dictionary.columns`,
+  bounded like the listing's other text: at most 512 columns, names of 1
+  to 128 bytes with no control characters and none twice, and
+  descriptions of at most 500 characters, refused with 400 over a bound
+  and 422 when not a dictionary's shape. A re-publish replaces the
+  columns. `GET /api/v1/connectors` lists the built-in connectors with the
+  columns each one's mapper writes, which the publish form pre-fills a
+  connector dataset's dictionary from; an upload's columns are entered by
+  hand. The portal shows the dictionary on every catalog listing and each
+  authorized dataset, with a `SELECT COUNT(*) AS n` example over the table
+  name to copy. The catalog is still in memory, so listings and their
+  dictionaries are lost on restart (P62).
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -256,6 +274,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* A query's table is the dataset's exact slug. The engine registered it by
+  parsing the slug as SQL, which cut a slug containing `--` short at the
+  comment marker, so `a--b` was queried as `a`.
 * A follow-up access request's approval adds its query budget to the
   existing grant instead of being dropped, and a retry of the same
   approval adds nothing (`BudgetLedger::top_up_once`). A retry of an

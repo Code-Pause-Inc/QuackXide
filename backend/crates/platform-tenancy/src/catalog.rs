@@ -8,12 +8,16 @@
 //! from nonexistent ones.
 //!
 //! Prices are integer cents; the display currency is configuration.
+//!
+//! A listing carries a data dictionary: the table name a query uses and the
+//! columns the steward describes. The server cannot read a dataset's schema
+//! without decrypting it, so the steward declares what researchers see.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
-use platform_core::TenantId;
+use platform_core::{ColumnType, TenantId};
 use serde::Serialize;
 
 use crate::{TenancyError, new_id, now_iso};
@@ -34,9 +38,36 @@ pub struct DatasetListing {
     pub compute_rate_cents: u64,
     /// Query-budget units included when a request is approved.
     pub grant_budget: u64,
+    pub data_dictionary: DataDictionary,
     pub published: bool,
     pub created_at_iso: String,
     pub updated_at_iso: String,
+}
+
+/// How a researcher queries a listed dataset: the SQL table name and the
+/// columns its steward chose to describe. Schema metadata only, never data
+/// values; the API bounds it like the listing's other text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DataDictionary {
+    /// The dataset's SQL table name: its slug, double-quoted where SQL
+    /// needs it (`health`, `"crm-2"`). Derived from the slug, not
+    /// steward-set.
+    pub table: String,
+    /// The described columns, in the steward's order; empty when the
+    /// steward described none.
+    pub columns: Vec<DictionaryColumn>,
+}
+
+/// One column of a [`DataDictionary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DictionaryColumn {
+    /// The column's exact name.
+    pub name: String,
+    /// Its type family, as a declared schema names it.
+    #[serde(rename = "type")]
+    pub column_type: ColumnType,
+    /// The steward's note on the column; empty when there is none.
+    pub description: String,
 }
 
 /// The steward-settable fields of a listing (everything but identity).
@@ -47,6 +78,7 @@ pub struct ListingDetails {
     pub license_fee_cents: u64,
     pub compute_rate_cents: u64,
     pub grant_budget: u64,
+    pub data_dictionary: DataDictionary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -91,7 +123,8 @@ pub enum CatalogError {
 #[async_trait]
 pub trait CatalogRegistry: Send + Sync {
     /// Publish (or re-publish) a listing. Upsert per (steward, connector):
-    /// the listing id is stable, details are replaced, `published` is set.
+    /// the listing id is stable, details (the data dictionary included) are
+    /// replaced, `published` is set.
     async fn publish(
         &self,
         steward: TenantId,
@@ -184,6 +217,7 @@ impl CatalogRegistry for InMemoryCatalogRegistry {
             existing.license_fee_cents = details.license_fee_cents;
             existing.compute_rate_cents = details.compute_rate_cents;
             existing.grant_budget = details.grant_budget;
+            existing.data_dictionary = details.data_dictionary;
             existing.published = true;
             existing.updated_at_iso = now;
             return Ok(existing.clone());
@@ -197,6 +231,7 @@ impl CatalogRegistry for InMemoryCatalogRegistry {
             license_fee_cents: details.license_fee_cents,
             compute_rate_cents: details.compute_rate_cents,
             grant_budget: details.grant_budget,
+            data_dictionary: details.data_dictionary,
             published: true,
             created_at_iso: now.clone(),
             updated_at_iso: now,
@@ -339,7 +374,67 @@ mod tests {
             license_fee_cents: 120_000,
             compute_rate_cents: 40,
             grant_budget: 25,
+            data_dictionary: DataDictionary::default(),
         }
+    }
+
+    fn column(name: &str, column_type: ColumnType, description: &str) -> DictionaryColumn {
+        DictionaryColumn {
+            name: name.to_owned(),
+            column_type,
+            description: description.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_keeps_the_data_dictionary_and_republish_replaces_it() {
+        let registry = InMemoryCatalogRegistry::default();
+        let steward = TenantId::generate();
+        let dictionary = DataDictionary {
+            table: "\"crm-2\"".to_owned(),
+            columns: vec![
+                column("condition", ColumnType::String, "diagnosis group"),
+                column("age", ColumnType::Int64, ""),
+            ],
+        };
+        let first = registry
+            .publish(
+                steward,
+                "crm-2",
+                ListingDetails {
+                    data_dictionary: dictionary.clone(),
+                    ..details("Cohorts")
+                },
+            )
+            .await
+            .expect("publish");
+        assert_eq!(first.data_dictionary, dictionary);
+        let listed = registry.list_published().await.expect("list");
+        assert_eq!(listed[0].data_dictionary, dictionary);
+
+        // Re-publishing replaces the columns along with the other details.
+        let fewer = DataDictionary {
+            columns: vec![column("age", ColumnType::Int64, "years")],
+            ..dictionary
+        };
+        let second = registry
+            .publish(
+                steward,
+                "crm-2",
+                ListingDetails {
+                    data_dictionary: fewer.clone(),
+                    ..details("Cohorts")
+                },
+            )
+            .await
+            .expect("republish");
+        assert_eq!(second.listing_id, first.listing_id);
+        let stored = registry
+            .get_listing(&first.listing_id)
+            .await
+            .expect("get")
+            .expect("listing");
+        assert_eq!(stored.data_dictionary, fewer);
     }
 
     #[tokio::test]
