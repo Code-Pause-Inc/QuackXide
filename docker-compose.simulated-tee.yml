@@ -54,7 +54,6 @@ services:
       SIM_ATTESTATION_URL: "http://sim-attestation:8070"
       SIM_ATTESTATION_ISSUER: "http://sim-attestation:8070"
       KEY_RELEASE_ALLOWED_IMAGE_DIGEST: "${KEY_RELEASE_ALLOWED_IMAGE_DIGEST:-}"
-      KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX: "${KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX:-}"
       LOG_FORMAT: "${LOG_FORMAT:-json}"
       RUST_LOG: "${RUST_LOG:-info}"
     ports:
@@ -84,10 +83,8 @@ services:
       METRICS_BIND_ADDR: "127.0.0.1:9464"
       KEY_RELEASE_URL: "http://key-release-service:8090"
       TEE_ATTESTATION_REQUIRED: "false"
-      FEATURE_ZK_ENABLED: "${FEATURE_ZK_ENABLED:-false}"
       SIM_ATTESTATION_URL: "http://sim-attestation:8070"
       SIM_ATTESTATION_ISSUER: "http://sim-attestation:8070"
-      ENCLAVE_CONFIG_DIGEST_HEX: "${ENCLAVE_CONFIG_DIGEST_HEX:-}"
       JWT_HS256_SECRET: "${JWT_HS256_SECRET:-simulated-tee-local-jwt-secret-32b!!}"
       JWT_ISSUER: "${JWT_ISSUER:-quackxide.local}"
       JWT_AUDIENCE: "${JWT_AUDIENCE:-quackxide-api}"

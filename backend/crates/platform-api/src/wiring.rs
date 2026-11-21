@@ -171,8 +171,6 @@ fn key_release_query_service(
     attestation: Arc<dyn platform_enclave::AttestationProvider>,
     research: &Arc<ResearchService>,
 ) -> anyhow::Result<crate::query::ConnectorQueryService> {
-    use anyhow::Context as _;
-
     use crate::key_release::{AttestedKeyProvider, EnclaveIdentity, HttpKeyReleaseClient};
     use crate::query::ConnectorQueryService;
 
@@ -181,13 +179,9 @@ fn key_release_query_service(
         require_attestation = config.features.tee_attestation_required,
         "enclave key-release path configured"
     );
-    let config_digest = match std::env::var("ENCLAVE_CONFIG_DIGEST_HEX") {
-        Ok(raw) if !raw.trim().is_empty() => {
-            platform_enclave::decode_hex_array::<32>(raw.trim())
-                .context("ENCLAVE_CONFIG_DIGEST_HEX must be exactly 64 hex chars (32 bytes)")?
-        }
-        _ => [0u8; 32],
-    };
+    // The configuration the simulated provider reports in each token, read
+    // from the same environment (`platform_enclave::provider_for`).
+    let config_digest = platform_enclave::config::config_digest(|name| std::env::var(name).ok());
     let identity = Arc::new(EnclaveIdentity::with_metadata(None, config_digest));
     let keys = Arc::new(AttestedKeyProvider::new(
         identity.clone(),
