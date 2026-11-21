@@ -233,7 +233,10 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(body["rows"][0]["n"], 3);
     assert_eq!(body["zk_mode"], true);
 
-    // Cohorts below k = 2 (the single EUR invoice) are withheld.
+    // Cohorts below k = 2 (the single EUR invoice) are withheld. The USD
+    // revenue sums two invoices, so the p% rule releases it as null, which
+    // the JSON leaves out: either invoice's holder would learn the other's
+    // from it (ADR 0015).
     let (status, body) = post_query(
         &app,
         Some(&token),
@@ -243,7 +246,7 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["rows"],
-        serde_json::json!([{ "currency": "USD", "n": 2, "revenue": 1730.25 }])
+        serde_json::json!([{ "currency": "USD", "n": 2 }])
     );
     assert_eq!(body["suppressed_rows"], 1);
 
@@ -1394,6 +1397,8 @@ async fn repeated_syncs_never_inflate_counts() {
         assert_eq!(rows["object_count"], 1, "after {syncs} syncs");
 
         // The single EUR invoice stays below k = 2 however many syncs ran.
+        // The two USD invoices' revenue stays masked by the p% rule (ADR
+        // 0015); a third, duplicated invoice would release it.
         let rows = service
             .query(tenant, &connector, COHORT_SQL)
             .await
@@ -1401,7 +1406,7 @@ async fn repeated_syncs_never_inflate_counts() {
             .expect("cohorts");
         assert_eq!(
             rows["rows"],
-            serde_json::json!([{ "currency": "USD", "n": 2, "revenue": 1730.25 }]),
+            serde_json::json!([{ "currency": "USD", "n": 2 }]),
             "after {syncs} syncs"
         );
         assert_eq!(rows["suppressed_rows"], 1, "after {syncs} syncs");

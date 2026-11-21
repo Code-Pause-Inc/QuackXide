@@ -13,6 +13,15 @@
 //! check use `SUM` or `AVG`, so they reach that check instead of stopping
 //! at the aggregate allowlist.
 //!
+//! A `SUM` or `AVG` that one or two rows dominate is released as null (the
+//! p% rule, ADR 0015). `leak()` cannot tell a dominated total, so
+//! `DOMINANCE_CASES` check whole results instead, mostly over `pay`: teams
+//! of six rows, each released by the cohort threshold, dominated by one
+//! outlier, by two, by a gain and a loss that offset, or by one of three
+//! non-null values, beside teams that are not. Renaming the sum, its
+//! argument or its group, or reading it through `HAVING`, `ORDER BY` or a
+//! derived column, must not get a dominated total past the mask.
+//!
 //! `leak()` checks each released row on its own, so it cannot see a leak
 //! that needs two rows of one result (a subtotal beside its parts). Any
 //! accepted shape whose groups overlap is therefore a defect; grouping sets
@@ -27,15 +36,18 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, make_array};
-use arrow::array::{Int64Array, LargeStringArray, StringArray, StringViewArray};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{Float64Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use platform_core::ZkMode;
-use quackxide_engine::{EngineSettings, MinCountThreshold, QueryError, QueryLimits, QueryScope};
+use quackxide_engine::{
+    EngineSettings, MinCountThreshold, PercentRule, QueryError, QueryLimits, QueryScope,
+};
 use serde_json::Value;
 
 const K: i64 = 5;
+const RULE: PercentRule = PercentRule { p: 10 };
 
 const ROWS: &[(&str, &str, i64)] = &[
     ("p01", "eng", 100),
@@ -56,6 +68,57 @@ const ROWS: &[(&str, &str, i64)] = &[
 ];
 
 const SMALL_COHORTS: &[&str] = &["legal", "ceo"];
+
+/// `pay`: `(id, team, bonus, rate)`. Each team but `solo` has six rows,
+/// so the cohort threshold releases it; whether its sums are masked is up
+/// to the p% rule.
+#[rustfmt::skip]
+const PAY: &[(&str, &str, Option<i64>, f64)] = &[
+    // Even bonuses and rates: released.
+    ("u1", "support", Some(100), 1.0),
+    ("u2", "support", Some(101), 1.25),
+    ("u3", "support", Some(102), 1.5),
+    ("u4", "support", Some(103), 1.75),
+    ("u5", "support", Some(104), 2.0),
+    ("u6", "support", Some(105), 2.25),
+    // One outlier: 5000 of 5060. Even rates.
+    ("s1", "sales", Some(10), 0.25),
+    ("s2", "sales", Some(11), 0.5),
+    ("s3", "sales", Some(12), 0.75),
+    ("s4", "sales", Some(13), 1.0),
+    ("s5", "sales", Some(14), 1.25),
+    ("s6", "sales", Some(5000), 1.5),
+    // Two outliers: each learns the other's from the total.
+    ("f1", "field", Some(1), 2.0),
+    ("f2", "field", Some(2), 2.0),
+    ("f3", "field", Some(3), 2.0),
+    ("f4", "field", Some(4), 2.0),
+    ("f5", "field", Some(4000), 2.0),
+    ("f6", "field", Some(4001), 2.0),
+    // A gain and a loss that offset: the total is 20.
+    ("t1", "trading", Some(5000), 1.0),
+    ("t2", "trading", Some(-4990), 1.0),
+    ("t3", "trading", Some(1), 1.0),
+    ("t4", "trading", Some(2), 1.0),
+    ("t5", "trading", Some(3), 1.0),
+    ("t6", "trading", Some(4), 1.0),
+    // Six rows, three bonuses.
+    ("x1", "sparse", Some(7000), 1.0),
+    ("x2", "sparse", None, 1.0),
+    ("x3", "sparse", None, 1.0),
+    ("x4", "sparse", None, 1.0),
+    ("x5", "sparse", Some(1), 1.0),
+    ("x6", "sparse", Some(2), 1.0),
+    // Even bonuses; one rate is not a number.
+    ("l1", "lab", Some(200), 1.0),
+    ("l2", "lab", Some(201), 2.0),
+    ("l3", "lab", Some(202), 3.0),
+    ("l4", "lab", Some(203), 4.0),
+    ("l5", "lab", Some(204), 5.0),
+    ("l6", "lab", Some(205), f64::NAN),
+    // Below k.
+    ("o1", "solo", Some(9999), 1.0),
+];
 
 #[derive(Debug, Clone, Copy)]
 enum Expect {
@@ -232,6 +295,11 @@ const CASES: &[(&str, &str, Expect)] = &[
     // to bisect a released group's top salary.
     ("max_in_having", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept HAVING MAX(salary) > 104", Rejected),
     ("min_in_order_by", "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept ORDER BY MIN(salary) DESC LIMIT 1", Rejected),
+    // The p% rule weighs rows, not distinct values, and an interval has no
+    // magnitude to weigh (ADR 0015).
+    ("sum_distinct", "SELECT dept, COUNT(*) AS n, SUM(DISTINCT salary) AS s FROM people GROUP BY dept", Rejected),
+    ("avg_distinct", "SELECT dept, COUNT(*) AS n, AVG(DISTINCT salary) AS a FROM people GROUP BY dept", Rejected),
+    ("sum_interval", "SELECT COUNT(*) AS n, SUM(INTERVAL '1 day') AS d FROM people", Rejected),
     // CTEs.
     ("cte_rows", "WITH r AS (SELECT id, salary FROM people) SELECT * FROM r", Rejected),
     ("cte_join", "WITH r AS (SELECT dept FROM people) SELECT a.dept, COUNT(*) AS n FROM r a CROSS JOIN r b GROUP BY a.dept", Rejected),
@@ -315,6 +383,107 @@ async fn zk_mode_without_a_cohort_threshold_refuses_every_query() {
     );
     let zero = scope(Some(0)).sql(group).await;
     assert!(matches!(zero, Err(QueryError::Disclosure(_))), "{zero:?}");
+}
+
+/// Exact results under the p% rule. The JSON leaves out null cells, so a
+/// masked sum or mean is a missing key.
+#[rustfmt::skip]
+const DOMINANCE_CASES: &[(&str, &str, &str)] = &[
+    // ADR 0015's examples: 9001 is 94% of the `ceo` and `eng` total, and
+    // either `legal` row gives the other's from the `legal` and `eng` one.
+    ("ceo_with_eng", "SELECT COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept IN ('ceo', 'eng')", r#"[{"n":7}]"#),
+    ("ceo_with_eng_mean", "SELECT COUNT(*) AS n, AVG(salary) AS a FROM people WHERE dept IN ('ceo', 'eng')", r#"[{"n":7}]"#),
+    ("legal_with_eng", "SELECT COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept IN ('legal', 'eng')", r#"[{"n":8}]"#),
+    ("even_depts", "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people WHERE dept IN ('eng', 'ops') GROUP BY dept ORDER BY dept", r#"[{"dept":"eng","n":6,"s":615},{"dept":"ops","n":6,"s":1215}]"#),
+    // Masked where one or two rows dominate, released where none do.
+    ("by_team", "SELECT team, COUNT(*) AS n, SUM(bonus) AS s, AVG(bonus) AS a FROM pay GROUP BY team ORDER BY team", r#"[{"team":"field","n":6},{"team":"lab","n":6,"s":1215,"a":202.5},{"team":"sales","n":6},{"team":"sparse","n":6},{"team":"support","n":6,"s":615,"a":102.5},{"team":"trading","n":6}]"#),
+    ("per_column", "SELECT team, COUNT(*) AS n, SUM(bonus) AS s, SUM(rate) AS r FROM pay WHERE team IN ('lab', 'sales') GROUP BY team ORDER BY team", r#"[{"team":"lab","n":6,"s":1215},{"team":"sales","n":6,"r":5.25}]"#),
+    ("count_beside_masked", "SELECT team, COUNT(*) AS n, COUNT(bonus) AS c, SUM(bonus) AS s FROM pay WHERE team = 'sparse' GROUP BY team", r#"[{"team":"sparse","n":6,"c":3}]"#),
+    ("split_from_its_outlier", "SELECT bonus > 1000 AS big, COUNT(*) AS n, SUM(bonus) AS s FROM pay WHERE team = 'sales' GROUP BY bonus > 1000", r#"[{"big":false,"n":5,"s":60}]"#),
+    ("everyone", "SELECT COUNT(*) AS n, SUM(bonus) AS s FROM pay", r#"[{"n":37,"s":31923}]"#),
+    ("literal", "SELECT team, COUNT(*) AS n, SUM(1) AS ones FROM pay WHERE team = 'sales' GROUP BY team", r#"[{"team":"sales","n":6,"ones":6}]"#),
+    ("beside_count_distinct", "SELECT team, COUNT(*) AS n, COUNT(DISTINCT rate) AS rates, SUM(bonus) AS s FROM pay WHERE team IN ('sales', 'support') GROUP BY team ORDER BY team", r#"[{"team":"sales","n":6,"rates":6},{"team":"support","n":6,"rates":6,"s":615}]"#),
+    // Renaming the sum, its argument or its group.
+    ("renamed", "SELECT team AS t, COUNT(*) AS n, SUM(bonus) AS total FROM pay WHERE team = 'sales' GROUP BY team", r#"[{"t":"sales","n":6}]"#),
+    ("named_like_count", r#"SELECT team, COUNT(*) AS n, SUM(bonus) AS "count(*)" FROM pay WHERE team = 'sales' GROUP BY team"#, r#"[{"team":"sales","n":6}]"#),
+    ("named_like_hidden", "SELECT team, COUNT(*) AS n, SUM(bonus) AS __releasable_0 FROM pay WHERE team IN ('sales', 'support') GROUP BY team ORDER BY team", r#"[{"team":"sales","n":6},{"team":"support","n":6,"__releasable_0":615}]"#),
+    ("grouped_by_hidden_name", r#"SELECT "__releasable_0" AS team, COUNT(*) AS n, SUM(bonus) AS s FROM pay GROUP BY "__releasable_0" ORDER BY team"#, r#"[{"team":"field","n":6},{"team":"lab","n":6,"s":1215},{"team":"sales","n":6},{"team":"sparse","n":6},{"team":"support","n":6,"s":615},{"team":"trading","n":6}]"#),
+    ("renamed_argument", "SELECT COUNT(*) AS n, SUM(b) AS s FROM (SELECT bonus AS b, team FROM pay) t WHERE team = 'sales'", r#"[{"n":6}]"#),
+    ("subquery", "SELECT g, n, total FROM (SELECT team AS g, COUNT(*) AS n, SUM(bonus) AS total FROM pay GROUP BY team) t WHERE g = 'sales'", r#"[{"g":"sales","n":6}]"#),
+    ("cte", "WITH c AS (SELECT team, COUNT(*) AS n, AVG(bonus) AS a FROM pay GROUP BY team) SELECT team, n, a AS mean FROM c WHERE team = 'sales'", r#"[{"team":"sales","n":6}]"#),
+    // Derived columns read the masked value.
+    ("derived", "SELECT team, COUNT(*) AS n, SUM(bonus) * 1 AS times, SUM(bonus) + 0 AS plus, SUM(bonus) / 1 AS per_one, COALESCE(SUM(bonus), 0) AS zero FROM pay WHERE team = 'sales' GROUP BY team", r#"[{"team":"sales","n":6,"zero":0}]"#),
+    ("mean_times_n", "SELECT team, COUNT(*) AS n, AVG(bonus) * COUNT(*) AS s FROM pay WHERE team = 'sales' GROUP BY team", r#"[{"team":"sales","n":6}]"#),
+    ("case_over_sum", "SELECT team, COUNT(*) AS n, CASE WHEN SUM(bonus) > 1000 THEN 'big' ELSE 'small' END AS size FROM pay WHERE team = 'sales' GROUP BY team", r#"[{"team":"sales","n":6,"size":"small"}]"#),
+    // So do HAVING and ORDER BY: neither filters or ranks on a dominated
+    // total (unmasked, `solo`'s 9999 would sort first).
+    ("having", "SELECT team, COUNT(*) AS n FROM pay GROUP BY team HAVING SUM(bonus) > 1000 ORDER BY team", r#"[{"team":"lab","n":6}]"#),
+    ("having_masked", "SELECT team, COUNT(*) AS n FROM pay GROUP BY team HAVING SUM(bonus) IS NULL ORDER BY team", r#"[{"team":"field","n":6},{"team":"sales","n":6},{"team":"sparse","n":6},{"team":"trading","n":6}]"#),
+    ("top_sum", "SELECT team, COUNT(*) AS n FROM pay GROUP BY team ORDER BY SUM(bonus) DESC NULLS LAST LIMIT 1", r#"[{"team":"lab","n":6}]"#),
+    ("top_mean", "SELECT team, COUNT(*) AS n, AVG(bonus) AS a FROM pay GROUP BY team ORDER BY a DESC NULLS LAST LIMIT 1", r#"[{"team":"lab","n":6,"a":202.5}]"#),
+];
+
+#[tokio::test]
+async fn dominated_sums_and_means_are_masked() {
+    let scope = scope(Some(K));
+    let mut failures = Vec::new();
+    for &(name, sql, expected) in DOMINANCE_CASES {
+        let expected: Value = serde_json::from_str(expected).expect("expected JSON");
+        match scope.sql_json(sql).await {
+            Ok(rows) if rows == expected => {}
+            Ok(rows) => failures.push(format!("{name}: returned {rows}\n    {sql}")),
+            Err(err) => failures.push(format!("{name}: {err}\n    {sql}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The hidden aggregates never leave the plan: a masked result holds
+/// exactly the columns the query names, and none of them is boolean.
+#[tokio::test]
+async fn masking_adds_no_columns_to_the_result() {
+    let sql = "SELECT team, COUNT(*) AS n, SUM(bonus) AS s, AVG(bonus) AS a, SUM(rate) AS r \
+               FROM pay GROUP BY team";
+    let scope = scope(Some(K));
+    let batches = scope.sql(sql).await.expect("query");
+    assert!(batches.iter().any(|batch| batch.num_rows() > 0));
+    for batch in &batches {
+        let schema = batch.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["team", "n", "s", "a", "r"]);
+        assert!(
+            schema
+                .fields()
+                .iter()
+                .all(|field| field.data_type() != &DataType::Boolean),
+            "{schema:?}"
+        );
+    }
+    let rows = scope.sql_json(sql).await.expect("query");
+    for row in rows.as_array().expect("rows") {
+        let keys = row.as_object().expect("row").keys();
+        for key in keys {
+            assert!(
+                ["team", "n", "s", "a", "r"].contains(&key.as_str()),
+                "{row}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_dominance_rule_below_one_percent_refuses_every_query() {
+    let scope = scope_with(Some(K), PercentRule { p: 0 });
+    for sql in [
+        "SELECT dept, COUNT(*) AS n FROM people GROUP BY dept",
+        "SELECT dept, COUNT(*) AS n, SUM(salary) AS s FROM people GROUP BY dept",
+    ] {
+        let result = scope.sql(sql).await;
+        assert!(
+            matches!(result, Err(QueryError::Disclosure(_))),
+            "{sql}: {result:?}"
+        );
+    }
 }
 
 /// Queries whose expressions fail only on some rows: `{P}` holds only for
@@ -603,12 +772,18 @@ fn text_scope() -> QueryScope {
             &parquet(&[("dept", &utf8), ("ldept", &large), ("vdept", &view)]),
         )
         .expect("register texts");
-    scope.set_disclosure(Arc::new(MinCountThreshold { k: K }));
+    scope.set_disclosure(Arc::new(MinCountThreshold { k: K }), RULE);
     scope
 }
 
-/// A zero-knowledge scope with a `MinCountThreshold` of `k`, if given.
+/// A zero-knowledge scope with a `MinCountThreshold` of `k`, if given, and
+/// the p% rule at `RULE`.
 fn scope(k: Option<i64>) -> QueryScope {
+    scope_with(k, RULE)
+}
+
+/// [`scope`], with the p% rule at `rule`.
+fn scope_with(k: Option<i64>, rule: PercentRule) -> QueryScope {
     let mut scope = QueryScope::new(EngineSettings {
         zk: ZkMode::Enabled,
         max_concurrent_queries: 1,
@@ -630,8 +805,26 @@ fn scope(k: Option<i64>) -> QueryScope {
         .register_parquet("spoof", &parquet(&[("dept", &depts), ("count(x)", &fake)]))
         .expect("register spoof");
 
+    // `__releasable_0` repeats `team` under the name of a hidden column.
+    let ids = StringArray::from_iter_values(PAY.iter().map(|r| r.0));
+    let teams = StringArray::from_iter_values(PAY.iter().map(|r| r.1));
+    let bonuses = Int64Array::from_iter(PAY.iter().map(|r| r.2));
+    let rates = Float64Array::from_iter_values(PAY.iter().map(|r| r.3));
+    scope
+        .register_parquet(
+            "pay",
+            &parquet(&[
+                ("id", &ids),
+                ("team", &teams),
+                ("__releasable_0", &teams),
+                ("bonus", &bonuses),
+                ("rate", &rates),
+            ]),
+        )
+        .expect("register pay");
+
     if let Some(k) = k {
-        scope.set_disclosure(Arc::new(MinCountThreshold { k }));
+        scope.set_disclosure(Arc::new(MinCountThreshold { k }), rule);
     }
     scope
 }
@@ -640,7 +833,9 @@ fn parquet(columns: &[(&str, &dyn Array)]) -> Vec<u8> {
     let schema = Arc::new(Schema::new(
         columns
             .iter()
-            .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
+            .map(|(name, array)| {
+                Field::new(*name, array.data_type().clone(), array.null_count() > 0)
+            })
             .collect::<Vec<_>>(),
     ));
     let arrays = columns

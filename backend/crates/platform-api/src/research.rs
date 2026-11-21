@@ -66,6 +66,9 @@ pub struct ResearchService {
     /// Minimum cohort size `k` for disclosure control
     /// (`RESEARCH_MIN_COHORT_SIZE`). Zero refuses every research query.
     min_cohort: u64,
+    /// The p% rule's `p` (`RESEARCH_DOMINANCE_PERCENT`, ADR 0015). Zero
+    /// refuses every research query.
+    dominance_percent: u64,
     /// Budget units allocated to a grant when the steward doesn't specify
     /// (`RESEARCH_DEFAULT_QUERY_BUDGET`).
     default_budget: u64,
@@ -115,7 +118,9 @@ pub struct ApproveRequestBody {
 
 impl ResearchService {
     /// `vault` must be the one the app serves (`AppState::vault`), so a
-    /// dataset uploaded or synced there is one the steward can publish.
+    /// dataset uploaded or synced there is one the steward can publish. The
+    /// p% rule takes its default `p` until
+    /// [`with_dominance_percent`](Self::with_dominance_percent) sets it.
     pub fn new(
         stores: ResearchStores,
         vault: Arc<dyn VaultStore>,
@@ -128,13 +133,20 @@ impl ResearchService {
             catalog: stores.catalog,
             vault,
             min_cohort,
+            dominance_percent: platform_config::DEFAULT_DOMINANCE_PERCENT,
             default_budget,
         }
     }
 
-    /// From `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`.
-    /// `RESEARCH_PRICING_CURRENCY` stays on `PlatformConfig`, where
-    /// `catalog_index` reads it.
+    /// Set the p% rule's `p` (`RESEARCH_DOMINANCE_PERCENT`).
+    pub fn with_dominance_percent(mut self, dominance_percent: u64) -> Self {
+        self.dominance_percent = dominance_percent;
+        self
+    }
+
+    /// From `RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT` and
+    /// `RESEARCH_DEFAULT_QUERY_BUDGET`. `RESEARCH_PRICING_CURRENCY` stays on
+    /// `PlatformConfig`, where `catalog_index` reads it.
     pub fn from_config(
         stores: ResearchStores,
         vault: Arc<dyn VaultStore>,
@@ -146,12 +158,19 @@ impl ResearchService {
             config.min_cohort_size,
             config.default_query_budget,
         )
+        .with_dominance_percent(config.dominance_percent)
     }
 
     /// The configured `k`. The query service applies it to research queries
     /// and to own-data queries in zero-knowledge mode.
     pub fn min_cohort(&self) -> u64 {
         self.min_cohort
+    }
+
+    /// The configured `p`, which the query service applies where it
+    /// applies `k`.
+    pub fn dominance_percent(&self) -> u64 {
+        self.dominance_percent
     }
 
     // ── Grants and budgets ──

@@ -12,7 +12,7 @@ except fuzzing; `CONTRIBUTING.md` lists what CI runs on each pull request.
 | Crate unit tests | `#[cfg(test)] mod tests` beside the code, in each crate under `backend/crates/` | `backend/crates/platform-storage/src/lib.rs` |
 | API integration tests | `backend/crates/platform-api/tests/*.rs` | `backend/crates/platform-api/tests/research_api.rs` |
 | Audit assertions | `backend/crates/platform-api/tests/audit_coverage.rs` | the same file |
-| Disclosure attacks | `backend/crates/quackxide-engine/tests/bypass.rs` | add a case to `CASES` or `ZK_CASES` |
+| Disclosure attacks | `backend/crates/quackxide-engine/tests/bypass.rs` | add a case to `CASES`, `ZK_CASES` or `DOMINANCE_CASES` |
 | Property tests (Rust) | `proptest!` blocks inside a crate's unit tests | `backend/crates/platform-auth/src/verify.rs` |
 | Property tests (TypeScript) | `frontend/src/**/*.property.test.ts` (fast-check) | `frontend/src/lib/vault/wire.property.test.ts` |
 | Frontend unit tests | `frontend/src/**/*.test.ts` (vitest `node` project) | `frontend/src/lib/vault/wire.test.ts` |
@@ -98,9 +98,10 @@ Two rules come from `backend/crates/platform-telemetry/src/capture.rs`:
 
 `bypass.rs` runs adversarial queries against the zero-knowledge and research
 gates. Each case must be refused or return only rows with `n >= K` that
-carry no identifier or small-cohort value. A new disclosure rule or query
-shape adds cases here, not a new file. `disclosure.rs` beside it covers the
-gate's expected behaviour.
+carry no identifier or small-cohort value. A dominated sum is not a value
+that check can recognise, so `DOMINANCE_CASES` compare whole results. A
+new disclosure rule or query shape adds cases here, not a new file.
+`disclosure.rs` beside it covers the gate's expected behaviour.
 
 ### Property tests
 
