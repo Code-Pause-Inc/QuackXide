@@ -234,7 +234,9 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   does not yet check the TLS key binding (P67) or the served bundle's
   digest (P49), and a release build of it compiles in no trust anchors
   until P49 and P50 publish them, so whoever runs it supplies the issuer,
-  key-set URL and image digests.
+  key-set URL and image digests. Its `seal-query` takes the SQL on the
+  command line, where other users of the same machine can see it in the
+  process list; it serves the simulated-TEE script, not researchers.
 * **Configuration bound so far.** Attestation binds
   `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED` and
   `RESEARCH_MIN_COHORT_SIZE`. `RESEARCH_DEFAULT_QUERY_BUDGET`,
