@@ -3682,6 +3682,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "criterion",
  "datafusion",
  "futures",
  "object_store",
@@ -3689,6 +3690,7 @@ dependencies = [
  "platform-core",
  "platform-crypto",
  "serde_json",
+ "synth-data",
  "thiserror",
  "tokio",
  "tracing",
