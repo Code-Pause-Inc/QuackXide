@@ -254,6 +254,7 @@ struct SealedMeta {
 
 impl ResearchRequest {
     /// A plaintext query: the `dev` route and in-process callers.
+    #[cfg(feature = "dev")]
     pub fn plain(steward: TenantId, connector: ConnectorSlug, sql: &str) -> Self {
         Self {
             steward,
@@ -812,7 +813,7 @@ impl ConnectorQueryService {
                     Begin::New(guard) => Some(guard),
                     Begin::Stored(StoredOutcome::Ok(body)) => return Ok(body),
                     Begin::Stored(StoredOutcome::Err(err)) => return Err(err),
-                    Begin::Refused => return Err(ApiError::Conflict),
+                    Begin::Refused(refusal) => return Err(refusal),
                 }
             }
         };
@@ -929,6 +930,12 @@ impl ConnectorQueryService {
                 .map_err(|_| ApiError::Backend)
         });
         if let Some(guard) = guard {
+            // A refused charge spent nothing: the nonce is dropped, so an
+            // exhausted grant cannot grow the store (ADR 0010).
+            if matches!(outcome, Err(ApiError::BudgetExhausted)) {
+                guard.forget();
+                return outcome;
+            }
             let stored = match &outcome {
                 Ok(body) => StoredOutcome::Ok(SecretBytes::new(body.expose().to_vec())),
                 Err(err) => StoredOutcome::Err(err.clone()),
@@ -1129,6 +1136,7 @@ pub struct TopUpRequest {
 /// The `dev` route's plaintext research query. Unknown fields are refused,
 /// so a sealed body carrying these fields too is neither shape and never
 /// runs unsealed.
+#[cfg(feature = "dev")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchQueryRequest {
@@ -1418,7 +1426,9 @@ mod tests {
         let body = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match service.run_detached(researcher, sealed()).await {
-                    Err(ApiError::Conflict) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(ApiError::QueryRunning) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                     other => break other,
                 }
             }

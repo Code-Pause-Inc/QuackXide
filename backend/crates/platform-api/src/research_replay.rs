@@ -39,9 +39,9 @@ pub(crate) enum Begin {
     New(ReplayGuard),
     /// The same envelope again: send this, with no new charge.
     Stored(StoredOutcome),
-    /// Another envelope under the nonce, a retry while the query runs, or a
-    /// stored response that has expired (409; re-send under a new nonce).
-    Refused,
+    /// A 409 saying why: another envelope under the nonce, a retry while
+    /// the query still runs, or a stored response that has expired.
+    Refused(ApiError),
 }
 
 enum State {
@@ -124,12 +124,12 @@ impl ReplayStore {
                     finished: false,
                 })
             }
-            Some(entry) if entry.digest != envelope_digest => Begin::Refused,
-            Some(Entry {
-                state: State::Done(outcome),
-                ..
-            }) => Begin::Stored(outcome.clone()),
-            Some(_) => Begin::Refused,
+            Some(entry) if entry.digest != envelope_digest => Begin::Refused(ApiError::NonceUsed),
+            Some(Entry { state, .. }) => match state {
+                State::Done(outcome) => Begin::Stored(outcome.clone()),
+                State::Running => Begin::Refused(ApiError::QueryRunning),
+                State::Expired => Begin::Refused(ApiError::ResponseExpired),
+            },
         }
     }
 }
@@ -147,6 +147,13 @@ impl ReplayGuard {
     pub(crate) fn finish(mut self, outcome: StoredOutcome, now: Instant) {
         self.finished = true;
         lock(&self.entries).finish(self.nonce, outcome, now);
+    }
+
+    /// Drop the nonce: its charge was refused, so it spent nothing and the
+    /// same request may be sent again (ADR 0010).
+    pub(crate) fn forget(mut self) {
+        self.finished = true;
+        lock(&self.entries).by_nonce.remove(&self.nonce);
     }
 }
 
@@ -210,7 +217,10 @@ mod tests {
         let store = ReplayStore::new();
         let t = Instant::now();
         finished(&store, ok(b"r"), t);
-        assert!(matches!(store.begin(NONCE, [3; 32], t), Begin::Refused));
+        assert!(matches!(
+            store.begin(NONCE, [3; 32], t),
+            Begin::Refused(ApiError::NonceUsed)
+        ));
     }
 
     #[test]
@@ -218,7 +228,10 @@ mod tests {
         let store = ReplayStore::new();
         let t = Instant::now();
         let _running = store.begin(NONCE, DIGEST, t);
-        assert!(matches!(store.begin(NONCE, DIGEST, t), Begin::Refused));
+        assert!(matches!(
+            store.begin(NONCE, DIGEST, t),
+            Begin::Refused(ApiError::QueryRunning)
+        ));
     }
 
     #[test]
@@ -227,11 +240,14 @@ mod tests {
         let t = Instant::now();
         finished(&store, ok(b"r"), t);
         let later = t + STORED_RESPONSE_TTL + Duration::from_secs(1);
-        assert!(matches!(store.begin(NONCE, DIGEST, later), Begin::Refused));
+        assert!(matches!(
+            store.begin(NONCE, DIGEST, later),
+            Begin::Refused(ApiError::ResponseExpired)
+        ));
         let much_later = later + STORED_RESPONSE_TTL;
         assert!(matches!(
             store.begin(NONCE, DIGEST, much_later),
-            Begin::Refused
+            Begin::Refused(ApiError::ResponseExpired)
         ));
     }
 
@@ -244,6 +260,17 @@ mod tests {
             store.begin(NONCE, DIGEST, t),
             Begin::Stored(StoredOutcome::Err(ApiError::QueryUnavailable))
         ));
+    }
+
+    #[test]
+    fn a_forgotten_nonce_begins_again() {
+        let store = ReplayStore::new();
+        let t = Instant::now();
+        match store.begin(NONCE, DIGEST, t) {
+            Begin::New(guard) => guard.forget(),
+            _ => panic!("expected a new entry"),
+        }
+        assert!(matches!(store.begin(NONCE, DIGEST, t), Begin::New(_)));
     }
 
     #[test]
