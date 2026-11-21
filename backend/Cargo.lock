@@ -3681,6 +3681,7 @@ name = "quackxide-engine"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "datafusion",
  "futures",
@@ -3689,6 +3690,7 @@ dependencies = [
  "platform-core",
  "platform-crypto",
  "serde_json",
+ "synth-data",
  "thiserror",
  "tokio",
  "tracing",
