@@ -13,6 +13,7 @@ mod secret;
 pub use limits::{QueryLimit, QueryLimits};
 pub use schema::{
     ColumnType, DeclaredColumn, DeclaredSchema, MAX_COLUMN_NAME_BYTES, MAX_DECLARED_COLUMNS,
+    is_column_name,
 };
 pub use secret::SecretString;
 

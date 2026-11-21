@@ -15,18 +15,27 @@
 //! access requests; approval mints the grant and budget through the same path
 //! as a direct grant, except that a retried approval never re-activates a
 //! revoked grant. Prices are integer cents in the configured currency.
+//!
+//! A listing's data dictionary tells researchers how to query the dataset:
+//! its SQL table name, derived here from the slug, and the columns the
+//! steward describes, bounded like the listing's other text. The server
+//! cannot read a dataset's columns, so the steward declares them;
+//! `GET /api/v1/connectors` gives the columns each connector's mapper
+//! writes, for the publish form to start from.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use platform_config::ResearchConfig;
-use platform_core::{ConnectorSlug, TenantId};
+use platform_core::{ColumnType, ConnectorSlug, MAX_DECLARED_COLUMNS, TenantId, is_column_name};
 use platform_storage::VaultStore;
 use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::{
     AccessRequest, BudgetError, BudgetLedger, BudgetState, CatalogError, CatalogRegistry,
-    DatasetGrant, GrantOutcome, GrantRegistry, ListingDetails, RequestStatus,
+    DataDictionary, DatasetGrant, DictionaryColumn, GrantOutcome, GrantRegistry, ListingDetails,
+    RequestStatus,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,6 +75,9 @@ pub struct ResearchService {
     /// Minimum cohort size `k` for disclosure control
     /// (`RESEARCH_MIN_COHORT_SIZE`). Zero refuses every research query.
     min_cohort: u64,
+    /// The p% rule's `p` (`RESEARCH_DOMINANCE_PERCENT`, ADR 0015). Zero
+    /// refuses every research query.
+    dominance_percent: u64,
     /// Budget units allocated to a grant when the steward doesn't specify
     /// (`RESEARCH_DEFAULT_QUERY_BUDGET`).
     default_budget: u64,
@@ -76,6 +88,10 @@ pub struct ResearchService {
 pub const MAX_TITLE_CHARS: usize = 120;
 pub const MAX_DESCRIPTION_CHARS: usize = 2000;
 pub const MAX_NOTE_CHARS: usize = 1000;
+/// Most columns a data dictionary may describe: as many as a declared
+/// schema may list, so an upload's whole schema fits.
+pub const MAX_DICTIONARY_COLUMNS: usize = MAX_DECLARED_COLUMNS;
+pub const MAX_COLUMN_DESCRIPTION_CHARS: usize = 500;
 
 // ── Wire types ───────────────────────────────────────────────────────────────
 
@@ -94,6 +110,29 @@ pub struct PublishListingRequest {
     /// (`RESEARCH_DEFAULT_QUERY_BUDGET`).
     #[serde(default)]
     pub grant_budget: Option<u64>,
+    /// The columns the steward describes. Omitted or `null` ⇒ none; a
+    /// re-publish replaces them like the other details.
+    #[serde(default)]
+    pub data_dictionary: Option<DataDictionaryRequest>,
+}
+
+/// A data dictionary as the steward sends it: the columns only. The API
+/// derives the table name from the slug.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataDictionaryRequest {
+    #[serde(default)]
+    pub columns: Vec<DictionaryColumnRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DictionaryColumnRequest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub column_type: ColumnType,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,7 +154,9 @@ pub struct ApproveRequestBody {
 
 impl ResearchService {
     /// `vault` must be the one the app serves (`AppState::vault`), so a
-    /// dataset uploaded or synced there is one the steward can publish.
+    /// dataset uploaded or synced there is one the steward can publish. The
+    /// p% rule takes its default `p` until
+    /// [`with_dominance_percent`](Self::with_dominance_percent) sets it.
     pub fn new(
         stores: ResearchStores,
         vault: Arc<dyn VaultStore>,
@@ -128,13 +169,20 @@ impl ResearchService {
             catalog: stores.catalog,
             vault,
             min_cohort,
+            dominance_percent: platform_config::DEFAULT_DOMINANCE_PERCENT,
             default_budget,
         }
     }
 
-    /// From `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`.
-    /// `RESEARCH_PRICING_CURRENCY` stays on `PlatformConfig`, where
-    /// `catalog_index` reads it.
+    /// Set the p% rule's `p` (`RESEARCH_DOMINANCE_PERCENT`).
+    pub fn with_dominance_percent(mut self, dominance_percent: u64) -> Self {
+        self.dominance_percent = dominance_percent;
+        self
+    }
+
+    /// From `RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT` and
+    /// `RESEARCH_DEFAULT_QUERY_BUDGET`. `RESEARCH_PRICING_CURRENCY` stays on
+    /// `PlatformConfig`, where `catalog_index` reads it.
     pub fn from_config(
         stores: ResearchStores,
         vault: Arc<dyn VaultStore>,
@@ -146,12 +194,19 @@ impl ResearchService {
             config.min_cohort_size,
             config.default_query_budget,
         )
+        .with_dominance_percent(config.dominance_percent)
     }
 
     /// The configured `k`. The query service applies it to research queries
     /// and to own-data queries in zero-knowledge mode.
     pub fn min_cohort(&self) -> u64 {
         self.min_cohort
+    }
+
+    /// The configured `p`, which the query service applies where it
+    /// applies `k`.
+    pub fn dominance_percent(&self) -> u64 {
+        self.dominance_percent
     }
 
     // ── Grants and budgets ──
@@ -371,7 +426,9 @@ impl ResearchService {
     /// Publish or re-publish a catalog listing for one of the steward's
     /// datasets (upsert; the listing id is stable). A dataset the steward
     /// does not hold (no committed snapshot) is refused with 404 and a
-    /// `denied` event, so a listing never points at nothing.
+    /// `denied` event, so a listing never points at nothing. The listing's
+    /// data dictionary names the dataset's SQL table, quoted where SQL needs
+    /// it, beside the columns the request describes.
     pub async fn publish_listing(
         &self,
         steward: TenantId,
@@ -387,12 +444,26 @@ impl ResearchService {
             );
             return Err(ApiError::NotFound);
         }
+        let columns = req
+            .data_dictionary
+            .iter()
+            .flat_map(|dictionary| &dictionary.columns)
+            .map(|column| DictionaryColumn {
+                name: column.name.clone(),
+                column_type: column.column_type,
+                description: column.description.trim().to_owned(),
+            })
+            .collect();
         let details = ListingDetails {
             title: req.title.trim().to_owned(),
             description: req.description.trim().to_owned(),
             license_fee_cents: req.license_fee_cents,
             compute_rate_cents: req.compute_rate_cents,
             grant_budget: req.grant_budget.unwrap_or(self.default_budget),
+            data_dictionary: DataDictionary {
+                table: quackxide_engine::sql_table_name(connector.as_str()),
+                columns,
+            },
         };
         let listing = self
             .catalog
@@ -748,6 +819,38 @@ fn require_text(value: &str, max: usize, what: &'static str) -> Result<(), ApiEr
     Ok(())
 }
 
+/// Refuse a data dictionary that is oversized or malformed: more than
+/// [`MAX_DICTIONARY_COLUMNS`] columns, a name a declared schema could not
+/// hold (empty, over 128 bytes, or with a control character), a name
+/// twice, or a description over [`MAX_COLUMN_DESCRIPTION_CHARS`]. Refused,
+/// never truncated. Column names are kept exactly as sent, since they must
+/// match the dataset's.
+fn check_dictionary(dictionary: &DataDictionaryRequest) -> Result<(), ApiError> {
+    let columns = &dictionary.columns;
+    if columns.len() > MAX_DICTIONARY_COLUMNS {
+        return Err(ApiError::BadRequest(
+            "data dictionary has too many columns (max 512)",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(columns.len());
+    for column in columns {
+        if !is_column_name(&column.name) {
+            return Err(ApiError::BadRequest(
+                "column name is required (max 128 bytes, no control characters)",
+            ));
+        }
+        if !seen.insert(column.name.as_str()) {
+            return Err(ApiError::BadRequest("data dictionary lists a column twice"));
+        }
+        if column.description.chars().count() > MAX_COLUMN_DESCRIPTION_CHARS {
+            return Err(ApiError::BadRequest(
+                "column description too long (max 500 chars)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `GET /api/v1/catalog` — published listings + the platform pricing currency.
 pub(crate) async fn catalog_index(
     State(state): State<AppState>,
@@ -780,9 +883,38 @@ pub(crate) async fn publish_listing(
             "description too long (max 2000 chars)",
         ));
     }
+    if let Some(dictionary) = &req.data_dictionary {
+        check_dictionary(dictionary)?;
+    }
     Ok(Json(
         research.publish_listing(steward, &connector, &req).await?,
     ))
+}
+
+/// `GET /api/v1/connectors` — the built-in connectors, each with the
+/// columns its mapper writes, typed as a data dictionary names them: what
+/// the publish form pre-fills a connector dataset's dictionary from. Static
+/// metadata: it reads no tenant data and needs no research service.
+pub(crate) async fn connector_columns(
+    Extension(AuthedTenant(_tenant)): Extension<AuthedTenant>,
+) -> Json<Value> {
+    let connectors: Vec<Value> = platform_connectors::catalog()
+        .into_iter()
+        .map(|connector| {
+            let columns: Vec<Value> = connector
+                .columns
+                .iter()
+                .map(|column| json!({ "name": column.name, "type": column.ty.family() }))
+                .collect();
+            json!({
+                "slug": connector.slug,
+                "display_name": connector.display_name,
+                "kind": connector.kind,
+                "columns": columns,
+            })
+        })
+        .collect();
+    Json(json!({ "connectors": connectors }))
 }
 
 /// `DELETE /api/v1/catalog/{listing_id}` — steward withdraws a listing.

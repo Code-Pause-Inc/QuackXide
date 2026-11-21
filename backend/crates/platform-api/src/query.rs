@@ -43,7 +43,7 @@ use platform_telemetry::{AuditKind, security_audit_event};
 use platform_tenancy::BudgetError;
 use prometheus_client::metrics::histogram::Histogram;
 use quackxide_engine::{
-    DisclosurePolicy, EngineSettings, MinCountThreshold, QueryError, QueryScope,
+    DisclosurePolicy, EngineSettings, MinCountThreshold, PercentRule, QueryError, QueryScope,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -214,6 +214,9 @@ pub struct ConnectorQueryService {
     /// Minimum cohort size `k` for disclosure control, shared by
     /// zero-knowledge and research queries. Zero refuses every such query.
     min_cohort: u64,
+    /// The p% rule's `p`, shared the same way (ADR 0015). Zero refuses
+    /// every such query.
+    dominance_percent: u64,
     /// Bounds how many queries hold decrypted plaintext at once
     /// (`EngineSettings::max_concurrent_queries`).
     plaintext_slots: Semaphore,
@@ -252,6 +255,7 @@ impl ConnectorQueryService {
             require_attestation,
             research: None,
             min_cohort: platform_config::DEFAULT_MIN_COHORT_SIZE,
+            dominance_percent: platform_config::DEFAULT_DOMINANCE_PERCENT,
             #[cfg(test)]
             disclosure_for_tests: None,
         }
@@ -298,12 +302,14 @@ impl ConnectorQueryService {
     }
 
     /// Enable research queries, which check grants and charge budgets
-    /// through `research`. Also sets this service's `k` to `research`'s
-    /// ([`with_min_cohort`](Self::with_min_cohort)). Pass the `Arc` that
-    /// `AppState::research` holds, so the grant a research route creates is
-    /// the one a research query checks and charges.
+    /// through `research`. Also sets this service's `k` and `p` to
+    /// `research`'s ([`with_min_cohort`](Self::with_min_cohort),
+    /// [`with_dominance_percent`](Self::with_dominance_percent)). Pass the
+    /// `Arc` that `AppState::research` holds, so the grant a research route
+    /// creates is the one a research query checks and charges.
     pub fn with_research(mut self, research: Arc<ResearchService>) -> Self {
         self.min_cohort = research.min_cohort();
+        self.dominance_percent = research.dominance_percent();
         self.research = Some(research);
         self
     }
@@ -312,6 +318,24 @@ impl ConnectorQueryService {
     pub fn with_min_cohort(mut self, min_cohort: u64) -> Self {
         self.min_cohort = min_cohort;
         self
+    }
+
+    /// Set the p% rule's `p` (`RESEARCH_DOMINANCE_PERCENT`).
+    pub fn with_dominance_percent(mut self, dominance_percent: u64) -> Self {
+        self.dominance_percent = dominance_percent;
+        self
+    }
+
+    /// Disclosure control for a gated query: `k` and `p`, composed for the
+    /// engine, which masks dominated sums inside the plan and then applies
+    /// the threshold to the result.
+    fn disclosure(&self) -> Disclosure {
+        Disclosure {
+            threshold: self.threshold(),
+            rule: PercentRule {
+                p: self.dominance_percent,
+            },
+        }
     }
 
     fn threshold(&self) -> Arc<dyn DisclosurePolicy> {
@@ -610,7 +634,7 @@ impl ConnectorQueryService {
         owner: TenantId,
         dataset: &ConnectorSlug,
         settings: EngineSettings,
-        disclosure: Option<Arc<dyn DisclosurePolicy>>,
+        disclosure: Option<Disclosure>,
         sql: &str,
     ) -> Result<Ran, Stopped> {
         let _slot = self
@@ -659,7 +683,7 @@ impl ConnectorQueryService {
     ) -> Result<Value, ApiError> {
         let tee_platform = platform_label(self.gate(tenant, "query").await?);
         let zk_mode = self.settings.zk.is_enabled();
-        let disclosure = zk_mode.then(|| self.threshold());
+        let disclosure = zk_mode.then(|| self.disclosure());
         let ran = self
             .decrypt_and_run(tenant, connector, self.settings.clone(), disclosure, sql)
             .await
@@ -784,7 +808,7 @@ impl ConnectorQueryService {
                 steward,
                 connector,
                 research_settings,
-                Some(self.threshold()),
+                Some(self.disclosure()),
                 sql,
             )
             .await
@@ -883,6 +907,15 @@ struct DecryptedDataset {
     declared: Option<(DeclaredSchema, u64)>,
 }
 
+/// Disclosure control for one gated query
+/// ([`ConnectorQueryService::disclosure`]).
+struct Disclosure {
+    /// Applied to the result: rows whose cohort is below `k` are withheld.
+    threshold: Arc<dyn DisclosurePolicy>,
+    /// Applied inside the plan: dominated sums and means are masked.
+    rule: PercentRule,
+}
+
 /// A query that ran: the objects it decrypted (none for a dataset with no
 /// snapshot), its rows, and how many rows disclosure control withheld.
 struct Ran {
@@ -936,14 +969,14 @@ impl Stopped {
 /// Returns the rows and the number suppressed by disclosure control.
 async fn run_scoped(
     settings: EngineSettings,
-    disclosure: Option<Arc<dyn DisclosurePolicy>>,
+    disclosure: Option<Disclosure>,
     dataset: &ConnectorSlug,
     decrypted: DecryptedDataset,
     sql: &str,
 ) -> Result<(Value, usize), ApiError> {
     let mut scope = QueryScope::new(settings);
-    if let Some(policy) = disclosure {
-        scope.set_disclosure(policy);
+    if let Some(Disclosure { threshold, rule }) = disclosure {
+        scope.set_disclosure(threshold, rule);
     }
     let blob_refs: Vec<&[u8]> = decrypted.blobs.iter().map(SecretBytes::expose).collect();
     match &decrypted.declared {

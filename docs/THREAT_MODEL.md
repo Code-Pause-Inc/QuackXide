@@ -56,6 +56,7 @@ Goal: obtain record-level data, or re-identify individuals from aggregates.
 | Singling out one person inside a large group (`SUM(CASE WHEN id = …)`, computed columns, subquery expressions) | Aggregate arguments must be plain columns; subquery expressions refused | Built, tested |
 | Value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`) | Aggregate allowlist: `COUNT`, `SUM`, `AVG` | Built, tested |
 | One person's value through an extreme (`MAX(salary)` over *k* or more rows; `WHERE salary < <that max>` for the next value; an id range to say whose) | `MIN` and `MAX` refused wherever they appear, `HAVING` and `ORDER BY` included ([ADR 0015](adr/0015-refuse-min-max-and-mask-dominated-sums.md)) | Built, tested (`tests/bypass.rs`) |
+| One or two people's values through a dominated sum or mean (with the six `eng` salaries, the one `ceo`'s is 94% of the total; `AVG` is that total over `n`) | p% rule, inside the plan: a `SUM` or `AVG` is released as null when its group's absolute values, less the two largest, total under *p*% of the largest, so `HAVING`, `ORDER BY` and derived columns read the masked value and no hidden value reaches the result; `DISTINCT` and intervals refused. *p* is `RESEARCH_DOMINANCE_PERCENT`: 10 when unset, an unparseable value refuses startup, and 0 refuses every gated query ([ADR 0015](adr/0015-refuse-min-max-and-mask-dominated-sums.md)) | Built, tested (`tests/bypass.rs`, `research_api.rs`) |
 | Overlapping groups in one result (`ROLLUP`, `CUBE`, `GROUPING SETS`: a subtotal minus its published groups reveals a suppressed cohort) | Plan allowlist refuses grouping sets ([ADR 0002](adr/0002-refuse-grouping-sets-and-positional-subsets.md)) | Built, tested (`tests/bypass.rs`) |
 | Picking rows by position below the aggregate (`ORDER BY … LIMIT`/`OFFSET` in a subquery or CTE) | Plan allowlist: only filters and column renames below the aggregate | Built, tested (`tests/bypass.rs`) |
 | Running statements before the gate (`CREATE TABLE … AS`, `DROP TABLE`, `SET`, `PREPARE`) | Statements are refused before planning finishes, so nothing runs ahead of the plan gate | Built, tested (`tests/bypass.rs`) |
@@ -162,9 +163,11 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
 * **Overlapping-query differencing.** Two aggregate queries whose cohorts
   differ by one record can reveal that record. For research queries the
   budget makes this finite and priced; it does not prevent it within an
-  allocation. The closure is a perturbation `DisclosurePolicy` composed at
-  the existing choke point, followed by a formal privacy-loss accountant in
-  place of the constant per-query cost.
+  allocation. The p% rule protects one released total at a time, so a
+  masked total can still be the difference of released totals over other
+  groups or columns (ADR 0015). The closure is a perturbation
+  `DisclosurePolicy` composed at the existing choke point, followed by a
+  formal privacy-loss accountant in place of the constant per-query cost.
 * **Differencing on own-data queries.** `ZkMode::Enabled` on
   `POST /api/v1/query` stops a single query from exporting rows. It does
   not bound differencing across queries: the route has no budget, so the
@@ -206,19 +209,11 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   on the input and the decoded dataset depend only on the dataset, and the
   result limits only on the rows released. Each probe costs a research
   query one unit; own-data queries have no budget (see above).
-* **Extreme values.** `MIN` and `MAX` are refused (ADR 0015). A `SUM`
-  over a cohort of at least *k* still comes close to one person's value
-  when one or two people hold most of the total, and so does `AVG`, which
-  is `SUM / n` with `n` released: on the bypass fixture, the total salary
-  of the one `ceo` and the six `eng` rows is 94% the `ceo`'s. The p% rule
-  that masks such a total is decided (ADR 0015) and to build (P58). It
-  will protect one released total at a time: two totals whose cohorts
-  differ by one person still give that person's value (overlapping-query
-  differencing, above).
-* **Rows, not people.** The cohort threshold counts rows, and so will the
-  p% rule. A dataset in which one person has several rows (visits,
-  transactions) must be prepared one row per person; otherwise a cohort
-  of *k* rows can hold fewer than *k* people.
+* **Rows, not people.** The cohort threshold and the p% rule count rows.
+  A dataset in which one person has several rows (visits, transactions)
+  must be prepared one row per person; otherwise a cohort of *k* rows can
+  hold fewer than *k* people, and one person's rows can dominate a total
+  that no single row dominates.
 * **Browser private keys during an open.** The envelope suite's KEM is not
   in Web Crypto, so the device's HPKE private key is decrypted in the crypto
   worker and copied into wasm memory for each open. Both copies are zeroed
@@ -233,7 +228,11 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   minutes ahead of the server's clock), and, in a plaintext record beside
   each snapshot, the envelope suite and the steward's declared row cap and
   schema: column names and type families (ADR 0012). A connector
-  snapshot's record holds only its suite.
+  snapshot's record holds only its suite. A published listing's data
+  dictionary, the columns its steward describes (names, type families
+  and free-text descriptions), is readable by every signed-in tenant as
+  well as the operator. It is what the steward chose to publish, and
+  nothing checks that a description holds no data values.
 * **Forged or rolled-back snapshots.** Connector objects, uploaded objects
   and snapshot manifests are sealed to the tenant's public key, which binds
   them to tenant, dataset and object or version but does not authenticate
