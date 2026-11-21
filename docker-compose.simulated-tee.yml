@@ -6,6 +6,8 @@
 #   3. key-release-service -> Cloud KMS stand-in, verifying tokens before release
 # and, run on demand:
 #   4. seal-upload         -> the steward's browser, sealing an upload body (ADR 0012)
+#   5. enclave-check       -> the researcher's browser, verifying the enclave and
+#                             sealing a research query (ADR 0010)
 # enclave-api starts with an empty vault; its data arrives as a steward
 # upload. It keeps its vault in the `enclave_vault` volume, so
 # scripts/test-simulated-tee.sh can check that only ciphertext is stored. No
@@ -121,6 +123,25 @@ services:
     profiles:
       - tools
     network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # The researcher's browser: verifies the enclave (ADR 0010) and seals a
+  # research query to it, for scripts/test-simulated-tee.sh:
+  #   docker compose -f docker-compose.simulated-tee.yml run --rm -T enclave-check \
+  #     verify --api http://enclave-api:8080
+  enclave-check:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: enclave-check
+    profiles:
+      - tools
+    networks:
+      - enclave_internal_net
     read_only: true
     cap_drop:
       - ALL

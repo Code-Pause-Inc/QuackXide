@@ -29,6 +29,7 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 
 pub mod admin;
+pub mod checker;
 mod datasets;
 #[cfg(feature = "dev")]
 pub mod dev;
