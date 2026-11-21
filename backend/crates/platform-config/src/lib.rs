@@ -144,6 +144,10 @@ pub struct EnclaveConfig {
     /// `SIM_ATTESTATION_URL` — the simulated attestation service. Dev only;
     /// `platform_enclave::provider_for` reads the same key.
     pub sim_attestation_url: Option<String>,
+    /// The bound configuration names (`platform_enclave::config`) as this
+    /// configuration read them: what attestation reports and binds, so it is
+    /// what the platform enforces (ADR 0010 check 5).
+    pub attested_env: std::collections::BTreeMap<String, String>,
 }
 
 /// Merchant-of-Record (Paddle) webhook settings. The secret is zeroized on
@@ -547,6 +551,7 @@ impl PlatformConfig {
             query_max_concurrent: raw_max_concurrent as usize,
             query_limits,
             sim_attestation_url: get_nonempty(&get, "SIM_ATTESTATION_URL"),
+            attested_env: platform_enclave::config::bound_env(&get),
         };
 
         let features = FeatureFlags {
@@ -1213,6 +1218,22 @@ mod tests {
                 PlatformConfig::from_source(source(&[("FEATURE_ZK_ENABLED", raw)])).expect("loads");
             assert_eq!(cfg.features.zk.is_enabled(), expected, "raw={raw}");
         }
+    }
+
+    /// The bound names travel with the configuration exactly as it read them,
+    /// so what attestation reports is what the platform enforces.
+    #[test]
+    fn attested_env_is_what_the_config_read() {
+        let cfg = PlatformConfig::from_source(source(&[
+            ("RESEARCH_MIN_COHORT_SIZE", " 5 "),
+            ("FEATURE_ZK_ENABLED", ""),
+            ("PATH", "/bin"),
+        ]))
+        .expect("loads");
+        assert_eq!(
+            cfg.enclave.attested_env.into_iter().collect::<Vec<_>>(),
+            [("RESEARCH_MIN_COHORT_SIZE".to_owned(), "5".to_owned())]
+        );
     }
 
     /// The bound-configuration policy reads each value as this crate does:
