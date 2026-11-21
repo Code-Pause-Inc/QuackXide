@@ -219,7 +219,8 @@ locally across isolated networks (`public_net` and `internal: true`
 
 * **`enclave-api`** — the workload (`platform-api`). It asks
   `sim-attestation` for Confidential Space-shaped tokens whose nonces bind
-  its ephemeral HPKE and result-signing keys, and checks them with the
+  its in-RAM key set (an `HPK2` request key and Ed25519 + ML-DSA-65
+  result-signing keys; binding v2, ADR 0010), and checks them with the
   production token verifier.
 * **`sim-attestation`** — plays Google's attestation service
   (`bin/sim-attestation`): signs RS256 tokens with a throwaway key and
