@@ -593,7 +593,6 @@ fn quickbooks() -> ConnectorSlug {
 const BY_CURRENCY: &str =
     "SELECT currency, SUM(total) AS revenue FROM quickbooks GROUP BY currency";
 
-/// Status, `Retry-After` and message of an expected refusal.
 /// `RESEARCH_SQL` as `researcher`'s plaintext research query, with the
 /// response body as JSON.
 async fn research_json(
@@ -607,6 +606,7 @@ async fn research_json(
     Ok(serde_json::from_slice(body.expose()).expect("json body"))
 }
 
+/// Status, `Retry-After` and message of an expected refusal.
 async fn refusal(
     result: Result<serde_json::Value, ApiError>,
 ) -> (StatusCode, Option<String>, String) {

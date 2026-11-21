@@ -1165,7 +1165,11 @@ pub struct TopUpRequest {
     pub additional: u64,
 }
 
+/// The `dev` route's plaintext research query. Unknown fields are refused,
+/// so a sealed body carrying these fields too is neither shape and never
+/// runs unsealed.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResearchQueryRequest {
     /// Steward tenant id (UUID) whose data is being queried.
     pub steward_tenant: String,
