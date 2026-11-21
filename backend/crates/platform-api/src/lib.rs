@@ -140,6 +140,9 @@ pub enum ApiError {
     WebhookNotConfigured,
     /// Query refused by the enclave attestation gate.
     AttestationUnavailable,
+    /// A sealed research query names a key set the enclave no longer holds:
+    /// the client attests again and re-sends (409, ADR 0010).
+    Reattest,
     /// Query rejected by the zero-knowledge policy gate.
     QueryRejected(&'static str),
     /// Research query refused: the grant's query budget is spent. The
@@ -213,6 +216,7 @@ impl ApiError {
             ApiError::ConnectorTogglesDisabled => "connector_toggles_disabled",
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
+            ApiError::Reattest => "reattest",
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
             ApiError::ListTooLarge => "list_too_large",
@@ -303,6 +307,8 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "enclave attestation unavailable",
             ),
+            // The browser matches this message to attest again (#239).
+            ApiError::Reattest => (StatusCode::CONFLICT, "reattest"),
             ApiError::QueryRejected(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::BudgetExhausted => (
                 StatusCode::TOO_MANY_REQUESTS,

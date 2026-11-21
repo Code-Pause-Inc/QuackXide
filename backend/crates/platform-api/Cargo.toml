@@ -79,6 +79,7 @@ bytes.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
@@ -99,7 +100,6 @@ parquet.workspace = true
 # so plain and release builds stay without `dev`, while `cargo test` and
 # `cargo clippy --all-targets` build and lint the dev wiring and `devstack`.
 platform-api = { path = ".", features = ["dev"] }
-sha2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 tracing-subscriber.workspace = true
