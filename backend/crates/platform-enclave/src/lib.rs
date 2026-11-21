@@ -14,7 +14,7 @@ pub mod binding;
 pub mod simulated_token;
 pub mod token;
 
-pub use binding::{REPORT_DATA_BYTES, ReportDataBinding};
+pub use binding::{EnclaveKeyBinding, REPORT_DATA_BYTES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeePlatform {
@@ -63,6 +63,31 @@ pub trait AttestationProvider: Send + Sync {
         _expected_nonce: &[u8],
     ) -> Result<(), EnclaveError> {
         Ok(())
+    }
+
+    /// Like [`produce_evidence`](Self::produce_evidence), for the public
+    /// evidence token (`token::BROWSER_ATTESTATION_AUDIENCE`). Anyone can
+    /// fetch that token, so it must not carry the audience key release
+    /// accepts. Fails closed unless a provider mints for that audience.
+    async fn produce_browser_evidence(
+        &self,
+        _nonce: &[u8],
+    ) -> Result<AttestationEvidence, EnclaveError> {
+        Err(EnclaveError::Rejected(
+            "no browser-audience evidence available".into(),
+        ))
+    }
+
+    /// Verify evidence from [`produce_browser_evidence`](Self::produce_browser_evidence).
+    /// Fails closed by default, unlike `verify_evidence`.
+    fn verify_browser_evidence(
+        &self,
+        _evidence: &AttestationEvidence,
+        _expected_nonce: &[u8],
+    ) -> Result<(), EnclaveError> {
+        Err(EnclaveError::Rejected(
+            "no browser-audience evidence available".into(),
+        ))
     }
 }
 
@@ -283,6 +308,18 @@ mod tests {
             .expect("dev evidence");
         assert_eq!(evidence.platform, TeePlatform::Development);
         assert_eq!(evidence.nonce, b"nonce");
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_browser_evidence_refuses_it() {
+        let provider = DevAttestation::allow_insecure_dev();
+        assert!(provider.produce_browser_evidence(b"nonce").await.is_err());
+        let evidence = provider.produce_evidence(b"nonce").await.unwrap();
+        assert!(
+            provider
+                .verify_browser_evidence(&evidence, b"nonce")
+                .is_err()
+        );
     }
 
     #[tokio::test]

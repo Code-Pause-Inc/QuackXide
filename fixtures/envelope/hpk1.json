@@ -112,6 +112,30 @@
       ],
       "info": "research-result-v1|6f2c8a2e-1111-4222-8333-444455556666|00000000-dddd-4ddd-8ddd-000000000001",
       "kind": "research_result"
+    },
+    {
+      "fields": [
+        "6f2c8a2e-1111-4222-8333-444455556666",
+        "11111111-2222-4333-8444-555555555555"
+      ],
+      "info": "research-query-v1|6f2c8a2e-1111-4222-8333-444455556666|11111111-2222-4333-8444-555555555555",
+      "kind": "research_query"
+    }
+  ],
+  "query_bindings": [
+    {
+      "grant_id": "11111111-2222-4333-8444-555555555555",
+      "query": "GrChwe4FHyeJ7D4VAW7eTPWLBvh7qmVyNwuTnbO_y9I",
+      "request_nonce_b64": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=",
+      "schema_version": "1",
+      "sql": "SELECT condition, COUNT(*) AS n FROM upload_cohorts GROUP BY condition"
+    },
+    {
+      "grant_id": "11111111-2222-4333-8444-555555555555",
+      "query": "RrAaM53KoifkboFugVTgwANY9D0l8ewR2MERgev1yOo",
+      "request_nonce_b64": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=",
+      "schema_version": null,
+      "sql": "SELECT condition, COUNT(*) AS n FROM upload_cohorts GROUP BY condition"
     }
   ],
   "recipients": [

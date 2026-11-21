@@ -8,6 +8,28 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* The base for sealed research queries and results (ADR 0010; part of P85
+  and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
+  together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must
+  verify) and gains the `research_query` `info` string and the query
+  binding that `research_result` takes, pinned in `fixtures/envelope/hpk1.json`
+  and exposed by the wasm module. `platform-enclave`'s binding v2
+  (`EnclaveKeyBinding`) replaces the fixed 32-byte fields of
+  `ReportDataBinding` with labelled, length-prefixed values. The enclave's
+  key set (`EnclaveIdentity`) is an `HPK2` request key, whose private half
+  now exists in every build, and a result-signing key, with a `key_id`.
+  `GET /api/v1/attestation` takes the caller's nonce as `?nonce=` (32
+  bytes, base64url; 400 when missing or malformed, instead of a nonce the
+  server chose) and returns ADR 0010's evidence bundle, and the key-release
+  stand-in checks binding v2 and refuses a request key that is not `HPK2`
+  (audited as `crypto.suite_refused`). A key-release request carries every
+  bound value, the KMS public key included, with its byte fields in
+  base64url as ADR 0010 sets out. The sealed-query wire types are
+  defined, with result signatures (`SignatureWire`) a type apart from the
+  signing keys; nothing routes to them yet. The public evidence token carries
+  the audience `urn:platform:browser-attestation`, which key release
+  refuses, so a caller who fetches it cannot open key release.
+  ADR 0005 and ADR 0010 are accepted.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -18,7 +40,7 @@ uses [Semantic Versioning](https://semver.org/).
   is refused without a token (401), outside the upload namespace (404) and
   at a stale version (409), that an approval retry after a revoke is
   refused (404), and, after the upload and again after the queries, that
-  the vault holds exactly the upload's object and manifest as `HPK1`
+  the vault holds exactly the upload's object and manifest as `HPK2`
   envelopes and its record, whose row cap and schema are the ones the
   steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
   `enclave-api`. The API tests seal uploads with the same code
