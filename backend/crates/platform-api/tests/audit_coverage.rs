@@ -13,7 +13,9 @@ use axum::Router;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
-use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
+use platform_api::query::{
+    ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider, ResearchRequest,
+};
 use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
@@ -1119,6 +1121,77 @@ fn count_outcome(capture: &AuditCapture, kind: &str, outcome: &str) -> usize {
         .count()
 }
 
+/// Each refusal of a sealed research query is an `auth.decision` denial
+/// (ARCHITECTURE "Security telemetry", rule 2): opening the frame reads the
+/// enclave's key, so even a 400 there is more than input validation.
+#[tokio::test]
+async fn sealed_research_query_refusals_are_audited() {
+    let capture = AuditCapture::install();
+    let (steward, researcher) = (TenantId::generate(), TenantId::generate());
+    let app = common::sealed_research_app(SECRET, steward).await;
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let sealer = common::Sealer::new(&app, researcher, steward).await;
+    let sql = "SELECT condition, COUNT(*) AS n FROM health GROUP BY condition";
+    let rtoken = token_for(researcher);
+    let with = |field: &str, value: serde_json::Value| {
+        let mut body: serde_json::Value =
+            serde_json::from_str(&sealer.body(grant_id, 1, sql)).unwrap();
+        body[field] = value;
+        body.to_string()
+    };
+
+    let cases = [
+        (with("version", serde_json::json!(2)), "unsupported_version"),
+        (with("key_id", serde_json::json!("stale")), "unknown_key_id"),
+        (with("envelope", serde_json::json!("AAAA")), "does_not_open"),
+    ];
+    for (body, reason) in cases {
+        let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &body).await;
+        assert!(status.is_client_error(), "{reason}: {status}");
+        assert_tenant_event(
+            &capture,
+            "auth.decision",
+            "denied",
+            researcher,
+            &format!("sealed research query refused reason={reason}"),
+        );
+    }
+
+    let (status, _) = post(
+        &app,
+        "/api/v1/research/query",
+        &rtoken,
+        &sealer.body(grant_id, 2, sql),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(
+        &app,
+        "/api/v1/research/query",
+        &rtoken,
+        &sealer.body(grant_id, 2, sql),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_tenant_event(
+        &capture,
+        "auth.decision",
+        "denied",
+        researcher,
+        &format!(
+            "sealed research query refused reason=nonce_used steward={steward} connector=health"
+        ),
+    );
+}
+
 #[tokio::test]
 async fn research_grants_and_budgets_are_audited() {
     let capture = AuditCapture::install();
@@ -1780,7 +1853,10 @@ async fn resource_limit_refusals_are_audited() {
     let research_sql = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency";
     assert!(
         service
-            .research_query(researcher, steward, &connector, research_sql)
+            .research_query(
+                researcher,
+                ResearchRequest::plain(steward, connector.clone(), research_sql)
+            )
             .await
             .is_err()
     );

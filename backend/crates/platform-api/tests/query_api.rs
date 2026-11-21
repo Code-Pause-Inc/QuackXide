@@ -16,7 +16,9 @@ use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use bytes::Bytes;
-use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
+use platform_api::query::{
+    ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider, ResearchRequest,
+};
 use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::snapshot::{SnapshotManifest, SnapshotWriter, manifest_info};
@@ -585,6 +587,19 @@ fn quickbooks() -> ConnectorSlug {
 const BY_CURRENCY: &str =
     "SELECT currency, SUM(total) AS revenue FROM quickbooks GROUP BY currency";
 
+/// `RESEARCH_SQL` as `researcher`'s plaintext research query, with the
+/// response body as JSON.
+async fn research_json(
+    service: &ConnectorQueryService,
+    researcher: TenantId,
+    steward: TenantId,
+    connector: &ConnectorSlug,
+) -> Result<serde_json::Value, ApiError> {
+    let request = ResearchRequest::plain(steward, connector.clone(), RESEARCH_SQL);
+    let body = service.research_query(researcher, request).await?;
+    Ok(serde_json::from_slice(body.expose()).expect("json body"))
+}
+
 /// Status, `Retry-After` and message of an expected refusal.
 async fn refusal(
     result: Result<serde_json::Value, ApiError>,
@@ -1061,12 +1076,10 @@ async fn a_research_query_refused_for_a_slot_is_charged() {
 
     let connector = quickbooks();
     let (first, second) = tokio::join!(
-        service.research_query(researcher, steward, &connector, RESEARCH_SQL),
+        research_json(&service, researcher, steward, &connector),
         async {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            service
-                .research_query(researcher, steward, &connector, RESEARCH_SQL)
-                .await
+            research_json(&service, researcher, steward, &connector).await
         }
     );
     let (status, _, message) = refusal(second).await;
@@ -1112,9 +1125,7 @@ async fn research_queries_refused_by_a_size_limit_are_charged() {
         let (service, _) = observed(steward, keypair, vault, observe, dev_attestation(), false);
         let service = service.with_research(research.clone());
 
-        let result = service
-            .research_query(researcher, steward, &quickbooks(), RESEARCH_SQL)
-            .await;
+        let result = research_json(&service, researcher, steward, &quickbooks()).await;
         let (status, _, message) = refusal(result).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{expected}");
         assert_eq!(message, expected);

@@ -37,13 +37,12 @@ mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+mod research_replay;
 pub mod sealed;
 pub mod sweep;
 pub mod wiring;
 use admin::ProvisioningService;
-use query::{
-    ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
-};
+use query::{ConnectorQueryService, GrantRequest, QueryRequest, ResearchRequest, TopUpRequest};
 use research::ResearchService;
 
 /// 4 MiB plaintext chunk + GCM tag + IV prefix, with headroom.
@@ -109,6 +108,7 @@ struct ListEntry {
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub enum ApiError {
     Unauthorized,
     Forbidden,
@@ -135,6 +135,18 @@ pub enum ApiError {
     WebhookNotConfigured,
     /// Query refused by the enclave attestation gate.
     AttestationUnavailable,
+    /// A sealed research query names a key set the enclave no longer holds:
+    /// the client attests again and re-sends (409, ADR 0010).
+    Reattest,
+    /// The sealed query's request nonce came with another envelope before:
+    /// re-seal under a new nonce (409).
+    NonceUsed,
+    /// The query under this request nonce is still running: send the same
+    /// request again later (409).
+    QueryRunning,
+    /// The stored response for this request nonce has expired: re-seal
+    /// under a new nonce (409).
+    ResponseExpired,
     /// Query rejected by the zero-knowledge policy gate.
     QueryRejected(&'static str),
     /// Research query refused: the grant's query budget is spent. The
@@ -208,6 +220,10 @@ impl ApiError {
             ApiError::ConnectorTogglesDisabled => "connector_toggles_disabled",
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
+            ApiError::Reattest => "reattest",
+            ApiError::NonceUsed => "nonce_used",
+            ApiError::QueryRunning => "query_running",
+            ApiError::ResponseExpired => "response_expired",
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
             ApiError::ListTooLarge => "list_too_large",
@@ -297,6 +313,12 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "enclave attestation unavailable",
             ),
+            // The browser matches these messages to attest again, re-seal or
+            // wait (#239).
+            ApiError::Reattest => (StatusCode::CONFLICT, "reattest"),
+            ApiError::NonceUsed => (StatusCode::CONFLICT, "nonce_used"),
+            ApiError::QueryRunning => (StatusCode::CONFLICT, "query_running"),
+            ApiError::ResponseExpired => (StatusCode::CONFLICT, "response_expired"),
             ApiError::QueryRejected(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::BudgetExhausted => (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -754,22 +776,51 @@ async fn list_grants(
     Ok(Json(research.list_grants(tenant).await?))
 }
 
+/// `POST /api/v1/research/query`'s body: sealed to the enclave (ADR 0010),
+/// or, only in `dev` builds, the plaintext query. A release build does not
+/// compile the plaintext shape, whatever its configuration.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResearchQueryBody {
+    Sealed(sealed::SealedQueryRequest),
+    #[cfg(feature = "dev")]
+    Plain(query::ResearchQueryRequest),
+}
+
 async fn run_research_query(
     State(state): State<AppState>,
     Extension(AuthedTenant(researcher)): Extension<AuthedTenant>,
-    Json(req): Json<ResearchQueryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Json(body): Json<ResearchQueryBody>,
+) -> Result<Response, ApiError> {
     let service = query_service(&state)?;
-    let steward: TenantId = req
-        .steward_tenant
-        .parse()
-        .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
-    let connector = ConnectorSlug::new(&req.connector)
-        .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
-    let result = service
-        .research_query(researcher, steward, &connector, &req.sql)
-        .await?;
-    Ok(Json(result))
+    let response = match body {
+        ResearchQueryBody::Sealed(request) => {
+            let opened = sealed::open_sealed(service.identity(), researcher, &request)?;
+            service
+                .run_detached(researcher, ResearchRequest::from(opened))
+                .await?
+        }
+        #[cfg(feature = "dev")]
+        ResearchQueryBody::Plain(request) => {
+            let steward: TenantId = request
+                .steward_tenant
+                .parse()
+                .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
+            let connector = ConnectorSlug::new(&request.connector)
+                .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
+            service
+                .research_query(
+                    researcher,
+                    ResearchRequest::plain(steward, connector, &request.sql),
+                )
+                .await?
+        }
+    };
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        response.expose().to_vec(),
+    )
+        .into_response())
 }
 
 // ── Drive ────────────────────────────────────────────────────────────────────

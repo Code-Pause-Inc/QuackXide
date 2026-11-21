@@ -30,6 +30,22 @@ uses [Semantic Versioning](https://semver.org/).
   the audience `urn:platform:browser-attestation`, which key release
   refuses, so a caller who fetches it cannot open key release.
   ADR 0005 and ADR 0010 are accepted.
+* Research queries sealed to the enclave (ADR 0010; part of P85).
+  `POST /api/v1/research/query` takes `{version, key_id, grant_id,
+  envelope}`, the query sealed to the request key from the attestation
+  bundle under `research_query`. The enclave refuses a key set it no longer
+  holds (409 `reattest`), a frame that does not open or a malformed sealed
+  query (400), and a grant other than the one `grant_id` names (403), none
+  of them charged and each audited as an `auth.decision` denial. A replay
+  store, per key set, records each request nonce just before the charge:
+  the same envelope again gets the stored response, uncharged, for an hour;
+  another envelope under the nonce, a retry while the query runs and an
+  expired response are 409 `nonce_used`, `query_running` and
+  `response_expired`. A refused charge records nothing. A sealed query runs
+  in a task of its own, so a client that disconnects does not cancel it.
+  The plaintext body `{steward_tenant, connector, sql}` is compiled only
+  into development builds and refuses unknown fields. `TokenVerifier`
+  requires a token's nonces exactly and in order.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
