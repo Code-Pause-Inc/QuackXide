@@ -872,7 +872,10 @@ Rules, enforced by the capture tests:
    and the refused retry and deny, and research grants and budgets (ok +
    denied): grant, revoke, the query refused without a grant (before the
    attestation gate), top-up, exhaustion, and refused revokes, top-ups and
-   budget reads of unknown, foreign and malformed grant ids.
+   budget reads of unknown, foreign and malformed grant ids, and sealed
+   research queries refused (an unsupported version, an unknown key set, a
+   frame that does not open, a reused nonce), each an `auth.decision`
+   naming its reason.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on

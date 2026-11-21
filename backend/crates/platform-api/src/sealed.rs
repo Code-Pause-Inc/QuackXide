@@ -7,6 +7,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use platform_core::{ConnectorSlug, TenantId};
 use platform_crypto::{CryptoError, EnvelopeSuite, ResultSignature, SuitePolicy, info};
+use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -85,43 +86,70 @@ pub(crate) struct OpenedQuery {
 /// Open `request` as `researcher` sent it, in ADR 0010's order: the version,
 /// then the key set (409 `reattest`), then the frame under
 /// `research_query(suite, researcher, grant_id)`, then its plaintext. Every
-/// failure after the key set is a 400.
+/// failure after the key set is a 400. Each refusal is an `auth.decision`
+/// denial naming its reason, never the request's content.
 pub(crate) fn open_sealed(
     identity: &EnclaveIdentity,
     researcher: TenantId,
     request: &SealedQueryRequest,
 ) -> Result<OpenedQuery, ApiError> {
-    const DOES_NOT_OPEN: ApiError = ApiError::BadRequest("sealed query does not open");
+    open_checked(identity, researcher, request).map_err(|(reason, err)| {
+        security_audit_event(
+            AuditKind::AuthDecision,
+            Some(researcher),
+            "denied",
+            &format!("sealed research query refused reason={reason}"),
+        );
+        err
+    })
+}
+
+/// [`open_sealed`]'s checks; a refusal carries its audit reason.
+fn open_checked(
+    identity: &EnclaveIdentity,
+    researcher: TenantId,
+    request: &SealedQueryRequest,
+) -> Result<OpenedQuery, (&'static str, ApiError)> {
+    let does_not_open = |_| {
+        (
+            "does_not_open",
+            ApiError::BadRequest("sealed query does not open"),
+        )
+    };
+    let malformed = |err| ("malformed", err);
     if request.version != 1 {
-        return Err(ApiError::BadRequest("unsupported sealed query version"));
+        return Err((
+            "unsupported_version",
+            ApiError::BadRequest("unsupported sealed query version"),
+        ));
     }
     if request.key_id != identity.key_id() {
-        return Err(ApiError::Reattest);
+        return Err(("unknown_key_id", ApiError::Reattest));
     }
     let frame = URL_SAFE_NO_PAD
         .decode(&request.envelope)
-        .map_err(|_| DOES_NOT_OPEN)?;
-    let suite = EnvelopeSuite::of_envelope(&frame).map_err(|_| DOES_NOT_OPEN)?;
+        .map_err(|_| does_not_open(()))?;
+    let suite = EnvelopeSuite::of_envelope(&frame).map_err(|_| does_not_open(()))?;
     let info = info::research_query(suite, &researcher.to_string(), &request.grant_id)
-        .map_err(|_| DOES_NOT_OPEN)?;
+        .map_err(|_| does_not_open(()))?;
     let opened = identity
         .open_request(&info, &frame)
-        .map_err(|_| DOES_NOT_OPEN)?;
-    let plaintext = SealedQueryPlaintext::parse(opened.expose())?;
-    let request_nonce = plaintext.request_nonce_bytes()?;
+        .map_err(|_| does_not_open(()))?;
+    let plaintext = SealedQueryPlaintext::parse(opened.expose()).map_err(malformed)?;
+    let request_nonce = plaintext.request_nonce_bytes().map_err(malformed)?;
     // Only checked here: P55 keeps it, matches it to the enrolled key and
     // seals the result to it. Either suite until the browser seals with HPK2
     // (P36; ADR 0010 "Recipient key", "No downgrade").
     plaintext
         .recipient_key
         .to_public_key(SuitePolicy::DEVELOPMENT)
-        .map_err(|_| ApiError::BadRequest("malformed recipient key"))?;
+        .map_err(|_| malformed(ApiError::BadRequest("malformed recipient key")))?;
     let steward = plaintext
         .steward_tenant
         .parse()
-        .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
+        .map_err(|_| malformed(ApiError::BadRequest("invalid steward tenant id")))?;
     let connector = ConnectorSlug::new(&plaintext.connector)
-        .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
+        .map_err(|_| malformed(ApiError::BadRequest("invalid connector slug")))?;
     Ok(OpenedQuery {
         steward,
         connector,
