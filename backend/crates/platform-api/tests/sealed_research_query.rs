@@ -246,6 +246,22 @@ async fn sealed_body_with_an_unknown_field_is_refused() {
     assert_eq!(remaining(&app, steward, &grant_id).await, 100);
 }
 
+/// A sealed body that also carries the plaintext fields is neither shape:
+/// it must not run as a plaintext query, unsealed and outside the replay
+/// store.
+#[tokio::test]
+async fn a_sealed_body_with_the_plaintext_fields_does_not_run() {
+    let (app, steward, researcher, grant_id) = granted(100).await;
+    let sealer = Sealer::new(&app, researcher, steward).await;
+    let mut body: Value = serde_json::from_str(&sealer.body(&grant_id, 1, AGG_SQL)).unwrap();
+    body["steward_tenant"] = json!(steward.to_string());
+    body["connector"] = json!("health");
+    body["sql"] = json!(AGG_SQL);
+    let (status, _) = query(&app, researcher, &body.to_string()).await;
+    assert!(status.is_client_error(), "{status}");
+    assert_eq!(remaining(&app, steward, &grant_id).await, 100);
+}
+
 #[tokio::test]
 async fn replay_after_revoke_is_refused() {
     let (app, steward, researcher, grant_id) = granted(100).await;
