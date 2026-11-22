@@ -1,9 +1,9 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import type { DatasetUploadResult } from "../../lib/crypto/datasetUpload";
-import { FOOTER_MAX_BYTES, readFooter } from "../../lib/datasets/footer";
+import { FOOTER_MAX_BYTES, readFooter, type FooterReading } from "../../lib/datasets/footer";
 import type { DatasetView } from "../../lib/research/client";
 import { parquetFixture } from "../../test/parquetFixtures";
 import DatasetList from "./DatasetList";
@@ -46,6 +46,7 @@ function setup({
   datasets = [] as DatasetView[],
   maxBytes = 64 * 1024 * 1024,
   upload = vi.fn(async () => RESULT),
+  read = readFooter as (file: File) => Promise<FooterReading>,
 } = {}) {
   const user = userEvent.setup();
   const onUploaded = vi.fn();
@@ -53,7 +54,7 @@ function setup({
     <DatasetUploadForm
       datasets={datasets}
       maxBytes={maxBytes}
-      readFooter={readFooter}
+      readFooter={read}
       onUpload={upload}
       onUploaded={onUploaded}
     />,
@@ -97,6 +98,30 @@ describe("DatasetUploadForm", () => {
     });
     expect(await screen.findByRole("status")).toHaveTextContent("Stored upload_cohorts");
     expect(onUploaded).toHaveBeenCalledWith(RESULT);
+  });
+
+  it("keeps the latest file's footer when an earlier read finishes last", async () => {
+    const first = new File(["first"], "first.parquet");
+    const second = cohortFile();
+    let finishFirst: (reading: FooterReading) => void = () => {};
+    const read = vi.fn((chosen: File) =>
+      chosen === first
+        ? new Promise<FooterReading>((resolve) => {
+            finishFirst = resolve;
+          })
+        : readFooter(chosen),
+    );
+    const { user, choose, button, upload } = setup({ read });
+    await choose("upload_new", first);
+    await choose("upload_new", second);
+    expect(await screen.findByText(/2 columns, 7 rows/)).toBeInTheDocument();
+
+    await act(async () => finishFirst({ ok: true, schema: [{ name: "other", type: "int64" }], rows: 99, footerBytes: 8 }));
+    expect(screen.getByText(/2 columns, 7 rows/)).toBeInTheDocument();
+    await user.click(button());
+    expect(upload).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ file: second, schema: COHORT_SCHEMA, rowCap: 7 }),
+    );
   });
 
   it("uploads a new dataset with no current version", async () => {

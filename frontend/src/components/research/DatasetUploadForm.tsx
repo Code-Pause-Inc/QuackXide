@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { DatasetUploadResult } from "../../lib/crypto/datasetUpload";
 import type { DatasetUploadFields } from "../../lib/crypto/protocol";
 import type { FooterReading, FooterRefusal } from "../../lib/datasets/footer";
@@ -109,19 +109,25 @@ export default function DatasetUploadForm({
   const [error, setError] = useState<string | null>(null);
   const [stored, setStored] = useState<DatasetUploadResult | null>(null);
 
+  // The latest choice. A footer read that finishes after another file was
+  // chosen is dropped, so a file is never uploaded with another's schema.
+  const choice = useRef(0);
+
   const choose = async (chosen: File | null) => {
+    const id = ++choice.current;
     setFile(chosen);
     setReading(null);
     setError(null);
     setStored(null);
+    setReadingFile(chosen !== null);
     if (!chosen) return;
-    setReadingFile(true);
     try {
-      setReading(await readFooter(chosen));
+      const read = await readFooter(chosen);
+      if (id === choice.current) setReading(read);
     } catch (err) {
-      setError(errorMessage(err, "the file could not be read"));
+      if (id === choice.current) setError(errorMessage(err, "the file could not be read"));
     } finally {
-      setReadingFile(false);
+      if (id === choice.current) setReadingFile(false);
     }
   };
 

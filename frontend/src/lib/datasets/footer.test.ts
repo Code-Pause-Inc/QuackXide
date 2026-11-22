@@ -138,6 +138,9 @@ function parquet(footer: T | Uint8Array, magic = "PAR1"): Blob {
 const INT64 = 2;
 const INT32 = 1;
 const BYTE_ARRAY = 6;
+const FIXED = 7;
+/** A converted DECIMAL annotation of `precision` and `scale`. */
+const decimal = (precision: number, scale: number) => ({ 6: i32(5), 7: i32(scale), 8: i32(precision) });
 
 describe("the schema vectors the enclave also reads", () => {
   for (const vector of vectors.vectors) {
@@ -248,6 +251,17 @@ describe("footers parquet-rs would not read", () => {
     ["a millisecond time on INT64", metadata([root(1), column("n", INT64, logical(7, { 1: bool(true), 2: st({ 1: st({}) }) }))])],
     ["a decimal without its scale and precision", metadata([root(1), column("n", INT64, logical(5, { 1: i32(2), 2: i32(10) }))])],
     ["a converted decimal without a precision", metadata([root(1), column("n", INT64, { 6: i32(5) })])],
+    ["a decimal of precision 0", metadata([root(1), column("n", INT64, decimal(0, 0))])],
+    ["a decimal of negative scale", metadata([root(1), column("n", BYTE_ARRAY, decimal(5, -1))])],
+    ["a decimal of scale over its precision", metadata([root(1), column("n", INT64, decimal(3, 5))])],
+    ["an INT32 decimal of 10 digits", metadata([root(1), column("n", INT32, decimal(10, 2))])],
+    ["an INT32 decimal of 20 digits", metadata([root(1), column("n", INT32, decimal(20, 2))])],
+    ["an INT64 decimal of 19 digits", metadata([root(1), column("n", INT64, decimal(19, 0))])],
+    ["a 4-byte decimal of 10 digits", metadata([root(1), column("n", FIXED, { 2: i32(4), ...decimal(10, 0) })])],
+    [
+      "a logical INT32 decimal of 10 digits",
+      metadata([root(1), column("n", INT32, { 7: i32(2), 8: i32(10), ...logical(5, { 1: i32(2), 2: i32(10) }) })]),
+    ],
     ["a fixed-length column without a length", metadata([root(1), column("n", 7)])],
     ["a MAP annotation on a primitive", metadata([root(1), column("n", BYTE_ARRAY, { 6: i32(1) })])],
   ];
@@ -287,6 +301,25 @@ describe("declarations", () => {
       rows: 3,
       footerBytes: expect.any(Number),
     });
+  });
+
+  it("declares decimals at the largest precision each physical type holds", async () => {
+    const footer = metadata([
+      root(5),
+      column("d32", INT32, decimal(9, 9)),
+      column("d64", INT64, decimal(18, 0)),
+      column("d4", FIXED, { 2: i32(4), ...decimal(9, 2) }),
+      column("d16", FIXED, { 2: i32(16), ...decimal(38, 4) }),
+      column("dbytes", BYTE_ARRAY, decimal(60, 5)),
+    ]);
+    const reading = await readFooter(parquet(footer));
+    expect(reading.ok && reading.schema.map((column) => column.type)).toEqual([
+      "decimal",
+      "decimal",
+      "decimal",
+      "decimal",
+      "decimal",
+    ]);
   });
 
   it("counts rows as the enclave does: the larger of the file's and its row groups'", async () => {
