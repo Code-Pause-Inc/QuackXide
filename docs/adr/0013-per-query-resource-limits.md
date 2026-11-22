@@ -46,8 +46,8 @@ The defaults are placeholders until the query benchmarks measure them.
 | Time | `QUERY_TIMEOUT_SECS` | 1–600 | 60 | From taking the slot through decryption, decoding, execution and serialization |
 | Input bytes | `DATASET_MAX_MIB` | 1–512 | 64 | Ciphertext of the objects stored at the snapshot's version, before any key is released; again on what the manifest lists, before each object is opened |
 | Input objects | `QUERY_MAX_INPUT_OBJECTS` | 1–256 | 64 | The same two points |
-| Decoded rows | `QUERY_MAX_DECODED_ROWS` | 1–10⁹ | 10⁷ | Every Parquet footer before any batch is decoded; decoded rows counted again |
-| Decoded bytes | `QUERY_MAX_DECODED_MIB` | 1–65536 | 1024 | Uncompressed sizes in every footer, before any batch is decoded; the Arrow memory of the decoded batches counted again |
+| Decoded rows | `QUERY_MAX_DECODED_ROWS` | 1–10⁹ | 10⁷ | The rows every Parquet footer reports, when the table is registered; then before each scan decodes, summed over the query's scans; decoded rows counted again |
+| Decoded bytes | `QUERY_MAX_DECODED_MIB` | 1–65536 | 1024 | Uncompressed sizes the footers report for the columns each scan reads, summed over the query's scans, before the scan decodes; the Arrow memory of the decoded batches, summed over the scans, counted again |
 | Memory | `QUERY_MEMORY_MIB` | 1–16384 | 256 | DataFusion's memory pool for the query's operators |
 | Result rows | `QUERY_MAX_RESULT_ROWS` | 1–10⁶ | 10⁴ | Rows left after disclosure control; without a disclosure policy, as the result streams |
 | Result bytes | `QUERY_MAX_RESULT_MIB` | 1–256 | 4 | The result's JSON, as it is written |
@@ -60,7 +60,7 @@ the input-object ceiling, fit in it.
 
 Each limit is bounded on its own, so together they could promise more
 memory than any machine has. One query's worst case,
-`QueryLimits::worst_case_bytes`, is its pool, its decoded table up to
+`QueryLimits::worst_case_bytes`, is its pool, its decoded columns up to
 `QUERY_MAX_DECODED_MIB`, three copies of its input (the ciphertext, the
 plaintext the query service keeps, and the engine's copy for the decoder)
 and two of its result (the JSON and the rows parsed from it). Startup is
@@ -124,8 +124,9 @@ The audit event is written before the swap and still names the limit.
 The metrics keep `query_limit` and `query_timed_out`, because they are
 served only on the operator's loopback listener. The other limits keep
 their responses in gated mode. The slot wait reads no data. The input
-and decode limits depend only on the dataset, the same for every query
-over it. The result limits count only the rows released.
+and decode limits depend only on the dataset and on which of its columns
+the SQL reads, the same for every query that reads them. The result
+limits count only the rows released.
 
 | Limit | Ungated | Gated (ZK or research) |
 | --- | --- | --- |
