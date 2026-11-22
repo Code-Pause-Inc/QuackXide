@@ -39,6 +39,18 @@ vi.mock("./drive", () => ({
   removeFile: vi.fn(),
 }));
 
+// The cache is under test in attestation.test.ts; here only the wiring is.
+const cache = vi.hoisted(() => ({
+  current: vi.fn(),
+  invalidate: vi.fn(),
+  clear: vi.fn(),
+}));
+vi.mock("./attestation", () => ({
+  EnclaveCache: vi.fn(function () {
+    return cache;
+  }),
+}));
+
 function b64url(value: unknown): string {
   return btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
@@ -65,6 +77,9 @@ beforeEach(async () => {
   vi.resetModules();
   responses = [];
   authHeaders = [];
+  cache.current.mockReset();
+  cache.invalidate.mockReset();
+  cache.clear.mockReset();
   vi.stubEnv("VITE_VAULT_MODE", "http");
   vi.stubGlobal("addEventListener", (_type: string, cb: (ev: MessageEvent) => void) => {
     handler = cb;
@@ -179,5 +194,53 @@ describe("crypto worker dataset uploads", () => {
     handler?.(new MessageEvent("message", { data: { ...upload, id, dataset: "health" } }));
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(responses.some((r) => r.id === id)).toBe(false);
+  });
+});
+
+describe("crypto worker enclave operations", () => {
+  it("answers the key id and expiry and never the keys", async () => {
+    cache.current.mockResolvedValue({
+      keyId: "k1",
+      expiresAt: 1_800_000_000,
+      requestKey: { suite: "s", publicKey: "pk" },
+      signingKeys: { ed25519: "a", mlDsa65: "b" },
+    });
+    const res = await send({ op: "verifyEnclave" });
+    expect(res).toEqual({
+      id: res.id,
+      type: "result",
+      result: { keyId: "k1", expiresAtIso: "2027-01-15T08:00:00.000Z" },
+    });
+    expect(JSON.stringify(res)).not.toContain("requestKey");
+  });
+
+  it("reports a failed check with its message", async () => {
+    cache.current.mockRejectedValue(new Error("attestation signature invalid"));
+    expect(await send({ op: "verifyEnclave" })).toMatchObject({
+      type: "error",
+      message: "attestation signature invalid",
+    });
+  });
+
+  it("invalidates the cache on request", async () => {
+    expect(await send({ op: "invalidateEnclave" })).toMatchObject({ type: "result" });
+    expect(cache.invalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the cache when the tenant changes, not otherwise", async () => {
+    await send({ op: "session", token: jwt("user-1", "tenant-1") });
+    expect(cache.clear).toHaveBeenCalledTimes(1);
+    cache.clear.mockClear();
+    await send({ op: "session", token: jwt("user-1", "tenant-1") });
+    expect(cache.clear).not.toHaveBeenCalled();
+    await send({ op: "session", token: jwt("user-1", "tenant-2") });
+    expect(cache.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the cache on a malformed token", async () => {
+    await send({ op: "session", token: jwt("user-1") });
+    cache.clear.mockClear();
+    await send({ op: "session", token: "not.a-jwt" });
+    expect(cache.clear).toHaveBeenCalledTimes(1);
   });
 });
