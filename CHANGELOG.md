@@ -409,6 +409,9 @@ uses [Semantic Versioning](https://semver.org/).
   over bands (`salary / 1000 AS band`) and the centre from `AVG`;
   ungated queries keep `MIN` and `MAX`. ADR 0015 also decides the p% rule
   that P58 applies to `SUM` and `AVG`.
+* `url` 2.5.9 (RUSTSEC-2026-0592: `Url::origin()` overflowed the stack on
+  nested `blob:` URLs), in `backend/Cargo.lock` and
+  `backend/fuzz/Cargo.lock`. No backend code calls `Url::origin()`.
 * The admin connector toggle route,
   `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
   (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
