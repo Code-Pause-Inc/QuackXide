@@ -55,6 +55,7 @@ async function stub(options: StubOptions = {}) {
   const signer = options.signer ?? issuer;
   const served = options.served ?? issuer;
   const calls: Call[] = [];
+  const mintedExp: number[] = [];
   let bundleRequests = 0;
   const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -72,10 +73,11 @@ async function stub(options: StubOptions = {}) {
       nowSecs(),
       options.claimOverrides,
     );
+    mintedExp.push(claims.exp as number);
     const token = await signer.mint(claims);
     return new Response(JSON.stringify({ ...vector.bundle, token }));
   }) as typeof fetch;
-  return { calls, fetch: fetchStub };
+  return { calls, mintedExp, fetch: fetchStub };
 }
 
 let clock = Date.now();
@@ -100,6 +102,15 @@ describe("attestEnclave", () => {
     const s = await stub();
     const enclave = await attestEnclave(deps(s.fetch));
     expect(enclave.keyId).toBe(bound.bundle.key_id);
+    expect(enclave.requestKey).toEqual({
+      suite: bound.bundle.request_key.suite,
+      publicKey: bound.bundle.request_key.public_key,
+    });
+    expect(enclave.signingKeys).toEqual({
+      ed25519: bound.bundle.signing_keys.ed25519,
+      mlDsa65: bound.bundle.signing_keys.ml_dsa_65,
+    });
+    expect(enclave.expiresAt).toBe(s.mintedExp[0]);
     expect(s.calls).toHaveLength(2);
     for (const { init } of s.calls) {
       expect(new Headers(init?.headers).has("Authorization")).toBe(false);
@@ -142,7 +153,8 @@ describe("attestEnclave", () => {
       () => null,
       (e: unknown) => e,
     );
-    expect(String(err instanceof Error ? err.message : err).startsWith(prefix)).toBe(true);
+    const message = String(err instanceof Error ? err.message : err);
+    expect(message.startsWith(prefix), message).toBe(true);
     expect(s.calls.at(-1)!.url).toBe(JWKS_URL);
     expect(s.calls).toHaveLength(2);
     // The cache stayed empty: the next call attests again.
