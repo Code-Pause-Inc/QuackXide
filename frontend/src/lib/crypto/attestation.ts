@@ -55,28 +55,55 @@ async function readCapped(response: Response): Promise<string | null> {
   return new TextDecoder().decode(all);
 }
 
+class TimeoutError extends Error {}
+/** A refusal with its final message; `fetchBundle` passes these through. */
+class Refusal extends Error {}
+
+/** Run `run` with a signal aborted after `FETCH_TIMEOUT_MS`. The timeout also
+ *  wins the race against a fetch or body stream that ignores the signal. */
+async function withTimeout<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new TimeoutError());
+    }, FETCH_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([run(controller.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchBundle(deps: AttestationDeps, challenge: Uint8Array): Promise<string> {
-  // The endpoint is unauthenticated: no credentials, no Authorization.
-  const response = await deps.fetch(
-    `${deps.apiBaseUrl}/api/v1/attestation?nonce=${base64url(challenge)}`,
-    { credentials: "omit", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
-  );
-  if (!response.ok) throw new Error(`enclave attestation unavailable (${response.status})`);
-  const body = await readCapped(response);
-  if (body === null) throw new Error("enclave attestation response too large");
-  return body;
+  const url = `${deps.apiBaseUrl}/api/v1/attestation?nonce=${base64url(challenge)}`;
+  try {
+    return await withTimeout(async (signal) => {
+      // The endpoint is unauthenticated: no credentials, no Authorization.
+      const response = await deps.fetch(url, { credentials: "omit", signal });
+      if (!response.ok) throw new Refusal(`enclave attestation unavailable (${response.status})`);
+      const body = await readCapped(response);
+      if (body === null) throw new Refusal("enclave attestation response too large");
+      return body;
+    });
+  } catch (err) {
+    if (err instanceof Refusal) throw new Error(err.message, { cause: err });
+    const why = err instanceof TimeoutError ? "timeout" : "unreachable";
+    throw new Error(`enclave attestation unavailable (${why})`, { cause: err });
+  }
 }
 
 async function fetchKeySet(deps: AttestationDeps): Promise<string> {
   const unreachable = new Error("attestation key set unreachable");
   let body: string | null;
   try {
-    const response = await deps.fetch(deps.trust.jwksUrl, {
-      credentials: "omit",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    body = await withTimeout(async (signal) => {
+      const response = await deps.fetch(deps.trust.jwksUrl, { credentials: "omit", signal });
+      if (!response.ok) throw unreachable;
+      return readCapped(response);
     });
-    if (!response.ok) throw unreachable;
-    body = await readCapped(response);
   } catch {
     throw unreachable;
   }
@@ -94,8 +121,15 @@ export async function attestEnclave(deps: AttestationDeps): Promise<VerifiedEncl
   ]);
   if (bundle.status === "rejected") throw bundle.reason as Error;
   if (keySet.status === "rejected") throw keySet.reason as Error;
-  return verifyAttestationBundle(bundle.value, challenge, keySet.value, deps.trust);
+  const enclave = await verifyAttestationBundle(bundle.value, challenge, keySet.value, deps.trust);
+  if (isExpiring(enclave, deps)) {
+    throw new Error("the enclave's attestation expires too soon; check this device's clock");
+  }
+  return enclave;
 }
+
+const isExpiring = (enclave: VerifiedEnclave, deps: AttestationDeps) =>
+  deps.now() / 1000 >= enclave.expiresAt - CLOCK_SKEW_LEEWAY_SECS;
 
 /** The verified enclave, attested again when it is within a minute of
  *  expiring. One attestation at a time; a result from before `invalidate()`
@@ -112,7 +146,7 @@ export class EnclaveCache {
     if (!deps) {
       return Promise.reject(new Error("enclave verification is not configured in this build"));
     }
-    if (this.cached && deps.now() / 1000 < this.cached.expiresAt - CLOCK_SKEW_LEEWAY_SECS) {
+    if (this.cached && !isExpiring(this.cached, deps)) {
       return Promise.resolve(this.cached);
     }
     if (this.inFlight) return this.inFlight;

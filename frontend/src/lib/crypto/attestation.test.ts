@@ -3,7 +3,7 @@
 // key set and mints the token for the nonce it is asked about; the checks
 // themselves run in the wasm module.
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import fixture from "../../../../fixtures/attestation/bundles.json";
 import type { AttestationTrust } from "../../config/attestation";
 import { claimsFor, testIssuer } from "../../test/attestationTokens";
@@ -39,7 +39,9 @@ interface StubOptions {
   /** The token's signer; the served key set is `served`'s (default: same). */
   signer?: Awaited<ReturnType<typeof testIssuer>>;
   served?: Awaited<ReturnType<typeof testIssuer>>;
-  bundleResponse?: () => Response;
+  bundleResponse?: () => Response | Promise<Response>;
+  /** Holds the first bundle request until this resolves. */
+  holdFirst?: Promise<void>;
   jwksResponse?: () => Response;
 }
 
@@ -53,12 +55,15 @@ async function stub(options: StubOptions = {}) {
   const signer = options.signer ?? issuer;
   const served = options.served ?? issuer;
   const calls: Call[] = [];
+  let bundleRequests = 0;
   const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, init });
     if (url === JWKS_URL) return options.jwksResponse?.() ?? new Response(served.jwks);
     if (!url.startsWith(`${API}/api/v1/attestation?nonce=`)) return new Response("", { status: 404 });
     if (options.bundleResponse) return options.bundleResponse();
+    bundleRequests += 1;
+    if (bundleRequests === 1) await options.holdFirst;
     const challenge = fromB64url(new URL(url).searchParams.get("nonce")!);
     const vector = options.bundle ?? bound;
     const claims = claimsFor(
@@ -82,6 +87,10 @@ const deps = (fetchStub: typeof fetch, overrides: Partial<AttestationDeps> = {})
   ...overrides,
 });
 
+afterEach(() => {
+  clock = Date.now();
+});
+
 beforeAll(async () => {
   await loadEnvelopeModule(envelopeWasmInline);
 });
@@ -97,6 +106,7 @@ describe("attestEnclave", () => {
       expect(init?.signal).toBeDefined();
     }
     expect(s.calls[1]!.init?.credentials).toBe("omit");
+    expect(new URL(s.calls[0]!.url).searchParams.get("nonce")).toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
 
   const refusals: [string, StubOptions | (() => Promise<StubOptions>), string][] = [
@@ -164,6 +174,45 @@ describe("attestEnclave", () => {
     await expect(attestEnclave(deps(s.fetch))).rejects.toThrow("attestation key set unreachable");
   });
 
+  describe("timeouts", () => {
+    afterEach(() => vi.useRealTimers());
+
+    const never = () => new ReadableStream<Uint8Array>({ start: () => undefined });
+    it.each([
+      ["a bundle fetch that never resolves", () => new Promise<Response>(() => undefined)],
+      ["a bundle body that never ends", () => new Response(never())],
+    ])("%s is refused after 10 s", async (_name, bundleResponse) => {
+      vi.useFakeTimers();
+      const s = await stub({ bundleResponse });
+      const cache = new EnclaveCache(() => deps(s.fetch));
+      const outcome = cache.current().then(
+        () => "resolved",
+        (e: unknown) => (e as Error).message,
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await outcome).toBe("enclave attestation unavailable (timeout)");
+      void cache.current().catch(() => undefined);
+      expect(s.calls).toHaveLength(4);
+    });
+  });
+
+  it("a network failure on the bundle is unreachable", async () => {
+    const s = await stub({ bundleResponse: () => Promise.reject(new TypeError("offline")) });
+    await expect(attestEnclave(deps(s.fetch))).rejects.toThrow(
+      "enclave attestation unavailable (unreachable)",
+    );
+  });
+
+  it("an enclave expiring within a minute by the device clock is refused", async () => {
+    const s = await stub();
+    const cache = new EnclaveCache(() => deps(s.fetch, { now: () => Date.now() + 3600_000 }));
+    await expect(cache.current()).rejects.toThrow(
+      "the enclave's attestation expires too soon; check this device's clock",
+    );
+    await cache.current().catch(() => undefined);
+    expect(s.calls).toHaveLength(4);
+  });
+
   it("html_key_set", async () => {
     const s = await stub({ jwksResponse: () => new Response("<html>502 Bad Gateway</html>") });
     await expect(attestEnclave(deps(s.fetch))).rejects.toThrow("attestation key set");
@@ -186,10 +235,11 @@ describe("EnclaveCache", () => {
     clock = (first.expiresAt - 61) * 1000;
     await cache.current();
     expect(s.calls).toHaveLength(2);
+    // The fresh token expires as soon as the first, so it is refused too;
+    // the point is that the cache did not hand back the old one.
     clock = (first.expiresAt - 60) * 1000;
-    await cache.current();
+    await cache.current().catch(() => undefined);
     expect(s.calls).toHaveLength(4);
-    clock = Date.now();
   });
 
   it("invalidate() makes the next call attest again", async () => {
@@ -210,14 +260,20 @@ describe("EnclaveCache", () => {
   });
 
   it.each(["clear", "invalidate"] as const)(
-    "%s() during an attestation leaves the cache empty",
+    "%s() during an attestation: the next current() attests anew",
     async (drop) => {
-      const s = await stub();
+      let release!: () => void;
+      const s = await stub({ holdFirst: new Promise<void>((r) => (release = r)) });
       const cache = new EnclaveCache(() => deps(s.fetch));
-      const inFlight = cache.current();
+      const old = cache.current();
       cache[drop]();
-      expect((await inFlight).keyId).toBe(bound.bundle.key_id);
-      await cache.current();
+      const fresh = cache.current();
+      expect(s.calls).toHaveLength(4);
+      release();
+      const [oldEnclave, freshEnclave] = await Promise.all([old, fresh]);
+      expect(freshEnclave).not.toBe(oldEnclave);
+      // Only the new attestation was cached.
+      expect(await cache.current()).toBe(freshEnclave);
       expect(s.calls).toHaveLength(4);
     },
   );
