@@ -117,8 +117,9 @@ runs `*.test.ts` and has no DOM. The `dom` project runs `*.test.tsx` under
 jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 
 The `browser` project runs `*.browser.test.ts` in real headless browsers
-through Playwright, with nothing mocked: the module crypto worker, Web
-Crypto keys and IndexedDB. The worker loads the wasm envelope module (build
+through Playwright with little mocked: the module crypto worker, Web
+Crypto keys and IndexedDB are real, and the attestation test stubs only
+`fetch`. The worker loads the wasm envelope module (build
 it first with `scripts/build-wasm.sh`), but no browser test seals with it
 yet. It needs no backend. Failure screenshots and Playwright traces go to
 `frontend/.vitest/`, which the `browser` workflow keeps when a job fails. `npm test` does not run it;
@@ -190,6 +191,13 @@ and queries.
 come from implementations other than ours (ADR 0007); regenerate them with
 `node scripts/hpk2-vectors.mjs` from `frontend/`, and
 `backend/crates/platform-crypto/tests/hpk2_vectors.rs` checks them.
+
+`fixtures/attestation/bundles.json` holds the evidence-bundle cases of ADR
+0010 (`bound`, `other`, `loosened`, `hpk1`: each a bundle without its token
+plus the container env and binding nonce the token must carry) and the simulator's image digest, for the Rust and
+TypeScript verifier tests. Regenerate it with
+`cargo test -p platform-enclave --test attestation_vectors -- --ignored write_vectors`
+from `backend/`. It holds no tokens: each test mints one at run time.
 
 ### Parquet schema vectors
 

@@ -572,18 +572,23 @@ Researcher ──▶ POST /api/v1/research/query {version, key_id, grant_id, env
                ─▶ aggregate rows + suppressed_rows + budget_remaining + metering audit event
 ```
 
-Before a research query, the browser's crypto worker runs ADR 0010's five
-checks on the attestation bundle (`platform_enclave::bundle::verify_bundle`,
-which `enclave-check` and the browser module share): Google's signature and the
-token's validity, the platform claims, the image digest, its own
-challenge, and the binding of the enclave's keys and of the configuration
-the token reports (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
-`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`), held to the
-compiled policy (a release build's trust values are `VITE_ATTESTATION_*`).
-The query is then to be sealed to the bundle's request key (ADR 0010
-"Sealed request"), so its SQL is plaintext only in the researcher's
-browser and inside the enclave; the browser does not seal yet (#239 part
-2). A sealed query runs in a task of its own, so a client that
+Before a research query, the browser's crypto worker verifies the enclave
+(`verifyEnclave`). It runs ADR 0010's five checks on the attestation bundle
+(`platform_enclave::bundle::verify_bundle`, which `enclave-check` and the
+browser module share): Google's signature and the token's validity, the
+platform claims, the image digest, its own challenge, and the binding of the
+enclave's keys and of the configuration the token reports
+(`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`). Two inputs
+steer them, both set by the build.
+The configuration policy (`ConfigPolicy`) is the release one or the
+simulator's. The trust values (the issuer, the key-set URL and the image
+digests) come, in a release frontend build, from `VITE_ATTESTATION_*`.
+
+The worker has no seal operation yet (#239 part 2). Sealing a query to the
+bundle's request key (ADR 0010 "Sealed request") is done by
+`enclave-check seal-query`, so its SQL is plaintext only in the researcher's
+client and inside the enclave. A sealed query runs in a task of its own, so a client that
 disconnects does not cancel it: its response is stored for an hour, and
 the same envelope sent again gets it with no new charge. A stored error
 replays unchanged, `Retry-After` included, so a client retries an error
@@ -792,10 +797,10 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-config | Env → `PlatformConfig` (brand/server/storage/research/dataset size) | Hardcoded brand strings |
 | platform-telemetry | JSON tracing init, `SECURITY_AUDIT_EVENT` emitter | Secrets/customer content in events |
 | platform-crypto | AEAD seal/open, HPKE suite pin, envelope frame check and suite names, envelope `info` strings, blind indexes, TOTP, `SecretBytes` | Tenant drive private keys (they don't exist server-side) |
-| envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and open, public-key derivation and `info` strings, and the evidence-bundle checks (`verifyAttestation`, ADR 0010), for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys beyond one open or derivation (zeroized before returning), the drive KEK or file keys; I/O, or a logging subscriber |
+| envelope-wasm | wasm32 build of `platform-crypto`'s envelope seal and open, public-key derivation and `info` strings, and the evidence-bundle checks (`verifyAttestation`, ADR 0010), for the browser's crypto worker (without the `server` feature: no AEAD helpers, blind indexes or TOTP) | Private keys beyond one open or derivation (zeroized before returning), the drive KEK or file keys; I/O or log output (`tracing` is linked through `platform-enclave`, with no subscriber) |
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait, the plaintext `SnapshotRecord` | Raw-string storage paths |
-| platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
+| platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, the evidence-bundle wire types and `verify_bundle` (builds for wasm32, because `envelope-wasm` links it), fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
 | platform-connectors | Connector catalog with each mapper's columns, OAuth2 grants, NDJSON bounds, Parquet-out, dataset snapshots (commit, prune, "holds"), the upload body parser and writer | Plaintext persistence |
 | platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory), listings' data dictionaries | Disclosure decisions |
 | platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |

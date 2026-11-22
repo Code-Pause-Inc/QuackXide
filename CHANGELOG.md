@@ -79,8 +79,7 @@ uses [Semantic Versioning](https://semver.org/).
   verifies them and keeps the enclave in worker memory until its token
   nears expiry. Release builds take their trust values from
   `VITE_ATTESTATION_ISSUER`, `VITE_ATTESTATION_JWKS_URL` and
-  `VITE_ATTESTATION_IMAGE_DIGESTS` and are refused without them. Sealing
-  the query to the verified key follows.
+  `VITE_ATTESTATION_IMAGE_DIGESTS` and are refused without them.
 * The base for sealed research queries and results (ADR 0010; part of P85
   and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
   together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must

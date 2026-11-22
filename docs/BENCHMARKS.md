@@ -146,6 +146,9 @@ describes the method. Each sample is a batch of calls lasting at least
 (the module's load plus its first seal) is one sample per page. The timings
 run on the page's main thread; the app does this work in the crypto worker.
 
+The wasm cold start was measured on the module before the attestation
+verifier was linked.
+
 From [run 44010807289](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/44010807289)
 of #232, started by hand, on GitHub-hosted `ubuntu-latest` runners (Ubuntu
 26.04, 4 CPUs). Each browser ran as its own job on a different CPU, so read
@@ -158,9 +161,8 @@ each column on its own rather than across:
 | `encryptPayload` 4 MiB, p50 / p99 | 4.58 / 12.3 ms | 5.56 / 6.28 ms | 1.19 / 1.58 ms |
 | Wasm cold start (load + first seal) | 6.6 ms | 7 ms | 11 ms |
 
-The wasm envelope module's size, now with the attestation verifier, awaits
-this change's CI run: the browser job prints `wasm envelope module: N bytes,
-M gzipped`.
+Not yet measured with the attestation verifier linked; the browser job
+prints `wasm envelope module: N bytes, M gzipped`.
 
 * Chromium's 4 MiB p99 is 2.7× its p50, so that run was noisy; take another
   run before setting a target from it.
