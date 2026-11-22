@@ -22,6 +22,7 @@ simulated = ["dep:rsa", "dep:reqwest"]
 async-trait.workspace = true
 base64.workspace = true
 jsonwebtoken.workspace = true
+platform-crypto = { path = "../platform-crypto", default-features = false }
 rand.workspace = true
 reqwest = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
@@ -37,4 +38,6 @@ zeroize.workspace = true
 # This crate with `simulated` on, for tests only (resolver 2 applies it only
 # when tests are built).
 platform-enclave = { path = ".", features = ["simulated"] }
+# Keypair generation for the bundle tests.
+platform-crypto = { path = "../platform-crypto" }
 tokio.workspace = true
