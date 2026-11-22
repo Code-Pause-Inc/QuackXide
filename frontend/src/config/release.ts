@@ -3,6 +3,8 @@
 // a baked-in development token, or an API base URL (the page calls its own
 // origin only). Pure, so vite.config.ts and tests share it.
 
+import { SIMULATOR_ISSUER } from "./attestation";
+
 export interface ReleaseEnv {
   readonly VITE_VAULT_MODE?: string;
   readonly VITE_DEV_JWT?: string;
@@ -13,8 +15,6 @@ export interface ReleaseEnv {
   readonly VITE_ATTESTATION_IMAGE_DIGESTS?: string;
 }
 
-// The simulator's issuer (platform-api); a release build must never trust it.
-const SIMULATOR_ISSUER = "http://sim-attestation:8070";
 const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/;
 
 /** Every reason the release build must fail; empty means it may proceed.

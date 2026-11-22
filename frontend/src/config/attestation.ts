@@ -15,7 +15,8 @@ export interface AttestationTrust {
   release: boolean;
 }
 
-const DEV_ISSUER = "http://sim-attestation:8070";
+/** The simulator's issuer; the dev default, and what release builds refuse. */
+export const SIMULATOR_ISSUER = "http://sim-attestation:8070";
 const DEV_JWKS_URL = "/sim-attestation/jwks";
 const DEV_IMAGE_DIGEST = "sha256:5155a7ab1d7e4c94d5bb3e1c6f0a3a4d6c7b8e9f00112233445566778899aabb";
 
@@ -26,13 +27,13 @@ export function resolveAttestationTrust(
   mode: string,
 ): AttestationTrust | null {
   const release = mode === "release";
-  const issuer = env.VITE_ATTESTATION_ISSUER?.trim() || (release ? "" : DEV_ISSUER);
+  const issuer = env.VITE_ATTESTATION_ISSUER?.trim() || (release ? "" : SIMULATOR_ISSUER);
   const jwksUrl = env.VITE_ATTESTATION_JWKS_URL?.trim() || (release ? "" : DEV_JWKS_URL);
-  const digests = env.VITE_ATTESTATION_IMAGE_DIGESTS?.trim()
-    ? env.VITE_ATTESTATION_IMAGE_DIGESTS.split(",").map((digest) => digest.trim())
-    : release
-      ? []
-      : [DEV_IMAGE_DIGEST];
+  const listed = (env.VITE_ATTESTATION_IMAGE_DIGESTS ?? "")
+    .split(",")
+    .map((digest) => digest.trim())
+    .filter((digest) => digest !== "");
+  const digests = listed.length > 0 ? listed : release ? [] : [DEV_IMAGE_DIGEST];
   if (!issuer || !jwksUrl || digests.length === 0) return null;
   return { issuer, jwksUrl, imageDigests: digests, release };
 }

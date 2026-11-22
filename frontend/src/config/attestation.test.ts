@@ -50,4 +50,23 @@ describe("resolveAttestationTrust", () => {
       expect(resolveAttestationTrust({ ...full, [key]: "  " }, "release")).toBeNull();
     }
   });
+
+  it("drops empty digest entries", () => {
+    expect(
+      resolveAttestationTrust({ VITE_ATTESTATION_IMAGE_DIGESTS: "a,,b," }, "development")?.imageDigests,
+    ).toEqual(["a", "b"]);
+  });
+
+  it("refuses a release build whose digest list is empty after trimming", () => {
+    expect(
+      resolveAttestationTrust(
+        {
+          VITE_ATTESTATION_ISSUER: "https://attest.example",
+          VITE_ATTESTATION_JWKS_URL: "https://attest.example/jwks",
+          VITE_ATTESTATION_IMAGE_DIGESTS: " , ",
+        },
+        "release",
+      ),
+    ).toBeNull();
+  });
 });
