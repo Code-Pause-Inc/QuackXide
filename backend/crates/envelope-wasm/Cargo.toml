@@ -1,6 +1,6 @@
 [package]
 name = "envelope-wasm"
-description = "Browser (wasm32) build of the tenant envelope seal, for the crypto worker."
+description = "Browser (wasm32) build of the tenant envelope seal and the enclave evidence checks, for the crypto worker."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

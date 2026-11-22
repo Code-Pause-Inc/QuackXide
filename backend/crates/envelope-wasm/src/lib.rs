@@ -1,4 +1,5 @@
-//! The tenant envelope seal and open, built for wasm32 and loaded only by
+//! The tenant envelope seal and open, and the enclave evidence checks
+//! (ADR 0010, `verifyAttestation`), built for wasm32 and loaded only by
 //! the browser's crypto worker (`frontend/src/lib/crypto/envelope.ts`).
 //!
 //! It is `platform-crypto`'s own envelope code, so the browser and the
@@ -19,14 +20,14 @@ use platform_crypto::{
     CryptoError, EnvelopeSuite, SuitePolicy, TenantPublicKey, hpk1_open_with_private_key,
     hpk1_public_key_from_private, hpke_seal_to_tenant, info,
 };
-
-/// The one suite the browser seals with until P36.
-const SUITE: EnvelopeSuite = EnvelopeSuite::Hpk1;
 use platform_enclave::bundle::{AttestationBundle, VerifiedBundle, verify_bundle};
 use platform_enclave::config::ConfigPolicy;
 use platform_enclave::token::{BROWSER_ATTESTATION_AUDIENCE, JwkSet, ReleasePolicy, TokenVerifier};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroize;
+
+/// The one suite the browser seals with until P36.
+const SUITE: EnvelopeSuite = EnvelopeSuite::Hpk1;
 
 /// Seal `plaintext` to a raw X25519 tenant public key under `info`,
 /// returning the framed `HPK1` envelope. A hybrid (`HPK2`) key is refused.
@@ -145,15 +146,15 @@ pub fn research_query_binding(
 }
 
 /// Run the evidence checks (ADR 0010) on an `/api/v1/attestation` bundle
-/// against a 32-byte `challenge` and the attestation key set. `release`
-/// picks the release configuration policy, otherwise the simulator's.
+/// against a 32-byte `challenge` and the attestation key set. `simulator`
+/// picks the simulator's configuration policy, otherwise the release one.
 pub fn verify_attestation(
     bundle_json: &str,
     challenge: &[u8],
     jwks_json: &str,
     issuer: &str,
     image_digests: Vec<String>,
-    release: bool,
+    simulator: bool,
 ) -> Result<VerifiedBundle, String> {
     let bundle: AttestationBundle =
         serde_json::from_str(bundle_json).map_err(|_| "malformed attestation bundle".to_owned())?;
@@ -171,17 +172,18 @@ pub fn verify_attestation(
         },
     )
     .map_err(|e| key_set_error(&e))?;
-    let policy = if release {
-        ConfigPolicy::RELEASE
-    } else {
+    let policy = if simulator {
         ConfigPolicy::SIMULATOR
+    } else {
+        ConfigPolicy::RELEASE
     };
     verify_bundle(&bundle, challenge, &verifier, policy).map_err(|e| e.to_string())
 }
 
 // ── wasm exports ─────────────────────────────────────────────────────────────
 //
-// Error messages are `CryptoError`'s, which carry no key material or data.
+// Error messages are `CryptoError`'s, or for `verifyAttestation` the failed
+// check's message; neither carries key material or data.
 
 fn js_error(err: CryptoError) -> JsError {
     JsError::new(&err.to_string())
@@ -266,7 +268,7 @@ pub fn verify_attestation_js(
     jwks_json: &str,
     issuer: &str,
     image_digests: Vec<String>,
-    release: bool,
+    simulator: bool,
 ) -> Result<String, JsError> {
     let verified = verify_attestation(
         bundle_json,
@@ -274,7 +276,7 @@ pub fn verify_attestation_js(
         jwks_json,
         issuer,
         image_digests,
-        release,
+        simulator,
     )
     .map_err(|message| JsError::new(&message))?;
     serde_json::to_string(&verified).map_err(|e| JsError::new(&e.to_string()))
@@ -406,7 +408,7 @@ mod tests {
             )
         }
 
-        fn verify(name: &str, challenge: &[u8], release: bool) -> Result<VerifiedBundle, String> {
+        fn verify(name: &str, challenge: &[u8], simulator: bool) -> Result<VerifiedBundle, String> {
             let (bundle, jwks) = minted(name);
             verify_attestation(
                 &bundle,
@@ -414,7 +416,7 @@ mod tests {
                 &jwks,
                 ISSUER,
                 vec![SIMULATED_IMAGE_DIGEST.to_owned()],
-                release,
+                simulator,
             )
         }
 
@@ -425,15 +427,15 @@ mod tests {
                 .as_str()
                 .expect("key id")
                 .to_owned();
-            let v = verify("bound", &CHALLENGE, false).expect("verifies");
+            let v = verify("bound", &CHALLENGE, true).expect("verifies");
             assert_eq!(v.key_id, key_id);
         }
 
         #[test]
         fn release_refuses_a_loosened_configuration() {
-            let err = verify("loosened", &CHALLENGE, true).expect_err("refused");
+            let err = verify("loosened", &CHALLENGE, false).expect_err("refused");
             assert!(err.starts_with("check 5 (configuration)"), "{err}");
-            verify("loosened", &CHALLENGE, false).expect("the simulator allows it");
+            verify("loosened", &CHALLENGE, true).expect("the simulator allows it");
         }
 
         #[test]
@@ -446,14 +448,14 @@ mod tests {
 
         #[test]
         fn an_hpk1_request_key_is_refused() {
-            let err = verify("hpk1", &CHALLENGE, false).expect_err("refused");
+            let err = verify("hpk1", &CHALLENGE, true).expect_err("refused");
             assert!(err.contains("No downgrade"), "{err}");
         }
 
         #[test]
         fn a_short_challenge_is_refused() {
             assert_eq!(
-                verify("bound", &CHALLENGE[..31], false).expect_err("refused"),
+                verify("bound", &CHALLENGE[..31], true).expect_err("refused"),
                 "the challenge must be 32 bytes"
             );
         }

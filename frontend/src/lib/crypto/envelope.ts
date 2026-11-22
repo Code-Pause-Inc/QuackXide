@@ -119,7 +119,7 @@ export async function verifyAttestationBundle(
       jwksJson,
       trust.issuer,
       trust.imageDigests,
-      trust.release,
+      !trust.release,
     ),
   ) as {
     key_id: string;

@@ -176,6 +176,7 @@ pub fn verify_bundle(
         signing_keys: bundle.signing_keys.clone(),
     })
 }
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
