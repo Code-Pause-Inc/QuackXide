@@ -334,14 +334,20 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
                                               │
                           key released into enclave (EnclaveKeyProvider)
                           open HPKE envelopes (info by dataset kind) → Parquet in RAM
-                          upload: schema and row cap as declared? (no ⇒ 502)
-                          footers within the decode limits? (no ⇒ 422)
+                          QueryScope reads the footers only, from its own wiped copy:
+                            objects' columns alike? (no ⇒ 502)
+                            upload: schema and row cap as declared? (no ⇒ 502)
+                            rows within the decode row limit? (no ⇒ 422)
+                          zeroize the service's blobs
                                               │
-                          QueryScope: DataFusion SQL over decrypted frames
+                          QueryScope: DataFusion SQL, nothing decoded yet
+                          ZkMode::Enabled → plan allowlist
+                          each scan: its columns' footers within the decode limits? (no ⇒ 422)
+                            decode only those columns (corrupt object ⇒ 502)
                           fixed memory pool, no disk (pool exhausted ⇒ 422; ZK: as disclosure)
-                          ZkMode::Enabled → plan allowlist + cohort threshold
+                          ZkMode::Enabled → cohort threshold
                           result within its row and byte limits? (no ⇒ 422)
-                          zeroize blobs; Drop releases Arrow frames
+                          Drop releases the scope's copy and the Arrow frames
                                               │
                                         JSON result rows
 ```
@@ -352,10 +358,22 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   blind-index column (HMAC-SHA256/128) — the engine matches HMAC images and
   never sees the plaintext query term or values. *In-enclave analytics*:
   DataFusion SQL over the decrypted frame.
-* **`QueryScope` memory hygiene.** Owns the DataFusion `SessionContext` and
-  the MemTables built from decrypted Parquet; `Drop` deregisters them and
-  releases the Arrow frames. Decrypted Parquet bytes live in zeroizing
-  buffers and are wiped on every exit path, including errors.
+* **`QueryScope` memory hygiene.** Owns the DataFusion `SessionContext` and,
+  for each registered table, a zeroizing copy of every decrypted Parquet
+  object with its footer, parsed without the column statistics (whose
+  minimum and maximum are values from the data). Registering a table reads
+  only the footers, and the query service then zeroizes its own copies of
+  the objects. Nothing is decoded until the query's plan has passed every
+  gate. Each table scan in the final plan then decodes, from every object,
+  only the columns the query reads, into an in-memory plan that is
+  dropped with the query; a query the gate refuses decodes nothing.
+  `Drop` deregisters the tables, releasing the scope's copies and any
+  Arrow frames still held. Decrypted Parquet bytes live in zeroizing
+  buffers and are wiped on every exit path, including errors; decoded
+  Arrow arrays are not (see "Unzeroized working memory" in
+  `docs/THREAT_MODEL.md`). Decryption is still whole-object in v1: each
+  object is one HPKE envelope, so a query decrypts every object of the
+  snapshot, and projection reduces decode work, not decrypt work.
 * **Bounded plaintext.** `max_concurrent_queries` (`QUERY_MAX_CONCURRENT`)
   caps how many queries hold decrypted data at once, and a limit of zero
   refuses with 503. A query waits at most `QUERY_SLOT_WAIT_SECS` for a slot,
@@ -384,19 +402,22 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   upload limit, so every stored upload stays queryable; a sealed manifest
   over the upload route's 16 KiB bound fails closed (502). Both input
   limits are checked again on what the manifest lists, cumulatively, before
-  each object is opened. `QueryScope` reads every Parquet footer before it
-  decodes anything: the rows and uncompressed bytes they report must fit
+  each object is opened. `QueryScope` refuses a table whose footers report
+  more rows than `QUERY_MAX_DECODED_ROWS`. Each table scan decodes every
+  row of the columns it reads, so before a scan decodes anything, the rows
+  and the uncompressed bytes the footers report for its columns, summed
+  over the query's scans (a self-join reads its table twice), must fit
   `QUERY_MAX_DECODED_ROWS` and `QUERY_MAX_DECODED_MIB`, since DataFusion's
-  memory pool does not track the decoded table. Both are counted again as
+  memory pool does not track decoded columns. Both are counted again as
   the batches decode: the rows, and the Arrow memory each batch of 1024 rows
-  holds, since a footer's uncompressed sizes understate columns that
-  dictionary or run-length encoding shrinks. String and binary columns,
-  plain or declared as dictionaries, decode as view arrays, which point into
-  the pages and dictionaries they came from. Plain ones are measured before
-  they expand, so a value repeated across rows is refused before it is
-  copied once per row, and dictionaries are rebuilt from the views, each
-  distinct value once. Fixed-width columns are checked from their widths
-  before each batch decodes. The decoded table can pass
+  holds, summed over the query's scans, since a footer's uncompressed sizes
+  understate columns that dictionary or run-length encoding shrinks. String
+  and binary columns, plain or declared as dictionaries, decode as view
+  arrays, which point into the pages and dictionaries they came from. Plain
+  ones are measured before they expand, so a value repeated across rows is
+  refused before it is copied once per row, and dictionaries are rebuilt
+  from the views, each distinct value once. Fixed-width columns are checked
+  from their widths before each batch decodes. The decoded columns can pass
   `QUERY_MAX_DECODED_MIB` only by the batch's list columns, and its strings
   or binary inside a struct, which are counted only after they expand; a
   page decompresses whole, to the size its own header states, and a
@@ -433,7 +454,9 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   and the rows its footer reports against what the steward declared before
   decoding, and the decoded rows after; a mismatch is refused with 502
   (`QueryError::DeclarationMismatch`, which names no column). A research
-  query is charged before this check.
+  query is charged before this check. Objects of one snapshot whose
+  columns differ, and an object that fails to decode, are the storage's
+  fault, never the caller's SQL: 502 (`QueryError::Parquet`).
 * **ZK gate.** In `ZkMode::Enabled` every query passes the same disclosure
   gate as research access: the plan allowlist, a genuine `COUNT(*) AS n`,
   the p% rule for sums and means (`RESEARCH_DOMINANCE_PERCENT`), and
@@ -495,7 +518,7 @@ Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                      plan gate: aggregate-only (no row egress)
                      plan gate: COUNT(*) AS n present and genuine (not a literal)
                      plan rewrite: dominated SUM / AVG released as null (p% rule)
-                     DataFusion executes
+                     DataFusion decodes the columns the plan reads, and executes
                      DisclosurePolicy (result gate): drop rows where n < k
                  zeroize plaintext; Drop releases frames
                ─▶ aggregate rows + suppressed_rows + budget_remaining + metering audit event

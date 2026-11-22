@@ -387,6 +387,25 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* A query decodes only the columns it reads, and nothing before its plan
+  passes every gate (P53). `QueryScope` registers a table by reading only
+  the Parquet footers, parsed without their column statistics, from its
+  own zeroizing copy of each object, and the query service then zeroizes
+  its copies. Each table scan decodes, from every object, only the columns
+  the query reads, so a query that the plan gate, the count-column check,
+  the runtime-failure check or the statement check refuses decodes
+  nothing. Registration still refuses footers that report more rows than
+  `QUERY_MAX_DECODED_ROWS`. Before a scan decodes, the rows and the
+  uncompressed bytes the footers report for its columns, summed over the
+  query's scans, must fit `QUERY_MAX_DECODED_ROWS` and
+  `QUERY_MAX_DECODED_MIB`, where the whole table's footers had to fit
+  before, and the Arrow memory the scans decode to, summed over them, is
+  counted against `QUERY_MAX_DECODED_MIB` as each batch decodes. A
+  refusal that registration gave for decoded bytes now comes from the
+  query that reads the columns. Objects of one snapshot whose columns
+  differ answer 502 instead of 400, and a stored object that fails to
+  decode, now during a scan, still answers 502. Decryption is still
+  whole-object.
 * Zero-knowledge and research queries release a `SUM` or `AVG` as null
   when one or two rows dominate it: when the group's absolute values,
   less the two largest, total under *p*% of the largest, so that anyone

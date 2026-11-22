@@ -180,11 +180,11 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
 * **Unzeroized working memory.** Decrypted Parquet bytes, OAuth secrets,
   connector response bodies, `Dataset` cells, the Parquet output buffer
   and the query-result JSON buffer are zeroized. Decoded Arrow arrays, the
-  Parquet encoder's and HTTP client's internal buffers, and parsed
-  `serde_json` values are freed without zeroization (clearing them would
-  require `unsafe` or changes to those libraries). Plaintext is confined to enclave
-  memory, so this matters only against an attacker who can read that
-  memory.
+  internal buffers of the Parquet encoder, the Parquet decoder and the HTTP
+  client, and parsed `serde_json` values are freed without zeroization
+  (clearing them would require `unsafe` or changes to those libraries).
+  Plaintext is confined to enclave memory, so this matters only against an
+  attacker who can read that memory.
 * **Credentials in the process environment.** Configuration reads
   `JWT_HS256_SECRET` and `MOR_WEBHOOK_SECRET` into zeroizing
   `SecretString`s, but the original values stay in the process
@@ -206,9 +206,10 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   SQL and the schema, so a refused query that passes those checks still
   answers one question about the rows it read. A time refusal also arrives
   only after the time limit, as response time otherwise shows. Size limits
-  on the input and the decoded dataset depend only on the dataset, and the
-  result limits only on the rows released. Each probe costs a research
-  query one unit; own-data queries have no budget (see above).
+  on the input and on decoding depend only on the dataset and the columns
+  the SQL reads, and the result limits only on the rows released. Each
+  probe costs a research query one unit; own-data queries have no budget
+  (see above).
 * **Rows, not people.** The cohort threshold and the p% rule count rows.
   A dataset in which one person has several rows (visits, transactions)
   must be prepared one row per person; otherwise a cohort of *k* rows can

@@ -15,6 +15,7 @@ workspace = true
 platform-core.workspace = true
 platform-crypto.workspace = true
 arrow = { workspace = true, features = ["json"] }
+async-trait.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
 futures.workspace = true
@@ -28,6 +29,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# Seeded synthetic tables, including the wide one, for the decode tests.
 synth-data.workspace = true
 tokio.workspace = true
 

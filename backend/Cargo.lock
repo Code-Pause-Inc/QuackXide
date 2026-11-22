@@ -3699,6 +3699,7 @@ name = "quackxide-engine"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "criterion",
  "datafusion",
