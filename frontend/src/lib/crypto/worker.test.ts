@@ -2,6 +2,9 @@
 // refresh, malformed tokens and the missing-token refusal in http mode.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveAttestationTrust } from "../../config/attestation";
+import { resolveBrand } from "../../config/brand";
+import type { AttestationDeps } from "./attestation";
 import type { WorkerResponse } from "./protocol";
 
 vi.mock("./keystore", () => ({
@@ -40,16 +43,16 @@ vi.mock("./drive", () => ({
 }));
 
 // The cache is under test in attestation.test.ts; here only the wiring is.
-const cache = vi.hoisted(() => ({
-  current: vi.fn(),
-  invalidate: vi.fn(),
-  clear: vi.fn(),
-}));
-vi.mock("./attestation", () => ({
-  EnclaveCache: vi.fn(function () {
-    return cache;
-  }),
-}));
+const { cache, EnclaveCacheCtor } = vi.hoisted(() => {
+  const cache = { current: vi.fn(), invalidate: vi.fn(), clear: vi.fn() };
+  return {
+    cache,
+    EnclaveCacheCtor: vi.fn(function () {
+      return cache;
+    }),
+  };
+});
+vi.mock("./attestation", () => ({ EnclaveCache: EnclaveCacheCtor }));
 
 function b64url(value: unknown): string {
   return btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -80,6 +83,7 @@ beforeEach(async () => {
   cache.current.mockReset();
   cache.invalidate.mockReset();
   cache.clear.mockReset();
+  EnclaveCacheCtor.mockClear();
   vi.stubEnv("VITE_VAULT_MODE", "http");
   vi.stubGlobal("addEventListener", (_type: string, cb: (ev: MessageEvent) => void) => {
     handler = cb;
@@ -242,5 +246,60 @@ describe("crypto worker enclave operations", () => {
     cache.clear.mockClear();
     await send({ op: "session", token: "not.a-jwt" });
     expect(cache.clear).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("crypto worker enclave deps", () => {
+  const releaseEnv = {
+    VITE_ATTESTATION_ISSUER: "https://issuer.example",
+    VITE_ATTESTATION_JWKS_URL: "https://issuer.example/jwks",
+    VITE_ATTESTATION_IMAGE_DIGESTS: "sha256:aa,sha256:bb",
+  };
+
+  function deps(): AttestationDeps | null {
+    const factory = (EnclaveCacheCtor.mock.calls as unknown[][])[0]?.[0] as (() => AttestationDeps | null) | undefined;
+    if (!factory) throw new Error("EnclaveCache was not constructed");
+    return factory();
+  }
+
+  it("fetches without the session token or credentials, and passes the call through", async () => {
+    await send({ op: "session", token: jwt("user-1") });
+    const init = { method: "GET", headers: { Accept: "application/json" } };
+    await deps()?.fetch("https://api.example/attestation", init);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith("https://api.example/attestation", init);
+    const sent = vi.mocked(fetch).mock.calls[0]?.[1];
+    expect(new Headers(sent?.headers).get("Authorization")).toBeNull();
+    expect(sent?.credentials).not.toBe("include");
+    expect(authHeaders).toEqual([null]);
+  });
+
+  it("uses the brand's API base URL and the clock", () => {
+    const d = deps();
+    expect(d?.apiBaseUrl).toBe(resolveBrand(import.meta.env).apiBaseUrl);
+    expect(d?.now).toBe(Date.now);
+  });
+
+  it("resolves the simulator trust in a dev build", () => {
+    vi.stubEnv("MODE", "development");
+    expect(deps()?.trust).toEqual(resolveAttestationTrust({}, "development"));
+    expect(deps()?.trust.release).toBe(false);
+  });
+
+  it("resolves the configured trust in a release build", () => {
+    vi.stubEnv("MODE", "release");
+    for (const [key, value] of Object.entries(releaseEnv)) vi.stubEnv(key, value);
+    expect(deps()?.trust).toEqual({
+      issuer: "https://issuer.example",
+      jwksUrl: "https://issuer.example/jwks",
+      imageDigests: ["sha256:aa", "sha256:bb"],
+      release: true,
+    });
+  });
+
+  it("is not configured in a release build without attestation variables", () => {
+    vi.stubEnv("MODE", "release");
+    for (const key of Object.keys(releaseEnv)) vi.stubEnv(key, "");
+    expect(deps()).toBeNull();
   });
 });
