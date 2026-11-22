@@ -146,25 +146,22 @@ describes the method. Each sample is a batch of calls lasting at least
 (the module's load plus its first seal) is one sample per page. The timings
 run on the page's main thread; the app does this work in the crypto worker.
 
-The wasm cold start was measured on the module before the attestation
-verifier was linked.
+From [run 45005794640](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/45005794640)
+of #286, started by hand, on GitHub-hosted `ubuntu-latest` runners (Ubuntu
+26.04, 4 CPUs). Each browser ran as its own job, so read each column on its
+own rather than across:
 
-From [run 44010807289](https://github.com/Code-Pause-Inc/QuackXide/actions/runs/44010807289)
-of #232, started by hand, on GitHub-hosted `ubuntu-latest` runners (Ubuntu
-26.04, 4 CPUs). Each browser ran as its own job on a different CPU, so read
-each column on its own rather than across:
-
-| | Chromium 158.0.8127.18 | Firefox 159.0 | WebKit 27.2 |
+| | Chromium 159.0.8154.6 | Firefox 159.0 | WebKit 27.2 |
 | --- | --- | --- | --- |
-| CPU | AMD EPYC 9V45 | Intel Xeon 6975P-C | Intel Xeon 6973P-C |
-| `encryptPayload` 4 KiB, p50 / p99 | 6.65 / 8.31 µs | 37.8 / 58.3 µs | 35.2 / 53.4 µs |
-| `encryptPayload` 4 MiB, p50 / p99 | 4.58 / 12.3 ms | 5.56 / 6.28 ms | 1.19 / 1.58 ms |
-| Wasm cold start (load + first seal) | 6.6 ms | 7 ms | 11 ms |
+| CPU | AMD EPYC 7763 | AMD EPYC 7763 | AMD EPYC 9V74 |
+| `encryptPayload` 4 KiB, p50 / p99 | 9.6 / 12.7 µs | 65.8 / 86 µs | 32 / 39.1 µs |
+| `encryptPayload` 4 MiB, p50 / p99 | 6.19 / 11.6 ms | 7.29 / 8.79 ms | 0.927 / 1.1 ms |
+| Wasm cold start (load + first seal) | 16.1 ms | 26 ms | 21 ms |
 
-Not yet measured with the attestation verifier linked; the browser job
-prints `wasm envelope module: N bytes, M gzipped`.
+The wasm envelope module, with the enclave evidence checks linked, is
+901 598 bytes, 306 648 gzipped.
 
-* Chromium's 4 MiB p99 is 2.7× its p50, so that run was noisy; take another
+* Chromium's 4 MiB p99 is 1.9× its p50, so that run was noisy; take another
   run before setting a target from it.
 * Firefox and WebKit report `performance.now()` to 1 ms, so their cold
   starts carry about ±1 ms, and each is a single sample.
