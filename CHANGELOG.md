@@ -385,6 +385,9 @@ uses [Semantic Versioning](https://semver.org/).
   differ answer 502 instead of 400, and a stored object that fails to
   decode, now during a scan, still answers 502. Decryption is still
   whole-object.
+* `url` 2.5.9 (RUSTSEC-2026-0592: `Url::origin()` overflowed the stack on
+  nested `blob:` URLs), in `backend/Cargo.lock` and
+  `backend/fuzz/Cargo.lock`. No backend code calls `Url::origin()`.
 * The admin connector toggle route,
   `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
   (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
