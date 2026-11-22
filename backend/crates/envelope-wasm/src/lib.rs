@@ -22,6 +22,9 @@ use platform_crypto::{
 
 /// The one suite the browser seals with until P36.
 const SUITE: EnvelopeSuite = EnvelopeSuite::Hpk1;
+use platform_enclave::bundle::{AttestationBundle, VerifiedBundle, verify_bundle};
+use platform_enclave::config::ConfigPolicy;
+use platform_enclave::token::{BROWSER_ATTESTATION_AUDIENCE, JwkSet, ReleasePolicy, TokenVerifier};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroize;
 
@@ -141,6 +144,41 @@ pub fn research_query_binding(
     info::research_query_binding(grant_id, request_nonce, sql, schema_version.as_deref())
 }
 
+/// Run the evidence checks (ADR 0010) on an `/api/v1/attestation` bundle
+/// against a 32-byte `challenge` and the attestation key set. `release`
+/// picks the release configuration policy, otherwise the simulator's.
+pub fn verify_attestation(
+    bundle_json: &str,
+    challenge: &[u8],
+    jwks_json: &str,
+    issuer: &str,
+    image_digests: Vec<String>,
+    release: bool,
+) -> Result<VerifiedBundle, String> {
+    let bundle: AttestationBundle =
+        serde_json::from_str(bundle_json).map_err(|_| "malformed attestation bundle".to_owned())?;
+    let challenge: &[u8; 32] = challenge
+        .try_into()
+        .map_err(|_| "the challenge must be 32 bytes".to_owned())?;
+    let key_set_error = |detail: &dyn std::fmt::Display| format!("attestation key set: {detail}");
+    let jwks: JwkSet = serde_json::from_str(jwks_json).map_err(|e| key_set_error(&e))?;
+    let verifier = TokenVerifier::new(
+        &jwks,
+        issuer,
+        BROWSER_ATTESTATION_AUDIENCE,
+        ReleasePolicy {
+            allowed_image_digests: image_digests,
+        },
+    )
+    .map_err(|e| key_set_error(&e))?;
+    let policy = if release {
+        ConfigPolicy::RELEASE
+    } else {
+        ConfigPolicy::SIMULATOR
+    };
+    verify_bundle(&bundle, challenge, &verifier, policy).map_err(|e| e.to_string())
+}
+
 // ── wasm exports ─────────────────────────────────────────────────────────────
 //
 // Error messages are `CryptoError`'s, which carry no key material or data.
@@ -217,6 +255,29 @@ pub fn research_query_binding_js(
 #[wasm_bindgen(js_name = researchResultInfo)]
 pub fn research_result_info_js(researcher_tenant: &str, query: &str) -> Result<Vec<u8>, JsError> {
     research_result_info(researcher_tenant, query).map_err(js_error)
+}
+
+/// The verified bundle as JSON (`VerifiedBundle`'s fields); the error is the
+/// refusal's message, which names a check and carries no token contents.
+#[wasm_bindgen(js_name = verifyAttestation)]
+pub fn verify_attestation_js(
+    bundle_json: &str,
+    challenge: &[u8],
+    jwks_json: &str,
+    issuer: &str,
+    image_digests: Vec<String>,
+    release: bool,
+) -> Result<String, JsError> {
+    let verified = verify_attestation(
+        bundle_json,
+        challenge,
+        jwks_json,
+        issuer,
+        image_digests,
+        release,
+    )
+    .map_err(|message| JsError::new(&message))?;
+    serde_json::to_string(&verified).map_err(|e| JsError::new(&e.to_string()))
 }
 
 #[cfg(test)]
@@ -298,5 +359,113 @@ mod tests {
         assert!(connector_object_info("t", "c", "").is_err());
         assert!(snapshot_manifest_info("t|", "c", "v").is_err());
         assert!(research_result_info("t", "q|").is_err());
+    }
+
+    mod attestation {
+        use super::super::*;
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use platform_enclave::simulated_token::{
+            SIMULATED_IMAGE_DIGEST, SimulatedClaims, TokenSigner,
+        };
+        use platform_enclave::token::BROWSER_ATTESTATION_AUDIENCE;
+        use serde_json::Value;
+        use std::time::Duration;
+
+        const VECTORS: &str = include_str!("../../../../fixtures/attestation/bundles.json");
+        const ISSUER: &str = "http://sim-attestation:8070";
+        const CHALLENGE: [u8; 32] = [9; 32];
+
+        /// The vector's bundle with a token minted for `CHALLENGE`, and the
+        /// key set that verifies it.
+        fn minted(name: &str) -> (String, String) {
+            let vectors: Value = serde_json::from_str(VECTORS).expect("vectors");
+            let entry = &vectors["bundles"][name];
+            let env = serde_json::from_value(entry["env"].clone()).expect("env");
+            let signer = TokenSigner::generate(
+                ISSUER,
+                SimulatedClaims {
+                    env,
+                    ..SimulatedClaims::default()
+                },
+            );
+            let nonces = [
+                B64URL.encode(CHALLENGE),
+                entry["binding_nonce"].as_str().expect("nonce").to_owned(),
+            ];
+            let token = signer.sign(
+                BROWSER_ATTESTATION_AUDIENCE,
+                &nonces,
+                Duration::from_secs(600),
+            );
+            let mut bundle = entry["bundle"].clone();
+            bundle["token"] = Value::String(token);
+            (
+                bundle.to_string(),
+                serde_json::to_string(&signer.jwks()).expect("jwks"),
+            )
+        }
+
+        fn verify(name: &str, challenge: &[u8], release: bool) -> Result<VerifiedBundle, String> {
+            let (bundle, jwks) = minted(name);
+            verify_attestation(
+                &bundle,
+                challenge,
+                &jwks,
+                ISSUER,
+                vec![SIMULATED_IMAGE_DIGEST.to_owned()],
+                release,
+            )
+        }
+
+        #[test]
+        fn verifies_a_bound_bundle() {
+            let key_id = serde_json::from_str::<Value>(VECTORS).expect("vectors")["bundles"]
+                ["bound"]["bundle"]["key_id"]
+                .as_str()
+                .expect("key id")
+                .to_owned();
+            let v = verify("bound", &CHALLENGE, false).expect("verifies");
+            assert_eq!(v.key_id, key_id);
+        }
+
+        #[test]
+        fn release_refuses_a_loosened_configuration() {
+            let err = verify("loosened", &CHALLENGE, true).expect_err("refused");
+            assert!(err.starts_with("check 5 (configuration)"), "{err}");
+            verify("loosened", &CHALLENGE, false).expect("the simulator allows it");
+        }
+
+        #[test]
+        fn an_html_key_set_is_refused() {
+            let (bundle, _) = minted("bound");
+            let err = verify_attestation(&bundle, &CHALLENGE, "<html>", ISSUER, vec![], false)
+                .expect_err("refused");
+            assert!(err.starts_with("attestation key set"), "{err}");
+        }
+
+        #[test]
+        fn an_hpk1_request_key_is_refused() {
+            let err = verify("hpk1", &CHALLENGE, false).expect_err("refused");
+            assert!(err.contains("No downgrade"), "{err}");
+        }
+
+        #[test]
+        fn a_short_challenge_is_refused() {
+            assert_eq!(
+                verify("bound", &CHALLENGE[..31], false).expect_err("refused"),
+                "the challenge must be 32 bytes"
+            );
+        }
+
+        #[test]
+        fn a_malformed_bundle_is_refused() {
+            let (_, jwks) = minted("bound");
+            assert_eq!(
+                verify_attestation("{}", &CHALLENGE, &jwks, ISSUER, vec![], false)
+                    .expect_err("refused"),
+                "malformed attestation bundle"
+            );
+        }
     }
 }

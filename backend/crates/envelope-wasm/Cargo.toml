@@ -17,14 +17,18 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Envelopes and `info` strings only: no AEAD helpers, blind indexes or TOTP.
 platform-crypto = { path = "../platform-crypto", default-features = false }
+platform-enclave = { path = "../platform-enclave" }
+serde_json.workspace = true
 wasm-bindgen.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom.workspace = true
+# rand 0.8 in platform-enclave needs getrandom 0.2's browser backend.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 base64.workspace = true
 rand.workspace = true
 rand_core.workspace = true
-serde_json.workspace = true
+platform-enclave = { path = "../platform-enclave", features = ["simulated"] }
