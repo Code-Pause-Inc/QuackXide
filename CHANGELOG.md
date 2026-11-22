@@ -72,6 +72,15 @@ uses [Semantic Versioning](https://semver.org/).
   reports only. `docs/BENCHMARKS.md` records the baseline (about 50 MiB/s,
   a module peak of three times the payload, 31.8 KiB brotli-compressed)
   and the largest payload one seal can take (about 1.33 GiB).
+* The researcher's browser verifies the enclave (ADR 0010; part of P85, #239
+  part 1). `envelope-wasm` exports `verifyAttestation`, the five checks of
+  `platform_enclave::bundle::verify_bundle`, and the crypto worker's
+  `verifyEnclave` fetches the attestation bundle and the issuer's key set,
+  verifies them and keeps the enclave in worker memory until its token
+  nears expiry. Release builds take their trust values from
+  `VITE_ATTESTATION_ISSUER`, `VITE_ATTESTATION_JWKS_URL` and
+  `VITE_ATTESTATION_IMAGE_DIGESTS` and are refused without them. Sealing
+  the query to the verified key follows.
 * The base for sealed research queries and results (ADR 0010; part of P85
   and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
   together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must

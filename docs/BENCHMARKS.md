@@ -158,7 +158,9 @@ each column on its own rather than across:
 | `encryptPayload` 4 MiB, p50 / p99 | 4.58 / 12.3 ms | 5.56 / 6.28 ms | 1.19 / 1.58 ms |
 | Wasm cold start (load + first seal) | 6.6 ms | 7 ms | 11 ms |
 
-The wasm envelope module is 97 838 bytes, 39 200 gzipped.
+The wasm envelope module's size, now with the attestation verifier, awaits
+this change's CI run: the browser job prints `wasm envelope module: N bytes,
+M gzipped`.
 
 * Chromium's 4 MiB p99 is 2.7× its p50, so that run was noisy; take another
   run before setting a target from it.
