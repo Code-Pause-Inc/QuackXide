@@ -8,6 +8,36 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Browser envelope seal benchmark (P34 checkpoint A, #171).
+  `scripts/bench-wasm-seal.sh` seals synthetic Parquet from `synth-data`
+  at about 1 MiB, 100 MiB and 1 GiB with the wasm module in a Chromium
+  worker and reports seal time, the module's peak memory, module load time
+  and bundle size. The `bench` workflow's `wasm-seal` job runs it and
+  reports only. `docs/BENCHMARKS.md` records the baseline (about 50 MiB/s,
+  a module peak of three times the payload, 31.8 KiB brotli-compressed)
+  and the largest payload one seal can take (about 1.33 GiB).
+* The base for sealed research queries and results (ADR 0010; part of P85
+  and P55). `platform-crypto` signs results with Ed25519 and ML-DSA-65
+  together (`ResultSigningKey`, `ResultVerifyingKeys`; both signatures must
+  verify) and gains the `research_query` `info` string and the query
+  binding that `research_result` takes, pinned in `fixtures/envelope/hpk1.json`
+  and exposed by the wasm module. `platform-enclave`'s binding v2
+  (`EnclaveKeyBinding`) replaces the fixed 32-byte fields of
+  `ReportDataBinding` with labelled, length-prefixed values. The enclave's
+  key set (`EnclaveIdentity`) is an `HPK2` request key, whose private half
+  now exists in every build, and a result-signing key, with a `key_id`.
+  `GET /api/v1/attestation` takes the caller's nonce as `?nonce=` (32
+  bytes, base64url; 400 when missing or malformed, instead of a nonce the
+  server chose) and returns ADR 0010's evidence bundle, and the key-release
+  stand-in checks binding v2 and refuses a request key that is not `HPK2`
+  (audited as `crypto.suite_refused`). A key-release request carries every
+  bound value, the KMS public key included, with its byte fields in
+  base64url as ADR 0010 sets out. The sealed-query wire types are
+  defined, with result signatures (`SignatureWire`) a type apart from the
+  signing keys; nothing routes to them yet. The public evidence token carries
+  the audience `urn:platform:browser-attestation`, which key release
+  refuses, so a caller who fetches it cannot open key release.
+  ADR 0005 and ADR 0010 are accepted.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -18,7 +48,7 @@ uses [Semantic Versioning](https://semver.org/).
   is refused without a token (401), outside the upload namespace (404) and
   at a stale version (409), that an approval retry after a revoke is
   refused (404), and, after the upload and again after the queries, that
-  the vault holds exactly the upload's object and manifest as `HPK1`
+  the vault holds exactly the upload's object and manifest as `HPK2`
   envelopes and its record, whose row cap and schema are the ones the
   steward declared. The compose stack no longer passes `DEMO_TENANT_*` to
   `enclave-api`. The API tests seal uploads with the same code
@@ -75,6 +105,14 @@ uses [Semantic Versioning](https://semver.org/).
   browsers (`npm run test:browser`, Playwright); `npm test` is unchanged.
   The `browser` workflow runs Chromium on every pull request and Chromium,
   Firefox and WebKit on `main` and nightly.
+* Engine query benchmarks and a regression check (P73, #185). Criterion
+  times two research-style queries in `quackxide-engine` over `synth-data`
+  tables of 10 000 to 1 000 000 rows. On pull requests the `bench` workflow
+  benchmarks the base commit and the head in one job, and
+  `scripts/bench-compare.sh` flags a benchmark whose whole 95 % interval is
+  more than 10 % slower as a warning in the job summary; the job fails only
+  when the comparison cannot run. `docs/BENCHMARKS.md` records the targets
+  for the hybrid suite and the engine.
 * Benchmarks (P73, #185). A criterion harness in `platform-crypto` times
   key generation and envelope seal and open for `HPK1` and `HPK2` at 32 B,
   4 KiB and 4 MiB, and a unit test pins each suite's envelope overhead
@@ -256,6 +294,22 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* `POST /api/v1/grants` no longer drops its `query_budget` when the grant
+  exists. An active grant that already has a budget is refused with 409
+  and audited; the body says to raise the budget with
+  `POST /api/v1/grants/{grant_id}/budget`. A revoked grant is re-activated
+  first, audited as `reactivated` at once (by a re-grant or an approval),
+  and keeps its budget: the re-grant's `query_budget` is added on top, and
+  nothing when it is omitted. If that funding fails, the grant stays
+  active with its old budget; a retry is refused if the grant had a budget
+  and funds it otherwise, so nothing is added twice or dropped. Every
+  top-up that raises the limit on a grant path (a re-grant or a follow-up
+  approval) emits `research.budget`. A grant with no budget entry (a
+  failed approval) is funded by the next direct grant. `BudgetLedger::top_up_once` now
+  creates a missing entry in the same step, so a failed approval leaves no
+  placeholder. Direct grants, approvals (from recording the decision),
+  top-ups and revokes are serialized, so two at once cannot drop a budget
+  and a revoke cannot land mid-grant (#235).
 * A follow-up access request's approval adds its query budget to the
   existing grant instead of being dropped, and a retry of the same
   approval adds nothing (`BudgetLedger::top_up_once`). A retry of an
@@ -324,9 +378,13 @@ uses [Semantic Versioning](https://semver.org/).
   uncompressed bytes the footers report for its columns, summed over the
   query's scans, must fit `QUERY_MAX_DECODED_ROWS` and
   `QUERY_MAX_DECODED_MIB`, where the whole table's footers had to fit
-  before. Objects of one snapshot whose columns differ answer 502 instead
-  of 400, and a stored object that fails to decode, now during a scan,
-  still answers 502. Decryption is still whole-object.
+  before, and the Arrow memory the scans decode to, summed over them, is
+  counted against `QUERY_MAX_DECODED_MIB` as each batch decodes. A
+  refusal that registration gave for decoded bytes now comes from the
+  query that reads the columns. Objects of one snapshot whose columns
+  differ answer 502 instead of 400, and a stored object that fails to
+  decode, now during a scan, still answers 502. Decryption is still
+  whole-object.
 * The admin connector toggle route,
   `POST /admin/tenants/{tenant_id}/connectors/{slug}`, answers 503
   (`connector_toggles_disabled`) unless `FEATURE_ADMIN_CONNECTOR_TOGGLES`
@@ -342,6 +400,17 @@ uses [Semantic Versioning](https://semver.org/).
   0.5, so `backend/deny.toml` no longer ignores RUSTSEC-2026-0387.
   `jsonwebtoken` 12 refuses an empty HMAC secret: minting with one fails,
   and `JwtVerifier::hs256` built from one rejects every token.
+* The decoded-size limit (`QUERY_MAX_DECODED_MIB`) also counts the Arrow
+  memory of each batch as it decodes, not only the sizes Parquet footers
+  report, which understate dictionary- and run-length-encoded columns: a
+  small upload whose strings decode a thousandfold is now refused (422)
+  instead of decoding past the limit. String and binary columns decode as
+  view arrays and are measured before they expand, so a value the file's
+  dictionary repeats is refused before it is copied once per row; a
+  column the file declares as a dictionary is rebuilt as one, and
+  fixed-width columns are checked from their widths before each batch. A
+  dataset whose decoded columns take more memory than its footers state
+  can now be refused where it was accepted before.
 * `backend/deny.toml` records why RUSTSEC-2026-0542, -0543 and -0555
   (`humantime`, `chrono` and `chrono-tz` declared unmaintained, with no
   fixed release) do not fail the dependency audit: they report

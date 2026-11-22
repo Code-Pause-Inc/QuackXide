@@ -111,7 +111,7 @@ input": round-trips, and "arbitrary input is never accepted". Rust uses
 
 ### Frontend tests
 
-`frontend/vite.config.ts` defines three vitest projects. The `node` project
+`frontend/vite.config.ts` defines four vitest projects. The `node` project
 runs `*.test.ts` and has no DOM. The `dom` project runs `*.test.tsx` under
 jsdom with `src/test/setup.ts`. Run both with `npm test` from `frontend/`.
 
@@ -128,6 +128,11 @@ npx playwright install chromium firefox webkit   # once
 npm run test:browser                              # Chromium
 BROWSERS=chromium,firefox,webkit npm run test:browser
 ```
+
+The `seal` project runs `*.browser.perf.ts` in headless Chromium: the
+wasm envelope seal benchmark, which needs generated data, so run it through
+`scripts/bench-wasm-seal.sh` (`docs/BENCHMARKS.md`). `npm test`,
+`npm run test:browser` and `npm run bench:browser` never run it.
 
 The full browser lifecycle against the API is not covered yet; see
 [Acceptance tests](#acceptance-tests-for-definition-of-done-items-1-3).
@@ -163,8 +168,8 @@ results. Recorded numbers belong in `docs/BENCHMARKS.md`.
 
 `fixtures/envelope/` holds the vectors that keep the browser and the backend
 on one envelope format. `hpk1.json` (test-only recipient keys derived from
-published seeds, enrollment keys, `info` strings, and envelopes that open or
-must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
+published seeds, enrollment keys, `info` strings, research-query bindings,
+and envelopes that open or must fail) is written by `backend/crates/envelope-wasm/tests/vectors.rs`,
 which fails when the file and its generator disagree; regenerate with
 `UPDATE_ENVELOPE_VECTORS=1 cargo test -p envelope-wasm --test vectors`.
 `hpk1-browser-sealed.json` holds envelopes sealed by the wasm module

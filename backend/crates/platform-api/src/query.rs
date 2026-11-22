@@ -265,17 +265,13 @@ impl ConnectorQueryService {
         self
     }
 
-    /// Produce an [`AttestationBundle`] binding `nonce` and this enclave's
-    /// ephemeral public keys (`GET /api/v1/attestation`).
+    /// Produce an [`AttestationBundle`] whose token binds `nonce` and this
+    /// enclave's key set (binding v2, ADR 0010) (`GET /api/v1/attestation`).
     pub async fn attestation_bundle(&self, nonce: [u8; 32]) -> Result<AttestationBundle, ApiError> {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::STANDARD as B64;
-
-        let binding = self.identity.binding_for_nonce(nonce);
-        let report_data = binding.to_report_data();
+        let report_data = self.identity.binding().report_data(&nonce);
         let evidence = self
             .attestation
-            .produce_evidence(&report_data)
+            .produce_browser_evidence(&report_data)
             .await
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
@@ -283,18 +279,10 @@ impl ConnectorQueryService {
             return Err(ApiError::AttestationUnavailable);
         }
         self.attestation
-            .verify_evidence(&evidence, &report_data)
+            .verify_browser_evidence(&evidence, &report_data)
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
-        Ok(AttestationBundle {
-            platform: platform_label(evidence.platform).to_owned(),
-            nonce_b64: B64.encode(nonce),
-            token: evidence.token,
-            enclave_hpke_public_key_b64: B64.encode(self.identity.enclave_hpke_public_key()),
-            result_signing_public_key_b64: B64.encode(self.identity.result_signing_public_key()),
-            tls_cert_sha256_b64: B64.encode(self.identity.tls_cert_sha256()),
-            config_digest_b64: B64.encode(self.identity.config_digest()),
-        })
+        Ok(AttestationBundle::new(&self.identity, evidence.token))
     }
 
     /// Enable research queries, which check grants and charge budgets

@@ -20,18 +20,25 @@
 //!
 //! A scope enforces its share of the [`QueryLimits`]: the footers of the
 //! columns a query reads must fit the decode limits before any of them is
-//! decoded, operators run in a fixed memory pool with nothing spilled to
-//! disk, and a result over the row or byte limit is refused, never
+//! decoded, and the Arrow memory they decode to is counted again as each
+//! batch decodes. Operators run in a fixed memory pool with nothing spilled
+//! to disk, and a result over the row or byte limit is refused, never
 //! truncated.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BinaryViewArray, DictionaryArray, GenericByteViewArray, Int32Array,
+    RecordBatch, RecordBatchOptions, StringViewArray,
+};
+use arrow::buffer::ScalarBuffer;
+use arrow::compute::{CastOptions, cast_with_options};
+use arrow::datatypes::{ByteViewType, DataType, FieldRef, Int32Type, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::catalog::{Session, TableProvider};
@@ -333,10 +340,17 @@ impl QueryScope {
     /// columns, summed over the query's scans (a table read twice counts
     /// twice), must fit [`QueryLimits::max_decoded_rows`] and
     /// [`QueryLimits::max_decoded_bytes`], since the memory pool does not
-    /// track decoded columns. Decoding is synchronous, so these limits also
-    /// bound how long it runs. A refusal is [`QueryError::LimitExceeded`]; a
-    /// stored object that fails to decode is [`QueryError::Parquet`], never
-    /// an error in the caller's SQL.
+    /// track decoded columns. The Arrow memory the scans decode to, summed
+    /// over them, is counted against the byte limit again as each batch
+    /// decodes, since a footer understates a column that dictionary or
+    /// run-length encoding shrinks. Each batch is measured before it
+    /// expands, its fixed-width columns from their widths and its string and
+    /// binary columns from their views, so the decoded columns can pass the
+    /// byte limit only by the list columns of the batch that crosses it, and
+    /// its strings inside a struct. Decoding is synchronous, so these limits
+    /// also bound how long it runs. A refusal is
+    /// [`QueryError::LimitExceeded`]; a stored object that fails to decode is
+    /// [`QueryError::Parquet`], never an error in the caller's SQL.
     ///
     /// Dropping the returned future stops the plan at its next batch
     /// boundary: every operator yields to the runtime as it produces batches
@@ -557,7 +571,9 @@ impl ParquetTable {
     /// order the scan asks for them) as batches of `schema`, one partition
     /// per object. Nothing is decoded until `budget` has taken the rows the
     /// footers report and the uncompressed bytes they report for these
-    /// columns.
+    /// columns. Each batch is then measured against the budget's decoded
+    /// bytes before it expands, and the Arrow memory it holds is taken from
+    /// them once it has.
     fn decode(
         &self,
         columns: &[usize],
@@ -581,14 +597,45 @@ impl ParquetTable {
         });
         budget.take(self.rows, bytes)?;
 
+        // The columns as the reader returns them, in file order, with the
+        // file's own types: what each batch is measured and cast back to.
+        let read_schema = Arc::new(
+            self.schema
+                .project(&roots)
+                .map_err(|_| ScanFault::Parquet(ParquetStage::Reader))?,
+        );
+        // Fixed-width columns take this many bytes a row, which a
+        // dictionary-encoded page can expand to before any batch is
+        // counted, so each batch is checked before it is decoded.
+        let row_width = read_schema
+            .fields()
+            .iter()
+            .map(|field| fixed_width(field.data_type()))
+            .fold(0u64, u64::saturating_add);
+
         let mut partitions = Vec::with_capacity(self.objects.len());
         let mut decoded = 0u64;
         for object in &self.objects {
+            // Rows the reader will produce, its row groups' counts, and no
+            // more: it stops there whatever the pages hold.
+            let mut rows_left = object.group_rows;
+            let mut reader = object.reader(&roots, rows_left)?;
             let mut object_rows = 0u64;
             let mut batches = Vec::new();
-            for batch in object.reader(&roots)? {
+            loop {
+                let next_rows = rows_left.min(DECODE_BATCH_ROWS as u64);
+                budget.fits_decoded(row_width.saturating_mul(next_rows))?;
+                let Some(batch) = reader.next() else {
+                    break;
+                };
                 let batch = batch.map_err(|_| ScanFault::Parquet(ParquetStage::Batch))?;
                 let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
+                // A batch larger than the one just checked would outrun the
+                // check.
+                if rows > next_rows {
+                    return Err(ScanFault::Parquet(ParquetStage::Batch));
+                }
+                rows_left -= rows;
                 object_rows = object_rows.saturating_add(rows);
                 decoded = decoded.saturating_add(rows);
                 // Decoded rows are counted again: past the declared cap the
@@ -601,6 +648,12 @@ impl ParquetTable {
                 if object_rows > object.rows {
                     return Err(ScanFault::Parquet(ParquetStage::Batch));
                 }
+                let batch = expand_views(&batch, &read_schema, budget.decoded_left())?;
+                // Buffer capacity, so shared or spare capacity counts too:
+                // this can only overstate the columns.
+                budget.take_decoded(
+                    u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
+                )?;
                 let arrays = order
                     .iter()
                     .map(|&position| batch.columns().get(position).cloned())
@@ -658,8 +711,10 @@ struct ParquetObject {
     /// The footer, parsed without its column statistics (whose minimum and
     /// maximum are values from the data), and the Arrow schema it gives.
     footer: ArrowReaderMetadata,
-    /// Rows the footer reports.
+    /// Rows the footer reports ([`footer_rows`]).
     rows: u64,
+    /// Rows its row groups report, summed: what the reader produces.
+    group_rows: u64,
 }
 
 impl ParquetObject {
@@ -671,10 +726,18 @@ impl ParquetObject {
         let footer = ArrowReaderMetadata::load(&bytes, options)
             .map_err(|_| QueryError::Parquet(ParquetStage::Metadata))?;
         let rows = footer_rows(footer.metadata())?;
+        // `footer_rows` has checked every count is non-negative.
+        let group_rows = footer
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|group| u64::try_from(group.num_rows()).unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
         Ok(Self {
             bytes,
             footer,
             rows,
+            group_rows,
         })
     }
 
@@ -702,31 +765,48 @@ impl ParquetObject {
         bytes
     }
 
-    /// A reader of the root columns `roots` (sorted) and no others.
-    fn reader(&self, roots: &[usize]) -> Result<ParquetRecordBatchReader, ScanFault> {
+    /// A reader of the root columns `roots` (sorted) and no others, in
+    /// batches of [`DECODE_BATCH_ROWS`], that stops after `limit` rows. It
+    /// reads from the footer already parsed, under [`view_hint`], so string
+    /// and binary columns decode as views.
+    fn reader(&self, roots: &[usize], limit: u64) -> Result<ParquetRecordBatchReader, ScanFault> {
+        let fault = |_| ScanFault::Parquet(ParquetStage::Reader);
         let descr = self.footer.metadata().file_metadata().schema_descr();
         let root_columns = descr.root_schema().get_fields().len();
         if roots.iter().any(|&root| root >= root_columns) {
             return Err(ScanFault::Parquet(ParquetStage::Reader));
         }
         let mask = ProjectionMask::roots(descr, roots.iter().copied());
-        ParquetRecordBatchReaderBuilder::new_with_metadata(self.bytes.clone(), self.footer.clone())
+        let options = ArrowReaderOptions::new().with_schema(view_hint(self.schema()));
+        let footer = ArrowReaderMetadata::try_new(Arc::clone(self.footer.metadata()), options)
+            .map_err(fault)?;
+        ParquetRecordBatchReaderBuilder::new_with_metadata(self.bytes.clone(), footer)
             .with_projection(mask)
+            .with_batch_size(DECODE_BATCH_ROWS)
+            .with_limit(usize::try_from(limit).unwrap_or(usize::MAX))
             .build()
-            .map_err(|_| ScanFault::Parquet(ParquetStage::Reader))
+            .map_err(fault)
     }
 }
 
-/// What the table scans of one query may decode, as the footers report it:
-/// every row, and the uncompressed bytes of the columns each scan reads,
-/// summed over the query's scans. [`QueryScope::sql`] gives each query its
-/// own, in the session config its scans see.
+/// What the table scans of one query may decode, summed over the query's
+/// scans: every row and the uncompressed bytes of the columns each scan
+/// reads, as the footers report them, and, counted apart against the same
+/// byte limit, the Arrow memory those columns decode to. [`QueryScope::sql`]
+/// gives each query its own, in the session config its scans see.
 #[derive(Debug)]
 struct DecodeBudget {
     max_rows: u64,
     max_bytes: u64,
-    /// Rows and bytes the query's scans have taken.
-    taken: Mutex<(u64, u64)>,
+    taken: Mutex<Taken>,
+}
+
+/// What a query's scans have taken from its [`DecodeBudget`].
+#[derive(Debug, Default)]
+struct Taken {
+    rows: u64,
+    footer_bytes: u64,
+    decoded_bytes: u64,
 }
 
 impl DecodeBudget {
@@ -734,22 +814,54 @@ impl DecodeBudget {
         Self {
             max_rows: limits.max_decoded_rows,
             max_bytes: limits.max_decoded_bytes,
-            taken: Mutex::new((0, 0)),
+            taken: Mutex::new(Taken::default()),
         }
     }
 
-    /// Takes one scan's `rows` and `bytes`, or refuses the scan if the
-    /// query's scans would then pass either decode limit.
+    fn taken(&self) -> std::sync::MutexGuard<'_, Taken> {
+        self.taken.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes one scan's `rows` and footer `bytes`, or refuses the scan if
+    /// the query's scans would then pass either decode limit.
     fn take(&self, rows: u64, bytes: u64) -> Result<(), ScanFault> {
-        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
-        let total = (taken.0.saturating_add(rows), taken.1.saturating_add(bytes));
-        if total.0 > self.max_rows {
+        let mut taken = self.taken();
+        let rows = taken.rows.saturating_add(rows);
+        let bytes = taken.footer_bytes.saturating_add(bytes);
+        if rows > self.max_rows {
             return Err(ScanFault::Limit(QueryLimit::DecodedRows));
         }
-        if total.1 > self.max_bytes {
+        if bytes > self.max_bytes {
             return Err(ScanFault::Limit(QueryLimit::DecodedBytes));
         }
-        *taken = total;
+        taken.rows = rows;
+        taken.footer_bytes = bytes;
+        Ok(())
+    }
+
+    /// Decoded bytes the query's scans may still take.
+    fn decoded_left(&self) -> u64 {
+        self.max_bytes.saturating_sub(self.taken().decoded_bytes)
+    }
+
+    /// Refuses the scan unless `bytes` more decoded bytes would fit,
+    /// without taking them.
+    fn fits_decoded(&self, bytes: u64) -> Result<(), ScanFault> {
+        if bytes > self.decoded_left() {
+            return Err(ScanFault::Limit(QueryLimit::DecodedBytes));
+        }
+        Ok(())
+    }
+
+    /// Takes `bytes` of decoded Arrow memory, or refuses the scan if the
+    /// query's scans would then hold more than the byte limit.
+    fn take_decoded(&self, bytes: u64) -> Result<(), ScanFault> {
+        let mut taken = self.taken();
+        let decoded = taken.decoded_bytes.saturating_add(bytes);
+        if decoded > self.max_bytes {
+            return Err(ScanFault::Limit(QueryLimit::DecodedBytes));
+        }
+        taken.decoded_bytes = decoded;
         Ok(())
     }
 }
@@ -893,6 +1005,280 @@ fn footer_rows(metadata: &ParquetMetaData) -> Result<u64, QueryError> {
     Ok(rows.max(file_rows))
 }
 
+/// Rows per decoded batch: the Parquet reader's default. Each batch is
+/// checked against [`QueryLimits::max_decoded_bytes`] before it expands:
+/// its fixed-width columns from their widths ([`fixed_width`]) before the
+/// reader decodes it, and its string and binary columns from their views
+/// ([`expand_views`]). A list column, or a string or binary column inside a
+/// struct, is counted only once decoded. The pages themselves are not
+/// bounded here: a page decompresses whole, to the size its own header
+/// states, and a `DELTA_BYTE_ARRAY` page rebuilds each value from its
+/// predecessor's prefix, so it can copy up to its own size once per row.
+const DECODE_BATCH_ROWS: usize = 1024;
+
+/// Bytes a row of a column of this type takes whatever its values: its
+/// fixed-width data, including fixed-size binary and lists and structs of
+/// them. Zero for a variable-width column, which is measured otherwise, and
+/// for booleans, a bit a row.
+fn fixed_width(data_type: &DataType) -> u64 {
+    match data_type {
+        DataType::FixedSizeBinary(width) => u64::try_from(*width).unwrap_or(0),
+        DataType::FixedSizeList(item, length) => u64::try_from(*length)
+            .unwrap_or(0)
+            .saturating_mul(fixed_width(item.data_type())),
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| fixed_width(field.data_type()))
+            .fold(0u64, u64::saturating_add),
+        // The reader may decode a dictionary's values a row each before it
+        // packs them, so both count.
+        DataType::Dictionary(keys, values) => fixed_width(keys).saturating_add(fixed_width(values)),
+        other => other
+            .primitive_width()
+            .map_or(0, |width| u64::try_from(width).unwrap_or(u64::MAX)),
+    }
+}
+
+/// A top-level string or binary column, which decodes as a view first.
+fn is_plain_bytes(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+    )
+}
+
+/// The view type a top-level column decodes as: its own kind of view for a
+/// string or binary column, or for a dictionary of one (as the file's
+/// embedded Arrow schema may declare it). `None` for every other column.
+fn byte_view(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => Some(DataType::Utf8View),
+        DataType::Binary | DataType::LargeBinary => Some(DataType::BinaryView),
+        DataType::Dictionary(_, values) if is_plain_bytes(values) => byte_view(values),
+        _ => None,
+    }
+}
+
+/// The file's schema with each top-level string or binary column, plain or
+/// dictionary, read as a view array of that kind. Views point into the
+/// pages and dictionaries they came from, so a value the file's dictionary
+/// holds once is not copied once per row, even where a batch crosses into
+/// another row group or from dictionary-encoded pages to plain ones (where
+/// a dictionary array would be expanded inside the reader).
+fn view_hint(schema: &Schema) -> SchemaRef {
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|field| match byte_view(field.data_type()) {
+            Some(view) => Arc::new(field.as_ref().clone().with_data_type(view)),
+            None => field.clone(),
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// `batch`, decoded under [`view_hint`], with its view columns cast back to
+/// the file's own types (`file_schema`, the file's schema projected to the
+/// columns the batch holds), refused before anything is copied when they would
+/// take more than `budget` bytes. A plain column expands, measured from its
+/// views' lengths ([`plain_size`]). A dictionary column is rebuilt from its
+/// distinct values ([`ViewDictionary`]), measured from theirs. Either is
+/// refused as malformed when its values would need more than 32-bit
+/// offsets allow, which the cast could not represent.
+fn expand_views(
+    batch: &RecordBatch,
+    file_schema: &SchemaRef,
+    budget: u64,
+) -> Result<RecordBatch, ScanFault> {
+    let narrow = |values: &DataType| matches!(values, DataType::Utf8 | DataType::Binary);
+    let mut expanded = 0u64;
+    let mut too_long = false;
+    let mut dictionaries = Vec::with_capacity(batch.num_columns());
+    for (column, field) in batch.columns().iter().zip(file_schema.fields()) {
+        let mut dictionary = None;
+        match field.data_type() {
+            plain if is_plain_bytes(plain) => {
+                let size = plain_size(column.as_ref(), plain)?;
+                expanded = expanded.saturating_add(size);
+                too_long |= narrow(plain) && size > i32::MAX as u64;
+            }
+            DataType::Dictionary(_, values) if is_plain_bytes(values) => {
+                let distinct = ViewDictionary::new(column.as_ref())?;
+                let size = distinct.size();
+                expanded = expanded.saturating_add(size);
+                too_long |= narrow(values) && size > i32::MAX as u64;
+                dictionary = Some(distinct);
+            }
+            _ => {}
+        }
+        dictionaries.push(dictionary);
+    }
+    if expanded > budget {
+        return Err(ScanFault::Limit(QueryLimit::DecodedBytes));
+    }
+    if too_long {
+        return Err(ScanFault::Parquet(ParquetStage::Batch));
+    }
+    // An overflow, such as more distinct values than the declared key type
+    // indexes, is an error, not a null.
+    let options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(file_schema.fields())
+        .zip(dictionaries)
+        .map(|((column, field), dictionary)| match dictionary {
+            Some(dictionary) => dictionary.finish(column.as_ref(), field.data_type(), &options),
+            None if is_plain_bytes(field.data_type()) => {
+                cast_with_options(column, field.data_type(), &options)
+                    .map_err(|_| ScanFault::Parquet(ParquetStage::Batch))
+            }
+            None => Ok(column.clone()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // With no columns (`COUNT(*)`) only the row count says how many rows.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(file_schema.clone(), columns, &options)
+        .map_err(|_| ScanFault::Parquet(ParquetStage::Batch))
+}
+
+/// A view column's rows keyed by their values. Rows whose values are stored
+/// at the same place hold the same value, so each stored value is read
+/// once: a value the file's dictionary repeats is not read once per row,
+/// even where the reader lists the dictionary's buffer again, under a new
+/// index, after a plain page. Equal values stored apart, as on plain pages
+/// or in another row group's dictionary, take the same key.
+struct ViewDictionary {
+    keys: Int32Array,
+    distinct: Vec<u128>,
+}
+
+impl ViewDictionary {
+    fn new(column: &dyn Array) -> Result<Self, ScanFault> {
+        if let Some(strings) = column.as_string_view_opt() {
+            Self::of(strings)
+        } else if let Some(binary) = column.as_binary_view_opt() {
+            Self::of(binary)
+        } else {
+            Err(ScanFault::Parquet(ParquetStage::Batch))
+        }
+    }
+
+    fn of<T: ByteViewType>(array: &GenericByteViewArray<T>) -> Result<Self, ScanFault> {
+        let malformed = || ScanFault::Parquet(ParquetStage::Batch);
+        // Where a value is stored: its address and length. An inline value
+        // is stored in its own view, so it is read each row, at most 12
+        // bytes.
+        let mut by_place: HashMap<(usize, usize), i32> = HashMap::new();
+        let mut by_value: HashMap<&[u8], i32> = HashMap::new();
+        let mut distinct = Vec::new();
+        let mut keys = Vec::with_capacity(array.len());
+        for (row, view) in array.views().iter().enumerate() {
+            if array.is_null(row) {
+                keys.push(None);
+                continue;
+            }
+            let value: &[u8] = array.value(row).as_ref();
+            let place = (value.as_ptr().addr(), value.len());
+            let key = match by_place.get(&place) {
+                Some(key) => *key,
+                None => {
+                    let next = i32::try_from(distinct.len()).map_err(|_| malformed())?;
+                    let key = *by_value.entry(value).or_insert_with(|| {
+                        distinct.push(*view);
+                        next
+                    });
+                    by_place.insert(place, key);
+                    key
+                }
+            };
+            keys.push(Some(key));
+        }
+        Ok(Self {
+            keys: Int32Array::from(keys),
+            distinct,
+        })
+    }
+
+    /// Bytes the rebuilt column takes: its distinct values, an offset each,
+    /// and a key a row.
+    fn size(&self) -> u64 {
+        let values = self
+            .distinct
+            .iter()
+            // A view's low 32 bits are its value's length.
+            .map(|view| u64::from(*view as u32))
+            .fold(0u64, u64::saturating_add);
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        values
+            .saturating_add(
+                count(self.distinct.len())
+                    .saturating_add(1)
+                    .saturating_mul(8),
+            )
+            .saturating_add(count(self.keys.len()).saturating_mul(4))
+    }
+
+    /// The dictionary of `target` type: the distinct views as the values,
+    /// over `column`'s data buffers, cast to the target's value and key
+    /// types.
+    fn finish(
+        self,
+        column: &dyn Array,
+        target: &DataType,
+        options: &CastOptions,
+    ) -> Result<ArrayRef, ScanFault> {
+        let malformed = |_| ScanFault::Parquet(ParquetStage::Batch);
+        let distinct = ScalarBuffer::from(self.distinct);
+        let values: ArrayRef = if let Some(strings) = column.as_string_view_opt() {
+            Arc::new(
+                StringViewArray::try_new(distinct, strings.data_buffers().to_vec(), None)
+                    .map_err(malformed)?,
+            )
+        } else if let Some(binary) = column.as_binary_view_opt() {
+            Arc::new(
+                BinaryViewArray::try_new(distinct, binary.data_buffers().to_vec(), None)
+                    .map_err(malformed)?,
+            )
+        } else {
+            return Err(ScanFault::Parquet(ParquetStage::Batch));
+        };
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(self.keys, values).map_err(malformed)?;
+        cast_with_options(&dictionary, target, options).map_err(malformed)
+    }
+}
+
+/// Bytes a string or binary view column takes once expanded to `plain`:
+/// its values, one offset per row, and the validity bitmap. Each view
+/// records its value's length, so nothing is expanded to measure it.
+fn plain_size(column: &dyn Array, plain: &DataType) -> Result<u64, ScanFault> {
+    let views = match plain {
+        DataType::Utf8 | DataType::LargeUtf8 => column.as_string_view_opt().map(|a| a.views()),
+        DataType::Binary | DataType::LargeBinary => column.as_binary_view_opt().map(|a| a.views()),
+        _ => None,
+    }
+    .ok_or(ScanFault::Parquet(ParquetStage::Batch))?;
+    let offset_width = match plain {
+        DataType::LargeUtf8 | DataType::LargeBinary => 8,
+        _ => 4,
+    };
+    let mut size = 0u64;
+    for (row, view) in views.iter().enumerate() {
+        if column.is_valid(row) {
+            // A view's low 32 bits are its value's length.
+            size = size.saturating_add(u64::from(*view as u32));
+        }
+    }
+    let rows = u64::try_from(column.len()).unwrap_or(u64::MAX);
+    Ok(size
+        .saturating_add(rows.saturating_add(1).saturating_mul(offset_width))
+        .saturating_add(rows.div_ceil(8)))
+}
+
 /// Makes every operator yield to the runtime as it produces batches.
 ///
 /// A time limit stops a query by dropping its future, which takes effect
@@ -979,7 +1365,7 @@ impl ObjectStoreRegistry for NoObjectStores {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{Field, SchemaRef};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::execution::memory_pool::MemoryLimit;
@@ -987,7 +1373,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::streaming::PartitionStream;
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::basic::{Compression, Encoding, ZstdLevel};
     use parquet::file::properties::WriterProperties;
 
     use super::*;
@@ -1287,7 +1673,7 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let values = Arc::new(arrow::array::StringArray::from(vec!["MARKER-31337"]));
+        let values = Arc::new(StringArray::from(vec!["MARKER-31337"]));
         let parquet = parquet_of(RecordBatch::try_new(schema, vec![values]).expect("batch"));
         let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
         scope.register_parquet("t", &parquet).expect("register");
@@ -1324,6 +1710,477 @@ mod tests {
         assert!(table.upgrade().is_some());
         drop(scope);
         assert!(table.upgrade().is_none(), "the table outlived its scope");
+    }
+
+    /// One `Utf8` column `s` with `value` in each of `rows` rows,
+    /// dictionary-encoded (the writer's default) and compressed.
+    fn repeated_string_parquet(value: &str, rows: usize) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let strings = StringArray::from_iter_values(std::iter::repeat_n(value, rows));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(strings)]).expect("batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let mut parquet = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        parquet
+    }
+
+    const TOTAL_LENGTH: &str = "SELECT SUM(LENGTH(s)) AS total FROM t";
+
+    /// One kibibyte string in every one of 20,000 rows: its footer reports a
+    /// few kilobytes, and it decodes to about 20 MiB of strings. The footer
+    /// check passes it, so the decode limit must refuse a query that reads
+    /// it while the column decodes.
+    #[tokio::test]
+    async fn the_decode_limit_counts_what_decoding_produces() {
+        const ROWS: usize = 20_000;
+        let parquet = repeated_string_parquet(&"x".repeat(1024), ROWS);
+
+        // The footer understates the decoded strings a thousandfold.
+        let footer_bytes = column_bytes(&parquet);
+        assert!(footer_bytes < 256 * 1024, "{footer_bytes} bytes");
+
+        let tight = QueryLimits {
+            max_decoded_bytes: 4 * MIB,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope_with(ZkMode::Disabled, tight);
+        assert_eq!(scope.register_parquet("t", &parquet).expect("footer"), ROWS);
+        let err = scope.sql(TOTAL_LENGTH).await.expect_err("refused");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+            "{err:?}"
+        );
+
+        // Under a limit with room for the decoded strings the query runs.
+        let roomy = QueryLimits {
+            max_decoded_bytes: 64 * MIB,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope_with(ZkMode::Disabled, roomy);
+        scope.register_parquet("t", &parquet).expect("footer");
+        let rows = scope.sql_json(TOTAL_LENGTH).await.expect("fits");
+        assert_eq!(rows, serde_json::json!([{ "total": ROWS * 1024 }]));
+    }
+
+    /// The decoded memory of every scan of a query counts toward the byte
+    /// limit together: a query reading the column twice is refused where
+    /// reading it once fits, though the footers fit either way.
+    #[tokio::test]
+    async fn every_scan_of_a_query_counts_its_decoded_memory() {
+        const ROWS: usize = 20_000;
+        let parquet = repeated_string_parquet(&"x".repeat(1024), ROWS);
+        let limits = QueryLimits {
+            max_decoded_bytes: 32 * MIB,
+            ..QueryLimits::default()
+        };
+        assert!(column_bytes(&parquet) * 2 < limits.max_decoded_bytes);
+        let mut scope = scope_with(ZkMode::Disabled, limits);
+        scope.register_parquet("t", &parquet).expect("footer");
+        let rows = scope.sql_json(TOTAL_LENGTH).await.expect("one scan fits");
+        assert_eq!(rows, serde_json::json!([{ "total": ROWS * 1024 }]));
+        let twice = "SELECT SUM(LENGTH(s)) AS total \
+                     FROM (SELECT s FROM t UNION ALL SELECT s FROM t)";
+        let err = scope.sql(twice).await.expect_err("two scans");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+            "{err:?}"
+        );
+    }
+
+    /// A scan reads its columns in file order, measures them against their
+    /// own fields and hands them out in the order it was asked for, string
+    /// columns cast back to their own types. With no columns (`COUNT(*)`)
+    /// it still counts every row, gated or not.
+    #[tokio::test]
+    async fn a_scan_reads_its_columns_in_any_order() {
+        let declared = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("d", declared.clone(), false),
+        ]));
+        let dictionary: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+            ["p", "q", "p"].into_iter().collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(dictionary),
+            ],
+        )
+        .expect("batch");
+        let parquet = parquet_of(batch);
+
+        let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+        scope.register_parquet("t", &parquet).expect("register");
+        let batches = scope
+            .sql("SELECT d, s, v FROM t ORDER BY v")
+            .await
+            .expect("query");
+        let types: Vec<DataType> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+        assert_eq!(types, [declared, DataType::Utf8, DataType::Int64]);
+        let rows = batches_to_json(&batches).expect("json");
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                { "d": "p", "s": "a", "v": 1 },
+                { "d": "q", "s": "b", "v": 2 },
+                { "d": "p", "s": "c", "v": 3 },
+            ])
+        );
+
+        let count = "SELECT COUNT(*) AS n FROM t";
+        let rows = scope.sql_json(count).await.expect("count");
+        assert_eq!(rows, serde_json::json!([{ "n": 3 }]));
+        let mut gated = scope_with(ZkMode::Enabled, QueryLimits::default());
+        gated.set_disclosure(Arc::new(MinCountThreshold { k: 1 }));
+        gated.register_parquet("t", &parquet).expect("register");
+        let rows = gated.sql_json(count).await.expect("gated count");
+        assert_eq!(rows, serde_json::json!([{ "n": 3 }]));
+    }
+
+    /// A string column in which `repeats` rows hold one `big`-byte value
+    /// and, unless `row_group` splits the file, 24 distinct 1 MiB values
+    /// follow. The file's dictionary holds the repeated value once; the 24
+    /// overflow an 8 MiB dictionary page, so the rest of the chunk is written
+    /// plain. Built as a dictionary: as plain strings the rows would not fit
+    /// an Arrow array. With `arrow_schema` the file declares the column a
+    /// dictionary, as Arrow writers do by default; without it the column
+    /// reads back as ordinary strings.
+    fn repeated_value_parquet(
+        big: usize,
+        repeats: usize,
+        row_group: Option<usize>,
+        arrow_schema: bool,
+    ) -> Vec<u8> {
+        let mut values = vec!["x".repeat(big)];
+        let mut keys = vec![0i32; repeats];
+        if row_group.is_none() {
+            for (key, first) in (1..=24).zip('a'..) {
+                values.push(format!("{first}{}", "x".repeat((1 << 20) - 1)));
+                keys.push(key);
+            }
+        }
+        let strings = arrow::array::DictionaryArray::try_new(
+            arrow::array::Int32Array::from(keys),
+            Arc::new(StringArray::from(values)),
+        )
+        .expect("dictionary");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            strings.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(strings)]).expect("batch");
+        // A dictionary page larger than the writer's 1 MiB default, as any
+        // file may carry, keeps the repeated value dictionary-encoded.
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_dictionary_page_size_limit(8 << 20)
+            .set_write_batch_size(1)
+            .set_max_row_group_row_count(row_group)
+            .build();
+        let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(!arrow_schema);
+        let mut parquet = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut parquet, schema, options).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        parquet
+    }
+
+    /// A value the file's dictionary holds once, repeated until one batch of
+    /// it expands past 2 GiB, is refused from its measured size before it
+    /// expands, including where the batch crosses from the dictionary to
+    /// plain pages or into another row group. Read as a dictionary array,
+    /// either crossing expands it inside the reader, which overflows instead.
+    #[tokio::test]
+    async fn a_repeated_value_is_refused_before_it_expands() {
+        let limits = QueryLimits {
+            max_decoded_bytes: 64 * MIB,
+            ..QueryLimits::default()
+        };
+        // 1000 rows of 3 MiB, then plain pages; two row groups of 512 rows
+        // of 5 MiB.
+        let files = [
+            (repeated_value_parquet(3 << 20, 1000, None, false), 1),
+            (repeated_value_parquet(5 << 20, 1024, Some(512), false), 2),
+        ];
+        for (parquet, row_groups) in files {
+            let object = ParquetObject::read_footer(&parquet).expect("footer");
+            assert_eq!(object.footer.metadata().num_row_groups(), row_groups);
+            let footer_bytes = column_bytes(&parquet);
+            assert!(footer_bytes < limits.max_decoded_bytes, "{footer_bytes}");
+
+            // Under the hint the first batch holds each value once, and its
+            // expanded size is measured without expanding it.
+            let first = object
+                .reader(&[0], object.group_rows)
+                .expect("reader")
+                .next()
+                .expect("a batch")
+                .expect("decoded");
+            assert_eq!(first.num_rows(), DECODE_BATCH_ROWS);
+            assert_eq!(first.column(0).data_type(), &DataType::Utf8View);
+            let held = u64::try_from(first.get_array_memory_size()).expect("size");
+            assert!(held < 64 * MIB, "{held} bytes held");
+            let expanded = plain_size(first.column(0).as_ref(), &DataType::Utf8).expect("size");
+            assert!(expanded > 2048 * MIB, "{expanded} bytes expanded");
+
+            let mut scope = scope_with(ZkMode::Disabled, limits);
+            scope.register_parquet("t", &parquet).expect("footer");
+            let err = scope.sql(TOTAL_LENGTH).await.expect_err("refused");
+            assert!(
+                matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// The same files declaring the column a dictionary, as Arrow writers do
+    /// by default: a query reads it as the dictionary it is, each value held
+    /// once, where read as a dictionary array either crossing would expand
+    /// it inside the reader and overflow.
+    #[tokio::test]
+    async fn a_declared_dictionary_is_not_expanded() {
+        let limits = QueryLimits {
+            max_decoded_bytes: 64 * MIB,
+            ..QueryLimits::default()
+        };
+        let files = [
+            repeated_value_parquet(3 << 20, 1000, None, true),
+            repeated_value_parquet(5 << 20, 1024, Some(512), true),
+        ];
+        for parquet in files {
+            let object = ParquetObject::read_footer(&parquet).expect("footer");
+            let declared = object.schema().field(0).data_type().clone();
+            assert!(matches!(declared, DataType::Dictionary(_, _)), "{declared}");
+
+            let mut scope = scope_with(ZkMode::Disabled, limits);
+            scope.register_parquet("t", &parquet).expect("footer");
+            let rows = scope
+                .sql_json("SELECT COUNT(s) AS n FROM t")
+                .await
+                .expect("fits");
+            assert_eq!(rows, serde_json::json!([{ "n": 1024 }]));
+            assert_eq!(byte_view(&declared), Some(DataType::Utf8View));
+        }
+    }
+
+    /// A fixed-size binary column whose dictionary holds one 64 KiB value:
+    /// a batch of it is 64 MiB, which the footer does not show. A query
+    /// reading it is refused from its width before the reader decodes a
+    /// batch.
+    #[tokio::test]
+    async fn a_wide_fixed_column_is_refused_before_it_decodes() {
+        use parquet::data_type::{FixedLenByteArray, FixedLenByteArrayType};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        const WIDTH: usize = 64 << 10;
+        assert_eq!(
+            fixed_width(&DataType::FixedSizeBinary(WIDTH as i32)),
+            64 << 10
+        );
+        assert_eq!(fixed_width(&DataType::Int64), 8);
+        assert_eq!(fixed_width(&DataType::Utf8), 0);
+        let wide_dictionary = DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::FixedSizeBinary(WIDTH as i32)),
+        );
+        assert_eq!(fixed_width(&wide_dictionary), 4 + (64 << 10));
+        // Writers store fixed-size binary plain unless writing Parquet 2.0;
+        // any file may dictionary-encode it.
+        let schema = Arc::new(
+            parse_message_type(&format!(
+                "message m {{ required fixed_len_byte_array({WIDTH}) w; }}"
+            ))
+            .expect("schema"),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+                .set_dictionary_enabled(true)
+                .build(),
+        );
+        let value = FixedLenByteArray::from(vec![7u8; WIDTH]);
+        let values = vec![value; DECODE_BATCH_ROWS];
+        let mut parquet = Vec::new();
+        let mut writer = SerializedFileWriter::new(&mut parquet, schema, props).expect("writer");
+        let mut group = writer.next_row_group().expect("row group");
+        let mut column = group.next_column().expect("column").expect("a column");
+        column
+            .typed::<FixedLenByteArrayType>()
+            .write_batch(&values, None, None)
+            .expect("write");
+        column.close().expect("column");
+        group.close().expect("row group");
+        writer.close().expect("close");
+
+        let object = ParquetObject::read_footer(&parquet).expect("footer");
+        let chunk = object.footer.metadata().row_group(0).column(0);
+        assert!(
+            chunk
+                .encodings()
+                .any(|encoding| encoding == Encoding::RLE_DICTIONARY),
+            "{:?}",
+            chunk.encodings().collect::<Vec<_>>()
+        );
+        let limits = QueryLimits {
+            max_decoded_bytes: 16 * MIB,
+            ..QueryLimits::default()
+        };
+        let footer_bytes = column_bytes(&parquet);
+        assert!(footer_bytes < limits.max_decoded_bytes, "{footer_bytes}");
+        let mut scope = scope_with(ZkMode::Disabled, limits);
+        scope.register_parquet("t", &parquet).expect("footer");
+        let err = scope
+            .sql("SELECT COUNT(w) AS n FROM t")
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+            "{err:?}"
+        );
+    }
+
+    /// String and binary columns, plain or declared as dictionaries, decode
+    /// as views and are cast back to their own types, measured exactly.
+    #[test]
+    fn string_columns_keep_their_type() {
+        let declared = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::LargeBinary, false),
+            Field::new("d", declared.clone(), true),
+        ]));
+        let strings = StringArray::from(vec![Some("a"), None, Some("a")]);
+        let binary = arrow::array::LargeBinaryArray::from_iter_values([b"x", b"y", b"x"]);
+        let dictionary: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+            vec![Some("p"), None, Some("p")].into_iter().collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(strings), Arc::new(binary), Arc::new(dictionary)],
+        )
+        .expect("batch");
+        let parquet = parquet_of(batch.clone());
+
+        let object = ParquetObject::read_footer(&parquet).expect("footer");
+        let file_schema = Arc::clone(object.schema());
+        let decoded = object
+            .reader(&[0, 1, 2], object.group_rows)
+            .expect("reader")
+            .next()
+            .expect("a batch")
+            .expect("decoded");
+        assert_eq!(decoded.column(0).data_type(), &DataType::Utf8View);
+        assert_eq!(decoded.column(1).data_type(), &DataType::BinaryView);
+        assert_eq!(decoded.column(2).data_type(), &DataType::Utf8View);
+        // The null row's length is not counted: "a", "a", four 4-byte
+        // offsets and a bitmap byte; for the binary column three 1-byte
+        // values, four 8-byte offsets and a bitmap byte; for the dictionary
+        // its one distinct value, two offsets and three keys.
+        let strings = 2 + 4 * 4 + 1;
+        let binary = 3 + 4 * 8 + 1;
+        let distinct = 1 + 2 * 8 + 3 * 4;
+        assert_eq!(
+            plain_size(decoded.column(0).as_ref(), &DataType::Utf8).expect("size"),
+            strings
+        );
+        assert_eq!(
+            plain_size(decoded.column(1).as_ref(), &DataType::LargeBinary).expect("size"),
+            binary
+        );
+        let views = ViewDictionary::new(decoded.column(2).as_ref()).expect("views");
+        assert_eq!(views.size(), distinct);
+        assert_eq!(file_schema.field(2).data_type(), &declared);
+        let expanded = expand_views(&decoded, &file_schema, u64::MAX).expect("expands");
+        assert_eq!(expanded, batch);
+        let err = expand_views(&decoded, &file_schema, strings + binary + distinct - 1)
+            .expect_err("over");
+        assert!(
+            matches!(err, ScanFault::Limit(QueryLimit::DecodedBytes)),
+            "{err:?}"
+        );
+    }
+
+    /// A value too long to sit inside its view, repeated in a column declared
+    /// a dictionary with 8-bit keys, from plain pages and from a dictionary
+    /// per row group: each row's view points to its own copy, but the rows
+    /// still take one key, where a key a view would overflow the key type.
+    #[tokio::test]
+    async fn equal_long_values_share_a_key() {
+        let declared = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![Field::new("d", declared, false)]));
+        let value = "y".repeat(24);
+        let dictionary: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+            std::iter::repeat_n(value.as_str(), 500).collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).expect("batch");
+        let plain = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+        let per_row_group = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        for props in [plain, per_row_group] {
+            let mut parquet = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut parquet, schema.clone(), Some(props)).expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+
+            let object = ParquetObject::read_footer(&parquet).expect("footer");
+            let file_schema = Arc::clone(object.schema());
+            let decoded = object
+                .reader(&[0], object.group_rows)
+                .expect("reader")
+                .next()
+                .expect("a batch")
+                .expect("decoded");
+            let views = decoded.column(0).as_string_view().views();
+            assert!(views.iter().any(|view| *view != views[0]), "views differ");
+            let expanded = expand_views(&decoded, &file_schema, u64::MAX).expect("expands");
+            assert_eq!(expanded, batch);
+
+            let mut scope = scope_with(ZkMode::Disabled, QueryLimits::default());
+            scope.register_parquet("t", &parquet).expect("footer");
+            let rows = scope
+                .sql_json("SELECT COUNT(d) AS n FROM t")
+                .await
+                .expect("fits");
+            assert_eq!(rows, serde_json::json!([{ "n": 500 }]));
+        }
+    }
+
+    /// The reader lists a dictionary's buffer again after each plain page,
+    /// so one stored value can come back under a view a row. Those rows
+    /// take one key, the value read once.
+    #[test]
+    fn a_value_listed_under_many_views_takes_one_key() {
+        let value = "z".repeat(24);
+        let buffer = arrow::buffer::Buffer::from(value.as_bytes());
+        let buffers = vec![buffer; 4];
+        let views: Vec<u128> = (0..8u32)
+            .map(|row| arrow::array::builder::make_view(value.as_bytes(), row % 4, 0))
+            .collect();
+        let column = StringViewArray::try_new(views.into(), buffers, None).expect("views");
+        let rebuilt = ViewDictionary::new(&column).expect("keys");
+        assert_eq!(rebuilt.distinct.len(), 1);
+        assert!(rebuilt.keys.iter().all(|key| key == Some(0)));
     }
 
     /// A single partition of `batches` batches of `rows` rows each (`v`,

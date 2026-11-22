@@ -12,9 +12,13 @@
 //! upload's, with a committed snapshot), opting it into discoverability. The
 //! service reads the vault only for that check, which lists the dataset's
 //! manifests and opens nothing. Researchers browse the catalog and file
-//! access requests; approval mints the grant and budget through the same path
-//! as a direct grant, except that a retried approval never re-activates a
-//! revoked grant. Prices are integer cents in the configured currency.
+//! access requests. A direct grant, an approval, a top-up and a revoke take
+//! one lock (see `ResearchService::minting`). An approval adds its budget to
+//! an active grant, a direct grant of an active grant that has a budget is
+//! refused, re-activating a revoked grant is audited when it happens, and a
+//! retried approval never re-activates a revoked grant.
+//! Prices are integer cents in
+//! the configured currency.
 
 use std::sync::Arc;
 
@@ -69,6 +73,18 @@ pub struct ResearchService {
     /// Budget units allocated to a grant when the steward doesn't specify
     /// (`RESEARCH_DEFAULT_QUERY_BUDGET`).
     default_budget: u64,
+    /// One lock for the paths that change a grant or its budget, in two
+    /// stores. A direct grant and an approval read the grant and the budget
+    /// and then write both, so they must not interleave with each other. A
+    /// top-up takes it so a grant path's audited raise (the change in the
+    /// limit) never counts a concurrent top-up as its own, and a revoke so it
+    /// lands before or after a grant in flight, never between its re-activation
+    /// and its reply. A top-up takes it after its ownership check (a grant's
+    /// steward never changes), and a denial not at all. One
+    /// lock for every tenant, held across store calls, holds in one process
+    /// only: several instances need conditional writes in the durable stores,
+    /// and striping once the stores do I/O (P62).
+    minting: tokio::sync::Mutex<()>,
 }
 
 /// Bounds on user-authored free text; oversize input is refused, not
@@ -129,6 +145,7 @@ impl ResearchService {
             vault,
             min_cohort,
             default_budget,
+            minting: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -156,11 +173,18 @@ impl ResearchService {
 
     // ── Grants and budgets ──
 
-    /// Steward grants a researcher aggregate access to one of its connectors,
-    /// allocating a query budget (default from config when unspecified).
-    /// `create` re-activates a revoked grant, so this is only for a new
-    /// decision by the steward. Approvals mint their grant in
-    /// [`resolve_access_request`](Self::resolve_access_request).
+    /// Steward grants a researcher aggregate access to one of its connectors.
+    /// An active grant that already has a budget is refused (409, audited):
+    /// a grant would keep its old budget, so the steward tops it up instead.
+    /// A grant with no budget entry (new, or one whose funding failed) opens
+    /// `query_budget`, or the configured default. A revoked grant is
+    /// re-activated first, audited as `reactivated` at once, and keeps its
+    /// budget: `query_budget` is added on top, and none is added when it is
+    /// omitted. If funding fails after the re-activation, the grant is active
+    /// with its old budget; a retry is then refused like any direct grant of
+    /// an active grant if the grant already had a budget, and funds it
+    /// otherwise. Nothing is added twice or dropped. Approvals mint their
+    /// grant in [`resolve_access_request`](Self::resolve_access_request).
     pub async fn grant(
         &self,
         steward: TenantId,
@@ -168,60 +192,116 @@ impl ResearchService {
         connector: &ConnectorSlug,
         query_budget: Option<u64>,
     ) -> Result<Value, ApiError> {
+        let _minting = self.minting.lock().await;
+        // Re-activate first: a failure after this changes no budget, so a
+        // retry adds its own amount.
+        let (grant, reactivated) = match self
+            .grants
+            .create_unless_revoked(steward, researcher, connector.as_str())
+            .await
+            .map_err(|_| ApiError::Backend)?
+        {
+            GrantOutcome::Active(grant) => (grant, false),
+            GrantOutcome::Revoked(_) => {
+                (self.reactivate(steward, researcher, connector).await?, true)
+            }
+        };
+        // No entry is a new grant, or one whose funding failed; an entry
+        // means it was funded before.
+        let id = &grant.grant_id;
+        let before = self
+            .budgets
+            .state(id)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        let budget = match before {
+            None => self
+                .budgets
+                .open(id, query_budget.unwrap_or(self.default_budget))
+                .await
+                .map_err(|_| ApiError::Backend)?,
+            Some(_) if !reactivated => {
+                security_audit_event(
+                    AuditKind::TenantProvisioned,
+                    Some(steward),
+                    "denied",
+                    &format!(
+                        "grant refused researcher={researcher} connector={connector} grant={id} reason=already_granted"
+                    ),
+                );
+                return Err(ApiError::ConflictWith(
+                    "grant already exists; raise its budget with POST /api/v1/grants/{grant_id}/budget",
+                ));
+            }
+            // A re-activated grant keeps its budget and gets only what the
+            // steward names on top.
+            Some(before) => {
+                let budget = self
+                    .budgets
+                    .top_up(id, query_budget.unwrap_or(0))
+                    .await
+                    .map_err(|_| ApiError::Backend)?;
+                audit_raise(&grant, &before, &budget);
+                budget
+            }
+        };
+        granted_json(&grant, &budget)
+    }
+
+    /// Re-activate `researcher`'s revoked grant on `steward`'s `connector`,
+    /// audited at once: the grant is usable from here, whether or not its
+    /// funding then succeeds.
+    async fn reactivate(
+        &self,
+        steward: TenantId,
+        researcher: TenantId,
+        connector: &ConnectorSlug,
+    ) -> Result<DatasetGrant, ApiError> {
         let grant = self
             .grants
             .create(steward, researcher, connector.as_str())
             .await
             .map_err(|_| ApiError::Backend)?;
-        self.fund_grant(&grant, query_budget, None).await
+        security_audit_event(
+            AuditKind::TenantProvisioned,
+            Some(steward),
+            "ok",
+            &format!(
+                "reactivated researcher={researcher} connector={connector} grant={}",
+                grant.grant_id
+            ),
+        );
+        Ok(grant)
     }
 
-    /// Fund the query budget of a grant that was just created or found
-    /// active, audit the grant, and return it with its budget as JSON. A
-    /// direct grant opens its budget; re-granting reuses the grant id, so it
-    /// never resets spend. An access-request approval (`approval` is its
-    /// request id) adds its budget once, on top of what the grant already
-    /// has: a follow-up request tops the grant up, and a retry of the same
-    /// approval adds nothing. All grant paths use it, so they cannot drift.
-    async fn fund_grant(
+    /// Add an approval's budget to its grant, once per access request
+    /// (`key`), creating the entry if there is none: a follow-up request
+    /// tops the grant up, and a retry adds nothing. A failed write leaves no
+    /// entry, so "has an entry" means "was funded". Audits the grant, and a
+    /// raise of an existing budget as `research.budget`, and returns the
+    /// grant with its budget as JSON.
+    async fn fund_approval(
         &self,
         grant: &DatasetGrant,
         query_budget: Option<u64>,
-        approval: Option<&str>,
+        key: &str,
     ) -> Result<Value, ApiError> {
-        let units = query_budget.unwrap_or(self.default_budget);
         let id = &grant.grant_id;
-        let budget = match approval {
-            None => self
-                .budgets
-                .open(id, units)
-                .await
-                .map_err(|_| ApiError::Backend)?,
-            Some(request_id) => {
-                self.budgets
-                    .open(id, 0)
-                    .await
-                    .map_err(|_| ApiError::Backend)?;
-                self.budgets
-                    .top_up_once(id, request_id, units)
-                    .await
-                    .map_err(|_| ApiError::Backend)?
-            }
-        };
-        let researcher = grant.researcher_tenant;
-        let connector = &grant.connector;
-        security_audit_event(
-            AuditKind::TenantProvisioned,
-            Some(grant.steward_tenant),
-            "ok",
-            &format!(
-                "granted researcher={researcher} connector={connector} budget_limit={}",
-                budget.limit
-            ),
-        );
-        let mut value = serde_json::to_value(grant).map_err(|_| ApiError::Backend)?;
-        value["budget"] = budget_json(&budget)?;
-        Ok(value)
+        let units = query_budget.unwrap_or(self.default_budget);
+        let before = self
+            .budgets
+            .state(id)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        let budget = self
+            .budgets
+            .top_up_once(id, key, units)
+            .await
+            .map_err(|_| ApiError::Backend)?;
+        if let Some(before) = before {
+            audit_raise(grant, &before, &budget);
+        }
+        granted_json(grant, &budget)
     }
 
     /// Steward-only budget top-up. Non-stewards — including the grant's own
@@ -250,20 +330,16 @@ impl ResearchService {
             );
             return Err(ApiError::NotFound);
         }
+        // Serialised with the grant paths, which audit the change in the
+        // limit, so a concurrent top-up is never counted as theirs. Taken
+        // after the ownership check: a grant's steward never changes.
+        let _minting = self.minting.lock().await;
         let budget = self
             .budgets
             .top_up(grant_id, additional)
             .await
             .map_err(|_| ApiError::Backend)?;
-        security_audit_event(
-            AuditKind::ResearchBudget,
-            Some(steward),
-            "ok",
-            &format!(
-                "top_up grant={grant_id} added={additional} limit={}",
-                budget.limit
-            ),
-        );
+        audit_top_up(steward, grant_id, additional, &budget);
         budget_json(&budget)
     }
 
@@ -301,6 +377,9 @@ impl ResearchService {
     /// same "not found" as an unknown id, and either refusal is audited as
     /// `denied`.
     pub async fn revoke_grant(&self, steward: TenantId, grant_id: &str) -> Result<Value, ApiError> {
+        // A grant, approval or top-up in flight finishes first, so none of
+        // them reports a grant that a revoke already took away.
+        let _minting = self.minting.lock().await;
         let revoked = self
             .grants
             .revoke(steward, grant_id)
@@ -487,8 +566,11 @@ impl ResearchService {
     /// Approval marks the request Approved first, recording its query budget
     /// (the steward's override, else the listing's included budget) in the
     /// same step, then mints the grant and adds that budget to it once,
-    /// keyed by the request (see `fund_grant`). If a later step fails, the request stays Approved
-    /// without a usable grant (fail closed) and the steward retries:
+    /// keyed by the request (see `fund_approval`). If a later step fails, the
+    /// request stays Approved and the steward retries. A new grant then has
+    /// no budget, so it is unusable (fail closed); a revoked grant that was
+    /// re-activated (audited at once, as a direct grant's) stays active with
+    /// its old budget until the retry adds the approved one. The retry:
     /// approving an already-Approved request re-runs every step after
     /// `resolve` (slug, grant and budget), all idempotent, so the retry
     /// converges. A retry finishes the recorded decision: it adds the
@@ -516,6 +598,14 @@ impl ResearchService {
         approve: bool,
         budget_override: Option<u64>,
     ) -> Result<Value, ApiError> {
+        // Held from the decision until it is audited, so a revoke cannot land
+        // between recording the approval and re-activating the grant, nor be
+        // logged before it. A denial changes no grant and takes no lock.
+        let _minting = if approve {
+            Some(self.minting.lock().await)
+        } else {
+            None
+        };
         let (request, retry) = match self
             .catalog
             .resolve(steward, request_id, approve, budget_override)
@@ -602,12 +692,19 @@ impl ResearchService {
             self.grant_on_retry(steward, &request, &connector, query_budget)
                 .await?
         } else {
-            let grant = self
+            let researcher = request.researcher_tenant;
+            let grant = match self
                 .grants
-                .create(steward, request.researcher_tenant, connector.as_str())
+                .create_unless_revoked(steward, researcher, connector.as_str())
                 .await
-                .map_err(|_| ApiError::Backend)?;
-            self.fund_grant(&grant, query_budget, Some(&request.request_id))
+                .map_err(|_| ApiError::Backend)?
+            {
+                GrantOutcome::Active(grant) => grant,
+                GrantOutcome::Revoked(_) => {
+                    self.reactivate(steward, researcher, &connector).await?
+                }
+            };
+            self.fund_approval(&grant, query_budget, &request.request_id)
                 .await?
         };
         let retry_note = if retry { " retry=true" } else { "" };
@@ -679,7 +776,7 @@ impl ResearchService {
             }
             GrantOutcome::Active(grant) => {
                 return self
-                    .fund_grant(&grant, query_budget, Some(&request.request_id))
+                    .fund_approval(&grant, query_budget, &request.request_id)
                     .await;
             }
         };
@@ -709,6 +806,46 @@ fn revoked_since(grant: &DatasetGrant, request: &AccessRequest) -> bool {
         (Some(revoked), Some(approved)) => revoked >= approved,
         _ => true,
     }
+}
+
+/// Audit a top-up of `added` units; `budget` is the standing after it.
+fn audit_top_up(steward: TenantId, grant_id: &str, added: u64, budget: &BudgetState) {
+    security_audit_event(
+        AuditKind::ResearchBudget,
+        Some(steward),
+        "ok",
+        &format!(
+            "top_up grant={grant_id} added={added} limit={}",
+            budget.limit
+        ),
+    );
+}
+
+/// Audit a grant path's change from `before` to `after` as a top-up, if it
+/// raised the limit: a retry or a zero top-up audits nothing.
+fn audit_raise(grant: &DatasetGrant, before: &BudgetState, after: &BudgetState) {
+    if after.limit != before.limit {
+        let added = after.limit.saturating_sub(before.limit);
+        audit_top_up(grant.steward_tenant, &grant.grant_id, added, after);
+    }
+}
+
+/// Audit a grant and return it with its budget as JSON.
+fn granted_json(grant: &DatasetGrant, budget: &BudgetState) -> Result<Value, ApiError> {
+    let researcher = grant.researcher_tenant;
+    let connector = &grant.connector;
+    security_audit_event(
+        AuditKind::TenantProvisioned,
+        Some(grant.steward_tenant),
+        "ok",
+        &format!(
+            "granted researcher={researcher} connector={connector} budget_limit={}",
+            budget.limit
+        ),
+    );
+    let mut value = serde_json::to_value(grant).map_err(|_| ApiError::Backend)?;
+    value["budget"] = budget_json(budget)?;
+    Ok(value)
 }
 
 /// Serialize a budget with its derived `remaining`.

@@ -28,6 +28,11 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 # Seeded synthetic tables, including the wide one, for the decode tests.
 synth-data.workspace = true
 tokio.workspace = true
+
+[[bench]]
+name = "query"
+harness = false

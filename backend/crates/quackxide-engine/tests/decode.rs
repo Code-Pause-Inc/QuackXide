@@ -140,9 +140,11 @@ async fn a_query_the_gates_refuse_decodes_no_column() {
 
 /// On the wide table (23 columns), an aggregate over `region` and `i00`
 /// answers the same over a copy whose other 21 columns are overwritten, so
-/// it decoded only those two. The byte limit holds it to what the footers
-/// report for those two columns, a fraction of the table: exactly that
-/// fits, one byte less is refused before anything is decoded.
+/// it decoded only those two. The byte limit holds it to those two columns,
+/// a fraction of the table: a tenth of the table's footer bytes fits. One
+/// byte under what the footers report for the two is refused before
+/// anything is decoded, and exactly that is refused as they decode, since
+/// they decode to more than their footers report.
 #[tokio::test]
 async fn a_two_column_aggregate_on_the_wide_table_decodes_only_those_columns() {
     const SQL: &str = "SELECT region, COUNT(*) AS n, SUM(i00) AS total FROM wide \
@@ -179,29 +181,32 @@ async fn a_two_column_aggregate_on_the_wide_table_decodes_only_those_columns() {
         .expect_err("an overwritten column");
     assert!(matches!(err, QueryError::Parquet(_)), "{err:?}");
 
-    let at_limit = QueryLimits {
-        max_decoded_bytes: two_columns,
+    let a_tenth = QueryLimits {
+        max_decoded_bytes: all_columns / 10,
         ..QueryLimits::default()
     };
-    let mut scope_at_limit = scope(ZkMode::Enabled, at_limit);
-    scope_at_limit
+    let mut scope_a_tenth = scope(ZkMode::Enabled, a_tenth);
+    scope_a_tenth
         .register_parquet("wide", &wiped)
         .expect("footer");
-    assert_eq!(scope_at_limit.sql_json(SQL).await.expect("fits"), expected);
+    assert_eq!(scope_a_tenth.sql_json(SQL).await.expect("fits"), expected);
 
-    let under = QueryLimits {
-        max_decoded_bytes: two_columns - 1,
-        ..QueryLimits::default()
-    };
-    let mut scope_under = scope(ZkMode::Enabled, under);
-    scope_under
-        .register_parquet("wide", &wiped)
-        .expect("footer");
-    let err = scope_under.sql(SQL).await.expect_err("one byte over");
-    assert!(
-        matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
-        "{err:?}"
-    );
+    // Every column overwritten: a refusal rather than a Parquet failure
+    // shows nothing was decoded.
+    let all_wiped = wipe_columns_except(&wide, &[]);
+    for (limit, table) in [(two_columns - 1, &all_wiped), (two_columns, &wide)] {
+        let limits = QueryLimits {
+            max_decoded_bytes: limit,
+            ..QueryLimits::default()
+        };
+        let mut scope = scope(ZkMode::Enabled, limits);
+        scope.register_parquet("wide", table).expect("footer");
+        let err = scope.sql(SQL).await.expect_err("over the limit");
+        assert!(
+            matches!(err, QueryError::LimitExceeded(QueryLimit::DecodedBytes)),
+            "{limit}: {err:?}"
+        );
+    }
 }
 
 /// An object with a valid footer and a corrupt data page fails, when a

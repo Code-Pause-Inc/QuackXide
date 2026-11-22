@@ -47,7 +47,7 @@ The defaults are placeholders until the query benchmarks measure them.
 | Input bytes | `DATASET_MAX_MIB` | 1–512 | 64 | Ciphertext of the objects stored at the snapshot's version, before any key is released; again on what the manifest lists, before each object is opened |
 | Input objects | `QUERY_MAX_INPUT_OBJECTS` | 1–256 | 64 | The same two points |
 | Decoded rows | `QUERY_MAX_DECODED_ROWS` | 1–10⁹ | 10⁷ | The rows every Parquet footer reports, when the table is registered; then before each scan decodes, summed over the query's scans; decoded rows counted again |
-| Decoded bytes | `QUERY_MAX_DECODED_MIB` | 1–65536 | 1024 | Uncompressed sizes the footers report for the columns each scan reads, summed over the query's scans, before the scan decodes |
+| Decoded bytes | `QUERY_MAX_DECODED_MIB` | 1–65536 | 1024 | Uncompressed sizes the footers report for the columns each scan reads, summed over the query's scans, before the scan decodes; the Arrow memory of the decoded batches, summed over the scans, counted again |
 | Memory | `QUERY_MEMORY_MIB` | 1–16384 | 256 | DataFusion's memory pool for the query's operators |
 | Result rows | `QUERY_MAX_RESULT_ROWS` | 1–10⁶ | 10⁴ | Rows left after disclosure control; without a disclosure policy, as the result streams |
 | Result bytes | `QUERY_MAX_RESULT_MIB` | 1–256 | 4 | The result's JSON, as it is written |
@@ -60,8 +60,8 @@ the input-object ceiling, fit in it.
 
 Each limit is bounded on its own, so together they could promise more
 memory than any machine has. One query's worst case,
-`QueryLimits::worst_case_bytes`, is its pool, its decoded table as the
-footers report it, three copies of its input (the ciphertext, the
+`QueryLimits::worst_case_bytes`, is its pool, its decoded columns up to
+`QUERY_MAX_DECODED_MIB`, three copies of its input (the ciphertext, the
 plaintext the query service keeps, and the engine's copy for the decoder)
 and two of its result (the JSON and the rows parsed from it). Startup is
 refused when that, times `QUERY_MAX_CONCURRENT`, exceeds
@@ -167,9 +167,6 @@ Rejected:
 * A gated response of its own. Every other refusal of a gated query
   depends only on its SQL and the dataset's schema, so a response of its
   own would name the cause just as the limit's message does.
-* Counting decoded Arrow memory while decoding. Batches share buffers
-  (dictionary values, view data), and per-batch sizes count each shared
-  buffer once per batch, which would refuse honest data.
 * Counting a gated query's rows before suppression as they stream. The
   refusal would depend on the cohorts suppression withholds.
 * Measuring the machine's memory at startup instead of
@@ -188,8 +185,28 @@ Rejected:
   build side before it next reads or produces a batch. The pool bounds
   the build side, so it bounds the step.
 * A footer's uncompressed sizes understate columns that dictionary or
-  run-length encoding shrinks, so a decoded table can take more memory
-  than `QUERY_MAX_DECODED_MIB`; the row limit holds regardless.
+  run-length encoding shrinks, so the decoded batches are counted too, as
+  the Arrow memory they hold. Top-level string and binary columns,
+  including those the file's Arrow schema declares as dictionaries, decode
+  as view arrays. A plain column is measured from its views' lengths
+  before it expands, so a value the file repeats is refused before it is
+  copied once per row; a dictionary column is rebuilt from the views, each
+  distinct value once. Views point into the pages and dictionaries they
+  came from; a dictionary array would not do, since the reader expands one
+  inside a batch that crosses into another row group or from
+  dictionary-encoded pages to plain ones. Fixed-width columns are checked
+  from their widths before each batch of 1024 rows decodes. The table can
+  pass `QUERY_MAX_DECODED_MIB` only by the batch's list columns, and its
+  strings or binary inside a struct, which are counted only after they
+  expand; one page decompresses whole, to the size its own header states,
+  before any count sees it, and a `DELTA_BYTE_ARRAY` page, which rebuilds
+  each value from the one before it, can copy up to its own size once per
+  row of the batch. Arrow memory exceeds a footer's sizes for most
+  dictionary-encoded columns, so a dataset near the limit by its footers
+  can be refused. A column the file's own Arrow schema declares as a view
+  type, or as a dictionary of anything but strings or binary, shares
+  buffers across batches, and each batch counts them again, so such a
+  dataset can be refused below the limit.
 * Whether a query runs out of memory or time depends on the rows it
   reads, including suppressed ones. In gated mode the response no longer
   says which limit tripped, but it still shows that a query was refused.

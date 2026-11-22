@@ -90,6 +90,25 @@ export default defineConfig(({ mode }) => {
             },
           },
         },
+        {
+          // Wasm envelope seal benchmark in Chromium (docs/BENCHMARKS.md).
+          // Run with scripts/bench-wasm-seal.sh, which generates its data.
+          extends: true,
+          test: {
+            name: "seal",
+            // Not `*.browser.bench.ts`, the `browser` project's timings: this
+            // is a run-mode test over generated data, not a Vitest bench.
+            include: ["src/**/*.browser.perf.ts"],
+            // One measurement at a time, so files never compete for the CPU.
+            fileParallelism: false,
+            browser: {
+              enabled: true,
+              provider: playwright(),
+              headless: true,
+              instances: [{ browser: "chromium" }],
+            },
+          },
+        },
       ],
     },
   };
