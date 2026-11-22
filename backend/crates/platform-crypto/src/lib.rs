@@ -27,6 +27,12 @@ use std::io::{self, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod info;
+pub mod signature;
+pub use signature::{
+    ED25519_PUBLIC_KEY_BYTES, ED25519_SIGNATURE_BYTES, ML_DSA_65_PUBLIC_KEY_BYTES,
+    ML_DSA_65_SIGNATURE_BYTES, ResultSignature, ResultSigningKey, ResultVerifyingKeys,
+    result_signature_message,
+};
 #[cfg(feature = "server")]
 mod totp;
 #[cfg(feature = "server")]
@@ -70,6 +76,9 @@ pub enum CryptoError {
     /// The envelope's suite is not the suite of the key opening it.
     #[error("envelope suite does not match the key")]
     SuiteMismatch,
+    /// A result signature did not verify under both schemes.
+    #[error("signature rejected")]
+    SignatureInvalid,
 }
 
 /// Heap bytes wiped on drop, with a redacted `Debug`. Use for every transient
@@ -417,6 +426,12 @@ impl TenantPublicKey {
             PublicKeyInner::Hpk2(pk) => pk.to_bytes().to_vec(),
         }
     }
+
+    /// The suite magic, then the raw key: how a bound key names its suite
+    /// (ADR 0010 "Binding v2", `request-key`).
+    pub fn to_framed(&self) -> Vec<u8> {
+        [&self.suite().magic()[..], &self.to_raw()].concat()
+    }
 }
 
 impl std::fmt::Debug for TenantPublicKey {
@@ -536,7 +551,9 @@ struct Hpk2Keypair {
     public_key: <Hpk2Kem as KemTrait>::PublicKey,
 }
 
-/// Test/dev-only tenant keypair. Both suites' private keys zeroize on drop
+/// An HPKE keypair in either suite: a tenant's (tests and development only;
+/// a tenant's private key otherwise stays in its browser) or the enclave's
+/// request key (ADR 0010). Both suites' private keys zeroize on drop
 /// (`x25519-dalek` and `x-wing`).
 pub struct TenantKeypair(KeypairInner);
 
@@ -1055,6 +1072,17 @@ mod tests {
         let mut relabelled = hpke_seal_to_tenant(&keypair.public_key(), b"i", b"").expect("seal");
         relabelled[..4].copy_from_slice(b"HPK2");
         assert!(check_envelope_frame(&relabelled).is_err());
+    }
+
+    #[test]
+    fn a_framed_public_key_is_its_magic_then_its_raw_bytes() {
+        for suite in SUITES {
+            let key = TenantKeypair::generate(suite).public_key();
+            assert_eq!(
+                key.to_framed(),
+                [&suite.magic()[..], &key.to_raw()].concat()
+            );
+        }
     }
 
     #[test]

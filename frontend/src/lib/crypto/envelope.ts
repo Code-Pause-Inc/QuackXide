@@ -14,6 +14,8 @@ import init, {
   connectorObjectInfo,
   openEnvelope,
   publicKeyFromPrivateKey,
+  researchQueryBinding,
+  researchQueryInfo,
   researchResultInfo,
   sealEnvelope,
   snapshotManifestInfo,
@@ -21,18 +23,28 @@ import init, {
 } from "./wasm/envelope";
 
 let loading: Promise<void> | null = null;
+let memory: WebAssembly.Memory | null = null;
 
 /** Instantiate the module once. A failed load is not cached, so the next
  *  call retries; until one succeeds every seal is refused. */
 export function loadEnvelopeModule(source: string | URL = envelopeWasmUrl): Promise<void> {
   loading ??= init({ module_or_path: source }).then(
-    () => undefined,
+    (exports) => {
+      memory = exports.memory;
+    },
     (err: unknown) => {
       loading = null;
       throw err;
     },
   );
   return loading;
+}
+
+/** The module's linear memory size in bytes, or null before it loads.
+ *  Linear memory only grows, so after a seal this is the module's peak
+ *  (docs/BENCHMARKS.md). */
+export function envelopeMemoryBytes(): number | null {
+  return memory ? memory.buffer.byteLength : null;
 }
 
 /** Seal `plaintext` to a tenant's raw public key under `info`. Returns the
@@ -98,5 +110,20 @@ export const envelopeInfo = {
   async researchResult(researcherTenant: string, query: string): Promise<Uint8Array> {
     await loadEnvelopeModule();
     return researchResultInfo(researcherTenant, query);
+  },
+  async researchQuery(tenant: string, grantId: string): Promise<Uint8Array> {
+    await loadEnvelopeModule();
+    return researchQueryInfo(tenant, grantId);
+  },
+  /** The `query` field of `researchResult` for a request (ADR 0010). The
+   *  request nonce is 32 bytes; an empty schema version is refused. */
+  async researchQueryBinding(
+    grantId: string,
+    requestNonce: Uint8Array,
+    sql: string,
+    schemaVersion?: string,
+  ): Promise<string> {
+    await loadEnvelopeModule();
+    return researchQueryBinding(grantId, requestNonce, sql, schemaVersion);
   },
 };

@@ -19,3 +19,5 @@ coverage/
 frontend/src/lib/crypto/wasm/
 # Vitest browser-mode failure screenshots
 frontend/.vitest/
+# Browser seal benchmark data and results, from scripts/bench-wasm-seal.sh
+frontend/bench-data/

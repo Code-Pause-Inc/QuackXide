@@ -1,6 +1,6 @@
 # 0010. Sealed research queries and results
 
-* Status: Proposed
+* Status: Accepted (2026-11-14, with the P85 and P55 foundation)
 * Date: 2026-11-04
 
 ## Context
@@ -72,9 +72,8 @@ Linux, outside the repository:
 At start, `ConnectorQueryService` generates a key set and holds it in
 memory only, in zeroize-on-drop types, never written, logged or exported:
 
-* a **request key**: an X25519 (`HPK1`) key pair today, X-Wing (`HPK2`)
-  once P85 (#176) builds binding v2, with its private half in production
-  builds;
+* a **request key**: an `HPK2` key pair (X-Wing), with its private half in
+  production builds;
 * a **result-signing key**: an Ed25519 key pair (`ed25519-dalek`) and an
   ML-DSA-65 key pair (`ml-dsa`).
 
@@ -82,7 +81,9 @@ Any change to a bound value (a restart, a renewed TLS key) produces a new
 key set. Its `key_id` is the binding digest below, base64url-encoded.
 
 The opened request (including the SQL text) and the result payload before
-sealing are zeroized after use, like the query-result buffer today.
+sealing are zeroized after use, like the query-result buffer today. For the
+SQL this is best-effort: serde_json copies a string containing JSON escapes
+into a scratch buffer that it frees without wiping.
 
 ### Binding v2
 
@@ -98,7 +99,7 @@ SHA-256( "attestation-binding-v2"
 
 | Label | Value |
 | --- | --- |
-| `request-key` | suite magic (`HPK1`, later `HPK2`) ‖ raw public key |
+| `request-key` | suite magic (`HPK2`) ‖ raw public key |
 | `signing-ed25519` | 32-byte public key |
 | `signing-ml-dsa-65` | encoded public key |
 | `kms-public-key` | KMS public key; empty until P50 |
@@ -122,6 +123,11 @@ compiled-in floor (P54). P14's policy may require more, never less. No
 expected digest is published or compared: one frontend image serves every
 deployment, so there is no trusted place to publish one.
 
+Until P85 reads the configuration from the token's environment, the
+enclave takes the digest from `ENCLAVE_CONFIG_DIGEST_HEX` (all zero when
+unset), and the bundle does not carry it. With the variable set, a client
+cannot recompute `key_id`.
+
 ### Evidence bundle
 
 `GET /api/v1/attestation?nonce=<base64url, 32 bytes>` is unauthenticated,
@@ -141,7 +147,7 @@ builds use the same audience. The body:
   "version": 1,
   "key_id": "…",
   "token": "<OIDC token>",
-  "request_key": { "suite": "HPK1", "public_key": "…" },
+  "request_key": { "suite": "HPK2", "public_key": "…" },
   "signing_keys": { "ed25519": "…", "ml_dsa_65": "…" },
   "kms_public_key": null,
   "tls_spki_sha256": null
@@ -282,11 +288,13 @@ identities.
 
 ### No downgrade
 
-Once P85 (#176) moves the request key to the hybrid suite, every step
-refuses the classical one, as ADR 0007 requires for stored data: the browser refuses an evidence bundle
-whose request key is `HPK1`, and the enclave refuses an `HPK1` envelope
-and an X25519-only recipient key. There is no fallback mode. The
-signatures are hybrid from the first build.
+The request key is hybrid (`HPK2`) from the first build, and so are the
+signatures. The browser's envelope module seals only `HPK1` until P36, so
+browser sealed queries wait on P36 as well as P85. Once the browser seals with the hybrid suite (P36, #186),
+every step refuses the classical one, as ADR 0007 requires for stored
+data: the browser refuses an evidence bundle whose request key is
+`HPK1`, and the enclave refuses an `HPK1` envelope and an X25519-only
+recipient key. There is no fallback mode.
 
 ### Sealed and signed result
 

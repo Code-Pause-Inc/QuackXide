@@ -11,7 +11,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
@@ -31,7 +31,7 @@ use platform_tenancy::{
 };
 use quackxide_engine::{EngineSettings, QueryLimits};
 
-use common::{call, dev_attestation, post};
+use common::{assert_event, call, dev_attestation, grant_body, post};
 
 const SECRET: &str = "research-itest-secret";
 
@@ -790,6 +790,851 @@ async fn cannot_grant_to_self() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn re_granting_an_active_grant_is_refused_and_keeps_its_budget() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
+    let stoken = token_for(steward);
+
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+
+    // A second grant would silently keep the old budget: it is refused, and
+    // the steward tops the grant up instead.
+    let (status, body) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 50)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "re-grant: {body}");
+    assert_eq!(body["error"], ALREADY_GRANTED);
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], 28, "{budget}");
+    assert_event(
+        &capture,
+        "tenant.provisioned",
+        "denied",
+        &format!(
+            "grant refused researcher={researcher} connector=health grant={grant_id} reason=already_granted"
+        ),
+    );
+}
+
+#[tokio::test]
+async fn re_granting_a_revoked_grant_adds_its_budget_once_per_revoke() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
+    let stoken = token_for(steward);
+    let (_, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+
+    for (added, limit) in [(50, 78), (10, 88)] {
+        revoke(&app, steward, grant_id).await;
+        // Re-granting re-activates the same grant and adds the new budget.
+        let body = grant_body(researcher, added);
+        let (status, regrant) = post(&app, "/api/v1/grants", &stoken, &body).await;
+        assert_eq!(status, StatusCode::OK, "re-grant: {regrant}");
+        assert_eq!(regrant["grant_id"], grant_id);
+        assert_eq!(regrant["revoked"], false);
+        assert_eq!(regrant["budget"]["limit"], limit, "{regrant}");
+        // A retry finds the grant active: refused, and it adds nothing.
+        let (status, _) = post(&app, "/api/v1/grants", &stoken, &body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (_, budget) = call(&app, "GET", &budget_uri, &stoken, None).await;
+        assert_eq!(budget["limit"], limit, "{budget}");
+    }
+}
+
+#[tokio::test]
+async fn direct_grant_retried_after_a_budget_failure_opens_its_budget() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            fail_open: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let body = grant_body(researcher, 28);
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // The grant exists without a budget, so the retry funds it.
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::OK, "retry: {grant}");
+    assert_eq!(grant["budget"]["limit"], 28, "{grant}");
+}
+
+/// A failed budget read is a 502 on every grant path, never read as "no
+/// budget": a direct grant of a funded grant would then reopen it with its
+/// old limit and drop the new amount with a 200, and a re-grant would do the
+/// same to a re-activated grant.
+#[tokio::test]
+async fn a_failed_budget_read_fails_a_direct_grant_of_a_funded_grant() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger::default());
+    let stores = ResearchStores {
+        budgets: ledger.clone(),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+
+    ledger.fail_state.store(true, Ordering::SeqCst);
+    let body = grant_body(researcher, 50);
+    let (status, answer) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}");
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(budget_of(&app, steward, grant_id).await["limit"], 28);
+}
+
+#[tokio::test]
+async fn a_failed_budget_read_fails_a_re_grant_after_re_activating() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger::default());
+    let stores = ResearchStores {
+        budgets: ledger.clone(),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let grant_id = grant_and_revoke(&app, steward, researcher, 28).await;
+
+    ledger.fail_state.store(true, Ordering::SeqCst);
+    let body = grant_body(researcher, 50);
+    let (status, answer) = post(&app, "/api/v1/grants", &token_for(steward), &body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}");
+    // Re-activated (and audited) with its old budget, as when the top-up
+    // itself fails.
+    assert_eq!(budget_of(&app, steward, &grant_id).await["limit"], 28);
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_failed_budget_read_fails_an_approval_and_its_retry_converges() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger::default());
+    let (app, grant_id, request_id) =
+        app_with_a_grant_and_a_request(steward, researcher, ledger.clone()).await;
+    let stoken = token_for(steward);
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    ledger.fail_state.store(true, Ordering::SeqCst);
+    let (status, answer) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}");
+    let (status, retry) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "retry: {retry}");
+    assert_eq!(retry["grant"]["budget"]["limit"], 53, "{retry}");
+    assert_eq!(
+        budget_events(&capture),
+        vec![format!("top_up grant={grant_id} added=25 limit=53")]
+    );
+}
+
+/// What a refused direct grant tells the steward.
+const ALREADY_GRANTED: &str =
+    "grant already exists; raise its budget with POST /api/v1/grants/{grant_id}/budget";
+
+/// Grant 28, revoke, then re-grant 50, whose first attempt fails before it
+/// re-activates the grant: nothing was added, so the retry adds 50 once.
+/// `revoke_between` revokes the still revoked grant again between the
+/// attempts, as a stale tab would.
+async fn re_grant_converges_after_a_failure(revoke_between: bool) {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let registry = Arc::new(TestRegistry::default());
+    let stores = ResearchStores {
+        grants: registry.clone(),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
+
+    registry.fail_create.store(true, Ordering::SeqCst);
+    let body = grant_body(researcher, 50);
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // The failed attempt left the grant revoked and its budget as it was.
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], 28, "{budget}");
+    if revoke_between {
+        revoke(&app, steward, grant_id).await;
+    }
+    let (status, regrant) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::OK, "retry: {regrant}");
+    assert_eq!(regrant["revoked"], false);
+    assert_eq!(regrant["budget"]["limit"], 78, "{regrant}");
+}
+
+#[tokio::test]
+async fn re_grant_retried_after_a_failed_reactivation_adds_its_budget_once() {
+    re_grant_converges_after_a_failure(false).await;
+}
+
+#[tokio::test]
+async fn a_revoke_between_a_failed_re_grant_and_its_retry_adds_nothing_more() {
+    re_grant_converges_after_a_failure(true).await;
+}
+
+#[tokio::test]
+async fn re_grant_whose_funding_fails_leaves_the_grant_active_and_its_retry_is_refused() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            fail_top_up: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
+
+    // The grant is re-activated first, so the failed top-up leaves it active
+    // with its old budget, and the re-activation is audited.
+    let body = grant_body(researcher, 50);
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        &format!("reactivated researcher={researcher} connector=health grant={grant_id}"),
+    );
+    let (status, answer) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {answer}");
+    assert_eq!(answer["budget_remaining"], 27);
+
+    // The retry is refused, not applied a second time, and the steward
+    // raises the budget as the refusal says.
+    let (status, refused) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "retry: {refused}");
+    assert_eq!(refused["error"], ALREADY_GRANTED);
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+    let (status, topped) = post(&app, &budget_uri, &stoken, r#"{"additional":50}"#).await;
+    assert_eq!(status, StatusCode::OK, "top-up: {topped}");
+    assert_eq!(topped["limit"], 78, "{topped}");
+}
+
+#[tokio::test]
+async fn a_re_grant_after_a_failed_one_adds_its_own_amount() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        grants: Arc::new(TestRegistry {
+            fail_create: armed(),
+            ..TestRegistry::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    grant_and_revoke(&app, steward, researcher, 28).await;
+
+    let (status, _) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 50)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // A different amount on the retry is its own amount, not the failed 50.
+    let (status, regrant) =
+        post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 10)).await;
+    assert_eq!(status, StatusCode::OK, "retry: {regrant}");
+    assert_eq!(regrant["budget"]["limit"], 38, "{regrant}");
+}
+
+/// An approval re-activates a revoked grant before funding it, so a failed
+/// funding leaves access restored: the re-activation is audited.
+#[tokio::test]
+async fn an_approval_that_re_activates_a_grant_audits_it_even_if_funding_fails() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let grant_id = grant_and_revoke(&app, steward, researcher, 28).await;
+
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let (status, _) = post(&app, &approve, &token_for(steward), "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (status, answer) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK, "query: {answer}");
+    assert_event(
+        &capture,
+        "tenant.provisioned",
+        "ok",
+        &format!("reactivated researcher={researcher} connector=health grant={grant_id}"),
+    );
+}
+
+/// A re-grant that names no budget restores the grant with the budget it
+/// had: it adds nothing the steward did not name.
+#[tokio::test]
+async fn a_re_grant_without_a_budget_restores_the_old_one() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
+    let stoken = token_for(steward);
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 25)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::OK);
+    revoke(&app, steward, &grant_id).await;
+
+    let body = format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#);
+    let (status, regrant) = post(&app, "/api/v1/grants", &stoken, &body).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regrant}");
+    assert_eq!(regrant["budget"]["limit"], 25, "{regrant}");
+    assert_eq!(regrant["budget"]["remaining"], 24, "{regrant}");
+    assert_eq!(budget_events(&capture), Vec::<String>::new());
+}
+
+/// A revoked grant that was never funded (its approval failed) opens its
+/// budget when re-granted, as a new grant does.
+#[tokio::test]
+async fn re_granting_a_revoked_grant_with_no_budget_opens_one() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    let grant_id = grants["grants"][0]["grant_id"].as_str().expect("grant id");
+    revoke(&app, steward, grant_id).await;
+
+    let (status, regrant) =
+        post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 50)).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regrant}");
+    assert_eq!(regrant["budget"]["limit"], 50, "{regrant}");
+    assert_eq!(budget_events(&capture), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_failed_re_grant_leaves_the_budget_for_a_later_approval_to_add_to() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        grants: Arc::new(TestRegistry {
+            fail_create: armed(),
+            ..TestRegistry::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
+
+    let (status, _) = post(
+        &app,
+        "/api/v1/grants",
+        &stoken,
+        &grant_body(researcher, 500),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], 28, "{budget}");
+    let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    assert_eq!(grants["grants"][0]["revoked"], true, "{grants}");
+
+    // A later approval re-activates the grant and adds only its own 5.
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let (status, resolved) = post(&app, &approve, &stoken, r#"{"query_budget":5}"#).await;
+    assert_eq!(status, StatusCode::OK, "approve: {resolved}");
+    assert_eq!(resolved["grant"]["budget"]["limit"], 33, "{resolved}");
+}
+
+#[tokio::test]
+async fn a_second_revoke_still_refuses_a_stale_approval_retry() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    // The approval's `create` fails; the direct grant before it and the
+    // re-grant after it succeed.
+    let stores = ResearchStores {
+        grants: Arc::new(TestRegistry {
+            fail_create: armed(),
+            ..TestRegistry::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
+
+    // Approval A is recorded after that revoke, then fails to re-activate.
+    let a = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{a}/approve");
+    let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":7}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // A later revoke and a re-grant: A's retry predates the revoke.
+    revoke(&app, steward, grant_id).await;
+    let (status, regrant) =
+        post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 10)).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regrant}");
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], 38, "{budget}");
+    assert_event(
+        &capture,
+        "research.catalog",
+        "denied",
+        &format!("approve refused request={a} grant={grant_id} retry=true reason=revoked_since"),
+    );
+}
+
+#[tokio::test]
+async fn of_two_simultaneous_re_grants_of_a_revoked_grant_only_one_is_made() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    // Once armed, the next request to find the grant revoked yields before
+    // re-activating it, so without the lock the other request would find it
+    // revoked too, and both would add their budget.
+    let registry = Arc::new(TestRegistry::default());
+    let stores = ResearchStores {
+        grants: registry.clone(),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let grant_id = &grant_and_revoke(&app, steward, researcher, 28).await;
+
+    registry.yield_after_check.store(true, Ordering::SeqCst);
+    let (body_a, body_b) = (grant_body(researcher, 50), grant_body(researcher, 10));
+    let (first, second) = tokio::join!(
+        post(&app, "/api/v1/grants", &stoken, &body_a),
+        post(&app, "/api/v1/grants", &stoken, &body_b),
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "{first:?} {second:?}"
+    );
+    // The budget is the old one plus the amount of the request that got 200.
+    let (made, added) = if first.0 == StatusCode::OK {
+        (&first.1, 50)
+    } else {
+        (&second.1, 10)
+    };
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], 28 + added, "{budget} {made}");
+    assert_eq!(budget["limit"], made["budget"]["limit"], "{budget} {made}");
+}
+
+#[tokio::test]
+async fn a_revoke_racing_a_grant_lands_after_it() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger {
+        fail_top_up_once: armed(),
+        ..TestLedger::default()
+    });
+    let stores = ResearchStores {
+        budgets: ledger.clone(),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    // A failed approval leaves an active grant with no budget entry.
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
+    let grant_id = grants["grants"][0]["grant_id"].as_str().expect("grant id");
+    let revoke = format!("/api/v1/grants/{grant_id}");
+
+    // The direct grant finds the grant and yields before funding it. A
+    // revoke that ran now would answer 200 before the grant's own 200 for a
+    // grant it is about to report as active, so it waits.
+    ledger.yield_on_state.store(true, Ordering::SeqCst);
+    let finished = AtomicUsize::new(0);
+    let (grant_done, revoke_done) = tokio::join!(
+        async {
+            let answer = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+            (answer, finished.fetch_add(1, Ordering::SeqCst))
+        },
+        async {
+            let answer = call(&app, "DELETE", &revoke, &stoken, None).await;
+            (answer, finished.fetch_add(1, Ordering::SeqCst))
+        },
+    );
+    assert_eq!(
+        grant_done.0.0,
+        StatusCode::OK,
+        "grant: {:?}",
+        grant_done.0.1
+    );
+    assert_eq!(revoke_done.0.0, StatusCode::OK);
+    assert!(grant_done.1 < revoke_done.1, "the revoke ran mid-grant");
+    let (status, _) = research_query(&app, researcher, steward).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The `research.budget` `ok` details captured so far.
+fn budget_events(capture: &platform_telemetry::capture::AuditCapture) -> Vec<String> {
+    capture
+        .events()
+        .iter()
+        .filter(|e| e.audit_kind == "research.budget" && e.outcome == "ok")
+        .map(|e| e.detail.clone())
+        .collect()
+}
+
+/// An app over `ledger` with `researcher` holding a 28-unit grant, and a
+/// pending request of `researcher`. Arm the ledger's switches after this
+/// setup.
+async fn app_with_a_grant_and_a_request(
+    steward: TenantId,
+    researcher: TenantId,
+    ledger: Arc<TestLedger>,
+) -> (Router, String, String) {
+    let stores = ResearchStores {
+        budgets: ledger,
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+    let request_id = pending_request(&app, steward, researcher).await;
+    (app, grant_id, request_id)
+}
+
+#[tokio::test]
+async fn a_revoke_queued_before_an_approval_lands_before_its_decision() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger {
+        fail_top_up_once: armed(),
+        ..TestLedger::default()
+    });
+    let (app, grant_id, request_id) =
+        app_with_a_grant_and_a_request(steward, researcher, ledger.clone()).await;
+    let stoken = token_for(steward);
+    let revoke = format!("/api/v1/grants/{grant_id}");
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+
+    // A direct grant holds the lock (it yields in `state`), a revoke queues
+    // behind it, and then the approval arrives. The approval's decision
+    // must come after the revoke, so its retry is not "revoked since".
+    ledger.yield_on_state.store(true, Ordering::SeqCst);
+    let direct = grant_body(researcher, 5);
+    let (_, revoked, approved) = tokio::join!(
+        post(&app, "/api/v1/grants", &stoken, &direct),
+        call(&app, "DELETE", &revoke, &stoken, None),
+        post(&app, &approve, &stoken, "{}"),
+    );
+    assert_eq!(revoked.0, StatusCode::OK);
+    assert_eq!(
+        approved.0,
+        StatusCode::BAD_GATEWAY,
+        "approve: {}",
+        approved.1
+    );
+    let (status, retry) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::OK, "retry: {retry}");
+    assert_eq!(retry["grant"]["revoked"], false);
+    assert_eq!(retry["grant"]["budget"]["limit"], 53, "{retry}");
+}
+
+#[tokio::test]
+async fn a_top_up_racing_a_follow_up_approval_is_not_counted_as_its_own() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let ledger = Arc::new(TestLedger::default());
+    let (app, grant_id, request_id) =
+        app_with_a_grant_and_a_request(steward, researcher, ledger.clone()).await;
+    let stoken = token_for(steward);
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
+
+    // The approval yields after reading the budget; the steward's top-up
+    // arrives meanwhile.
+    ledger.yield_on_state.store(true, Ordering::SeqCst);
+    let (approved, topped) = tokio::join!(
+        post(&app, &approve, &stoken, r#"{"query_budget":3}"#),
+        post(&app, &budget_uri, &stoken, r#"{"additional":100}"#),
+    );
+    assert_eq!(approved.0, StatusCode::OK, "approve: {}", approved.1);
+    assert_eq!(topped.0, StatusCode::OK, "top-up: {}", topped.1);
+    // A retry alongside another top-up adds nothing and audits nothing. The
+    // yield is armed again, so the top-up lands while the retry waits.
+    ledger.yield_on_state.store(true, Ordering::SeqCst);
+    let (retry, topped) = tokio::join!(
+        post(&app, &approve, &stoken, "{}"),
+        post(&app, &budget_uri, &stoken, r#"{"additional":7}"#),
+    );
+    assert_eq!(retry.0, StatusCode::OK, "retry: {}", retry.1);
+    assert_eq!(topped.0, StatusCode::OK);
+    let mut events = budget_events(&capture);
+    events.sort();
+    let mut expected = vec![
+        format!("top_up grant={grant_id} added=100 limit=131"),
+        format!("top_up grant={grant_id} added=3 limit=31"),
+        format!("top_up grant={grant_id} added=7 limit=138"),
+    ];
+    expected.sort();
+    assert_eq!(events, expected);
+}
+
+#[tokio::test]
+async fn a_zero_budget_re_grant_audits_no_top_up() {
+    let capture = platform_telemetry::capture::AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
+    let stoken = token_for(steward);
+    grant_and_revoke(&app, steward, researcher, 28).await;
+
+    let (status, regrant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 0)).await;
+    assert_eq!(status, StatusCode::OK, "re-grant: {regrant}");
+    assert_eq!(regrant["budget"]["limit"], 28, "{regrant}");
+    assert_eq!(budget_events(&capture), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_failed_approval_leaves_no_budget_for_a_direct_grant_to_trip_over() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let request_id = pending_request(&app, steward, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let (status, _) = post(&app, &approve, &stoken, "{}").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // The grant exists with no budget entry, so a direct grant funds it.
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 28)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    assert_eq!(grant["budget"]["limit"], 28, "{grant}");
+
+    // The approval's retry then adds its own 25 once.
+    for _ in 0..2 {
+        let (status, resolved) = post(&app, &approve, &stoken, "{}").await;
+        assert_eq!(status, StatusCode::OK, "retry: {resolved}");
+        assert_eq!(resolved["grant"]["budget"]["limit"], 53, "{resolved}");
+    }
+}
+
+#[tokio::test]
+async fn a_zero_budget_grant_is_still_a_grant_a_direct_grant_cannot_replace() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
+    let stoken = token_for(steward);
+    let (status, grant) = post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 0)).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    assert_eq!(grant["budget"]["limit"], 0, "{grant}");
+
+    let (status, refused) =
+        post(&app, "/api/v1/grants", &stoken, &grant_body(researcher, 50)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "re-grant: {refused}");
+    assert_eq!(refused["error"], ALREADY_GRANTED);
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], 0, "{budget}");
+}
+
+#[tokio::test]
+async fn a_grant_and_an_approval_at_once_drop_no_budget() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    // The direct grant's first `state` yields, so the approval runs mid-grant.
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            yield_on_state: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let listing_id = publish(&app, steward).await;
+    let request_id = request_listing(&app, &listing_id, researcher).await;
+    let approve = format!("/api/v1/research/requests/{request_id}/approve");
+    let grant = grant_body(researcher, 28);
+    let ((grant_status, granted), (approve_status, approved)) = tokio::join!(
+        post(&app, "/api/v1/grants", &stoken, &grant),
+        post(&app, &approve, &stoken, r#"{"query_budget":50}"#),
+    );
+    assert_eq!(approve_status, StatusCode::OK, "approve: {approved}");
+    let grant_id = approved["grant"]["grant_id"].as_str().expect("grant id");
+    let budget = budget_of(&app, steward, grant_id).await;
+    // A direct grant that got 200 has its 28 in the budget; one that came
+    // second is refused, never silently dropped.
+    let expected = match grant_status {
+        StatusCode::OK => 78,
+        StatusCode::CONFLICT => 50,
+        other => panic!("grant: {other} {granted}"),
+    };
+    assert_eq!(budget["limit"], expected, "{budget} {granted}");
+}
+
+#[tokio::test]
+async fn of_two_simultaneous_grants_only_one_is_made() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    // The first `state` yields, so the other request runs mid-grant.
+    let stores = ResearchStores {
+        budgets: Arc::new(TestLedger {
+            yield_on_state: armed(),
+            ..TestLedger::default()
+        }),
+        ..ResearchStores::in_memory()
+    };
+    let app = research_app_with_stores(
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::CURRENT),
+        stores,
+    )
+    .await;
+    let stoken = token_for(steward);
+    let (body_a, body_b) = (grant_body(researcher, 28), grant_body(researcher, 50));
+    let (first, second) = tokio::join!(
+        post(&app, "/api/v1/grants", &stoken, &body_a),
+        post(&app, "/api/v1/grants", &stoken, &body_b),
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "{first:?} {second:?}"
+    );
+    // The budget is the one the 200 reported.
+    let made = if first.0 == StatusCode::OK {
+        &first.1
+    } else {
+        &second.1
+    };
+    let grant_id = made["grant_id"].as_str().expect("grant id");
+    let budget = budget_of(&app, steward, grant_id).await;
+    assert_eq!(budget["limit"], made["budget"]["limit"], "{budget} {made}");
+}
+
 // ── What a grant covers, and refusals that reveal nothing ──
 
 /// A whole response — status, headers and body — so two refusals can be
@@ -834,6 +1679,37 @@ async fn raw_research_query(
         &body.to_string(),
     )
     .await
+}
+
+/// Grants `researcher` the `health` dataset with `units`, then revokes the
+/// grant; returns its id.
+async fn grant_and_revoke(
+    app: &Router,
+    steward: TenantId,
+    researcher: TenantId,
+    units: u64,
+) -> String {
+    let body = grant_body(researcher, units);
+    let (status, grant) = post(app, "/api/v1/grants", &token_for(steward), &body).await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+    revoke(app, steward, &grant_id).await;
+    grant_id
+}
+
+/// Revokes `grant_id` as `steward`.
+async fn revoke(app: &Router, steward: TenantId, grant_id: &str) {
+    let uri = format!("/api/v1/grants/{grant_id}");
+    let (status, body) = call(app, "DELETE", &uri, &token_for(steward), None).await;
+    assert_eq!(status, StatusCode::OK, "revoke: {body}");
+}
+
+/// The budget of `grant_id`, as its steward reads it.
+async fn budget_of(app: &Router, steward: TenantId, grant_id: &str) -> serde_json::Value {
+    let uri = format!("/api/v1/grants/{grant_id}/budget");
+    let (status, budget) = call(app, "GET", &uri, &token_for(steward), None).await;
+    assert_eq!(status, StatusCode::OK, "budget: {budget}");
+    budget
 }
 
 /// Grants `researcher` the steward's `health` dataset; returns the grant id.
@@ -1019,18 +1895,15 @@ async fn revoked_grant_still_answers_its_steward() {
 }
 
 /// Revoking and re-granting reuses the grant id, and with it the budget
-/// already spent: the re-grant's `query_budget` is ignored.
+/// already spent: the re-grant's `query_budget` is added to the old limit,
+/// and nothing resets the spend.
 #[tokio::test]
 async fn cannot_reset_budget_spend_by_regranting() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let app = research_app(steward, TenantKeypair::generate(EnvelopeSuite::CURRENT)).await;
     let stoken = token_for(steward);
-    let grant = |budget: u64| {
-        format!(
-            r#"{{"researcher_tenant":"{researcher}","connector":"health","query_budget":{budget}}}"#
-        )
-    };
+    let grant = |budget: u64| grant_body(researcher, budget);
 
     let (status, granted) = post(&app, "/api/v1/grants", &stoken, &grant(2)).await;
     assert_eq!(status, StatusCode::OK, "grant: {granted}");
@@ -1039,47 +1912,54 @@ async fn cannot_reset_budget_spend_by_regranting() {
     assert_eq!(status, StatusCode::OK, "query: {body}");
     assert_eq!(body["budget_remaining"], 1);
 
-    let revoke = format!("/api/v1/grants/{grant_id}");
-    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
-    assert_eq!(status, StatusCode::OK);
+    revoke(&app, steward, grant_id).await;
     let (status, regranted) = post(&app, "/api/v1/grants", &stoken, &grant(100)).await;
     assert_eq!(status, StatusCode::OK, "re-grant: {regranted}");
     assert_eq!(regranted["grant_id"], grant_id);
     assert_eq!(regranted["revoked"], false);
-    assert_eq!(regranted["budget"]["limit"], 2, "re-grant: {regranted}");
+    // The re-grant adds its 100 to the old limit; the spent unit stays spent.
+    assert_eq!(regranted["budget"]["limit"], 102, "re-grant: {regranted}");
     assert_eq!(regranted["budget"]["spent"], 1, "re-grant: {regranted}");
 
     let (status, body) = research_query(&app, researcher, steward).await;
     assert_eq!(status, StatusCode::OK, "query: {body}");
-    assert_eq!(body["budget_remaining"], 0);
-    let (status, _) = research_query(&app, researcher, steward).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["budget_remaining"], 100);
 }
 
 // ── Approval after a partial failure ──
 
-/// Fails the first call and passes every later one. The error is
-/// `TenancyError::NotFound`, that enum's only variant; the API answers any
-/// registry error with 502.
-fn fail_once(failed: &AtomicBool) -> Result<(), TenancyError> {
-    if failed.swap(true, Ordering::SeqCst) {
-        Ok(())
-    } else {
-        Err(TenancyError::NotFound)
-    }
+/// The in-memory budget ledger with one-shot faults. Each switch, while
+/// armed (true), acts on the next call of its method and disarms itself:
+/// `fail_*` fails that call before it changes anything, and
+/// `yield_on_state` yields after the read, so a concurrent request runs
+/// while the reader holds a stale answer. A test arms a switch when it
+/// builds the ledger, or after its setup.
+#[derive(Default)]
+struct TestLedger {
+    inner: InMemoryBudgetLedger,
+    fail_open: AtomicBool,
+    fail_top_up: AtomicBool,
+    fail_top_up_once: AtomicBool,
+    fail_state: AtomicBool,
+    yield_on_state: AtomicBool,
 }
 
-/// The in-memory budget ledger, except that the first `open` fails.
-#[derive(Default)]
-struct FailFirstOpen {
-    inner: InMemoryBudgetLedger,
-    failed: AtomicBool,
+/// Whether `switch` was armed; disarms it.
+fn fires(switch: &AtomicBool) -> bool {
+    switch.swap(false, Ordering::SeqCst)
+}
+
+/// An armed [`TestLedger`] switch.
+fn armed() -> AtomicBool {
+    AtomicBool::new(true)
 }
 
 #[async_trait]
-impl BudgetLedger for FailFirstOpen {
+impl BudgetLedger for TestLedger {
     async fn open(&self, grant_id: &str, limit: u64) -> Result<BudgetState, TenancyError> {
-        fail_once(&self.failed)?;
+        if fires(&self.fail_open) {
+            return Err(TenancyError::NotFound);
+        }
         self.inner.open(grant_id, limit).await
     }
 
@@ -1088,6 +1968,9 @@ impl BudgetLedger for FailFirstOpen {
     }
 
     async fn top_up(&self, grant_id: &str, additional: u64) -> Result<BudgetState, BudgetError> {
+        if fires(&self.fail_top_up) {
+            return Err(BudgetError::UnknownGrant);
+        }
         self.inner.top_up(grant_id, additional).await
     }
 
@@ -1097,30 +1980,49 @@ impl BudgetLedger for FailFirstOpen {
         key: &str,
         additional: u64,
     ) -> Result<BudgetState, BudgetError> {
+        if fires(&self.fail_top_up_once) {
+            return Err(BudgetError::UnknownGrant);
+        }
         self.inner.top_up_once(grant_id, key, additional).await
     }
 
     async fn state(&self, grant_id: &str) -> Result<Option<BudgetState>, TenancyError> {
-        self.inner.state(grant_id).await
+        if fires(&self.fail_state) {
+            return Err(TenancyError::NotFound);
+        }
+        let state = self.inner.state(grant_id).await;
+        if fires(&self.yield_on_state) {
+            tokio::task::yield_now().await;
+        }
+        state
     }
 }
 
-/// The in-memory grant registry, except that the first `create` fails.
+/// The in-memory grant registry with one-shot switches, as on
+/// [`TestLedger`]: `fail_create` and `fail_create_unless_revoked` fail that
+/// call before it changes anything (with `TenancyError::NotFound`, that
+/// enum's only variant; the API answers any registry error with 502), and
+/// `yield_after_check` yields after `create_unless_revoked` answers, so a
+/// concurrent request runs before this one acts on that answer.
 #[derive(Default)]
-struct FailFirstCreate {
+struct TestRegistry {
     inner: InMemoryGrantRegistry,
-    failed: AtomicBool,
+    fail_create: AtomicBool,
+    fail_create_unless_revoked: AtomicBool,
+    yield_after_check: AtomicBool,
 }
 
 #[async_trait]
-impl GrantRegistry for FailFirstCreate {
+impl GrantRegistry for TestRegistry {
     async fn create(
         &self,
         steward: TenantId,
         researcher: TenantId,
         connector: &str,
     ) -> Result<DatasetGrant, TenancyError> {
-        fail_once(&self.failed)?;
+        if fires(&self.fail_create) {
+            return Err(TenancyError::NotFound);
+        }
         self.inner.create(steward, researcher, connector).await
     }
 
@@ -1130,9 +2032,17 @@ impl GrantRegistry for FailFirstCreate {
         researcher: TenantId,
         connector: &str,
     ) -> Result<GrantOutcome, TenancyError> {
-        self.inner
+        if fires(&self.fail_create_unless_revoked) {
+            return Err(TenancyError::NotFound);
+        }
+        let outcome = self
+            .inner
             .create_unless_revoked(steward, researcher, connector)
-            .await
+            .await;
+        if fires(&self.yield_after_check) {
+            tokio::task::yield_now().await;
+        }
+        outcome
     }
 
     async fn find_active(
@@ -1158,8 +2068,8 @@ impl GrantRegistry for FailFirstCreate {
 }
 
 /// The in-memory grant registry, except that `create_unless_revoked`, which
-/// only an approval retry calls, first revokes the grant it is about to
-/// check: a revoke that lands after the retry starts and before its grant
+/// an approval retry and a direct grant call, first revokes the grant it is
+/// about to check: a revoke that lands after the retry starts and before its grant
 /// step, made deterministic instead of racing two tasks.
 #[derive(Default)]
 struct RevokeDuringRetry {
@@ -1304,7 +2214,10 @@ async fn approval_retried_after_a_budget_failure_converges() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let stores = ResearchStores {
-        budgets: Arc::new(FailFirstOpen::default()),
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
         ..ResearchStores::in_memory()
     };
     let app = research_app_with_stores(
@@ -1317,8 +2230,8 @@ async fn approval_retried_after_a_budget_failure_converges() {
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
 
-    // `create` succeeds and `open` fails: the request is Approved and the
-    // grant exists, but with no budget entry it serves no queries.
+    // `create` succeeds and `top_up_once` fails: the request is Approved and
+    // the grant exists, but with no budget entry it serves no queries.
     let (status, _) = post(&app, &approve, &stoken, "{}").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let (_, inbox) = call(&app, "GET", "/api/v1/research/requests", &stoken, None).await;
@@ -1342,7 +2255,10 @@ async fn deny_after_a_failed_approval_is_refused() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let stores = ResearchStores {
-        grants: Arc::new(FailFirstCreate::default()),
+        grants: Arc::new(TestRegistry {
+            fail_create_unless_revoked: armed(),
+            ..TestRegistry::default()
+        }),
         ..ResearchStores::in_memory()
     };
     let app = research_app_with_stores(
@@ -1355,7 +2271,7 @@ async fn deny_after_a_failed_approval_is_refused() {
     let request_id = pending_request(&app, steward, researcher).await;
     let uri = |action: &str| format!("/api/v1/research/requests/{request_id}/{action}");
 
-    // `create` fails: the request is Approved and no grant exists.
+    // Minting the grant fails: the request is Approved and no grant exists.
     let (status, _) = post(&app, &uri("approve"), &stoken, "{}").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
@@ -1430,9 +2346,7 @@ async fn approval_retry_after_a_revoke_is_refused() {
     let grant_id = resolved["grant"]["grant_id"].as_str().expect("grant id");
     let (status, _) = research_query(&app, researcher, steward).await;
     assert_eq!(status, StatusCode::OK);
-    let revoke = format!("/api/v1/grants/{grant_id}");
-    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
-    assert_eq!(status, StatusCode::OK);
+    revoke(&app, steward, grant_id).await;
 
     // The old approval arrives again (a retry, a double-click or a stale
     // tab). It is refused, and access stays revoked.
@@ -1459,6 +2373,8 @@ async fn approval_retry_after_a_revoke_is_refused() {
     assert_eq!(status, StatusCode::OK, "re-grant: {grant}");
     assert_eq!(grant["grant_id"], grant_id);
     assert_eq!(grant["revoked"], false);
+    // It names no budget, so the grant keeps the approval's 25.
+    assert_eq!(grant["budget"]["limit"], 25, "{grant}");
     let (status, body) = research_query(&app, researcher, steward).await;
     assert_eq!(status, StatusCode::OK, "query: {body}");
 }
@@ -1468,7 +2384,10 @@ async fn half_finished_approval_retry_after_a_revoke_is_refused() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let stores = ResearchStores {
-        budgets: Arc::new(FailFirstOpen::default()),
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
         ..ResearchStores::in_memory()
     };
     let app = research_app_with_stores(
@@ -1481,16 +2400,14 @@ async fn half_finished_approval_retry_after_a_revoke_is_refused() {
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
 
-    // `create` succeeds and `open` fails: the request is Approved and the
-    // grant exists without a budget. The steward revokes it instead of
+    // `create` succeeds and `top_up_once` fails: the request is Approved and
+    // the grant exists without a budget. The steward revokes it instead of
     // retrying.
     let (status, _) = post(&app, &approve, &stoken, "{}").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let (_, grants) = call(&app, "GET", "/api/v1/grants", &stoken, None).await;
     let grant_id = grants["grants"][0]["grant_id"].as_str().expect("grant id");
-    let revoke = format!("/api/v1/grants/{grant_id}");
-    let (status, _) = call(&app, "DELETE", &revoke, &stoken, None).await;
-    assert_eq!(status, StatusCode::OK);
+    revoke(&app, steward, grant_id).await;
 
     // A late retry must not re-activate the revoked grant.
     let (status, body) = post(&app, &approve, &stoken, "{}").await;
@@ -1561,8 +2478,7 @@ async fn approval_retry_with_a_different_budget_is_refused() {
     // A retry cannot change the approved budget, and the budget is unchanged.
     let (status, body) = post(&app, &approve, &stoken, r#"{"query_budget":50}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "retry: {body}");
-    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
-    let (_, budget) = call(&app, "GET", &budget_uri, &stoken, None).await;
+    let budget = budget_of(&app, steward, grant_id).await;
     assert_eq!(budget["limit"], 10, "budget: {budget}");
 
     // A retry that repeats the approved budget, or leaves it out, converges.
@@ -1578,7 +2494,10 @@ async fn approval_retry_after_a_budget_failure_keeps_the_approved_budget() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let stores = ResearchStores {
-        budgets: Arc::new(FailFirstOpen::default()),
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
         ..ResearchStores::in_memory()
     };
     let app = research_app_with_stores(
@@ -1591,7 +2510,7 @@ async fn approval_retry_after_a_budget_failure_keeps_the_approved_budget() {
     let request_id = pending_request(&app, steward, researcher).await;
     let approve = format!("/api/v1/research/requests/{request_id}/approve");
 
-    // The approval asks for 10 query units and fails before the budget opens.
+    // The approval asks for 10 query units and fails before its budget is added.
     let (status, _) = post(&app, &approve, &stoken, r#"{"query_budget":10}"#).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
@@ -1716,7 +2635,10 @@ async fn stale_approval_retry_after_a_revoke_and_regrant_adds_nothing() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let stores = ResearchStores {
-        budgets: Arc::new(FailFirstOpen::default()),
+        budgets: Arc::new(TestLedger {
+            fail_top_up_once: armed(),
+            ..TestLedger::default()
+        }),
         ..ResearchStores::in_memory()
     };
     let app = research_app_with_stores(
@@ -1757,14 +2679,12 @@ async fn stale_approval_retry_after_a_revoke_and_regrant_adds_nothing() {
     // A stale retry of A predates the revoke: refused, and adds nothing.
     let (status, _) = post(&app, &approve(&a), &stoken, "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let budget_uri = format!("/api/v1/grants/{grant_id}/budget");
-    let (_, budget) = call(&app, "GET", &budget_uri, &stoken, None).await;
+    let budget = budget_of(&app, steward, &grant_id).await;
     assert_eq!(budget["limit"], 2, "{budget}");
-    assert!(
-        capture.events().iter().any(|e| e.detail.contains(&format!(
-            "approve refused request={a} grant={grant_id} retry=true reason=revoked_since"
-        ))),
-        "{:?}",
-        capture.events()
+    assert_event(
+        &capture,
+        "research.catalog",
+        "denied",
+        &format!("approve refused request={a} grant={grant_id} retry=true reason=revoked_since"),
     );
 }
