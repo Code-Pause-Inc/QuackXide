@@ -14,7 +14,7 @@ use bytes::Bytes;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use platform_core::ZkMode;
 use quackxide_engine::{
-    EngineSettings, MinCountThreshold, QueryError, QueryLimit, QueryLimits, QueryScope,
+    EngineSettings, MinCountThreshold, PercentRule, QueryError, QueryLimit, QueryLimits, QueryScope,
 };
 use synth_data::{SchemaName, Spec};
 
@@ -66,7 +66,7 @@ fn scope(zk: ZkMode, limits: QueryLimits) -> QueryScope {
         limits,
     });
     if zk.is_enabled() {
-        scope.set_disclosure(Arc::new(MinCountThreshold { k: K }));
+        scope.set_disclosure(Arc::new(MinCountThreshold { k: K }), PercentRule { p: 10 });
     }
     scope
 }
@@ -98,7 +98,7 @@ async fn a_query_the_gates_refuse_decodes_no_column() {
             |err| matches!(err, QueryError::Disclosure(_)),
         ),
         (
-            "SELECT condition, MAX(age) AS n FROM cohort GROUP BY condition",
+            "SELECT condition, SUM(age) AS n FROM cohort GROUP BY condition",
             |err| matches!(err, QueryError::Disclosure(_)),
         ),
         // An expression that can fail at runtime (ADR 0011).

@@ -8,6 +8,24 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Data dictionary on published listings (P59): a catalog listing carries
+  `data_dictionary`, the dataset's SQL table name and the columns its
+  steward describes (name, type family and an optional description), so a
+  researcher can write a query without spending budget to learn the
+  schema. The API derives the table name from the slug, double-quoted
+  where SQL needs it (`health`, `"2026-cohorts"`), and
+  `POST /api/v1/catalog` takes the columns in `data_dictionary.columns`,
+  bounded like the listing's other text: at most 512 columns, names of 1
+  to 128 bytes with no control characters and none twice, and
+  descriptions of at most 500 characters, refused with 400 over a bound
+  and 422 when not a dictionary's shape. A re-publish replaces the
+  columns. `GET /api/v1/connectors` lists the built-in connectors with the
+  columns each one's mapper writes, which the publish form pre-fills a
+  connector dataset's dictionary from; an upload's columns are entered by
+  hand. The portal shows the dictionary on every catalog listing and each
+  authorized dataset, with a `SELECT COUNT(*) AS n` example over the table
+  name to copy. The catalog is still in memory, so listings and their
+  dictionaries are lost on restart (P62).
 * Browser envelope seal benchmark (P34 checkpoint A, #171).
   `scripts/bench-wasm-seal.sh` seals synthetic Parquet from `synth-data`
   at about 1 MiB, 100 MiB and 1 GiB with the wasm module in a Chromium
@@ -294,6 +312,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* A query's table is the dataset's exact slug. The engine registered it by
+  parsing the slug as SQL, which cut a slug containing `--` short at the
+  comment marker, so `a--b` was queried as `a`.
 * `POST /api/v1/grants` no longer drops its `query_budget` when the grant
   exists. An active grant that already has a budget is refused with 409
   and audited; the body says to raise the budget with
@@ -385,6 +406,28 @@ uses [Semantic Versioning](https://semver.org/).
   differ answer 502 instead of 400, and a stored object that fails to
   decode, now during a scan, still answers 502. Decryption is still
   whole-object.
+* Zero-knowledge and research queries release a `SUM` or `AVG` as null
+  when one or two rows dominate it: when the group's absolute values,
+  less the two largest, total under *p*% of the largest, so that anyone
+  who knows the second-largest would learn the largest to within *p*%
+  (the p% rule, ADR 0015, proposed; P58). The mask is applied inside the
+  plan, directly above the aggregate, so `HAVING`, `ORDER BY` and derived
+  columns read the masked value, and the hidden aggregates it uses never
+  reach the result. The row keeps `n` and its other cells, and
+  `suppressed_rows` still counts only rows below *k*. *p* is
+  `RESEARCH_DOMINANCE_PERCENT`: 10 when unset; a value that is not a whole
+  number refuses startup, and 0 refuses every zero-knowledge and research
+  query. A sum over fewer than three non-null values is masked unless
+  they are all zero. `SUM` and `AVG` with `DISTINCT`, or over an
+  interval, are refused.
+* `MIN` and `MAX` are refused in zero-knowledge and research queries,
+  wherever they appear, `HAVING` and `ORDER BY` included (ADR 0015,
+  proposed; P57). Each returns one row's value however large the cohort:
+  one query gave the highest salary in a dataset, filtering below it gave
+  the next, and an id range said whose it was. Ranges come from counts
+  over bands (`salary / 1000 AS band`) and the centre from `AVG`;
+  ungated queries keep `MIN` and `MAX`. ADR 0015 also decides the p% rule
+  that P58 applies to `SUM` and `AVG`.
 * `url` 2.5.9 (RUSTSEC-2026-0592: `Url::origin()` overflowed the stack on
   nested `blob:` URLs), in `backend/Cargo.lock` and
   `backend/fuzz/Cargo.lock`. No backend code calls `Url::origin()`.

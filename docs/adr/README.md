@@ -45,3 +45,4 @@ What becomes easier or harder, and what must now be true.
 * [0011. Refuse expressions that can fail at runtime in the disclosure gate](0011-refuse-expressions-that-can-fail-at-runtime.md)
 * [0012. Steward dataset upload](0012-steward-dataset-upload.md)
 * [0013. Per-query resource limits](0013-per-query-resource-limits.md)
+* [0015. Refuse `MIN` and `MAX`, and mask dominated sums, in the disclosure gate](0015-refuse-min-max-and-mask-dominated-sums.md)

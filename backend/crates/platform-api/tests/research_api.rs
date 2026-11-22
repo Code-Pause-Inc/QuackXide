@@ -592,6 +592,150 @@ async fn researcher_cannot_egress_raw_rows_or_skip_count() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // MAX returns one row's value, however large the cohort → 422 (ADR 0015).
+    let (status, _) = post(
+        &app,
+        "/api/v1/research/query",
+        &rtoken,
+        &format!(
+            r#"{{"steward_tenant":"{steward}","connector":"health","sql":"SELECT COUNT(*) AS n, MAX(age) AS oldest FROM health"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+const SYNTHETIC: &str = "upload_cohort";
+
+/// An app where `steward` has uploaded [`SYNTHETIC`], the synthetic cohort
+/// built around k = 5 (`platform_api::dev::seal_cohort_upload`): its
+/// `transplant` group of 10 rows, which the cohort threshold releases, has
+/// one person holding over 95% of the group's `cost_cents`. Own-data
+/// queries run in zero-knowledge mode, and the p% rule's `p` is
+/// `dominance_percent`.
+async fn synthetic_cohort_app(steward: TenantId, dominance_percent: u64) -> Router {
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let key = keypair.public_key();
+    let vault: Arc<dyn platform_storage::VaultStore> =
+        Arc::new(platform_storage::ObjectStoreVault::new_in_memory());
+    let mut stack = DevResearchStack::with_vault(vault.clone());
+    stack.register_key(steward, keypair);
+    let research = Arc::new(
+        ResearchService::new(ResearchStores::in_memory(), vault.clone(), 5, 100)
+            .with_dominance_percent(dominance_percent),
+    );
+    let service = stack.query_service_with_attestation(
+        EngineSettings {
+            zk: ZkMode::Enabled,
+            max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
+        },
+        research.clone(),
+        dev_attestation(),
+        false,
+    );
+    let app = build_app(AppState {
+        config: Arc::new(common::default_config()),
+        research: Some(research),
+        query: Some(Arc::new(service)),
+        ..common::app_state(SECRET, vault)
+    });
+
+    let dataset = ConnectorSlug::new(SYNTHETIC).expect("slug");
+    let sealed = platform_api::dev::seal_cohort_upload(steward, &key, &dataset, 5).expect("seal");
+    let (status, body) =
+        common::put_upload(&app, Some(&token_for(steward)), SYNTHETIC, sealed.body).await;
+    assert_eq!(status, StatusCode::OK, "upload: {body}");
+    app
+}
+
+/// `sql` over [`SYNTHETIC`] as `researcher` through the research endpoint,
+/// then as `steward` through the own-data one.
+async fn research_and_own_data(
+    app: &Router,
+    steward: TenantId,
+    researcher: TenantId,
+    sql: &str,
+) -> [(&'static str, StatusCode, serde_json::Value); 2] {
+    let (status, grant) = post(
+        app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"{SYNTHETIC}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let research = serde_json::json!({
+        "steward_tenant": steward.to_string(), "connector": SYNTHETIC, "sql": sql,
+    });
+    let (research_status, research_body) = post(
+        app,
+        "/api/v1/research/query",
+        &token_for(researcher),
+        &research.to_string(),
+    )
+    .await;
+    let own = serde_json::json!({ "connector": SYNTHETIC, "sql": sql });
+    let (own_status, own_body) =
+        common::post_query(app, Some(&token_for(steward)), &own.to_string()).await;
+    [
+        ("research", research_status, research_body),
+        ("own data", own_status, own_body),
+    ]
+}
+
+/// The p% rule reaches both gated endpoints: the `transplant` group's sum
+/// and mean are released as null beside its `n`, every other released
+/// group's are not, and no row carries a column the query did not name.
+#[tokio::test]
+async fn dominated_sums_are_masked_in_research_and_own_data_responses() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = synthetic_cohort_app(steward, 10).await;
+    let sql = format!(
+        "SELECT condition, COUNT(*) AS n, SUM(cost_cents) AS cost, AVG(cost_cents) AS mean \
+         FROM {SYNTHETIC} GROUP BY condition"
+    );
+    for (endpoint, status, body) in research_and_own_data(&app, steward, researcher, &sql).await {
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+        // k = 5 withholds the k - 1 and single-row groups.
+        assert_eq!(body["suppressed_rows"], 2, "{endpoint}: {body}");
+        let rows = body["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 7, "{endpoint}: {body}");
+        for row in rows {
+            let cells = row.as_object().expect("row");
+            assert!(
+                cells
+                    .keys()
+                    .all(|key| ["condition", "n", "cost", "mean"].contains(&key.as_str())),
+                "{endpoint}: {row}"
+            );
+            let dominated = row["condition"] == "transplant";
+            assert_eq!(cells.contains_key("cost"), !dominated, "{endpoint}: {row}");
+            assert_eq!(cells.contains_key("mean"), !dominated, "{endpoint}: {row}");
+            if dominated {
+                assert_eq!(row["n"], 10, "{endpoint}: {row}");
+            }
+        }
+    }
+}
+
+/// `RESEARCH_DOMINANCE_PERCENT=0` refuses every gated query, even one with
+/// no sum, as a zero cohort size does.
+#[tokio::test]
+async fn a_zero_dominance_percent_refuses_every_gated_query() {
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let app = synthetic_cohort_app(steward, 0).await;
+    let sql = format!("SELECT condition, COUNT(*) AS n FROM {SYNTHETIC} GROUP BY condition");
+    for (endpoint, status, body) in research_and_own_data(&app, steward, researcher, &sql).await {
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{endpoint}: {body}"
+        );
+    }
 }
 
 /// A query whose expression fails only on the rare cohort's row gets the

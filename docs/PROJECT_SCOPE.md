@@ -61,7 +61,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Benchmarks | **Build** | `HPK1` and `HPK2` envelope keygen, seal and open benchmarks and research-query latency in `quackxide-engine` exist (`docs/BENCHMARKS.md`); CI benchmarks the base and head of each pull request and flags a significant regression of more than 10 % as a warning. Still to build: browser encryption throughput and enclave overhead. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
 | DataFusion upgrade | **Built** | DataFusion 55, Arrow/Parquet 59, and `object_store` 0.13 ([ADR 0008](adr/0008-datafusion-55-upgrade.md)); `thrift`, `paste`, and `rustls-pemfile` advisories cleared; disclosure allowlist and `tests/bypass.rs` verified. |
-| Dominance rule | **Build** | Suppress `MIN`/`MAX` (and sums) dominated by a single individual, closing the extreme-value residual in `docs/THREAT_MODEL.md`. |
+| Dominance rule | **Built** | `MIN` and `MAX` are refused, since each returns one person's value, and the p% rule releases a `SUM` or `AVG` that one or two rows dominate as null, inside the plan, so nothing above the aggregate reads the unmasked total ([ADR 0015](adr/0015-refuse-min-max-and-mask-dominated-sums.md)); `RESEARCH_DOMINANCE_PERCENT` sets *p*. |
 | A test for every failure path | **Harden** | Every refusal (403, 422, 429, 503, attestation, malformed input) has a negative test. |
 
 ## Stack

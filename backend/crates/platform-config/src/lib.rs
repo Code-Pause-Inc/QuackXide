@@ -16,6 +16,10 @@ pub const DEFAULT_PUBLIC_NAME: &str = "Confidential Drive";
 const DEFAULT_SYNC_INTERVAL_SECS: u64 = 900;
 /// A common small-cell suppression threshold for health statistics.
 pub const DEFAULT_MIN_COHORT_SIZE: u64 = 11;
+/// The p% rule's `p` (ADR 0015): a sum or mean is masked when anyone who
+/// knows its second-largest contribution would learn the largest to within
+/// 10%.
+pub const DEFAULT_DOMINANCE_PERCENT: u64 = 10;
 const DEFAULT_QUERY_BUDGET: u64 = 100;
 const DEFAULT_SIGNATURE_TOLERANCE_SECS: u64 = 300;
 pub const DEFAULT_QUERY_MAX_CONCURRENT: usize = 4;
@@ -186,6 +190,11 @@ pub struct ResearchConfig {
     /// `RESEARCH_MIN_COHORT_SIZE` — result rows whose cohort (`COUNT(*) AS n`)
     /// is smaller are suppressed before egress.
     pub min_cohort_size: u64,
+    /// `RESEARCH_DOMINANCE_PERCENT` — the p% rule's `p`, an integer percent
+    /// (ADR 0015): a `SUM` or `AVG` that one or two rows dominate is
+    /// released as null. Zero refuses every zero-knowledge and research
+    /// query, as a zero cohort size does.
+    pub dominance_percent: u64,
     /// `RESEARCH_DEFAULT_QUERY_BUDGET` — query units for a new grant when the
     /// steward sets none. Budgets bound adaptive (differencing) querying and
     /// are raised by top-up, never reset.
@@ -501,6 +510,11 @@ impl PlatformConfig {
 
         let research = ResearchConfig {
             min_cohort_size: parse_u64(&get, "RESEARCH_MIN_COHORT_SIZE", DEFAULT_MIN_COHORT_SIZE)?,
+            dominance_percent: parse_u64(
+                &get,
+                "RESEARCH_DOMINANCE_PERCENT",
+                DEFAULT_DOMINANCE_PERCENT,
+            )?,
             default_query_budget: parse_u64(
                 &get,
                 "RESEARCH_DEFAULT_QUERY_BUDGET",
@@ -937,12 +951,43 @@ mod tests {
         assert!(!cfg.features.admin_connector_toggles);
         assert_eq!(cfg.connectors.sync_interval_secs, 900);
         assert_eq!(cfg.research.min_cohort_size, 11);
+        assert_eq!(cfg.research.dominance_percent, 10);
         assert_eq!(cfg.research.default_query_budget, 100);
         assert_eq!(cfg.research.pricing_currency, "USD");
         assert!(cfg.billing.paddle_webhook_secret.is_none());
         assert_eq!(cfg.billing.signature_tolerance_secs, 300);
         assert_eq!(cfg.storage.client, StorageClientConfig::default());
         assert_eq!(cfg.storage.client.worst_case(), Duration::from_secs(55));
+    }
+
+    /// Unset or blank takes the default, which enforces the p% rule; a value
+    /// that is not a whole number refuses startup. Zero loads, and the
+    /// engine refuses every gated query with it (`quackxide-engine`'s
+    /// `tests/bypass.rs`), as with `RESEARCH_MIN_COHORT_SIZE`.
+    #[test]
+    fn dominance_percent_is_read_and_malformed_values_refuse_startup() {
+        let dominance = |value: &'static str| {
+            PlatformConfig::from_source(source(&[("RESEARCH_DOMINANCE_PERCENT", value)]))
+                .map(|cfg| cfg.research.dominance_percent)
+        };
+        assert_eq!(dominance("25").expect("loads"), 25);
+        assert_eq!(dominance(" 0 ").expect("loads"), 0);
+        assert_eq!(
+            dominance("").expect("blank is unset"),
+            DEFAULT_DOMINANCE_PERCENT
+        );
+        for value in ["ten", "-1", "1.5", "10%", "18446744073709551616"] {
+            assert!(
+                matches!(
+                    dominance(value),
+                    Err(ConfigError::Invalid {
+                        key: "RESEARCH_DOMINANCE_PERCENT",
+                        ..
+                    })
+                ),
+                "{value} must be refused"
+            );
+        }
     }
 
     #[test]

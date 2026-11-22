@@ -71,11 +71,13 @@ key that opens the data.
 3. **Query.** Apache DataFusion runs inside the enclave over transiently
    decrypted Parquet. A logical-plan allowlist admits only simple aggregate
    queries; each must carry a genuine `COUNT(*) AS n`, and cohorts below
-   `RESEARCH_MIN_COHORT_SIZE` are suppressed. Blind indexes support
-   equality search without decryption.
-4. **Research access.** A steward grants a researcher a finite query
-   budget, spent before execution and never refunded. Research queries
-   pass the same gate.
+   `RESEARCH_MIN_COHORT_SIZE` are suppressed. A sum or mean that one or
+   two rows dominate is released as null (`RESEARCH_DOMINANCE_PERCENT`).
+   Blind indexes support equality search without decryption.
+4. **Research access.** A steward publishes a dataset's listing, with a
+   data dictionary of its table name and the columns the steward
+   describes, and grants a researcher a finite query budget, spent before
+   execution and never refunded. Research queries pass the same gate.
 
 Every security decision, including denials, is written to a
 `SECURITY_AUDIT_EVENT` stream with identifiers and outcomes only.
@@ -185,8 +187,8 @@ DEVSTACK_ALLOW_INSECURE=1 cargo run -p platform-api --features dev --bin devstac
 
 At startup it seals a synthetic cohort (`synth-data`, with groups on both
 sides of `RESEARCH_MIN_COHORT_SIZE`) as a steward's `health` dataset,
-publishes its catalog listing, and prints a token for the steward and one
-for a researcher.
+publishes its catalog listing with a data dictionary of the cohort's
+columns, and prints a token for the steward and one for a researcher.
 
 Terminal 2: put the two tokens in variables, list the steward's datasets
 as stored (the `health` snapshot's version, object ids, ciphertext size,

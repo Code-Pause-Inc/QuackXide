@@ -233,7 +233,10 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(body["rows"][0]["n"], 3);
     assert_eq!(body["zk_mode"], true);
 
-    // Cohorts below k = 2 (the single EUR invoice) are withheld.
+    // Cohorts below k = 2 (the single EUR invoice) are withheld. The USD
+    // revenue sums two invoices, so the p% rule releases it as null, which
+    // the JSON leaves out: either invoice's holder would learn the other's
+    // from it (ADR 0015).
     let (status, body) = post_query(
         &app,
         Some(&token),
@@ -243,7 +246,7 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["rows"],
-        serde_json::json!([{ "currency": "USD", "n": 2, "revenue": 1730.25 }])
+        serde_json::json!([{ "currency": "USD", "n": 2 }])
     );
     assert_eq!(body["suppressed_rows"], 1);
 
@@ -251,17 +254,20 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     let (status, body) = post_query(
         &app,
         Some(&token),
-        r#"{"connector":"quickbooks","sql":"SELECT id, COUNT(*) AS n, MAX(total) AS t FROM quickbooks GROUP BY id"}"#,
+        r#"{"connector":"quickbooks","sql":"SELECT id, COUNT(*) AS n, SUM(total) AS t FROM quickbooks GROUP BY id"}"#,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["row_count"], 0);
     assert_eq!(body["suppressed_rows"], 3);
 
-    // Aggregates without a genuine cohort size are rejected with 422.
+    // Aggregates without a genuine cohort size, and MIN or MAX, which
+    // return one row's value whatever the cohort size (ADR 0015), are
+    // rejected with 422.
     for sql in [
-        "SELECT id, MAX(total) AS t FROM quickbooks GROUP BY id",
+        "SELECT id, SUM(total) AS t FROM quickbooks GROUP BY id",
         "SELECT id, 9999 AS n FROM quickbooks GROUP BY id",
+        "SELECT COUNT(*) AS n, MAX(total) AS t FROM quickbooks",
     ] {
         let body = serde_json::json!({ "connector": "quickbooks", "sql": sql }).to_string();
         let (status, _) = post_query(&app, Some(&token), &body).await;
@@ -1391,6 +1397,8 @@ async fn repeated_syncs_never_inflate_counts() {
         assert_eq!(rows["object_count"], 1, "after {syncs} syncs");
 
         // The single EUR invoice stays below k = 2 however many syncs ran.
+        // The two USD invoices' revenue stays masked by the p% rule (ADR
+        // 0015); a third, duplicated invoice would release it.
         let rows = service
             .query(tenant, &connector, COHORT_SQL)
             .await
@@ -1398,7 +1406,7 @@ async fn repeated_syncs_never_inflate_counts() {
             .expect("cohorts");
         assert_eq!(
             rows["rows"],
-            serde_json::json!([{ "currency": "USD", "n": 2, "revenue": 1730.25 }]),
+            serde_json::json!([{ "currency": "USD", "n": 2 }]),
             "after {syncs} syncs"
         );
         assert_eq!(rows["suppressed_rows"], 1, "after {syncs} syncs");
@@ -1664,8 +1672,7 @@ async fn a_stored_object_with_a_corrupt_data_page_is_502() {
         .await;
         let service = service_over(tenant, keypair, vault, zk);
 
-        let reads_age =
-            "SELECT condition, COUNT(*) AS n, MAX(age) AS oldest FROM cohorts GROUP BY condition";
+        let reads_age = "SELECT condition, COUNT(*) AS n, SUM(age) AS total_age FROM cohorts GROUP BY condition";
         let (status, _, message) = refusal(service.query(tenant, &dataset, reads_age).await).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{zk:?}");
         assert_eq!(message, "storage backend error", "{zk:?}");
