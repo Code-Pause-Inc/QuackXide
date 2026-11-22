@@ -1712,6 +1712,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-dsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f6d49c3f3f0e10e18ca975ffda66f8da0ec36521c1d911adcbc521bf0743f5c"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils",
+ "hybrid-array",
+ "module-lattice",
+ "pkcs8 0.11.0",
+ "shake",
+ "signature 3.0.0",
+ "zeroize",
+]
+
+[[package]]
 name = "ml-kem"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2121,9 +2137,12 @@ name = "platform-crypto"
 version = "0.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
+ "base64 0.22.1",
+ "ed25519-dalek",
  "getrandom 0.4.3",
  "hmac 0.12.1",
  "hpke",
+ "ml-dsa",
  "rand 0.8.8",
  "sha1",
  "sha2 0.10.9",

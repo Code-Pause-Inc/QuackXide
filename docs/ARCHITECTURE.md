@@ -421,12 +421,23 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   each object is opened. `QueryScope` reads every Parquet footer before it
   decodes anything: the rows and uncompressed bytes they report must fit
   `QUERY_MAX_DECODED_ROWS` and `QUERY_MAX_DECODED_MIB`, since DataFusion's
-  memory pool does not track the decoded table, and decoded rows are counted
-  again. Decoding is synchronous, so these limits also bound the one stretch
-  the time limit cannot interrupt. A footer's uncompressed sizes understate
-  columns that dictionary or run-length encoding shrinks, so the decoded
-  table can take more memory than `QUERY_MAX_DECODED_MIB`; the row limit
-  holds regardless. Operators run in a pool of `QUERY_MEMORY_MIB` with
+  memory pool does not track the decoded table. Both are counted again as
+  the batches decode: the rows, and the Arrow memory each batch of 1024 rows
+  holds, since a footer's uncompressed sizes understate columns that
+  dictionary or run-length encoding shrinks. String and binary columns,
+  plain or declared as dictionaries, decode as view arrays, which point into
+  the pages and dictionaries they came from. Plain ones are measured before
+  they expand, so a value repeated across rows is refused before it is
+  copied once per row, and dictionaries are rebuilt from the views, each
+  distinct value once. Fixed-width columns are checked from their widths
+  before each batch decodes. The decoded table can pass
+  `QUERY_MAX_DECODED_MIB` only by the batch's list columns, and its strings
+  or binary inside a struct, which are counted only after they expand; a
+  page decompresses whole, to the size its own header states, and a
+  `DELTA_BYTE_ARRAY` page, which rebuilds each value from the one before it,
+  can copy up to its own size once per row of the batch. Decoding is
+  synchronous, so these limits also bound the one stretch the time limit
+  cannot interrupt. Operators run in a pool of `QUERY_MEMORY_MIB` with
   DataFusion's disk manager disabled, so a sort or aggregation that runs out
   fails the query instead of spilling decrypted rows to a temporary file. A
   result with more rows than `QUERY_MAX_RESULT_ROWS` after disclosure
@@ -475,12 +486,17 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   In a `dev` build, when `KEY_RELEASE_URL` is configured,
   `AttestedKeyProvider` acquires a per-query `ReleasedKeySession` from
   `KeyReleaseRelyingParty`: it fetches a single-use challenge nonce, binds
-  the nonce and its in-RAM `EnclaveIdentity` public keys into a 64-byte
-  `ReportDataBinding`, presents a simulated Confidential Space token
+  the nonce and its in-RAM `EnclaveIdentity` key set into 64 bytes (binding
+  v2, ADR 0010: the nonce, then a digest of its `HPK2` request key, both
+  result-signing keys and its configuration), presents a simulated
+  Confidential Space token
   carrying that binding as its nonces, and unwraps the HPKE-sealed tenant
   key into a zeroize-on-drop `TenantKeypair` for the duration of that
   query. The relying party checks the token with the production verifier
-  (`platform_enclave::token`) against the `sim-attestation` key set. When `KEY_RELEASE_URL` is unset, the query,
+  (`platform_enclave::token`) against the `sim-attestation` key set, and
+  accepts only the enclave audience: the public evidence token
+  (`GET /api/v1/attestation`) carries the browser audience, so a caller who
+  fetched it cannot open key release. When `KEY_RELEASE_URL` is unset, the query,
   research-query and attestation endpoints fail closed with 503; research
   access (below) does not need key release. That relying party is the development and
   simulation stand-in (ADR 0004): it and its clients compile only with the
@@ -568,9 +584,23 @@ only; revoke and top-up are steward-only. `DELETE /api/v1/grants/{id}`,
 `GET /api/v1/grants/{id}/budget` and `POST /api/v1/grants/{id}/budget`
 answer a grant id that is unknown and one the caller may not act on with
 the same 404 body, each audited as a denial. A steward's revoked grant
-stays its own: revoking it again succeeds, and its budget can still be read
-and topped up, which does not restore access. Metering rides the
-`engine.query` event and doubles as the billing meter.
+stays its own: revoking it again succeeds and records the later time, and its
+budget can still be read and topped up, which does not restore access.
+`POST /api/v1/grants` for an active grant that already has a budget is
+refused with 409 (a `tenant.provisioned` `denied` event) and a body that
+points to `POST /api/v1/grants/{grant_id}/budget`, where the steward raises
+the budget. A grant with no budget yet (a failed approval left it so) is
+funded. A revoked grant is re-activated first, with a `tenant.provisioned`
+`reactivated` event at once, and keeps its budget: the request's
+`query_budget` is added on top, and nothing when it is omitted. If that
+funding fails, the grant stays active with its old budget; a retry is then
+refused like any direct grant of an active grant if the grant already had a
+budget, and funds it otherwise, so nothing is added twice or dropped. Every
+top-up that raises the limit emits a `research.budget` event. Direct grants, approvals, top-ups and revokes take
+one lock, because a grant and its budget live in two stores; that holds in one
+process, and several instances need conditional writes in the durable stores
+(P61, P62). Metering rides the `engine.query` event and doubles as the
+billing meter.
 
 Catalog, access requests, grants and budgets need no key material. They
 live in `research::ResearchService` (`AppState::research`), which
@@ -591,14 +621,18 @@ dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`), so the steward's
 dataset listing (section 2) shows exactly what it can publish. Researchers file
 access requests (idempotent while pending); approval mints the grant
-through the same code path as a direct grant, and adds its query budget
-to the grant once, keyed by the request: a follow-up request tops up a
-grant that already exists (spend is kept), and a retry adds nothing. A
+(re-activating a revoked one, which a direct grant does the same way) and
+adds its query budget to it once, keyed by the request: a follow-up request
+tops up a grant that already exists (spend is kept), and a retry adds
+nothing. The budget write creates the entry if there is none, so a failure
+leaves no placeholder entry. A
 pending request whose listing has been unpublished can be denied but not
 approved (404, `denied` event). The approval is recorded first, with its
 query budget, so a failure
-partway leaves an approved request without a usable grant, never a grant
-behind a pending or denied one, and the steward's retry re-runs the
+partway leaves an approved request, never a grant behind a pending or
+denied one. A new grant is then unusable until funded; a revoked grant the
+approval re-activated (audited at once, as a direct grant's) is usable on
+its old budget. The steward's retry re-runs the
 idempotent grant and budget steps with the approved budget; a retry cannot
 change it. A retry never undoes a revoke: while the steward's grant to that
 researcher for that connector is revoked, the retry is refused (404) with a
@@ -705,7 +739,7 @@ browser and signatures are still classical.
 
 | Use | Current | Target |
 | --- | --- | --- |
-| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The browser (`envelope-wasm`) and the enclave's key-release key are still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186; key-release key: P85, #176) |
+| Key encapsulation (envelopes, enrollment) | HPKE base mode, X-Wing (X25519 + ML-KEM-768, KEM 0x647a, draft-06) with HKDF-SHA256 and AES-256-GCM, frame `HPK2`, on the backend. The enclave's request key is `HPK2` too. The browser (`envelope-wasm`) is still X25519, frame `HPK1`, accepted in development only | `HPK2` everywhere (browser: P36, #186) |
 | Bulk encryption | AES-256-GCM | AES-256-GCM |
 | Signatures (tokens, attestation-bound material) | RS256 (RSA); HS256 for local development | Hybrid Ed25519 + ML-DSA-65 for keys only an attested workload holds; tokens per ADR 0006 |
 
@@ -726,12 +760,11 @@ Migration rules:
   they are the browser's `HPK1` path and go away with P36 (#186). Tenant
   enrollment and the demo tenant build it from `APP_ENV` (ADR 0009):
   production accepts only `HPK2` keys, development also `HPK1`, so the
-  browser works until P36. The
-  key-release stand-in and released keys accept only `HPK2` in every mode;
-  the browser build and the enclave's key-release key accept only `HPK1`
-  until P36 and P85. A key opens only frames of its own suite, and a query
-  opens only a snapshot whose record names its key's suite. Refusals at
-  enrollment, upload, key release, query and open emit
+  browser works until P36. The enclave's request key, the key-release
+  stand-in and released keys accept only `HPK2` in every mode; the browser
+  build accepts only `HPK1` until P36. A key opens only frames of its own
+  suite, and a query opens only a snapshot whose record names its key's
+  suite. Refusals at enrollment, upload, key release, query and open emit
   `crypto.suite_refused`.
 * No silent downgrade: production refuses `HPK1` frames and X25519
   enrollment keys. v1 has no migration mode or re-seal tool (ADR 0007):
@@ -752,7 +785,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `crypto.key_enrollment` | Tenant HPKE public-key enrollment (ok/denied; every refusal, a suite refusal included, is a denial) |
 | `crypto.key_release` | Attestation-gated tenant key release into enclave memory (ok/denied/failed) |
 | `tee.attestation` | Every pipeline and query attestation decision |
-| `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created and revoked, and refused revokes |
+| `tenant.provisioned` | Provisioning, suspension, connector toggles; research grants created, re-activated, refused and revoked, and refused revokes |
 | `data.access` | Every vault read, write, delete, and list — including misses; each steward upload's stored object, commit, pruned or unprunable superseded snapshot, pruned leftover objects at the committed version, and refusal |
 | `connector.sync` | Each sealed dataset flush, snapshot commit, and pruned or unprunable superseded snapshot |
 | `engine.query` | Every confidential query, with metering fields, and each refusal by a resource limit ("denied", with `limit=<name>`) |
@@ -765,7 +798,7 @@ Grant events stay under `tenant.provisioned` rather than a `research.grant`
 kind of their own: a grant is the steward provisioning access to its own
 tenant's data, and keeping them there keeps the audit vocabulary
 (`AuditKind`) fixed. Their details tell them apart (`granted …`,
-`revoked …`, `revoke refused …`). Budget actions on a grant are
+`reactivated …`, `grant refused …`, `revoked …`, `revoke refused …`). Budget actions on a grant are
 `research.budget`, and a research query's grant check is an
 `auth.decision`. A refused revoke, top-up or budget read records the
 caller's tenant and the grant id, or `grant=malformed` when the path
@@ -783,7 +816,8 @@ Rules, enforced by the capture tests:
    all appear in the stream. On the grant and research-query routes, input
    refused with 400 before any lookup (a malformed tenant id or slug, a
    zero top-up, a grant to oneself) is not audited: the check reads only
-   the request and the caller's own tenant id.
+   the request and the caller's own tenant id. The same holds for a
+   malformed attestation nonce on the unauthenticated attestation route.
 3. Coverage is tested: `platform_telemetry::capture::AuditCapture` records
    emitted events in-process, and `platform-api/tests/audit_coverage.rs`
    asserts the contract for data access (ok + miss), auth denial, key

@@ -27,7 +27,10 @@ use rsa::traits::PublicKeyParts as _;
 use rsa::{RsaPrivateKey, rand_core::OsRng};
 use serde_json::{Value, json};
 
-use crate::token::{ReleasePolicy, SIMULATED_AUDIENCE, TokenVerifier, nonces_from_bytes};
+use crate::token::{
+    BROWSER_ATTESTATION_AUDIENCE, ReleasePolicy, SIMULATED_AUDIENCE, TokenError, TokenVerifier,
+    nonces_from_bytes,
+};
 use crate::{AttestationEvidence, AttestationProvider, EnclaveError, TeePlatform};
 
 /// Issuer of the `sim-attestation` service's tokens unless
@@ -212,24 +215,38 @@ pub struct SimulatedTokenProvider {
     source: TokenSource,
     issuer: String,
     policy: ReleasePolicy,
-    verifier: RwLock<Option<TokenVerifier>>,
+    verifiers: RwLock<Option<Verifiers>>,
+}
+
+/// One verifier per audience, built from the same key set.
+struct Verifiers {
+    enclave: TokenVerifier,
+    browser: TokenVerifier,
+}
+
+impl Verifiers {
+    fn new(jwks: &JwkSet, issuer: &str, policy: &ReleasePolicy) -> Result<Self, TokenError> {
+        Ok(Self {
+            enclave: TokenVerifier::new(jwks, issuer, SIMULATED_AUDIENCE, policy.clone())?,
+            browser: TokenVerifier::new(
+                jwks,
+                issuer,
+                BROWSER_ATTESTATION_AUDIENCE,
+                policy.clone(),
+            )?,
+        })
+    }
 }
 
 impl SimulatedTokenProvider {
     /// Sign in process (tests and single-process demos).
     pub fn in_process(signer: Arc<TokenSigner>, policy: ReleasePolicy) -> Self {
-        let verifier = TokenVerifier::new(
-            &signer.jwks(),
-            signer.issuer(),
-            SIMULATED_AUDIENCE,
-            policy.clone(),
-        )
-        .ok();
+        let verifiers = Verifiers::new(&signer.jwks(), signer.issuer(), &policy).ok();
         Self {
             issuer: signer.issuer().to_owned(),
             source: TokenSource::InProcess(signer),
             policy,
-            verifier: RwLock::new(verifier),
+            verifiers: RwLock::new(verifiers),
         }
     }
 
@@ -246,14 +263,14 @@ impl SimulatedTokenProvider {
             },
             issuer: issuer.to_owned(),
             policy,
-            verifier: RwLock::new(None),
+            verifiers: RwLock::new(None),
         }
     }
 
-    async fn token(&self, nonces: &[String]) -> Result<String, EnclaveError> {
+    async fn token(&self, audience: &str, nonces: &[String]) -> Result<String, EnclaveError> {
         match &self.source {
             TokenSource::InProcess(signer) => {
-                Ok(signer.sign(SIMULATED_AUDIENCE, nonces, Duration::from_secs(3600)))
+                Ok(signer.sign(audience, nonces, Duration::from_secs(3600)))
             }
             TokenSource::Http { base_url, client } => {
                 #[derive(serde::Deserialize)]
@@ -261,7 +278,7 @@ impl SimulatedTokenProvider {
                     token: String,
                 }
                 let body = json!({
-                    "audience": SIMULATED_AUDIENCE,
+                    "audience": audience,
                     "nonces": nonces,
                     "token_type": "OIDC",
                 });
@@ -281,11 +298,11 @@ impl SimulatedTokenProvider {
     /// Load the signer's key set, once more when a token names an unknown key.
     async fn ensure_keys_for(&self, token: &str) -> Result<(), EnclaveError> {
         let known = self
-            .verifier
+            .verifiers
             .read()
             .map_err(|_| unavailable())?
             .as_ref()
-            .is_some_and(|v| v.knows_kid(token));
+            .is_some_and(|v| v.enclave.knows_kid(token));
         if known {
             return Ok(());
         }
@@ -301,11 +318,43 @@ impl SimulatedTokenProvider {
                 .await
                 .map_err(|_| unavailable())?,
         };
-        let verifier =
-            TokenVerifier::new(&jwks, &self.issuer, SIMULATED_AUDIENCE, self.policy.clone())
-                .map_err(|e| EnclaveError::Rejected(e.to_string()))?;
-        *self.verifier.write().map_err(|_| unavailable())? = Some(verifier);
+        let verifiers = Verifiers::new(&jwks, &self.issuer, &self.policy)
+            .map_err(|e| EnclaveError::Rejected(e.to_string()))?;
+        *self.verifiers.write().map_err(|_| unavailable())? = Some(verifiers);
         Ok(())
+    }
+
+    async fn evidence(
+        &self,
+        audience: &str,
+        nonce: &[u8],
+    ) -> Result<AttestationEvidence, EnclaveError> {
+        let nonces = nonces_from_bytes(nonce).map_err(|e| EnclaveError::Rejected(e.to_string()))?;
+        let token = self.token(audience, &nonces).await?;
+        self.ensure_keys_for(&token).await?;
+        Ok(AttestationEvidence {
+            platform: TeePlatform::Simulated,
+            nonce: nonce.to_vec(),
+            token,
+        })
+    }
+
+    fn verify(
+        &self,
+        pick: fn(&Verifiers) -> &TokenVerifier,
+        evidence: &AttestationEvidence,
+        expected_nonce: &[u8],
+    ) -> Result<(), EnclaveError> {
+        let nonces =
+            nonces_from_bytes(expected_nonce).map_err(|e| EnclaveError::Rejected(e.to_string()))?;
+        let guard = self.verifiers.read().map_err(|_| unavailable())?;
+        let verifiers = guard.as_ref().ok_or_else(|| {
+            EnclaveError::Rejected("simulated attestation keys not loaded".into())
+        })?;
+        pick(verifiers)
+            .verify(&evidence.token, &nonces)
+            .map(|_| ())
+            .map_err(|e| EnclaveError::Rejected(e.to_string()))
     }
 }
 
@@ -318,14 +367,7 @@ fn unavailable() -> EnclaveError {
 #[async_trait]
 impl AttestationProvider for SimulatedTokenProvider {
     async fn produce_evidence(&self, nonce: &[u8]) -> Result<AttestationEvidence, EnclaveError> {
-        let nonces = nonces_from_bytes(nonce).map_err(|e| EnclaveError::Rejected(e.to_string()))?;
-        let token = self.token(&nonces).await?;
-        self.ensure_keys_for(&token).await?;
-        Ok(AttestationEvidence {
-            platform: TeePlatform::Simulated,
-            nonce: nonce.to_vec(),
-            token,
-        })
+        self.evidence(SIMULATED_AUDIENCE, nonce).await
     }
 
     fn verify_evidence(
@@ -333,16 +375,22 @@ impl AttestationProvider for SimulatedTokenProvider {
         evidence: &AttestationEvidence,
         expected_nonce: &[u8],
     ) -> Result<(), EnclaveError> {
-        let nonces =
-            nonces_from_bytes(expected_nonce).map_err(|e| EnclaveError::Rejected(e.to_string()))?;
-        let guard = self.verifier.read().map_err(|_| unavailable())?;
-        let verifier = guard.as_ref().ok_or_else(|| {
-            EnclaveError::Rejected("simulated attestation keys not loaded".into())
-        })?;
-        verifier
-            .verify(&evidence.token, &nonces)
-            .map(|_| ())
-            .map_err(|e| EnclaveError::Rejected(e.to_string()))
+        self.verify(|v| &v.enclave, evidence, expected_nonce)
+    }
+
+    async fn produce_browser_evidence(
+        &self,
+        nonce: &[u8],
+    ) -> Result<AttestationEvidence, EnclaveError> {
+        self.evidence(BROWSER_ATTESTATION_AUDIENCE, nonce).await
+    }
+
+    fn verify_browser_evidence(
+        &self,
+        evidence: &AttestationEvidence,
+        expected_nonce: &[u8],
+    ) -> Result<(), EnclaveError> {
+        self.verify(|v| &v.browser, evidence, expected_nonce)
     }
 }
 
@@ -469,6 +517,23 @@ mod tests {
         assert_eq!(evidence.platform, TeePlatform::Simulated);
         assert!(!evidence.token.is_empty());
         provider.verify_evidence(&evidence, &binding).unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_and_enclave_evidence_do_not_verify_as_each_other() {
+        let provider = provider(SimulatedClaims::default());
+        let binding = [5u8; 64];
+        let browser = provider.produce_browser_evidence(&binding).await.unwrap();
+        provider
+            .verify_browser_evidence(&browser, &binding)
+            .unwrap();
+        assert!(provider.verify_evidence(&browser, &binding).is_err());
+        let enclave = provider.produce_evidence(&binding).await.unwrap();
+        assert!(
+            provider
+                .verify_browser_evidence(&enclave, &binding)
+                .is_err()
+        );
     }
 
     #[tokio::test]

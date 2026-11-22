@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use envelope_wasm::{
-    connector_object_info, research_result_info, snapshot_manifest_info, steward_upload_info,
+    connector_object_info, research_query_binding, research_query_info, research_result_info,
+    snapshot_manifest_info, steward_upload_info,
 };
 use platform_crypto::{EnvelopeSuite, TenantKeypair, hpke_seal_to_tenant_with_rng};
 use rand::rngs::StdRng;
@@ -36,6 +37,9 @@ const RECIPIENTS: [(&str, &str); 2] = [
 const TENANT: &str = "6f2c8a2e-1111-4222-8333-444455556666";
 const DATASET: &str = "00000000-dddd-4ddd-8ddd-000000000001";
 const OBJECT: &str = "00000000-aaaa-4bbb-8ccc-000000000001";
+const GRANT: &str = "11111111-2222-4333-8444-555555555555";
+const REQUEST_NONCE: [u8; 32] = [0x66; 32];
+const SQL: &str = "SELECT condition, COUNT(*) AS n FROM upload_cohorts GROUP BY condition";
 const PLAINTEXT: &str = "synthetic cohort rows: site-a,42\nsite-b,17\n";
 
 /// rand 0.8's `StdRng` behind the `rand_core` 0.10 traits `hpke` 0.14 takes,
@@ -120,7 +124,21 @@ fn generate() -> Value {
           "info": utf8(snapshot_manifest_info(TENANT, "lab-results", "00000000000000000001").unwrap()) },
         { "kind": "research_result", "fields": [TENANT, DATASET],
           "info": utf8(research_result_info(TENANT, DATASET).unwrap()) },
+        { "kind": "research_query", "fields": [TENANT, GRANT],
+          "info": utf8(research_query_info(TENANT, GRANT).unwrap()) },
     ]);
+    let query_bindings: Vec<Value> = [Some("1"), None]
+        .into_iter()
+        .map(|schema_version| {
+            json!({
+                "grant_id": GRANT,
+                "request_nonce_b64": B64.encode(REQUEST_NONCE),
+                "sql": SQL,
+                "schema_version": schema_version,
+                "query": research_query_binding(GRANT, &REQUEST_NONCE, SQL, schema_version.map(str::to_owned)).unwrap(),
+            })
+        })
+        .collect();
     let refused_fields = json!(["", "|", "a|b"]);
 
     let upload_info = steward_upload_info(TENANT, DATASET, OBJECT).unwrap();
@@ -195,6 +213,7 @@ fn generate() -> Value {
         "enrollment": enrollment,
         "info": info,
         "refused_info_fields": refused_fields,
+        "query_bindings": query_bindings,
         "envelopes": envelopes,
     })
 }

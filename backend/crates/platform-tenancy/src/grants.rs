@@ -47,9 +47,11 @@ pub enum GrantOutcome {
 pub trait GrantRegistry: Send + Sync {
     /// Create (or re-activate) a grant. Idempotent per
     /// (steward, researcher, connector): repeating returns the existing
-    /// grant, un-revoking it if needed. Call it only for a new decision by
-    /// the steward (a direct grant or a first approval); an approval retry
-    /// uses [`create_unless_revoked`].
+    /// grant, un-revoking it if needed. Call it only on a new decision by
+    /// the steward (a direct grant or a first approval), and only after
+    /// [`create_unless_revoked`] found the grant revoked, so the caller knows
+    /// it re-activates one. An approval retry calls only
+    /// [`create_unless_revoked`].
     ///
     /// [`create_unless_revoked`]: GrantRegistry::create_unless_revoked
     async fn create(
@@ -85,9 +87,12 @@ pub trait GrantRegistry: Send + Sync {
     ) -> Result<Option<DatasetGrant>, TenancyError>;
 
     /// Revoke by id; only the grant's steward may revoke. Sets
-    /// `revoked_at_iso`, which `create` keeps on re-activation. A durable
-    /// backend must persist it: approval retries refuse based on it, and a
-    /// lost value lets a stale retry add budget to a newer grant.
+    /// `revoked_at_iso`, which `create` keeps on re-activation. Revoking a
+    /// revoked grant records the new time; a backend must not keep the
+    /// first, or an approval recorded between the two revokes passes the
+    /// retry check. A durable backend must persist it: approval retries
+    /// refuse based on it, and a lost value lets a stale retry add budget to
+    /// a newer grant.
     async fn revoke(
         &self,
         steward: TenantId,
@@ -254,6 +259,22 @@ mod tests {
             .unwrap();
         assert!(!again.revoked);
         assert_eq!(again.revoked_at_iso.as_deref(), Some(revoked_at.as_str()));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_revoked_grant_records_the_latest_time() {
+        let registry = InMemoryGrantRegistry::default();
+        let steward = TenantId::generate();
+        let grant = registry
+            .create(steward, TenantId::generate(), "health")
+            .await
+            .unwrap();
+        let first = registry.revoke(steward, &grant.grant_id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let second = registry.revoke(steward, &grant.grant_id).await.unwrap();
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(second.revoked);
+        assert!(second.revoked_at_iso > first.revoked_at_iso);
     }
 
     #[tokio::test]

@@ -96,9 +96,14 @@ rand = "0.8"
 # The browser build of the envelope code (`envelope-wasm`). `scripts/build-wasm.sh`
 # refuses a `wasm-bindgen` CLI whose version differs from this one.
 wasm-bindgen = "=0.2.126"
-# `hpke` 0.14 draws randomness through getrandom 0.4; on wasm32 it needs the
-# JavaScript backend (`crypto.getRandomValues`). Only `envelope-wasm` uses it.
+# `hpke` 0.14 draws randomness through getrandom 0.4, and `platform-crypto`
+# seeds result-signing keys with it. On wasm32 (`envelope-wasm`) it needs the
+# JavaScript backend (`crypto.getRandomValues`); elsewhere `wasm_js` is unused.
 getrandom = { version = "0.4", features = ["wasm_js"] }
+# Attestation-bound result signatures, both required (ADR 0007, ADR 0010).
+# ed25519-dalek is the version jsonwebtoken already locks.
+ed25519-dalek = "3"
+ml-dsa = { version = "0.1.2", default-features = false, features = ["alloc", "zeroize"] }
 
 # ── auth + storage backends ─────────────────────────────────────────────────
 jsonwebtoken = { version = "12.0", features = ["rust_crypto"] }

@@ -93,6 +93,14 @@ fi
 echo "== CODEOWNERS guard: every pattern matches a tracked path =="
 "$ROOT/scripts/check-codeowners.sh"
 
+echo "== bench-compare: the regression rule on fixtures (docs/BENCHMARKS.md) =="
+# CI always runs it; locally it runs only when jq is installed.
+if command -v jq >/dev/null 2>&1; then
+    "$ROOT/scripts/bench-compare.sh" selftest
+else
+    echo "skipped: jq is not installed (CI runs it on every pull request)"
+fi
+
 echo "== attribution guard: tools are never credited =="
 "$ROOT/scripts/attribution-guard.sh" selftest
 "$ROOT/scripts/attribution-guard.sh" tree
