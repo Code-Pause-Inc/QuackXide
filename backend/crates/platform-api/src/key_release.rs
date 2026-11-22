@@ -15,7 +15,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use platform_crypto::{
     CryptoError, EnvelopeSuite, ResultSignature, ResultSigningKey, ResultVerifyingKeys,
-    SecretBytes, SuitePolicy, TenantKeypair, TenantPublicKey,
+    SecretBytes, TenantKeypair, TenantPublicKey,
 };
 use platform_enclave::EnclaveKeyBinding;
 pub use platform_enclave::bundle::{AttestationBundle, KeyWire, SigningKeysWire, decode_b64url_32};
@@ -120,7 +120,7 @@ impl EnclaveIdentity {
             .map_err(|_| ApiError::AttestationUnavailable)?;
         TenantKeypair::from_private_key_bytes(
             raw_sk.expose(),
-            SuitePolicy::only(EnvelopeSuite::Hpk2),
+            platform_crypto::SuitePolicy::only(EnvelopeSuite::Hpk2),
         )
         .map_err(|e| {
             if matches!(e, CryptoError::SuiteRefused) {
@@ -179,7 +179,7 @@ pub fn attestation_bundle(identity: &EnclaveIdentity, token: String) -> Attestat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platform_crypto::hpke_seal_to_tenant;
+    use platform_crypto::{SuitePolicy, hpke_seal_to_tenant};
 
     #[test]
     fn generate_binds_an_empty_configuration() {
