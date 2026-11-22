@@ -142,10 +142,10 @@ describe("DatasetUploadForm", () => {
   const cohort = parquetFixture("upload-cohort.parquet");
   const footerLength = new DataView(cohort.buffer).getUint32(cohort.length - 8, true);
 
-  it.each<[string, () => File, RegExp]>([
-    ["a file that is not Parquet", () => bytes("condition,n\nflu,6\n"), /not a Parquet file/],
-    ["a footer longer than the file", () => bytes(cohort.subarray(0, cohort.length - 8), trailer(cohort.length)), /truncated/],
-    ["a footer longer than the cap", () => bytes(new Uint8Array(FOOTER_MAX_BYTES + 1), trailer(FOOTER_MAX_BYTES + 1)), /larger than 16 MiB/],
+  it.each<[string, () => File, string]>([
+    ["a file that is not Parquet", () => bytes("condition,n\nflu,6\n"), "not a Parquet file"],
+    ["a footer longer than the file", () => bytes(cohort.subarray(0, cohort.length - 8), trailer(cohort.length)), "truncated"],
+    ["a footer longer than the cap", () => bytes(new Uint8Array(FOOTER_MAX_BYTES + 1), trailer(FOOTER_MAX_BYTES + 1)), "larger than 16 MiB"],
     [
       "a truncated footer",
       () =>
@@ -153,9 +153,9 @@ describe("DatasetUploadForm", () => {
           cohort.subarray(0, cohort.length - 8 - footerLength + Math.floor(footerLength / 2)),
           trailer(Math.floor(footerLength / 2)),
         ),
-      /footer is malformed/,
+      "footer is malformed",
     ],
-    ["an unsupported column", () => new File([parquetFixture("binary.parquet")], "b.parquet"), /“payload” has a type/],
+    ["an unsupported column", () => new File([parquetFixture("binary.parquet")], "b.parquet"), "“payload” has a type"],
   ])("refuses %s before sealing", async (_what, file, message) => {
     const { choose, button, upload } = setup();
     await choose("upload_cohorts", file());
@@ -167,7 +167,7 @@ describe("DatasetUploadForm", () => {
   it("refuses a file over the upload limit before sealing", async () => {
     const { choose, button, upload } = setup({ maxBytes: cohort.length + 51 });
     await choose("upload_cohorts", cohortFile());
-    expect(await screen.findByRole("alert")).toHaveTextContent(/upload limit/);
+    expect(await screen.findByRole("alert")).toHaveTextContent("upload limit");
     expect(button()).toBeDisabled();
     expect(upload).not.toHaveBeenCalled();
   });
@@ -176,7 +176,7 @@ describe("DatasetUploadForm", () => {
     const datasets = [stored({ schema: [{ name: "condition", type: "string" }] })];
     const { choose, button, upload } = setup({ datasets });
     await choose("upload_cohorts", cohortFile());
-    expect(await screen.findByRole("alert")).toHaveTextContent(/differ from the schema recorded for upload_cohorts/);
+    expect(await screen.findByRole("alert")).toHaveTextContent("differ from the schema recorded for upload_cohorts");
     expect(button()).toBeDisabled();
     expect(upload).not.toHaveBeenCalled();
   });
@@ -184,14 +184,14 @@ describe("DatasetUploadForm", () => {
   it("refuses a re-upload when the recorded schema is unreadable", async () => {
     const { choose, button } = setup({ datasets: [stored({ schema: null, suite: null })] });
     await choose("upload_cohorts", cohortFile());
-    expect(await screen.findByRole("alert")).toHaveTextContent(/unreadable/);
+    expect(await screen.findByRole("alert")).toHaveTextContent("unreadable");
     expect(button()).toBeDisabled();
   });
 
   it("refuses a dataset name outside the upload namespace", async () => {
     const { user, button } = setup();
     await user.type(screen.getByLabelText("Dataset name"), "health");
-    expect(screen.getByRole("alert")).toHaveTextContent(/starts with upload_/);
+    expect(screen.getByRole("alert")).toHaveTextContent("starts with upload_");
     expect(button()).toBeDisabled();
   });
 
