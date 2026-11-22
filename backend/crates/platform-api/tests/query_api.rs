@@ -233,7 +233,10 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(body["rows"][0]["n"], 3);
     assert_eq!(body["zk_mode"], true);
 
-    // Cohorts below k = 2 (the single EUR invoice) are withheld.
+    // Cohorts below k = 2 (the single EUR invoice) are withheld. The USD
+    // revenue sums two invoices, so the p% rule releases it as null, which
+    // the JSON leaves out: either invoice's holder would learn the other's
+    // from it (ADR 0015).
     let (status, body) = post_query(
         &app,
         Some(&token),
@@ -243,7 +246,7 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["rows"],
-        serde_json::json!([{ "currency": "USD", "n": 2, "revenue": 1730.25 }])
+        serde_json::json!([{ "currency": "USD", "n": 2 }])
     );
     assert_eq!(body["suppressed_rows"], 1);
 
@@ -251,17 +254,20 @@ async fn zk_mode_blocks_row_egress_at_the_endpoint() {
     let (status, body) = post_query(
         &app,
         Some(&token),
-        r#"{"connector":"quickbooks","sql":"SELECT id, COUNT(*) AS n, MAX(total) AS t FROM quickbooks GROUP BY id"}"#,
+        r#"{"connector":"quickbooks","sql":"SELECT id, COUNT(*) AS n, SUM(total) AS t FROM quickbooks GROUP BY id"}"#,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["row_count"], 0);
     assert_eq!(body["suppressed_rows"], 3);
 
-    // Aggregates without a genuine cohort size are rejected with 422.
+    // Aggregates without a genuine cohort size, and MIN or MAX, which
+    // return one row's value whatever the cohort size (ADR 0015), are
+    // rejected with 422.
     for sql in [
-        "SELECT id, MAX(total) AS t FROM quickbooks GROUP BY id",
+        "SELECT id, SUM(total) AS t FROM quickbooks GROUP BY id",
         "SELECT id, 9999 AS n FROM quickbooks GROUP BY id",
+        "SELECT COUNT(*) AS n, MAX(total) AS t FROM quickbooks",
     ] {
         let body = serde_json::json!({ "connector": "quickbooks", "sql": sql }).to_string();
         let (status, _) = post_query(&app, Some(&token), &body).await;
@@ -1391,6 +1397,8 @@ async fn repeated_syncs_never_inflate_counts() {
         assert_eq!(rows["object_count"], 1, "after {syncs} syncs");
 
         // The single EUR invoice stays below k = 2 however many syncs ran.
+        // The two USD invoices' revenue stays masked by the p% rule (ADR
+        // 0015); a third, duplicated invoice would release it.
         let rows = service
             .query(tenant, &connector, COHORT_SQL)
             .await
@@ -1398,7 +1406,7 @@ async fn repeated_syncs_never_inflate_counts() {
             .expect("cohorts");
         assert_eq!(
             rows["rows"],
-            serde_json::json!([{ "currency": "USD", "n": 2, "revenue": 1730.25 }]),
+            serde_json::json!([{ "currency": "USD", "n": 2 }]),
             "after {syncs} syncs"
         );
         assert_eq!(rows["suppressed_rows"], 1, "after {syncs} syncs");
@@ -1598,6 +1606,157 @@ async fn a_manifest_listing_an_object_twice_fails_closed() {
     let service = service_over(tenant, keypair, vault, ZkMode::Disabled);
     let result = service.query(tenant, &connector, COUNT_SQL).await;
     assert_eq!(error_status(result), StatusCode::BAD_GATEWAY);
+}
+
+// ── Decoding: the stored data's faults are 502, never the caller's 400 ──
+
+/// A vault holding one committed snapshot of `tenant`'s `dataset`, with
+/// `objects` (plaintext Parquet) sealed to `keypair` as its objects.
+async fn snapshot_of(
+    tenant: TenantId,
+    keypair: &TenantKeypair,
+    dataset: &ConnectorSlug,
+    objects: &[Vec<u8>],
+) -> Arc<dyn VaultStore> {
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let public_key = keypair.public_key();
+    let mut snapshot = SnapshotWriter::begin(&*vault, tenant, &public_key, dataset.clone());
+    for (part, object) in objects.iter().enumerate() {
+        snapshot
+            .put(&format!("part-{part}"), object)
+            .await
+            .expect("put");
+    }
+    snapshot.commit().await.expect("commit");
+    vault
+}
+
+/// [`common::cohorts_parquet`] with the data pages of its `age` column
+/// overwritten, from the first one's header on. Its footer and its
+/// `condition` column are intact.
+fn cohorts_with_a_corrupt_age_page() -> Vec<u8> {
+    let parquet = common::cohorts_parquet();
+    let footer = parquet::file::metadata::ParquetMetaDataReader::new()
+        .parse_and_finish(&Bytes::from(parquet.clone()))
+        .expect("footer");
+    let mut corrupt = parquet;
+    for group in footer.row_groups() {
+        for column in group.columns() {
+            if column.column_path().string() == "age" {
+                let (start, len) = column.byte_range();
+                let first = usize::try_from(column.data_page_offset()).expect("offset");
+                let end = usize::try_from(start + len).expect("end");
+                corrupt[first..end].fill(0xA5);
+            }
+        }
+    }
+    corrupt
+}
+
+/// A stored object with a valid footer and a corrupt data page is the
+/// storage's fault: 502, in either mode, never the 400 of SQL that cannot
+/// run. A query that reads only intact columns answers, and one the gate
+/// refuses is refused before anything is decoded.
+#[tokio::test]
+async fn a_stored_object_with_a_corrupt_data_page_is_502() {
+    let dataset = ConnectorSlug::new("cohorts").expect("slug");
+    for zk in [ZkMode::Disabled, ZkMode::Enabled] {
+        let tenant = TenantId::generate();
+        let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+        let vault = snapshot_of(
+            tenant,
+            &keypair,
+            &dataset,
+            &[cohorts_with_a_corrupt_age_page()],
+        )
+        .await;
+        let service = service_over(tenant, keypair, vault, zk);
+
+        let reads_age = "SELECT condition, COUNT(*) AS n, SUM(age) AS total_age FROM cohorts GROUP BY condition";
+        let (status, _, message) = refusal(service.query(tenant, &dataset, reads_age).await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{zk:?}");
+        assert_eq!(message, "storage backend error", "{zk:?}");
+
+        let rows = service
+            .query(
+                tenant,
+                &dataset,
+                "SELECT condition, COUNT(*) AS n FROM cohorts GROUP BY condition ORDER BY condition",
+            )
+            .await
+            .map_err(|_| "query failed")
+            .expect("condition is intact");
+        assert_eq!(
+            rows["rows"][0],
+            serde_json::json!({ "condition": "flu", "n": 6 })
+        );
+    }
+
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let vault = snapshot_of(
+        tenant,
+        &keypair,
+        &dataset,
+        &[cohorts_with_a_corrupt_age_page()],
+    )
+    .await;
+    let service = service_over(tenant, keypair, vault, ZkMode::Enabled);
+    let (status, _, message) = refusal(
+        service
+            .query(tenant, &dataset, "SELECT condition, age FROM cohorts")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        message,
+        "row-level egress is not permitted in zero-knowledge mode"
+    );
+}
+
+/// Objects of one snapshot whose columns differ are the storage's fault:
+/// 502, never the 400 of SQL that cannot run.
+#[tokio::test]
+async fn a_snapshot_whose_objects_have_unlike_columns_is_502() {
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    // `age` as a float: the same names, another type.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("condition", DataType::Utf8, false),
+        Field::new("age", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from_iter_values(["flu"])),
+            Arc::new(Float64Array::from(vec![30.5])),
+        ],
+    )
+    .expect("batch");
+    let mut float_ages = Vec::new();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(&mut float_ages, schema, None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let dataset = ConnectorSlug::new("cohorts").expect("slug");
+    let objects = [common::cohorts_parquet(), float_ages];
+    let vault = snapshot_of(tenant, &keypair, &dataset, &objects).await;
+    let service = service_over(tenant, keypair, vault, ZkMode::Disabled);
+
+    let (status, _, message) = refusal(
+        service
+            .query(tenant, &dataset, "SELECT COUNT(*) AS n FROM cohorts")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(message, "storage backend error");
 }
 
 #[tokio::test]

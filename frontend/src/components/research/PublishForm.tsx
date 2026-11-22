@@ -1,23 +1,40 @@
 import { useId, useState } from "react";
-import { dollarsToCents, type PublishListingBody } from "../../lib/research/client";
+import {
+  type ConnectorView,
+  dollarsToCents,
+  type PublishListingBody,
+} from "../../lib/research/client";
+import {
+  type DictionaryColumn,
+  connectorPrefill,
+  dictionaryProblem,
+  sameColumns,
+} from "../../lib/research/dictionary";
+import DictionaryEditor from "./DictionaryEditor";
 import { inputCls, primaryBtnCls } from "./styles";
 
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 2000;
 
-/** Publishes (or re-publishes) a priced listing for one of the steward's
- *  stored datasets (`GET /api/v1/datasets`): publishing is refused for a
- *  dataset the steward does not hold, so the form offers only those. */
+/** Publishes (or re-publishes) a priced listing, with its data dictionary,
+ *  for one of the steward's stored datasets (`GET /api/v1/datasets`):
+ *  publishing is refused for a dataset the steward does not hold, so the
+ *  form offers only those. A connector dataset's dictionary starts from the
+ *  columns its connector's mapper writes; any other dataset's is entered by
+ *  hand. */
 export default function PublishForm({
   busy,
   currency,
   datasets,
+  connectors = [],
   onPublish,
 }: {
   busy: boolean;
   currency: string;
   /** The ids of the datasets the steward holds. */
   datasets: string[];
+  /** The built-in connectors and their columns (`GET /api/v1/connectors`). */
+  connectors?: ConnectorView[];
   onPublish: (body: PublishListingBody) => void;
 }) {
   const datasetId = useId();
@@ -27,6 +44,17 @@ export default function PublishForm({
   const [fee, setFee] = useState("");
   const [rate, setRate] = useState("");
   const [queries, setQueries] = useState("");
+  const [columns, setColumns] = useState<DictionaryColumn[]>([]);
+
+  const prefill = connectorPrefill(connectors, connector.trim());
+  /** Columns that are empty or still the pre-fill follow the dataset;
+   *  once the steward edits them they stay. */
+  const chooseDataset = (value: string) => {
+    const untouched =
+      columns.length === 0 || (prefill !== null && sameColumns(columns, prefill.columns));
+    setConnector(value);
+    if (untouched) setColumns(connectorPrefill(connectors, value.trim())?.columns ?? []);
+  };
 
   const feeCents = dollarsToCents(fee);
   const rateCents = dollarsToCents(rate);
@@ -40,7 +68,8 @@ export default function PublishForm({
     title.trim().length <= TITLE_MAX &&
     feeCents !== null &&
     rateCents !== null &&
-    queriesOk;
+    queriesOk &&
+    dictionaryProblem(columns) === null;
 
   return (
     <div className="mt-3 space-y-2 rounded-lg bg-slate-50 p-3 ring-1 ring-slate-100">
@@ -53,7 +82,7 @@ export default function PublishForm({
             id={datasetId}
             className={`${inputCls} min-w-0 flex-1 font-mono`}
             value={connector}
-            onChange={(ev) => setConnector(ev.target.value)}
+            onChange={(ev) => chooseDataset(ev.target.value)}
           >
             <option value="">{datasets.length === 0 ? "no stored datasets" : "choose a stored dataset"}</option>
             {datasets.map((id) => (
@@ -103,6 +132,16 @@ export default function PublishForm({
           Listings are published for stored datasets only: upload a dataset first.
         </p>
       )}
+      <DictionaryEditor
+        columns={columns}
+        onChange={setColumns}
+        source={prefill?.source ?? null}
+        onUseSource={
+          prefill && !sameColumns(columns, prefill.columns)
+            ? () => setColumns(prefill.columns)
+            : undefined
+        }
+      />
       <div className="flex justify-end">
         <button
           type="button"
@@ -117,6 +156,12 @@ export default function PublishForm({
               license_fee_cents: feeCents,
               compute_rate_cents: rateCents,
               ...(queriesNum !== undefined ? { grant_budget: queriesNum } : {}),
+              data_dictionary: {
+                columns: columns.map((column) => ({
+                  ...column,
+                  description: column.description.trim(),
+                })),
+              },
             })
           }
           className={primaryBtnCls}

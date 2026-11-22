@@ -8,6 +8,7 @@ import {
   type AccessRequestView,
   type BudgetView,
   type CatalogView,
+  type ConnectorView,
   type DatasetListingView,
   type GrantView,
   type ListingView,
@@ -17,6 +18,8 @@ import {
   shortId,
   tenantFromJwt,
 } from "../../lib/research/client";
+import { quotedTableName } from "../../lib/research/dictionary";
+import DataDictionaryPanel from "./DataDictionaryPanel";
 import DatasetList from "./DatasetList";
 import DatasetUploadForm from "./DatasetUploadForm";
 import IssuedGrantRow from "./IssuedGrantRow";
@@ -26,9 +29,10 @@ import { inputCls, primaryBtnCls, quietBtnCls } from "./styles";
 import { Meter, SectionLabel, StatusChip } from "./ui";
 
 // Research portal for both roles. Researchers see authorized datasets and the
-// priced catalog and can request access; stewards review requests, manage
-// listings, and top up or revoke issued access. The token is pasted in (or
-// prefilled from VITE_DEV_JWT) for development.
+// priced catalog, each with its data dictionary, and can request access;
+// stewards review requests, manage listings, and top up or revoke issued
+// access. The token is pasted in (or prefilled from VITE_DEV_JWT) for
+// development.
 
 const NOTE_MAX = 1000;
 
@@ -44,6 +48,9 @@ interface PortalData {
    *  `datasetsError` explains. */
   datasets: DatasetListingView | null;
   datasetsError: string | null;
+  /** Connector columns for the publish form's pre-fill; empty when they
+   *  failed to load, which leaves the columns to the steward. */
+  connectors: ConnectorView[];
 }
 
 function findListing(
@@ -87,6 +94,8 @@ export default function ResearchPortal() {
       (listing) => ({ listing, error: null }),
       (err: unknown) => ({ listing: null, error: errorMessage(err, "failed to load your datasets") }),
     );
+    // Only a pre-fill: failing to load it leaves the rest usable.
+    const connectors = c.connectors().catch((): ConnectorView[] => []);
     const [catalog, grants, requests] = await Promise.all([
       c.catalog(),
       c.grants(),
@@ -116,6 +125,7 @@ export default function ResearchPortal() {
       budgets,
       unfunded,
       requests,
+      connectors: await connectors,
       datasets: stored.listing,
       datasetsError: stored.error,
     });
@@ -279,26 +289,36 @@ export default function ResearchPortal() {
             ) : (
               <ul className="mt-3 divide-y divide-slate-100">
                 {authorized.map(({ grant, listing, budget }) => (
-                  <li key={grant.grant_id} className="flex items-center gap-6 py-4">
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">
-                        {listing?.title ?? grant.connector}
-                      </p>
-                      <p className="mt-0.5 text-xs text-slate-500">
-                        steward {shortId(grant.steward_tenant)} · dataset {grant.connector}
-                      </p>
-                    </div>
-                    <div className="w-48">
-                      <p className="text-right text-xs tabular-nums text-slate-600">
-                        {budget
-                          ? `${budget.remaining} of ${budget.limit} queries left`
-                          : "allowance unavailable"}
-                      </p>
-                      <div className="mt-1.5">
-                        <Meter spent={budget?.spent ?? 0} limit={budget?.limit ?? 0} />
+                  <li key={grant.grant_id} className="py-4">
+                    <div className="flex items-center gap-6">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium">
+                          {listing?.title ?? grant.connector}
+                        </p>
+                        <p className="mt-0.5 text-xs text-slate-500">
+                          steward {shortId(grant.steward_tenant)} · dataset {grant.connector}
+                        </p>
                       </div>
+                      <div className="w-48">
+                        <p className="text-right text-xs tabular-nums text-slate-600">
+                          {budget
+                            ? `${budget.remaining} of ${budget.limit} queries left`
+                            : "allowance unavailable"}
+                        </p>
+                        <div className="mt-1.5">
+                          <Meter spent={budget?.spent ?? 0} limit={budget?.limit ?? 0} />
+                        </div>
+                      </div>
+                      <StatusChip tone="active" label="Active" />
                     </div>
-                    <StatusChip tone="active" label="Active" />
+                    {listing ? (
+                      <DataDictionaryPanel dictionary={listing.data_dictionary} />
+                    ) : (
+                      <DataDictionaryPanel
+                        dictionary={{ table: quotedTableName(grant.connector), columns: [] }}
+                        withdrawn
+                      />
+                    )}
                   </li>
                 ))}
               </ul>
@@ -371,6 +391,7 @@ export default function ResearchPortal() {
                           )}
                         </div>
                       </div>
+                      <DataDictionaryPanel dictionary={listing.data_dictionary} />
                       {open && !own && !active && request?.status !== "pending" && (
                         <div className="mt-3 flex gap-2 rounded-lg bg-slate-50 p-3 ring-1 ring-slate-100">
                           <input
@@ -560,6 +581,7 @@ export default function ResearchPortal() {
                 busy={busy === "publish"}
                 currency={data.catalog.currency}
                 datasets={data.datasets?.datasets.map((d) => d.dataset) ?? []}
+                connectors={data.connectors}
                 onPublish={(body) =>
                   act("publish", () => client().publishListing(body)).then(
                     (ok) => ok && setShowPublishForm(false),

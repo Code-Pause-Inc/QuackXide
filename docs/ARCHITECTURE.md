@@ -368,14 +368,20 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
                                               │
                           key released into enclave (EnclaveKeyProvider)
                           open HPKE envelopes (info by dataset kind) → Parquet in RAM
-                          upload: schema and row cap as declared? (no ⇒ 502)
-                          footers within the decode limits? (no ⇒ 422)
+                          QueryScope reads the footers only, from its own wiped copy:
+                            objects' columns alike? (no ⇒ 502)
+                            upload: schema and row cap as declared? (no ⇒ 502)
+                            rows within the decode row limit? (no ⇒ 422)
+                          zeroize the service's blobs
                                               │
-                          QueryScope: DataFusion SQL over decrypted frames
+                          QueryScope: DataFusion SQL, nothing decoded yet
+                          ZkMode::Enabled → plan allowlist
+                          each scan: its columns' footers within the decode limits? (no ⇒ 422)
+                            decode only those columns (corrupt object ⇒ 502)
                           fixed memory pool, no disk (pool exhausted ⇒ 422; ZK: as disclosure)
-                          ZkMode::Enabled → plan allowlist + cohort threshold
+                          ZkMode::Enabled → cohort threshold
                           result within its row and byte limits? (no ⇒ 422)
-                          zeroize blobs; Drop releases Arrow frames
+                          Drop releases the scope's copy and the Arrow frames
                                               │
                                         JSON result rows
 ```
@@ -386,10 +392,22 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   blind-index column (HMAC-SHA256/128) — the engine matches HMAC images and
   never sees the plaintext query term or values. *In-enclave analytics*:
   DataFusion SQL over the decrypted frame.
-* **`QueryScope` memory hygiene.** Owns the DataFusion `SessionContext` and
-  the MemTables built from decrypted Parquet; `Drop` deregisters them and
-  releases the Arrow frames. Decrypted Parquet bytes live in zeroizing
-  buffers and are wiped on every exit path, including errors.
+* **`QueryScope` memory hygiene.** Owns the DataFusion `SessionContext` and,
+  for each registered table, a zeroizing copy of every decrypted Parquet
+  object with its footer, parsed without the column statistics (whose
+  minimum and maximum are values from the data). Registering a table reads
+  only the footers, and the query service then zeroizes its own copies of
+  the objects. Nothing is decoded until the query's plan has passed every
+  gate. Each table scan in the final plan then decodes, from every object,
+  only the columns the query reads, into an in-memory plan that is
+  dropped with the query; a query the gate refuses decodes nothing.
+  `Drop` deregisters the tables, releasing the scope's copies and any
+  Arrow frames still held. Decrypted Parquet bytes live in zeroizing
+  buffers and are wiped on every exit path, including errors; decoded
+  Arrow arrays are not (see "Unzeroized working memory" in
+  `docs/THREAT_MODEL.md`). Decryption is still whole-object in v1: each
+  object is one HPKE envelope, so a query decrypts every object of the
+  snapshot, and projection reduces decode work, not decrypt work.
 * **Bounded plaintext.** `max_concurrent_queries` (`QUERY_MAX_CONCURRENT`)
   caps how many queries hold decrypted data at once, and a limit of zero
   refuses with 503. A query waits at most `QUERY_SLOT_WAIT_SECS` for a slot,
@@ -418,19 +436,22 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   upload limit, so every stored upload stays queryable; a sealed manifest
   over the upload route's 16 KiB bound fails closed (502). Both input
   limits are checked again on what the manifest lists, cumulatively, before
-  each object is opened. `QueryScope` reads every Parquet footer before it
-  decodes anything: the rows and uncompressed bytes they report must fit
+  each object is opened. `QueryScope` refuses a table whose footers report
+  more rows than `QUERY_MAX_DECODED_ROWS`. Each table scan decodes every
+  row of the columns it reads, so before a scan decodes anything, the rows
+  and the uncompressed bytes the footers report for its columns, summed
+  over the query's scans (a self-join reads its table twice), must fit
   `QUERY_MAX_DECODED_ROWS` and `QUERY_MAX_DECODED_MIB`, since DataFusion's
-  memory pool does not track the decoded table. Both are counted again as
+  memory pool does not track decoded columns. Both are counted again as
   the batches decode: the rows, and the Arrow memory each batch of 1024 rows
-  holds, since a footer's uncompressed sizes understate columns that
-  dictionary or run-length encoding shrinks. String and binary columns,
-  plain or declared as dictionaries, decode as view arrays, which point into
-  the pages and dictionaries they came from. Plain ones are measured before
-  they expand, so a value repeated across rows is refused before it is
-  copied once per row, and dictionaries are rebuilt from the views, each
-  distinct value once. Fixed-width columns are checked from their widths
-  before each batch decodes. The decoded table can pass
+  holds, summed over the query's scans, since a footer's uncompressed sizes
+  understate columns that dictionary or run-length encoding shrinks. String
+  and binary columns, plain or declared as dictionaries, decode as view
+  arrays, which point into the pages and dictionaries they came from. Plain
+  ones are measured before they expand, so a value repeated across rows is
+  refused before it is copied once per row, and dictionaries are rebuilt
+  from the views, each distinct value once. Fixed-width columns are checked
+  from their widths before each batch decodes. The decoded columns can pass
   `QUERY_MAX_DECODED_MIB` only by the batch's list columns, and its strings
   or binary inside a struct, which are counted only after they expand; a
   page decompresses whole, to the size its own header states, and a
@@ -467,13 +488,16 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
   and the rows its footer reports against what the steward declared before
   decoding, and the decoded rows after; a mismatch is refused with 502
   (`QueryError::DeclarationMismatch`, which names no column). A research
-  query is charged before this check.
+  query is charged before this check. Objects of one snapshot whose
+  columns differ, and an object that fails to decode, are the storage's
+  fault, never the caller's SQL: 502 (`QueryError::Parquet`).
 * **ZK gate.** In `ZkMode::Enabled` every query passes the same disclosure
   gate as research access: the plan allowlist, a genuine `COUNT(*) AS n`,
-  and suppression of cohorts below `RESEARCH_MIN_COHORT_SIZE` (see
-  "Research access" below). Refusals return HTTP 422; results report
-  `suppressed_rows`. A ZK scope without a threshold, or with `k = 0`,
-  refuses every query.
+  the p% rule for sums and means (`RESEARCH_DOMINANCE_PERCENT`), and
+  suppression of cohorts below `RESEARCH_MIN_COHORT_SIZE` (see "Research
+  access" below). Refusals return HTTP 422; results report
+  `suppressed_rows`. A ZK scope without a threshold, or with `k = 0` or
+  `p = 0`, refuses every query.
 * **What the ZK gate does not bound.** On own-data queries it stops a
   single query from returning rows, and nothing more. `POST /api/v1/query`
   has no query budget, so anyone holding the tenant's access token can run
@@ -527,27 +551,31 @@ Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  QueryScope, ZkMode FORCED Enabled:
                      plan gate: aggregate-only (no row egress)
                      plan gate: COUNT(*) AS n present and genuine (not a literal)
-                     DataFusion executes
+                     plan rewrite: dominated SUM / AVG released as null (p% rule)
+                     DataFusion decodes the columns the plan reads, and executes
                      DisclosurePolicy (result gate): drop rows where n < k
                  zeroize plaintext; Drop releases frames
                ─▶ aggregate rows + suppressed_rows + budget_remaining + metering audit event
 ```
 
-Three enforcement layers at one choke point, all in code:
+Four enforcement layers at one choke point, all in code:
 
 * **Plan level** (`policy::is_aggregate_only` + `disclosure::verify_count_column`,
   shared with ZK mode): an allowlist, not a denylist. A plan is a single
   table scan, optionally filtered or column-renamed (nothing else may sit
   below the aggregate, so it reads every matching row), feeding exactly
   one `Aggregate` with plain `GROUP BY`, with only projection, filter,
-  sort, and limit above it. Aggregates are limited to `COUNT`, `SUM`,
-  `AVG`, `MIN`, and `MAX` over plain columns, and `n` must be a genuine
-  `COUNT(*)`. Joins, set operations, window functions, grouping sets
-  (`ROLLUP`, `CUBE`, `GROUPING SETS`), sorts or limits below the aggregate,
-  subquery expressions, table functions, `VALUES`, computed aggregate
-  arguments, and value-returning aggregates (`ARRAY_AGG`, `STRING_AGG`,
-  `FIRST_VALUE`) are refused — each can inflate a cohort count, single out
-  an individual, or put a subtotal beside its parts in one result.
+  sort, and limit above it. Aggregates are limited to `COUNT`, `SUM` and
+  `AVG` over plain columns, with no `DISTINCT` on a sum or mean, and `n`
+  must be a genuine `COUNT(*)`. Joins,
+  set operations, window functions, grouping sets (`ROLLUP`, `CUBE`,
+  `GROUPING SETS`), sorts or limits below the aggregate, subquery
+  expressions, table functions, `VALUES`, computed aggregate arguments,
+  and value-returning aggregates (`MIN`, `MAX`, `ARRAY_AGG`, `STRING_AGG`,
+  `FIRST_VALUE`) are refused, wherever they appear, `HAVING` and
+  `ORDER BY` included — each can inflate a cohort count, single out an
+  individual, or put a subtotal beside its parts in one result. `MIN` and
+  `MAX` return one row's value however large the cohort (ADR 0015).
   After type coercion, every expression must also be one that cannot fail
   at runtime (`policy::expressions_cannot_fail`, ADR 0011): comparisons,
   boolean logic, `IN`, `LIKE` with a pattern of at most 1,000 characters,
@@ -557,6 +585,18 @@ Three enforcement layers at one choke point, all in code:
   constant subexpressions itself. A failure on some rows would otherwise
   answer a question about rows that suppression hides. `tests/bypass.rs` holds the adversarial cases; add to
   it whenever the allowlist changes.
+* **Cell level** (`dominance::mask_dominated`, ADR 0015): once the plan
+  passes the gate, the engine adds one hidden aggregate per `SUM` or `AVG`
+  argument to the plan's `Aggregate`, and a projection directly above it
+  that releases a group's sums and means of that argument as null when
+  one or two rows dominate them: when the group's absolute values, less
+  the two largest, total under *p*% of the largest
+  (`RESEARCH_DOMINANCE_PERCENT`, default 10). Anyone who knows the
+  second-largest value would otherwise learn the largest to within *p*%.
+  `HAVING`, `ORDER BY`, derived columns and outer queries read the masked
+  value, and the hidden columns never leave the plan. The row keeps `n`
+  and its other cells, and `suppressed_rows` does not count masked cells.
+  A sum over an interval, which has no magnitude, is refused.
 * **Result level** (`disclosure::DisclosurePolicy`): `MinCountThreshold`
   suppresses sub-`k` cohorts; a perturbation/DP policy composes after it via
   `CompositePolicy` without touching the engine.
@@ -605,7 +645,8 @@ billing meter.
 Catalog, access requests, grants and budgets need no key material. They
 live in `research::ResearchService` (`AppState::research`), which
 `platform_api::wiring::build_state` always builds from
-`RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DEFAULT_QUERY_BUDGET`, so their
+`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT` and
+`RESEARCH_DEFAULT_QUERY_BUDGET`, so their
 routes answer without key release; with no research service they refuse
 with 503. The query service holds the same `Arc`, so a research query
 checks and charges the grant those routes created. The stores are in
@@ -615,11 +656,30 @@ reads only to check that a steward holds a dataset before publishing it.
 
 **Catalog** (`platform_tenancy::CatalogRegistry`, frontend Research tab):
 publishing a listing — title, description, license fee, compute rate,
-included budget, prices in integer cents — is the steward's opt-in to
-discoverability. It is refused (404, a `research.catalog` denial) for a
+included budget, prices in integer cents, and a data dictionary — is the
+steward's opt-in to discoverability. It is refused (404, a `research.catalog` denial) for a
 dataset the steward does not hold, one with no committed snapshot under
 its tenant (`platform_connectors::snapshot::holds`), so the steward's
-dataset listing (section 2) shows exactly what it can publish. Researchers file
+dataset listing (section 2) shows exactly what it can publish.
+
+The data dictionary is how a researcher learns to query a dataset, since
+`DESCRIBE` is refused and every query costs a unit. It holds the SQL table
+name, which the API derives from the slug and double-quotes where SQL
+needs it (`health`, `"2026-cohorts"`; `quackxide_engine::sql_table_name`;
+`QueryScope` registers the table under exactly the slug), and the columns
+the steward describes, each a name, a type family and an optional
+description. The server cannot read the columns without decrypting, so
+the steward declares them, and nothing checks them against the data. The
+API refuses more than 512 columns, a name a declared schema could not
+hold or one given twice, or a description over 500 characters (400), and
+a dictionary not of that shape (422); a re-publish replaces the columns.
+`GET /api/v1/connectors` gives the columns each built-in connector's
+mapper writes, which the publish form starts a connector dataset's
+dictionary from; an upload's are entered by hand. The portal shows the
+dictionary on every listing and each authorized dataset, with a
+`SELECT COUNT(*) AS n` example over the table name.
+
+Researchers file
 access requests (idempotent while pending); approval mints the grant
 (re-activating a revoked one, which a direct grant does the same way) and
 adds its query budget to it once, keyed by the request: a follow-up request
@@ -702,10 +762,10 @@ browser ──redirect──▶ Auth0 Universal Login (OIDC code + PKCE)
 | platform-auth | JWT verification (HS256 dev / RS256+JWKS), `TokenSigner`, keygen | Signing keys on verify-only replicas |
 | platform-storage | `TenantPaths` (sole `VaultPath` factory), `VaultStore` trait, the plaintext `SnapshotRecord` | Raw-string storage paths |
 | platform-enclave | `AttestationProvider` seam, Confidential Space token verifier, fail-closed dev stub; token simulator behind the dev-only `simulated` feature | "Trust me" attestation bypasses |
-| platform-connectors | Connector catalog, OAuth2 grants, NDJSON bounds, Parquet-out, dataset snapshots (commit, prune, "holds"), the upload body parser and writer | Plaintext persistence |
-| platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory) | Disclosure decisions |
+| platform-connectors | Connector catalog with each mapper's columns, OAuth2 grants, NDJSON bounds, Parquet-out, dataset snapshots (commit, prune, "holds"), the upload body parser and writer | Plaintext persistence |
+| platform-tenancy | Tenant/grant/budget/catalog registries (traits + in-memory), listings' data dictionaries | Disclosure decisions |
 | platform-billing | MoR (Paddle) webhook signature verification, replay guard, status-change ordering by `occurred_at` | Webhook secrets in Debug output |
-| quackxide-engine | `QueryScope` RAII, declared-shape check, plan gate, disclosure policies | Customer-facing naming |
+| quackxide-engine | `QueryScope` RAII, declared-shape check, plan gate, p% rule, disclosure policies, SQL table names | Customer-facing naming |
 | platform-api | HTTP edge, routing, JWT tenant middleware | Business logic |
 | synth-data (dev-only) | Seeded synthetic Parquet (`cohort`, `wide`) for tests, benchmarks and demos | Real or personal data; dependencies on other workspace crates |
 

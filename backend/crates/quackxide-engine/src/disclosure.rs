@@ -1,10 +1,12 @@
 //! Statistical disclosure control for zero-knowledge and research results.
 //!
-//! Queries in `ZkMode::Enabled` (research always runs in it) pass two gates:
-//! the plan-level aggregate-only allowlist (`policy::is_aggregate_only`) and
-//! a [`DisclosurePolicy`] applied to the aggregate rows before egress.
-//! [`MinCountThreshold`] suppresses every row whose cohort is smaller than
-//! `k`, so grouping by a unique key cannot rebuild the dataset row by row.
+//! Queries in `ZkMode::Enabled` (research always runs in it) pass the
+//! plan-level aggregate-only allowlist (`policy::is_aggregate_only`), the
+//! p% rule, which masks dominated sums and means inside the plan
+//! ([`crate::dominance`]), and a [`DisclosurePolicy`] applied to the
+//! aggregate rows before egress. [`MinCountThreshold`] suppresses every row
+//! whose cohort is smaller than `k`, so grouping by a unique key cannot
+//! rebuild the dataset row by row.
 //!
 //! Every such query must include `COUNT(*) AS n`. [`verify_count_column`]
 //! checks at the plan level that `n` is a genuine COUNT, so a literal

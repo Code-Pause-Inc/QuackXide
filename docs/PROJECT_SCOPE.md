@@ -47,7 +47,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Grant check | **Harden** | `GrantRegistry`, steward-scoped, revocable, no existence oracle. |
 | Attestation | **Build** | Verification of Google's Confidential Space attestation token on Intel TDX (ADR 0004). The provider currently refuses (fails closed). |
 | Key release | **Build** | Production `EnclaveKeyProvider`: Cloud KMS unwraps each dataset's data key only for the attested workload (ADR 0004). Query endpoints return 503 until wired; the path is proven by `DevKeyProvider` and `query-demo`. |
-| Query | **Harden** | DataFusion inside `QueryScope`, plaintext zeroized after use; per-query time, memory, input, decode and result limits, and nothing spilled to disk. |
+| Query | **Harden** | DataFusion inside `QueryScope`, plaintext zeroized after use; a query decodes only the columns it reads, after the plan gates; per-query time, memory, input, decode and result limits, and nothing spilled to disk. |
 | Disclosure control | **Harden** | Plan gate, genuine-count check, `MinCountThreshold`, budget ledger. |
 | Result | **Harden** | Aggregates, suppressed-row count, and remaining budget. |
 | Encrypted results | **Build** | Results sealed to the researcher's key inside the enclave and opened only in the researcher's browser. They currently leave as JSON over TLS. |
@@ -61,7 +61,7 @@ completion, review, and failure-path tests), or **Build** (does not exist).
 | Benchmarks | **Build** | `HPK1` and `HPK2` envelope keygen, seal and open benchmarks and research-query latency in `quackxide-engine` exist (`docs/BENCHMARKS.md`); CI benchmarks the base and head of each pull request and flags a significant regression of more than 10 % as a warning. Still to build: browser encryption throughput and enclave overhead. |
 | Operations | **Build** | Health checks, structured operational metrics, backup and restore of ciphertext and registries, key-rotation procedure, and a runbook. |
 | DataFusion upgrade | **Built** | DataFusion 55, Arrow/Parquet 59, and `object_store` 0.13 ([ADR 0008](adr/0008-datafusion-55-upgrade.md)); `thrift`, `paste`, and `rustls-pemfile` advisories cleared; disclosure allowlist and `tests/bypass.rs` verified. |
-| Dominance rule | **Build** | Suppress `MIN`/`MAX` (and sums) dominated by a single individual, closing the extreme-value residual in `docs/THREAT_MODEL.md`. |
+| Dominance rule | **Built** | `MIN` and `MAX` are refused, since each returns one person's value, and the p% rule releases a `SUM` or `AVG` that one or two rows dominate as null, inside the plan, so nothing above the aggregate reads the unmasked total ([ADR 0015](adr/0015-refuse-min-max-and-mask-dominated-sums.md)); `RESEARCH_DOMINANCE_PERCENT` sets *p*. |
 | A test for every failure path | **Harden** | Every refusal (403, 422, 429, 503, attestation, malformed input) has a negative test. |
 
 ## Stack

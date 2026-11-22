@@ -142,3 +142,35 @@ describe("ResearchClient.datasets", () => {
     await expect(new ResearchClient("", "t").datasets()).rejects.toThrow(message);
   });
 });
+
+describe("ResearchClient.connectors", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("loads the connector columns with the caller's token", async () => {
+    const connectors = [
+      {
+        slug: "quickbooks",
+        display_name: "QuickBooks",
+        kind: "accounting",
+        columns: [{ name: "id", type: "string" }],
+      },
+    ];
+    const fetchMock = vi.fn<typeof fetch>(
+      async () => new Response(JSON.stringify({ connectors }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(new ResearchClient("https://api.example/", "t").connectors()).resolves.toEqual(
+      connectors,
+    );
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://api.example/api/v1/connectors");
+    expect(init?.headers).toEqual({ Authorization: "Bearer t" });
+  });
+
+  it("throws when they cannot be loaded", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 502 })));
+    await expect(new ResearchClient("", "t").connectors()).rejects.toThrow(
+      "failed to load connector columns (502)",
+    );
+  });
+});

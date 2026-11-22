@@ -5,6 +5,8 @@ import type {
   AccessRequestView,
   BudgetView,
   CatalogView,
+  ConnectorView,
+  DataDictionaryView,
   DatasetListingView,
   GrantView,
   ListingView,
@@ -14,6 +16,7 @@ import ResearchPortal from "./ResearchPortal";
 const api = vi.hoisted(() => ({
   constructed: vi.fn(),
   catalog: vi.fn(),
+  connectors: vi.fn(),
   grants: vi.fn(),
   budget: vi.fn(),
   myRequests: vi.fn(),
@@ -56,6 +59,7 @@ vi.mock("../../lib/research/client", async (importOriginal) => ({
       api.constructed(baseUrl, token);
     }
     catalog = api.catalog;
+    connectors = api.connectors;
     grants = api.grants;
     budget = api.budget;
     myRequests = api.myRequests;
@@ -84,6 +88,7 @@ function listing(
   steward_tenant: string,
   connector: string,
   title: string,
+  data_dictionary: DataDictionaryView = { table: connector, columns: [] },
 ): ListingView {
   return {
     listing_id,
@@ -94,6 +99,7 @@ function listing(
     license_fee_cents: 120_000,
     compute_rate_cents: 40,
     grant_budget: 50,
+    data_dictionary,
     published: true,
     created_at_iso: STAMP,
     updated_at_iso: STAMP,
@@ -137,8 +143,18 @@ function request(
   };
 }
 
-const authorizedListing = listing("l-auth", STEWARD, "claims", "Claims aggregates");
-const pendingListing = listing("l-pending", STEWARD, "labs", "Lab panels");
+const authorizedListing = listing("l-auth", STEWARD, "claims", "Claims aggregates", {
+  table: "claims",
+  columns: [
+    { name: "condition", type: "string", description: "Diagnosis group" },
+    { name: "paid_cents", type: "int64", description: "" },
+  ],
+});
+// The API quotes a slug SQL cannot read unquoted.
+const pendingListing = listing("l-pending", STEWARD, "labs-2026", "Lab panels", {
+  table: '"labs-2026"',
+  columns: [{ name: "panel", type: "string", description: "Panel code" }],
+});
 const deniedListing = listing("l-denied", STEWARD, "imaging", "Imaging metadata");
 const openListing = listing("l-open", STEWARD, "survey", "Survey responses");
 const ownListing = listing("l-own", ME, "health", "Outcomes registry");
@@ -154,6 +170,16 @@ const catalog: CatalogView = {
 
 // Unexpected fields must never reach the page, whatever the API returns.
 const leakyCatalog = { ...catalog, rows: [RAW_ROW], sample: RAW_ROW } as CatalogView;
+
+const quickbooks: ConnectorView = {
+  slug: "quickbooks",
+  display_name: "QuickBooks",
+  kind: "accounting",
+  columns: [
+    { name: "id", type: "string" },
+    { name: "total", type: "float64" },
+  ],
+};
 
 const budgets: Record<string, BudgetView> = {
   "g-mine": { grant_id: "g-mine", limit: 50, spent: 12, remaining: 38 },
@@ -191,10 +217,19 @@ const storedDatasets: DatasetListingView = {
   ],
   dataset_max_bytes: 64 * 1024 * 1024,
 };
+/** The stored datasets and a QuickBooks connector's. */
+const withQuickbooks: DatasetListingView = {
+  ...storedDatasets,
+  datasets: [
+    ...storedDatasets.datasets,
+    { ...storedDatasets.datasets[0]!, dataset: "quickbooks", suite: "HPK2" },
+  ],
+};
 
 function seed() {
   api.datasets.mockResolvedValue(storedDatasets);
   api.catalog.mockResolvedValue(leakyCatalog);
+  api.connectors.mockResolvedValue([quickbooks]);
   api.grants.mockResolvedValue([myGrant, issuedGrant, unmeteredGrant]);
   api.budget.mockImplementation(async (grantId: string) => {
     const budget = budgets[grantId];
@@ -248,6 +283,13 @@ function unfinishedSection() {
 
 function catalogItem(title: string) {
   const section = within(screen.getByRole("heading", { name: "Dataset catalog" }).parentElement!);
+  return within(section.getByText(title).closest("li")!);
+}
+
+function authorizedItem(title: string) {
+  const section = within(
+    screen.getByRole("heading", { name: "Authorized datasets" }).parentElement!,
+  );
   return within(section.getByText(title).closest("li")!);
 }
 
@@ -463,6 +505,7 @@ describe("ResearchPortal", () => {
       description: "",
       license_fee_cents: 10_000,
       compute_rate_cents: 25,
+      data_dictionary: { columns: [] },
     });
     expect(await screen.findByRole("button", { name: "Publish a dataset" })).toBeInTheDocument();
     expect(screen.queryByLabelText("Dataset")).not.toBeInTheDocument();
@@ -542,5 +585,105 @@ describe("ResearchPortal", () => {
     expect(api.revokeGrant).not.toHaveBeenCalled();
     await user.click(issued.getByRole("button", { name: "Confirm revoke" }));
     expect(api.revokeGrant).toHaveBeenCalledWith("g-issued");
+  });
+
+  it("shows each listing's data dictionary with its example query", async () => {
+    await openPortal();
+    await screen.findByText("Research data access");
+
+    const claims = catalogItem("Claims aggregates");
+    expect(claims.getByText("Data dictionary · 2 columns")).toBeInTheDocument();
+    const rows = within(claims.getByRole("table", { name: "Columns of claims" })).getAllByRole(
+      "row",
+    );
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "ColumnTypeDescription",
+      "conditionstringDiagnosis group",
+      "paid_centsint64",
+    ]);
+    expect(claims.getByText("SELECT COUNT(*) AS n FROM claims")).toBeInTheDocument();
+
+    // The table name is the API's, quoted where SQL needs it.
+    expect(
+      catalogItem("Lab panels").getByText('SELECT COUNT(*) AS n FROM "labs-2026"'),
+    ).toBeInTheDocument();
+
+    const survey = catalogItem("Survey responses");
+    expect(survey.getByText("Data dictionary · columns not described")).toBeInTheDocument();
+    expect(survey.getByText(/has not described this dataset’s columns/)).toBeInTheDocument();
+    expect(survey.getByText("SELECT COUNT(*) AS n FROM survey")).toBeInTheDocument();
+  });
+
+  it("copies the example query, and says so when copying fails", async () => {
+    const user = await openPortal();
+    await screen.findByText("Research data access");
+
+    const labs = catalogItem("Lab panels");
+    await user.click(labs.getByRole("button", { name: "Copy example query" }));
+    expect(await navigator.clipboard.readText()).toBe('SELECT COUNT(*) AS n FROM "labs-2026"');
+    expect(labs.getByRole("status")).toHaveTextContent("Copied.");
+
+    // Refused, the query is selected for the keyboard to copy instead.
+    vi.spyOn(navigator.clipboard, "writeText").mockRejectedValueOnce(new Error("denied"));
+    const claims = catalogItem("Claims aggregates");
+    await user.click(claims.getByRole("button", { name: "Copy example query" }));
+    expect(await claims.findByRole("alert")).toHaveTextContent("Copying failed");
+    expect(window.getSelection()?.toString()).toBe("SELECT COUNT(*) AS n FROM claims");
+  });
+
+  it("shows the dictionary on each authorized dataset, and the table once a listing is withdrawn", async () => {
+    api.grants.mockResolvedValue([myGrant, grant("g-gone", STEWARD, ME, "gone-2")]);
+    await openPortal();
+    await screen.findByText("Research data access");
+
+    const claims = authorizedItem("Claims aggregates");
+    expect(claims.getByText("Data dictionary · 2 columns")).toBeInTheDocument();
+    expect(claims.getByText("Diagnosis group")).toBeInTheDocument();
+    expect(claims.getByText("SELECT COUNT(*) AS n FROM claims")).toBeInTheDocument();
+
+    // No listing names it now: the slug, quoted, still queries it.
+    const gone = authorizedItem("gone-2");
+    expect(gone.getByText("Data dictionary · listing withdrawn")).toBeInTheDocument();
+    expect(gone.getByText(/withdrew this listing/)).toBeInTheDocument();
+    expect(gone.getByText('SELECT COUNT(*) AS n FROM "gone-2"')).toBeInTheDocument();
+  });
+
+  it("pre-fills a connector dataset's dictionary in the publish form", async () => {
+    api.datasets.mockResolvedValue(withQuickbooks);
+    api.publishListing.mockResolvedValue(ownListing);
+    const user = await openPortal();
+
+    await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
+    await user.selectOptions(screen.getByLabelText("Dataset"), "quickbooks");
+    expect(screen.getByRole("textbox", { name: "Column 1 name" })).toHaveValue("id");
+    expect(screen.getByRole("textbox", { name: "Column 2 name" })).toHaveValue("total");
+    await user.type(screen.getByPlaceholderText(/listing title/), "Invoices");
+    await user.type(screen.getByPlaceholderText(/license fee/), "0");
+    await user.type(screen.getByPlaceholderText(/rate per query/), "0");
+    await user.click(screen.getByRole("button", { name: "Publish listing" }));
+
+    expect(api.publishListing).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connector: "quickbooks",
+        data_dictionary: {
+          columns: [
+            { name: "id", type: "string", description: "" },
+            { name: "total", type: "float64", description: "" },
+          ],
+        },
+      }),
+    );
+  });
+
+  it("opens without connector columns, leaving them to the steward", async () => {
+    api.datasets.mockResolvedValue(withQuickbooks);
+    api.connectors.mockRejectedValue(new Error("failed to load connector columns (502)"));
+    const user = await openPortal();
+
+    await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
+    await user.selectOptions(screen.getByLabelText("Dataset"), "quickbooks");
+    expect(screen.queryByRole("textbox", { name: "Column 1 name" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add column" })).toBeEnabled();
+    expect(screen.queryByText(/failed to load connector columns/)).not.toBeInTheDocument();
   });
 });

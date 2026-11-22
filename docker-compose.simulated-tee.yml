@@ -92,6 +92,7 @@ services:
       JWT_ISSUER: "${JWT_ISSUER:-quackxide.local}"
       JWT_AUDIENCE: "${JWT_AUDIENCE:-quackxide-api}"
       RESEARCH_MIN_COHORT_SIZE: "${RESEARCH_MIN_COHORT_SIZE:-}"
+      RESEARCH_DOMINANCE_PERCENT: "${RESEARCH_DOMINANCE_PERCENT:-}"
       STORAGE_LOCAL_DIR: /var/lib/quackxide/vault
       RUST_LOG: "${RUST_LOG:-info}"
     volumes:

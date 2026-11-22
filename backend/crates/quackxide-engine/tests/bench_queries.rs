@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use platform_core::ZkMode;
-use quackxide_engine::{EngineSettings, MinCountThreshold, QueryLimits, QueryScope};
+use quackxide_engine::{EngineSettings, MinCountThreshold, PercentRule, QueryLimits, QueryScope};
 use synth_data::{SchemaName, Spec};
 
 #[path = "../benches/common/mod.rs"]
@@ -23,7 +23,7 @@ async fn bench_queries_pass_the_disclosure_gate() {
         scope
             .register_parquet_many("t", &[&parquet])
             .expect("register");
-        scope.set_disclosure(Arc::new(MinCountThreshold { k: 5 }));
+        scope.set_disclosure(Arc::new(MinCountThreshold { k: 5 }), PercentRule { p: 10 });
         let batches = scope.sql(query).await.expect(query);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert!(rows > 0, "{query} returned no rows");

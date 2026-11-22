@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use platform_core::ZkMode;
-use quackxide_engine::{EngineSettings, MinCountThreshold, QueryLimits, QueryScope};
+use quackxide_engine::{EngineSettings, MinCountThreshold, PercentRule, QueryLimits, QueryScope};
 use synth_data::{SchemaName, Spec};
 
 mod common;
@@ -54,7 +54,10 @@ fn engine(c: &mut Criterion) {
                     scope
                         .register_parquet_many("t", black_box(blobs))
                         .expect("register");
-                    scope.set_disclosure(Arc::new(MinCountThreshold { k: 5 }));
+                    scope.set_disclosure(
+                        Arc::new(MinCountThreshold { k: 5 }),
+                        PercentRule { p: 10 },
+                    );
                     runtime
                         .block_on(scope.sql(black_box(query)))
                         .expect("query")

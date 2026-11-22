@@ -30,12 +30,14 @@ pub struct QueryLimits {
     /// Most objects of a snapshot that one query decrypts
     /// ([`QueryLimit::InputObjects`]).
     pub max_input_objects: u64,
-    /// Most rows a query decodes, summed over the snapshot's objects
+    /// Most rows a query decodes, as the Parquet footers report them,
+    /// summed over the snapshot's objects and the query's table scans
     /// ([`QueryLimit::DecodedRows`]).
     pub max_decoded_rows: u64,
-    /// Most uncompressed bytes the snapshot's Parquet footers may report,
-    /// summed, and most Arrow memory its decoded batches may hold
-    /// ([`QueryLimit::DecodedBytes`]).
+    /// Most uncompressed bytes the Parquet footers may report for the
+    /// columns a query reads, summed over the snapshot's objects and the
+    /// query's table scans, and most Arrow memory those scans' decoded
+    /// batches may hold ([`QueryLimit::DecodedBytes`]).
     pub max_decoded_bytes: u64,
     /// Most rows a result returns, after disclosure control
     /// ([`QueryLimit::ResultRows`]).
@@ -66,13 +68,13 @@ impl Default for QueryLimits {
 
 impl QueryLimits {
     /// The most memory one query can hold at once under these limits: its
-    /// operators' pool, its decoded table (up to this limit, plus the
+    /// operators' pool, the columns it decodes (up to this limit, plus the
     /// list columns of the batch that crosses it), three copies of its
-    /// input (the ciphertext, the plaintext the query service
-    /// keeps, and the engine's copy for the decoder) and two of its result
-    /// (the JSON and the rows parsed from it). Only the pool is enforced as
-    /// memory; the size limits bound the rest. `platform-config` refuses to
-    /// start when this, times the concurrent queries, exceeds
+    /// input (the ciphertext, the plaintext the query service keeps, and
+    /// the engine's copy for the decoder) and two of its result (the JSON
+    /// and the rows parsed from it). Only the pool is enforced as memory;
+    /// the size limits bound the rest. `platform-config` refuses to start
+    /// when this, times the concurrent queries, exceeds
     /// `QUERY_TOTAL_MEMORY_MIB`.
     pub fn worst_case_bytes(&self) -> u64 {
         self.memory_bytes

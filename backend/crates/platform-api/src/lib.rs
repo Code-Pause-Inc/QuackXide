@@ -517,6 +517,12 @@ fn routes(state: AppState) -> Router {
         )
         .layer(tenant_auth());
 
+    // Static: the columns each built-in connector's mapper writes, which a
+    // listing's data dictionary starts from.
+    let connectors = Router::new()
+        .route("/", get(research::connector_columns))
+        .layer(tenant_auth());
+
     let admin_tenants = Router::new()
         .route("/", get(admin_list_tenants))
         .route(
@@ -542,6 +548,7 @@ fn routes(state: AppState) -> Router {
         .nest("/api/v1/research", research)
         .nest("/api/v1/datasets", datasets)
         .nest("/api/v1/catalog", catalog)
+        .nest("/api/v1/connectors", connectors)
         .nest("/admin/tenants", admin_tenants)
         .nest("/admin/webhooks", webhooks)
         .layer(TraceLayer::new_for_http())
