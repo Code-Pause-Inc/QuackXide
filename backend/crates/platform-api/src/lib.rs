@@ -32,6 +32,7 @@ pub mod admin;
 mod datasets;
 #[cfg(feature = "dev")]
 pub mod dev;
+pub mod edge;
 pub mod key_release;
 mod metrics;
 pub mod query;
@@ -445,10 +446,10 @@ pub fn build_apps(state: AppState) -> (Router, Router) {
             .as_ref()
             .map(|query| query.plaintext_wait_metric()),
     ));
-    let api = routes(state).layer(middleware::from_fn_with_state(
+    let api = edge::security_headers(routes(state).layer(middleware::from_fn_with_state(
         metrics.clone(),
         metrics::track,
-    ));
+    )));
     let metrics_app = Router::new()
         .route("/metrics", get(metrics::render))
         .with_state(metrics);
