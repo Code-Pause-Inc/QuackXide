@@ -57,9 +57,10 @@ for _ in $(seq 100); do
 done
 curl -sf -o /dev/null "$base/" || { cat "$log"; echo "FAIL: vite preview did not start"; exit 1; }
 
-worker=""
-for f in "$OUT"/assets/worker-*.js; do worker="${f#"$OUT"/}"; done
-[ -n "$worker" ] || { echo "FAIL: no crypto worker script under $OUT/assets"; exit 1; }
+workers=()
+for f in "$OUT"/assets/worker-*.js; do [ -e "$f" ] && workers+=("${f#"$OUT"/}"); done
+[ "${#workers[@]}" -eq 1 ] || { echo "FAIL: want exactly one crypto worker script under $OUT/assets, found ${#workers[@]}"; exit 1; }
+worker="${workers[0]}"
 
 expected_csp="$(cat "$ROOT/backend/crates/platform-api/page-csp.txt")"
 fail=0
