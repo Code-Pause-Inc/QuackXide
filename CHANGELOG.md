@@ -312,6 +312,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* `README.md` and `docs/ARCHITECTURE.md` no longer describe live
+  connector sync or blind-index search as v1.0 capabilities; both say they
+  are not in v1.0 (`docs/PROJECT_SCOPE.md`).
 * A query's table is the dataset's exact slug. The engine registered it by
   parsing the slug as SQL, which cut a slug containing `--` short at the
   comment marker, so `a--b` was queried as `a`.
