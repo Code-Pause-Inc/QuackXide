@@ -473,25 +473,37 @@ fn routes(state: AppState, timeouts: edge::EdgeTimeouts) -> Router {
     // The status a server-side timeout answers with: the server took too
     // long, so not 408, which blames the client.
     let total = |limit| TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, limit);
-    // Uploads have no total timeout, only a gap between body reads.
+    // Only upload PUTs have no total timeout, just a gap between body reads;
+    // every other route, on the same routers too, gets the default total.
     let body_gap = || middleware::from_fn_with_state(timeouts.body_gap, edge::body_gap);
     let tenant_auth = || middleware::from_fn_with_state(state.clone(), require_tenant);
 
     let drive = Router::new()
-        .route("/objects", get(list_objects))
+        .route("/objects", get(list_objects).layer(total(timeouts.default)))
         .route(
             "/objects/{object_id}/manifest",
-            put(put_manifest).get(get_manifest),
+            put(put_manifest)
+                .layer(body_gap())
+                .merge(get(get_manifest).layer(total(timeouts.default))),
         )
         .route(
             "/objects/{object_id}/chunks/{chunk_index}",
-            put(put_chunk).get(get_chunk),
+            put(put_chunk)
+                .layer(body_gap())
+                .merge(get(get_chunk).layer(total(timeouts.default))),
         )
-        .route("/objects/{object_id}", delete(delete_object))
-        .route("/enrollment", put(put_enrollment).get(get_enrollment))
+        .route(
+            "/objects/{object_id}",
+            delete(delete_object).layer(total(timeouts.default)),
+        )
+        .route(
+            "/enrollment",
+            put(put_enrollment)
+                .layer(body_gap())
+                .merge(get(get_enrollment).layer(total(timeouts.default))),
+        )
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES))
-        .layer(tenant_auth())
-        .layer(body_gap());
+        .layer(tenant_auth());
 
     let query = Router::new()
         .route("/", post(run_query))
@@ -527,11 +539,13 @@ fn routes(state: AppState, timeouts: edge::EdgeTimeouts) -> Router {
     // configuration, so they work where research queries are not
     // configured.
     let datasets = Router::new()
-        .route("/", get(datasets::list_datasets))
-        .route("/{dataset}", put(datasets::put_dataset))
+        .route(
+            "/",
+            get(datasets::list_datasets).layer(total(timeouts.default)),
+        )
+        .route("/{dataset}", put(datasets::put_dataset).layer(body_gap()))
         .layer(DefaultBodyLimit::max(datasets::body_limit(&state.config)))
-        .layer(tenant_auth())
-        .layer(body_gap());
+        .layer(tenant_auth());
 
     let catalog = Router::new()
         .route(

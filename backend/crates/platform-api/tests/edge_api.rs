@@ -16,6 +16,7 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use platform_api::edge::{EdgeTimeouts, PAGE_CSP};
 use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
+use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{ApiError, AppState, MAX_CHUNK_BODY_BYTES, build_app, build_apps_with};
 use platform_config::PlatformConfig;
 use platform_core::{ConnectorSlug, TenantId};
@@ -23,6 +24,10 @@ use platform_crypto::{EnvelopeSuite, SecretBytes, TenantKeypair};
 use platform_enclave::{AttestationEvidence, AttestationProvider, EnclaveError};
 use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, TenantPaths, VaultEntry, VaultPath, VaultStore,
+};
+use platform_tenancy::{
+    AccessRequest, CatalogError, CatalogRegistry, DatasetListing, InMemoryCatalogRegistry,
+    ListingDetails, TenancyError,
 };
 use quackxide_engine::{EngineSettings, QueryLimits};
 use tower::ServiceExt;
@@ -115,7 +120,7 @@ async fn oversized_bodies_are_refused_with_headers() {
 const SHORT: EdgeTimeouts = EdgeTimeouts {
     default: Duration::from_millis(200),
     query: Duration::from_millis(300),
-    body_gap: Duration::from_millis(200),
+    body_gap: Duration::from_millis(400),
 };
 
 /// Evidence that is never produced: a handler that waits on it never answers.
@@ -375,4 +380,203 @@ async fn cut_upload_commit_leaves_nothing_visible() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listing, br#"{"datasets":[]}"#);
+}
+
+/// Stalls every drive listing for good.
+struct StallList(ObjectStoreVault);
+
+#[async_trait]
+impl VaultStore for StallList {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.0.put(path, ciphertext).await
+    }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.0.put_if_absent(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        self.0.get(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        self.0.delete(path).await
+    }
+    async fn list(&self, _: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        std::future::pending().await
+    }
+    async fn list_entries(&self, _: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        std::future::pending().await
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.0.usage(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn hung_reads_on_upload_routers_time_out_with_503() {
+    let vault: Arc<dyn VaultStore> = Arc::new(StallList(ObjectStoreVault::new_in_memory()));
+    let (app, _) = build_apps_with(app_state(SECRET, vault), SHORT);
+    let token = common::token_for(SECRET, TenantId::generate());
+    // Only the upload PUTs go without a total timeout; every read gets one.
+    for uri in ["/api/v1/drive/objects", "/api/v1/datasets"] {
+        // Bounded here so a missing server timeout fails instead of hanging.
+        let (status, headers, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_with_headers(&app, "GET", uri, &[bearer(&token)], Vec::new()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("GET {uri} never timed out"));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "GET {uri}");
+        assert_edge_headers(&headers, uri);
+    }
+}
+
+/// Delays every key open by `delay`, then lets it through.
+struct SlowOpen {
+    inner: DevKeyProvider,
+    delay: Duration,
+}
+
+#[async_trait]
+impl EnclaveKeyProvider for SlowOpen {
+    fn key_suite(&self, tenant: TenantId) -> Option<EnvelopeSuite> {
+        self.inner.key_suite(tenant)
+    }
+
+    async fn open_envelope(
+        &self,
+        tenant: TenantId,
+        info: &[u8],
+        envelope: &[u8],
+    ) -> Result<SecretBytes, ApiError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.open_envelope(tenant, info, envelope).await
+    }
+}
+
+#[tokio::test]
+async fn query_route_takes_the_query_timeout() {
+    // The default timeout would cut a 300 ms query; the query timeout must not.
+    let timeouts = EdgeTimeouts {
+        default: Duration::from_millis(100),
+        query: Duration::from_secs(2),
+        body_gap: Duration::from_millis(100),
+    };
+    let tenant = TenantId::generate();
+    let keypair = TenantKeypair::generate(EnvelopeSuite::CURRENT);
+    let vault = synced_vault(tenant, &keypair, 1).await;
+    let service = ConnectorQueryService::new(
+        vault.clone(),
+        Arc::new(SlowOpen {
+            inner: DevKeyProvider::new(tenant, keypair),
+            delay: Duration::from_millis(300),
+        }),
+        common::dev_attestation(),
+        EngineSettings {
+            zk: platform_core::ZkMode::Disabled,
+            max_concurrent_queries: 1,
+            limits: QueryLimits::default(),
+        },
+        false,
+    );
+    let (app, _) = build_apps_with(
+        AppState {
+            query: Some(Arc::new(service)),
+            ..app_state(SECRET, vault)
+        },
+        timeouts,
+    );
+    let token = common::token_for(SECRET, tenant);
+    let sql = r#"{"connector":"quickbooks","sql":"SELECT COUNT(*) AS n FROM quickbooks"}"#;
+    let (status, body) = common::post_query(&app, Some(&token), sql).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A catalog whose request listing never answers; the rest is in memory.
+#[derive(Default)]
+struct StallRequests(InMemoryCatalogRegistry);
+
+#[async_trait]
+impl CatalogRegistry for StallRequests {
+    async fn publish(
+        &self,
+        steward: TenantId,
+        connector: &str,
+        details: ListingDetails,
+    ) -> Result<DatasetListing, TenancyError> {
+        self.0.publish(steward, connector, details).await
+    }
+    async fn unpublish(
+        &self,
+        steward: TenantId,
+        listing_id: &str,
+    ) -> Result<Option<DatasetListing>, TenancyError> {
+        self.0.unpublish(steward, listing_id).await
+    }
+    async fn list_published(&self) -> Result<Vec<DatasetListing>, TenancyError> {
+        self.0.list_published().await
+    }
+    async fn get_listing(&self, listing_id: &str) -> Result<Option<DatasetListing>, TenancyError> {
+        self.0.get_listing(listing_id).await
+    }
+    async fn request_access(
+        &self,
+        listing_id: &str,
+        researcher: TenantId,
+        note: &str,
+    ) -> Result<AccessRequest, CatalogError> {
+        self.0.request_access(listing_id, researcher, note).await
+    }
+    async fn list_requests_for(&self, _: TenantId) -> Result<Vec<AccessRequest>, TenancyError> {
+        std::future::pending().await
+    }
+    async fn resolve(
+        &self,
+        steward: TenantId,
+        request_id: &str,
+        approve: bool,
+        budget_override: Option<u64>,
+    ) -> Result<Option<AccessRequest>, TenancyError> {
+        self.0
+            .resolve(steward, request_id, approve, budget_override)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn non_query_research_route_takes_the_default_timeout() {
+    // The query timeout is longer than the test waits: only the default can answer.
+    let timeouts = EdgeTimeouts {
+        default: Duration::from_millis(100),
+        query: Duration::from_secs(60),
+        body_gap: Duration::from_millis(100),
+    };
+    let vault: Arc<dyn VaultStore> = Arc::new(ObjectStoreVault::new_in_memory());
+    let research = ResearchService::new(
+        ResearchStores {
+            catalog: Arc::new(StallRequests::default()),
+            ..ResearchStores::in_memory()
+        },
+        vault.clone(),
+        5,
+        100,
+    );
+    let (app, _) = build_apps_with(
+        AppState {
+            research: Some(Arc::new(research)),
+            ..app_state(SECRET, vault)
+        },
+        timeouts,
+    );
+    let token = common::token_for(SECRET, TenantId::generate());
+    let started = Instant::now();
+    let (status, headers, _) = send_with_headers(
+        &app,
+        "GET",
+        "/api/v1/research/requests",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_edge_headers(&headers, "slow research request listing");
 }
