@@ -20,10 +20,10 @@ for customer data**. Drive content is encrypted with browser-held keys the
 server never sees. A steward's research dataset is sealed in the steward's
 browser before it is uploaded. Connector data is plaintext only inside
 hardware-attested TEE memory, and is re-encrypted to the tenant's public key
-before it touches any persistent medium. Analytics run inside the same enclave boundary over
-encrypted Parquet, using blind indexes so equality search never reveals
-values. Compromise of the object store, of the API host's disk, or of an
-operator credential yields ciphertext only.
+before it touches any persistent medium (live connector sync is not in
+v1.0, `docs/PROJECT_SCOPE.md`). Analytics run inside the same enclave
+boundary over encrypted Parquet. Compromise of the object store, of the
+API host's disk, or of an operator credential yields ciphertext only.
 
 ## Deployment topology (target)
 
@@ -354,10 +354,12 @@ POST /api/v1/query ──▶ attestation gate ──▶ plaintext slot (none wit
 
 `quackxide-engine` + `platform-api::query`:
 
-* **Two query paths.** *Ciphertext scan*: equality filters over a
-  blind-index column (HMAC-SHA256/128) — the engine matches HMAC images and
-  never sees the plaintext query term or values. *In-enclave analytics*:
-  DataFusion SQL over the decrypted frame.
+* **One query path in v1.0.** *In-enclave analytics*: DataFusion SQL over
+  the decrypted frame. The engine library also has a *ciphertext scan*:
+  equality filters over a blind-index column (HMAC-SHA256/128), matching
+  HMAC images without seeing the plaintext query term or values. No route
+  produces that column and there is no key management for it, so
+  blind-index search is not in v1.0 (`docs/PROJECT_SCOPE.md`).
 * **`QueryScope` memory hygiene.** Owns the DataFusion `SessionContext` and,
   for each registered table, a zeroizing copy of every decrypted Parquet
   object with its footer, parsed without the column statistics (whose
