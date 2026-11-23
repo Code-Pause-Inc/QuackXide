@@ -27,4 +27,20 @@ describe("releaseEnvProblems", () => {
     expect(problems.join(" ")).toContain("VITE_ADMIN_JWT");
     expect(problems.join(" ")).not.toContain("token-value");
   });
+
+  it("refuses a cross-origin API base without echoing it", () => {
+    const problems = releaseEnvProblems({
+      VITE_VAULT_MODE: "http",
+      VITE_API_BASE_URL: "https://api.example",
+    });
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("VITE_API_BASE_URL");
+    expect(problems[0]).not.toContain("api.example");
+  });
+
+  it("accepts an empty or blank API base (same origin)", () => {
+    for (const base of [undefined, "", "   "]) {
+      expect(releaseEnvProblems({ VITE_VAULT_MODE: "http", VITE_API_BASE_URL: base })).toEqual([]);
+    }
+  });
 });
