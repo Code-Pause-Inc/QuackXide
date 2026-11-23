@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # check.sh — full validation: backend fmt/check/clippy/test, the browser
-# envelope module (wasm), frontend typecheck/lint/test/build, the white-label
-# guards, the secret scan, and the attribution guard.
+# envelope module (wasm), frontend typecheck/lint/test/build, the release
+# build's page headers, the white-label guards, the secret scan, and the
+# attribution guard.
 # Must pass before every push.
 # =============================================================================
 set -euo pipefail
@@ -45,6 +46,9 @@ echo "== frontend: unit tests =="
 
 echo "== frontend: production build =="
 (cd "$ROOT/frontend" && npm run build)
+
+echo "== release build: page headers (CSP file, policy headers, worker script) =="
+"$ROOT/scripts/check-page-headers.sh"
 
 echo "== white-label guard: the engine name must not reach the shipped bundle =="
 if grep -riq "quackxide" "$ROOT/frontend/dist"; then
