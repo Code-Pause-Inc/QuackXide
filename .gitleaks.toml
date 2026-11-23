@@ -1,4 +1,5 @@
-# gitleaks configuration for scripts/secret-scan.sh (ci.yml and scripts/check.sh).
+# gitleaks configuration for scripts/secret-scan.sh (ci.yml, secret-scan.yml
+# and scripts/check.sh).
 # docs/DATA_POLICY.md rule 3: no credentials in the repository.
 #
 # The default rules apply. A test-only literal that trips a rule (a

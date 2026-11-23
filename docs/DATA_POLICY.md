@@ -32,10 +32,12 @@ test environment use **synthetic or public data only**.
 
 * `scripts/check.sh` fails if a data file is tracked outside a `fixtures/`
   directory.
-* gitleaks scans every diff in the history being merged for credentials
-  on every pull request (`.gitleaks.toml`, `scripts/secret-scan.sh`), and
-  `scripts/check.sh` runs a similar scan of the branch when gitleaks is
-  installed. Commit messages are not scanned. A synthetic test literal
+* gitleaks scans every diff and every commit message in the history being
+  merged for credentials on every pull request, and in the pushed history
+  on every push to every branch, with no run cancelled (`.gitleaks.toml`,
+  `scripts/secret-scan.sh`, `.github/workflows/secret-scan.yml`).
+  `scripts/check.sh` runs the same scan of the branch when gitleaks is
+  installed. A synthetic test literal
   that trips a rule is allowed in `.gitleaks.toml` by exact value or path,
   never by disabling a rule.
 * Pull requests are reviewed for data content.
