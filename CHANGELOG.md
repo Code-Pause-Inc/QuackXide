@@ -628,6 +628,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The benchmark targets and regression threshold in `docs/BENCHMARKS.md`,
+  backend and browser, are agreed (no longer proposed).
 * `docs/DATA_POLICY.md` says test sign-in users are synthetic `.example`
   identities with email verification off, and `docs/DEVELOPMENT.md` names
   the development-only store for shared values.
