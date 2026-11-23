@@ -65,4 +65,36 @@ mod tests {
             ["'self'", GOOGLE_KEY_SET]
         );
     }
+
+    #[tokio::test]
+    async fn edge_replaces_headers_a_handler_sets() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = security_headers(Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [
+                        (header::CACHE_CONTROL, "public, max-age=60"),
+                        (header::CONTENT_SECURITY_POLICY, "default-src *"),
+                    ],
+                    "ok",
+                )
+            }),
+        ));
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        for (name, expected) in [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+        ] {
+            let all: Vec<_> = response.headers().get_all(&name).iter().collect();
+            assert_eq!(all, [expected], "{name}");
+        }
+    }
 }
