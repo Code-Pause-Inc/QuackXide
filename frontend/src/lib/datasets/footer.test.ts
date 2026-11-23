@@ -258,6 +258,8 @@ describe("footers parquet-rs would not read", () => {
     ["an INT32 decimal of 20 digits", metadata([root(1), column("n", INT32, decimal(20, 2))])],
     ["an INT64 decimal of 19 digits", metadata([root(1), column("n", INT64, decimal(19, 0))])],
     ["a 4-byte decimal of 10 digits", metadata([root(1), column("n", FIXED, { 2: i32(4), ...decimal(10, 0) })])],
+    ["a 1-byte decimal of 3 digits", metadata([root(1), column("n", FIXED, { 2: i32(1), ...decimal(3, 0) })])],
+    ["a 0-byte decimal", metadata([root(1), column("n", FIXED, { 2: i32(0), ...decimal(1, 0) })])],
     [
       "a logical INT32 decimal of 10 digits",
       metadata([root(1), column("n", INT32, { 7: i32(2), 8: i32(10), ...logical(5, { 1: i32(2), 2: i32(10) }) })]),
@@ -276,6 +278,15 @@ describe("footers parquet-rs would not read", () => {
       root(1),
       element("group", { 3: REQUIRED, 5: i32(1), ...logical(10, { 1: i32(24), 2: bool(true) }) }),
       column("n", INT64),
+    ]);
+    expect(await refusal(parquet(footer))).toBe("malformed_footer");
+  });
+
+  it("refuses a 0-byte decimal even on a nested column", async () => {
+    const footer = metadata([
+      root(1),
+      element("group", { 3: REQUIRED, 5: i32(1) }),
+      column("n", FIXED, { 2: i32(0), ...decimal(1, 0) }),
     ]);
     expect(await refusal(parquet(footer))).toBe("malformed_footer");
   });
@@ -305,15 +316,17 @@ describe("declarations", () => {
 
   it("declares decimals at the largest precision each physical type holds", async () => {
     const footer = metadata([
-      root(5),
+      root(6),
       column("d32", INT32, decimal(9, 9)),
       column("d64", INT64, decimal(18, 0)),
+      column("d1", FIXED, { 2: i32(1), ...decimal(2, 0) }),
       column("d4", FIXED, { 2: i32(4), ...decimal(9, 2) }),
       column("d16", FIXED, { 2: i32(16), ...decimal(38, 4) }),
       column("dbytes", BYTE_ARRAY, decimal(60, 5)),
     ]);
     const reading = await readFooter(parquet(footer));
     expect(reading.ok && reading.schema.map((column) => column.type)).toEqual([
+      "decimal",
       "decimal",
       "decimal",
       "decimal",

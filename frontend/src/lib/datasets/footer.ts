@@ -454,14 +454,16 @@ function checkAnnotations(el: Element): void {
  *  scale from 0 to the precision, and a precision the physical type holds
  *  (9 digits in `INT32`, 18 in `INT64`, and what a fixed length's signed
  *  value holds). `BYTE_ARRAY` has no limit. A logical decimal's precision
- *  and scale equal the element's (`checkAnnotations`). */
+ *  and scale equal the element's (`checkAnnotations`). A length of 0 makes
+ *  that bound the log of a negative number: parquet-rs's `as i32` turns the
+ *  NaN into 0, so it holds no digits. */
 function checkDecimal({ physical, precision, scale, typeLength }: Element): void {
   if (precision < 1 || scale < 0 || scale > precision) throw new Malformed();
   if (physical === Physical.INT32 && precision > 9) throw new Malformed();
   if (physical === Physical.INT64 && precision > 18) throw new Malformed();
   if (physical === Physical.FIXED_LEN_BYTE_ARRAY) {
     const max = Math.floor(Math.log10(2 ** (8 * typeLength - 1) - 1));
-    if (precision > max) throw new Malformed();
+    if (!(precision <= max)) throw new Malformed();
   }
 }
 
