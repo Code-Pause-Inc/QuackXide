@@ -887,6 +887,48 @@ listener (`METRICS_BIND_ADDR`, default `127.0.0.1:9464`), never on the
 API's port. Labels are route patterns, methods, status codes and error
 kinds only: no tenant ids, paths, messages, SQL text or engine name.
 
+## HTTP edge
+
+`platform_api::build_apps` wraps every route `routes()` defines
+(`/api/v1/*`, `/admin/*`, `/healthz`, `/readyz`), not the loopback metrics
+router. Layers, outermost first:
+
+1. **Headers.** `Content-Security-Policy`, `X-Content-Type-Options:
+   nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and
+   `Cache-Control: no-store`, each overriding anything a handler set, so
+   every response (auth rejections, 404s, timeouts and panics included)
+   carries exactly one of each.
+2. **Request metrics** (`metrics::track`), so timeouts and caught panics
+   are counted.
+3. **Panic containment.** A handler panic answers 500 `{"error":"internal"}`
+   and logs one `tracing::error!` with a fixed message and no panic text
+   (not a security audit event). The release profile unwinds, so this
+   catches.
+4. **Timeouts, per route group.** Query routes (`POST /api/v1/query`,
+   `POST /api/v1/research/query`): `QUERY_SLOT_WAIT_SECS` plus
+   `QUERY_TIMEOUT_SECS` plus a 60 s margin for key release, storage reads
+   and writing the response, so the query's own limits end it first. Upload
+   routes (drive `PUT`s, `PUT /api/v1/datasets/{dataset}`): no total, a 30 s
+   gap between body reads (408). Everything else: 60 s. A server timeout
+   answers 503 with an empty body.
+
+The policy is one line in `backend/crates/platform-api/page-csp.txt`,
+embedded by `platform-api` (`PAGE_CSP`) and read by `vite.config.ts` for
+`vite preview`; no setting can widen it (ADR 0005: the environment may only
+tighten controls). Static files, which #181 will serve inside the header
+layer, get the first four headers but stay cacheable. `vite preview` stands
+in for that today, and `scripts/check-page-headers.sh` (part of
+`scripts/check.sh`) builds the release bundle, serves it and checks the
+page, `/index.html` and the crypto worker script for exactly the policy
+file's value and the other headers. `frontend/scripts/csp-smoke.mjs`
+(`check-page-headers.sh --smoke`, the `browser` workflow) loads the page in
+Chromium and runs a worker operation that instantiates the wasm module, and
+fails on any policy violation.
+
+There is no CORS layer: the page and the API share one origin (ADR 0005),
+so no cross-origin caller is allowed. The release build refuses a non-empty
+`VITE_API_BASE_URL`.
+
 ## Production mode
 
 Production mode is the deployment mode of `platform-api` and
