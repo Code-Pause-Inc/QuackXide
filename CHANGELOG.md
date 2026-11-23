@@ -628,6 +628,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The benchmark targets and regression threshold in `docs/BENCHMARKS.md`,
+  backend and browser, are agreed (no longer proposed).
 * Every dataset snapshot, a connector sync's included, writes a plaintext
   record (`platform_storage::SnapshotRecord`: its suite, and for an upload
   the declared row cap and schema) before its manifest, writes both
