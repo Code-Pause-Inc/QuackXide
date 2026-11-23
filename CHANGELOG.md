@@ -628,6 +628,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `docs/DATA_POLICY.md` says test sign-in users are synthetic `.example`
+  identities with email verification off, and `docs/DEVELOPMENT.md` names
+  the development-only store for shared values.
 * Every dataset snapshot, a connector sync's included, writes a plaintext
   record (`platform_storage::SnapshotRecord`: its suite, and for an upload
   the declared row cap and schema) before its manifest, writes both

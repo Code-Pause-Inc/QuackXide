@@ -13,7 +13,11 @@ test environment use **synthetic or public data only**.
 2. **No other personal data.** No real names, email addresses, phone
    numbers, addresses, government identifiers, or financial records.
    Fixtures use obviously fake values (for example `alex@lead-one.example`,
-   "Alex Sample") on reserved `.example` domains.
+   "Alex Sample") on reserved `.example` domains. Test sign-in users in
+   the provider's development tenant are synthetic too: `.example`
+   addresses with email verification off, never a team member's own
+   address or phone number. Their passwords and TOTP seeds are kept in the
+   development secret store (`docs/DEVELOPMENT.md`), never committed.
 3. **No credentials.** No API keys, tokens, private keys, passwords, or
    `.env` files. Only `*.env.example` templates with empty values are
    committed. Cross-implementation test vectors are the one exception: they

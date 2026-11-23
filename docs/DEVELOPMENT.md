@@ -41,6 +41,18 @@ The browser's envelope code is a wasm32 build (`envelope-wasm`, built by
 `scripts/build-wasm.sh`). It enables getrandom 0.4's `wasm_js` feature for
 `crypto.getRandomValues`, so it needs no `--cfg getrandom_backend` flag.
 
+## Shared development values
+
+The values the team shares for development, such as the sign-in
+provider's development tenant settings and the synthetic test users'
+passwords and TOTP seeds, live in the organization's private
+`quackxide-dev-secrets` repository. Every organization member can read it;
+ask the maintainer to be added to the organization. Copy what you need into
+your gitignored `backend/.env` and `frontend/.env`, never into this
+repository, its issues or pull requests, or chat. It holds development
+values only: every value is rotated before staging, and staging and
+production secrets never go there.
+
 ## Everyday commands
 
 From `backend/`:
