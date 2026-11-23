@@ -387,6 +387,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* `parquet` 59.3.3 (RUSTSEC-2026-0595: bloom filters were written in
+  plaintext in encrypted Parquet files), in `backend/Cargo.lock` and
+  `backend/fuzz/Cargo.lock`. The backend writes no encrypted Parquet.
 * A query decodes only the columns it reads, and nothing before its plan
   passes every gate (P53). `QueryScope` registers a table by reading only
   the Parquet footers, parsed without their column statistics, from its
