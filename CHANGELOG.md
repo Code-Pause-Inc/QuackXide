@@ -387,6 +387,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* The secret scan also reads every commit message in the history it scans
+  (`gitleaks stdin`), since a squash merge copies them onto main, and
+  `.github/workflows/secret-scan.yml` runs it on every push to every
+  branch, never cancelled, under that branch's own `.gitleaks.toml`. A
+  branch with no pull request, the intermediate commits of a branch
+  squash-merged over a red scan, and a key force-pushed away before its
+  run finished are now scanned. The self-test covers a key that is only
+  in a commit message.
 * `parquet` 59.3.3 (RUSTSEC-2026-0595: bloom filters were written in
   plaintext in encrypted Parquet files), in `backend/Cargo.lock` and
   `backend/fuzz/Cargo.lock`. The backend writes no encrypted Parquet.
