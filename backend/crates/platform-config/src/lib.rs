@@ -234,8 +234,9 @@ pub struct ServerConfig {
     pub metrics_bind_addr: SocketAddr,
 }
 
-/// GCS vault settings. Optional so the API boots in storage-less local dev;
-/// routes that need the vault refuse instead.
+/// GCS vault settings. With no bucket, a service in development uses an
+/// in-memory vault (logged as a warning; data is lost on restart), and in
+/// production it refuses to start ([`PlatformConfig::check_production`]).
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// `STORAGE_BUCKET` — bucket holding `tenants/{tenant_id}/…` paths.
