@@ -1,13 +1,83 @@
 //! The HTTP edge shared by every response: the page policy and the baseline
 //! security headers.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use axum::Router;
-use axum::http::{HeaderName, HeaderValue, header};
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use futures::TryStreamExt;
+use platform_core::QueryLimits;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutBody;
 
 /// The page Content-Security-Policy, one line, defined once in
 /// `page-csp.txt` (also read by the frontend's `vite preview`).
 pub const PAGE_CSP: &str = include_str!("../page-csp.txt");
+
+/// Total time for every route that is neither a query nor an upload.
+pub const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Added to a query's slot wait and run limit for the work around the run:
+/// key release, storage reads and writing the response.
+pub const QUERY_ROUTE_MARGIN: Duration = Duration::from_secs(60);
+/// Longest an upload body may go without delivering data.
+pub const BODY_GAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long each route group may take. Query routes get a total timeout and
+/// uploads get none, only a gap between body reads.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeTimeouts {
+    pub default: Duration,
+    pub query: Duration,
+    pub body_gap: Duration,
+}
+
+impl EdgeTimeouts {
+    /// The query total is the slot wait, the run limit and the margin, so
+    /// the query's own limits end it first.
+    pub fn from_limits(limits: &QueryLimits) -> Self {
+        Self {
+            default: DEFAULT_ROUTE_TIMEOUT,
+            query: limits.slot_wait + limits.timeout + QUERY_ROUTE_MARGIN,
+            body_gap: BODY_GAP_TIMEOUT,
+        }
+    }
+}
+
+/// Answer 408 when the request body goes `gap` without delivering data.
+/// tower-http's `RequestBodyTimeoutLayer` alone ends the body with an error
+/// that handlers' extractors report as 400, so this notes the timeout and
+/// replaces the response.
+pub(crate) async fn body_gap(
+    State(gap): State<Duration>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let seen = timed_out.clone();
+    let (parts, body) = request.into_parts();
+    let body = Body::new(TimeoutBody::new(gap, body))
+        .into_data_stream()
+        .inspect_err(move |err| {
+            if std::error::Error::source(err)
+                .is_some_and(|source| source.is::<tower_http::timeout::TimeoutError>())
+            {
+                seen.store(true, Ordering::SeqCst);
+            }
+        });
+    let response = next
+        .run(Request::from_parts(parts, Body::from_stream(body)))
+        .await;
+    if timed_out.load(Ordering::SeqCst) {
+        return StatusCode::REQUEST_TIMEOUT.into_response();
+    }
+    response
+}
 
 /// Set the baseline security headers on every response of `router`,
 /// replacing any value a handler set, so each appears exactly once.
@@ -42,6 +112,26 @@ mod tests {
     use super::*;
 
     const GOOGLE_KEY_SET: &str = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com";
+
+    #[test]
+    fn query_timeout_follows_the_limits() {
+        let secs = Duration::from_secs;
+        let limits = QueryLimits {
+            slot_wait: secs(10),
+            timeout: secs(60),
+            ..QueryLimits::default()
+        };
+        let timeouts = EdgeTimeouts::from_limits(&limits);
+        assert_eq!(timeouts.query, secs(130));
+        assert_eq!(timeouts.default, secs(60));
+        assert_eq!(timeouts.body_gap, secs(30));
+        let long = QueryLimits {
+            slot_wait: secs(120),
+            timeout: secs(600),
+            ..QueryLimits::default()
+        };
+        assert_eq!(EdgeTimeouts::from_limits(&long).query, secs(780));
+    }
 
     #[test]
     fn page_csp_file_is_one_clean_line() {
