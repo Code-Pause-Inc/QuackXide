@@ -14,7 +14,7 @@ uses [Semantic Versioning](https://semver.org/).
   `X-Frame-Options` and `Cache-Control: no-store`. Requests time out per
   route group (query routes follow `QueryLimits`, uploads get a 30 s body gap
   answered with 408, the rest 60 s answered with 503), and a handler panic
-  answers a generic 500 and is logged without its message.
+  answers a generic 500 (the edge logs a fixed message).
   `scripts/check-page-headers.sh` checks a release build's page and worker
   headers in `scripts/check.sh`, and a Chromium smoke test in the `browser`
   workflow runs a wasm operation under the policy. The frontend's release

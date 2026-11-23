@@ -901,8 +901,9 @@ router. Layers, outermost first:
 2. **Request metrics** (`metrics::track`), so timeouts and caught panics
    are counted.
 3. **Panic containment.** A handler panic answers 500 `{"error":"internal"}`
-   and logs one `tracing::error!` with a fixed message and no panic text
-   (not a security audit event). The release profile unwinds, so this
+   and the edge logs one `tracing::error!` with a fixed message and no
+   panic text (not a security audit event). Rust's default panic hook still
+   prints the panic message to stderr. The release profile unwinds, so this
    catches.
 4. **Timeouts, per route group.** Query routes (`POST /api/v1/query`,
    `POST /api/v1/research/query`): `QUERY_SLOT_WAIT_SECS` plus
