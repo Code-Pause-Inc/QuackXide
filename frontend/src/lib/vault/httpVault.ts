@@ -30,6 +30,15 @@ function objectPath(objectId: string): string {
   return `/objects/${encodeURIComponent(objectId)}`;
 }
 
+/** The account already has a different key enrolled (HTTP 409). Enrollment
+ *  is create-once; only an explicit rotation replaces the key. */
+export class EnrollmentRefusedError extends Error {
+  constructor() {
+    super("a different key is already enrolled for this account");
+    this.name = "EnrollmentRefusedError";
+  }
+}
+
 export class HttpVault implements VaultClient {
   constructor(private readonly config: HttpVaultConfig) {}
 
@@ -123,6 +132,7 @@ export class HttpVault implements VaultClient {
       headers: this.headers("application/json"),
       body: JSON.stringify({ hpke_public_key_b64: publicKeyB64 }),
     });
+    if (response.status === 409) throw new EnrollmentRefusedError();
     if (!response.ok) throw new Error(`enrollment failed (${response.status})`);
   }
 }

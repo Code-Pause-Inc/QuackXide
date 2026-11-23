@@ -12,6 +12,8 @@ interface KeySetupGateProps {
 export default function KeySetupGate({ info, onAcknowledge }: KeySetupGateProps) {
   const [accepted, setAccepted] = useState(false);
 
+  if (info.enrollment === "refused") return <SecondDeviceRefusal />;
+
   return (
     <div className="mx-auto max-w-xl rounded-2xl border border-slate-800 bg-slate-900/60 p-8">
       <p className="text-xs font-semibold uppercase tracking-widest text-emerald-400">
@@ -51,8 +53,10 @@ export default function KeySetupGate({ info, onAcknowledge }: KeySetupGateProps)
 
       {!info.hpkeKeyAvailable && (
         <p className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
-          This browser could not load the encryption module for your data key. Drive encryption
-          works fully; connector and research features need a browser that can run it.
+          This browser could not load the encryption module for your data key, so it cannot
+          receive sealed research results yet. Drive encryption works fully. When the module
+          loads in a later session, a data key is added to this device automatically and your
+          existing files stay readable.
         </p>
       )}
 
@@ -75,6 +79,40 @@ export default function KeySetupGate({ info, onAcknowledge }: KeySetupGateProps)
       >
         Open my encrypted drive
       </button>
+    </div>
+  );
+}
+
+/** Shown when the account already has a different key enrolled. In v1 a
+ *  key lives on one device and is never replaced silently (ADR 0004), so a
+ *  second device or a cleared browser is refused rather than re-keyed. */
+function SecondDeviceRefusal() {
+  return (
+    <div
+      role="alert"
+      className="mx-auto max-w-xl rounded-2xl border border-rose-500/40 bg-slate-900/60 p-8"
+    >
+      <p className="text-xs font-semibold uppercase tracking-widest text-rose-400">
+        This device cannot be used
+      </p>
+      <h2 className="mt-2 text-2xl font-semibold text-slate-100">
+        Your account&apos;s keys are on another device
+      </h2>
+      <ul className="mt-6 space-y-3 text-sm text-slate-300">
+        <li>
+          Your account already has an encryption key, created on the device or browser you first
+          used. Keys stay on that device and are never copied to {brand.domainName}.
+        </li>
+        <li>
+          To keep your data safe, a new device cannot replace that key. Open your drive on the
+          original device and browser instead.
+        </li>
+        <li>
+          If you cleared this browser&apos;s site data, the original key is gone and{" "}
+          {brand.publicName} cannot recover it. Using more than one device and replacing a lost
+          key are not supported in this version.
+        </li>
+      </ul>
     </div>
   );
 }

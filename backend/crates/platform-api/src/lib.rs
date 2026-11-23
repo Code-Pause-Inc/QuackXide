@@ -470,6 +470,7 @@ fn routes(state: AppState) -> Router {
         )
         .route("/objects/{object_id}", delete(delete_object))
         .route("/enrollment", put(put_enrollment).get(get_enrollment))
+        .route("/enrollment/rotate", post(rotate_enrollment))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES))
         .layer(tenant_auth());
 
@@ -1118,15 +1119,79 @@ pub struct EnrollmentBody {
     pub hpke_public_key_b64: String,
 }
 
-/// Enroll the tenant's HPKE public key, which enclave pipelines use to seal
-/// connector data to the tenant. The key's length names its suite; the
-/// deployment's suite policy decides whether that suite is accepted, and the
-/// record stores the suite. Every attempt is audited.
+/// The stored enrollment record. It is created once per tenant; replacing
+/// the key is a separate, audited rotation (ADR 0004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentRecord {
+    /// Base64 raw tenant public key, as enrolled.
+    pub hpke_public_key_b64: String,
+    /// [`platform_crypto::TenantPublicKey::fingerprint`] of the key.
+    pub key_id: String,
+    /// [`platform_crypto::EnvelopeSuite::name`] of the key's suite.
+    pub suite: String,
+    /// Creation time, Unix seconds.
+    pub created_at_unix: u64,
+}
+
+/// Why a stored enrollment record is refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnrollmentError {
+    Malformed,
+    UnknownSuite,
+    /// The key's suite is one this deployment does not accept.
+    SuiteRefused,
+    InvalidPublicKey,
+    KeyIdMismatch,
+}
+
+/// Parse and verify a stored enrollment record. Anything that reads the
+/// enrollment to seal to it calls this first and refuses a record that
+/// fails (fail closed): unknown fields, a missing creation time, a key that
+/// does not parse, a suite `policy` refuses or that is not the key's own
+/// suite, or a `key_id` that is not the key's fingerprint.
+pub fn verify_enrollment_record(
+    stored: &[u8],
+    policy: platform_crypto::SuitePolicy,
+) -> Result<EnrollmentRecord, EnrollmentError> {
+    let record: EnrollmentRecord =
+        serde_json::from_slice(stored).map_err(|_| EnrollmentError::Malformed)?;
+    if record.created_at_unix == 0 {
+        return Err(EnrollmentError::Malformed);
+    }
+    let raw = B64
+        .decode(&record.hpke_public_key_b64)
+        .map_err(|_| EnrollmentError::InvalidPublicKey)?;
+    let key = match platform_crypto::TenantPublicKey::from_raw(&raw, policy) {
+        Ok(key) => key,
+        Err(platform_crypto::CryptoError::SuiteRefused) => {
+            return Err(EnrollmentError::SuiteRefused);
+        }
+        Err(_) => return Err(EnrollmentError::InvalidPublicKey),
+    };
+    if record.suite != key.suite().name() {
+        return Err(EnrollmentError::UnknownSuite);
+    }
+    if record.key_id != key.fingerprint() {
+        return Err(EnrollmentError::KeyIdMismatch);
+    }
+    Ok(record)
+}
+
+/// Enroll the tenant's HPKE public key. Enrollment is create-once: the
+/// first key wins, re-sending the same key is an idempotent success, and a
+/// different key is refused with 409 (only an explicit rotation replaces
+/// it). The one exception is the development-only P36 migration from an
+/// X25519 key to an X-Wing key. The key's length names its suite, the deployment's suite policy
+/// decides whether that suite is accepted, and every attempt is audited.
 async fn put_enrollment(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
     Json(body): Json<EnrollmentBody>,
 ) -> Result<StatusCode, ApiError> {
+    let denied = |detail: &str| {
+        security_audit_event(AuditKind::KeyEnrollment, Some(tenant), "denied", detail);
+    };
     let public_key_b64 = body.hpke_public_key_b64.trim();
     let Ok(raw) = B64.decode(public_key_b64) else {
         security_audit_event(
@@ -1166,23 +1231,98 @@ async fn put_enrollment(
         }
     };
 
-    let record = json!({
-        "hpke_public_key_b64": public_key_b64,
-        "suite": key.suite().name(),
-    });
-    let stored = serde_json::to_vec(&record).map_err(|_| ApiError::Backend)?;
-    state
-        .vault
-        .put(&TenantPaths::tenant_enrollment(tenant), stored.into())
-        .await?;
+    let key_id = key.fingerprint();
 
+    let created_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ApiError::Backend)?
+        .as_secs();
+    let record = EnrollmentRecord {
+        hpke_public_key_b64: public_key_b64.to_owned(),
+        key_id: key_id.clone(),
+        suite: key.suite().name().to_owned(),
+        created_at_unix,
+    };
+    let stored = serde_json::to_vec(&record).map_err(|_| ApiError::Backend)?;
+    let path = TenantPaths::tenant_enrollment(tenant);
+    match state.vault.put_if_absent(&path, stored.into()).await {
+        Ok(()) => {
+            security_audit_event(
+                AuditKind::KeyEnrollment,
+                Some(tenant),
+                "ok",
+                &format!("enrolled key_id={key_id}"),
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(StorageError::AlreadyExists) => {
+            let existing = state.vault.get(&path).await?;
+            match verify_enrollment_record(&existing, policy) {
+                Ok(current) if current.key_id == key_id => {
+                    security_audit_event(
+                        AuditKind::KeyEnrollment,
+                        Some(tenant),
+                        "ok",
+                        &format!("already enrolled key_id={key_id}"),
+                    );
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                // The P36 migration: a development-only X25519 key moves to
+                // X-Wing. Allowed only where X25519 is still accepted, so
+                // never in production, which refuses `HPK1` keys outright.
+                Ok(current)
+                    if current.suite == platform_crypto::EnvelopeSuite::Hpk1.name()
+                        && key.suite() == platform_crypto::EnvelopeSuite::Hpk2
+                        && policy.check(platform_crypto::EnvelopeSuite::Hpk1).is_ok() =>
+                {
+                    state.vault.put(&path, stored_again(&record)?).await?;
+                    security_audit_event(
+                        AuditKind::KeyEnrollment,
+                        Some(tenant),
+                        "ok",
+                        &format!(
+                            "migrated key from HPK1 to HPK2 key_id={key_id} previous={}",
+                            current.key_id
+                        ),
+                    );
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                Ok(current) => {
+                    denied(&format!(
+                        "refused re-enrollment key_id={key_id} enrolled={}",
+                        current.key_id
+                    ));
+                    Err(ApiError::Conflict)
+                }
+                Err(err) => {
+                    denied(&format!("stored enrollment fails verification: {err:?}"));
+                    Err(ApiError::Conflict)
+                }
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn stored_again(record: &EnrollmentRecord) -> Result<Bytes, ApiError> {
+    serde_json::to_vec(record)
+        .map(Into::into)
+        .map_err(|_| ApiError::Backend)
+}
+
+/// Replace the enrolled key. Rotation needs a fresh second factor (P30);
+/// until that check exists it always refuses (fail closed), audited as its
+/// own outcome. Worker initialization never calls it.
+async fn rotate_enrollment(
+    Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,
+) -> Result<StatusCode, ApiError> {
     security_audit_event(
         AuditKind::KeyEnrollment,
         Some(tenant),
-        "ok",
-        "tenant HPKE public key enrolled",
+        "denied",
+        "rotation refused: fresh second factor not available",
     );
-    Ok(StatusCode::NO_CONTENT)
+    Err(ApiError::Forbidden)
 }
 
 async fn get_enrollment(
@@ -1203,6 +1343,74 @@ async fn get_enrollment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_json(key_b64: &str, key_id: &str, suite: &str, created: u64) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "hpke_public_key_b64": key_b64,
+            "key_id": key_id,
+            "suite": suite,
+            "created_at_unix": created,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn enrollment_record_verification_fails_closed() {
+        use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair};
+        let dev = SuitePolicy::DEVELOPMENT;
+        let key = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+        let b64 = B64.encode(key.to_raw());
+        let id = key.fingerprint();
+        let hpk2 = EnvelopeSuite::Hpk2.name();
+        let now = 1_763_000_000;
+        assert!(verify_enrollment_record(&record_json(&b64, &id, hpk2, now), dev).is_ok());
+        assert!(
+            verify_enrollment_record(&record_json(&b64, &id, hpk2, now), SuitePolicy::PRODUCTION)
+                .is_ok()
+        );
+        let other = TenantKeypair::generate(EnvelopeSuite::Hpk2)
+            .public_key()
+            .fingerprint();
+        assert_eq!(
+            verify_enrollment_record(&record_json(&b64, &other, hpk2, now), dev),
+            Err(EnrollmentError::KeyIdMismatch)
+        );
+        // The stored suite must be the key's own suite.
+        for wrong in ["HPK9", EnvelopeSuite::Hpk1.name()] {
+            assert_eq!(
+                verify_enrollment_record(&record_json(&b64, &id, wrong, now), dev),
+                Err(EnrollmentError::UnknownSuite)
+            );
+        }
+        assert_eq!(
+            verify_enrollment_record(&record_json("AAAA", &id, hpk2, now), dev),
+            Err(EnrollmentError::InvalidPublicKey)
+        );
+        assert_eq!(
+            verify_enrollment_record(&record_json(&b64, &id, hpk2, 0), dev),
+            Err(EnrollmentError::Malformed)
+        );
+        // A development-only X25519 key is refused under the production policy.
+        let x25519 = TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
+        let x_record = record_json(
+            &B64.encode(x25519.to_raw()),
+            &x25519.fingerprint(),
+            EnvelopeSuite::Hpk1.name(),
+            now,
+        );
+        assert!(verify_enrollment_record(&x_record, dev).is_ok());
+        assert_eq!(
+            verify_enrollment_record(&x_record, SuitePolicy::PRODUCTION),
+            Err(EnrollmentError::SuiteRefused)
+        );
+        // A record written before create-once enrollment is refused.
+        let legacy =
+            serde_json::to_vec(&json!({"hpke_public_key_b64": b64, "suite": hpk2})).unwrap();
+        assert_eq!(
+            verify_enrollment_record(&legacy, dev),
+            Err(EnrollmentError::Malformed)
+        );
+    }
 
     #[test]
     fn storage_errors_map_to_documented_statuses() {

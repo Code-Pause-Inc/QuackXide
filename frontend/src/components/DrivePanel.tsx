@@ -8,6 +8,10 @@ import KeySetupGate from "./KeySetupGate";
 
 const ACK_STORAGE_KEY = "key-isolation-acknowledged";
 
+function ackKey(identityKey: string): string {
+  return `${ACK_STORAGE_KEY}:${identityKey}`;
+}
+
 interface Transfer {
   key: string;
   name: string;
@@ -42,8 +46,11 @@ export default function DrivePanel() {
         const result = await client().init();
         if (cancelled) return;
         setInfo(result);
-        const acknowledged = localStorage.getItem(ACK_STORAGE_KEY) === "1";
-        setPhase(result.created && !acknowledged ? "gate" : "ready");
+        // The acknowledgement is per identity: another account signing in on
+        // this browser gets its own keys and its own briefing.
+        const acknowledged = localStorage.getItem(ackKey(result.identityKey)) === "1";
+        const needsGate = result.enrollment === "refused" || (result.created && !acknowledged);
+        setPhase(needsGate ? "gate" : "ready");
         await refresh();
       } catch (err) {
         if (!cancelled) {
@@ -138,7 +145,7 @@ export default function DrivePanel() {
       <KeySetupGate
         info={info}
         onAcknowledge={() => {
-          localStorage.setItem(ACK_STORAGE_KEY, "1");
+          localStorage.setItem(ackKey(info.identityKey), "1");
           setPhase("ready");
         }}
       />

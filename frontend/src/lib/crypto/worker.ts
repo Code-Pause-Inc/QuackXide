@@ -6,13 +6,21 @@ import { resolveBrand } from "../../config/brand";
 import { resolveVaultConfig } from "../../config/vault";
 import { toB64 } from "../encoding";
 import { errorMessage } from "../format";
-import { HttpVault } from "../vault/httpVault";
+import { EnrollmentRefusedError, HttpVault } from "../vault/httpVault";
 import { LocalVault } from "../vault/localVault";
 import type { VaultClient } from "../vault/types";
 import { generateMasterKey, keyFingerprint } from "./core";
 import { createDeviceHpkeKey } from "./devicekey";
 import { downloadFile, listFiles, removeFile, uploadFile, type DriveContext } from "./drive";
-import { loadDeviceKeys, saveDeviceKeys, type DeviceKeys } from "./keystore";
+import {
+  identityKey,
+  LOCAL_IDENTITY,
+  loadDeviceKeys,
+  sameIdentity,
+  saveDeviceKeys,
+  type DeviceKeys,
+  type KeyIdentity,
+} from "./keystore";
 import { decodeSessionClaims, parseWorkerRequest } from "./protocol";
 import type { InitResult, SessionClaims, WorkerRequest, WorkerResponse } from "./protocol";
 
@@ -67,8 +75,8 @@ function respond(msg: WorkerResponse): void {
 
 /** Give `keys` an HPKE key if it has none: on first setup, after the
  *  envelope module failed to load before, or for a record saved before
- *  ADR 0007's key storage. Without the module the drive still works and
- *  the next call tries again. */
+ *  ADR 0007's key storage. The master key is kept, so no file is lost.
+ *  Without the module the drive still works and the next call tries again. */
 async function withHpkeKey(keys: DeviceKeys): Promise<DeviceKeys> {
   if (keys.hpke) return keys;
   let hpke;
@@ -83,6 +91,18 @@ async function withHpkeKey(keys: DeviceKeys): Promise<DeviceKeys> {
   return upgraded;
 }
 
+/** The identity whose keys this worker may use. In http mode it is the
+ *  session's verified identity, and there are no keys without a session. In
+ *  local mode (development, no server) it is one fixed local identity. */
+function currentIdentity(): KeyIdentity {
+  if (resolveVaultConfig(import.meta.env).mode === "local") {
+    return LOCAL_IDENTITY;
+  }
+  if (!session) throw new Error("no session token");
+  const { iss, sub, tid } = session.claims;
+  return { iss, sub, tid };
+}
+
 let ensuring: Promise<{ keys: DeviceKeys; created: boolean }> | null = null;
 
 /** One key setup at a time: two requests arriving together must not each
@@ -95,16 +115,23 @@ function ensureKeys(): Promise<{ keys: DeviceKeys; created: boolean }> {
 }
 
 async function loadOrCreateKeys(): Promise<{ keys: DeviceKeys; created: boolean }> {
+  const identity = currentIdentity();
+  if (deviceKeys && !sameIdentity(deviceKeys.identity, identity)) {
+    // Another identity signed in: drop the previous keys and vault client.
+    deviceKeys = null;
+    vaultInstance = null;
+  }
   if (deviceKeys?.hpke) return { keys: deviceKeys, created: false };
 
-  const existing = deviceKeys ?? (await loadDeviceKeys());
+  const existing = deviceKeys ?? (await loadDeviceKeys(identity));
   if (existing) {
     deviceKeys = await withHpkeKey(existing);
     return { keys: deviceKeys, created: false };
   }
 
   const fresh: DeviceKeys = {
-    tenantId: crypto.randomUUID(),
+    identity,
+    tenantId: identity.tid,
     kek: await generateMasterKey(),
     hpke: null,
     createdAtIso: new Date().toISOString(),
@@ -122,13 +149,23 @@ async function handleInit(): Promise<InitResult> {
   const publicKeyRaw = keys.hpke?.publicKeyRaw ?? null;
   const hpkePublicKeyB64 = publicKeyRaw ? toB64(publicKeyRaw) : null;
 
-  // Enroll the public key so enclave pipelines can seal connector data to
-  // this tenant. Best-effort: an unreachable backend must not block the drive.
-  if (hpkePublicKeyB64) {
+  // Enroll the public key. Enrollment is create-once on the server, so this
+  // never replaces a key: a different key already enrolled for the account
+  // (another device, or a cleared browser) is refused, and the UI says so.
+  // An unreachable backend does not block the drive; the next init retries.
+  let enrollment: InitResult["enrollment"] = "unavailable";
+  const vault = vaultFor(keys);
+  if (hpkePublicKeyB64 && vault.enrollTenantKey) {
     try {
-      await vaultFor(keys).enrollTenantKey?.(hpkePublicKeyB64);
+      await vault.enrollTenantKey(hpkePublicKeyB64);
+      enrollment = "enrolled";
     } catch (err) {
-      console.warn("tenant key enrollment failed (will retry next init)", err);
+      if (err instanceof EnrollmentRefusedError) {
+        enrollment = "refused";
+      } else {
+        enrollment = "failed";
+        console.warn("tenant key enrollment failed (will retry next init)", err);
+      }
     }
   }
 
@@ -138,6 +175,8 @@ async function handleInit(): Promise<InitResult> {
     hpkeKeyAvailable: publicKeyRaw !== null,
     hpkePublicKeyB64,
     fingerprint: publicKeyRaw ? await keyFingerprint(publicKeyRaw) : null,
+    identityKey: identityKey(keys.identity),
+    enrollment,
   };
 }
 

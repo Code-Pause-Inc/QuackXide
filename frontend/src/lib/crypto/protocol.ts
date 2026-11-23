@@ -12,6 +12,15 @@ export interface InitResult {
   hpkePublicKeyB64: string | null;
   /** Fingerprint of the device public key; null without an HPKE key. */
   fingerprint: string | null;
+  /** Stable name of the signed-in identity the keys belong to. */
+  identityKey: string;
+  /**
+   * The server's answer to this device's key enrollment: "enrolled" (first
+   * enrollment or the same key again), "refused" (the account already has a
+   * different key, e.g. enrolled from another device), "unavailable" (no
+   * HPKE key on this browser, or no server), or "failed" (will retry).
+   */
+  enrollment: "enrolled" | "refused" | "unavailable" | "failed";
 }
 
 export interface DriveFileSummary {
