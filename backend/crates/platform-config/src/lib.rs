@@ -1321,12 +1321,30 @@ mod tests {
                 ),
             }
         }
+        for raw in ["10", "+10", " 25 ", "9", "0", "10.0", "ten", ""] {
+            let pairs = [("RESEARCH_DOMINANCE_PERCENT", raw)];
+            let policy = ConfigPolicy::RELEASE.check(source(&pairs));
+            match PlatformConfig::from_source(source(&pairs)) {
+                Ok(cfg) if cfg.research.dominance_percent >= DEFAULT_DOMINANCE_PERCENT => {
+                    assert_eq!(policy, Ok(()), "{raw:?}")
+                }
+                Ok(_) => assert!(matches!(policy, Err(ConfigRefused::Loosens(_))), "{raw:?}"),
+                Err(_) => assert!(
+                    matches!(policy, Err(ConfigRefused::Unreadable(_))),
+                    "{raw:?}"
+                ),
+            }
+        }
         let absent = PlatformConfig::from_source(source(&[])).expect("defaults load");
         assert!(absent.features.zk.is_enabled() && absent.features.tee_attestation_required);
         assert_eq!(ConfigPolicy::RELEASE.check(source(&[])), Ok(()));
         assert_eq!(
             ConfigPolicy::RELEASE.min_cohort_floor,
             DEFAULT_MIN_COHORT_SIZE
+        );
+        assert_eq!(
+            platform_enclave::config::DOMINANCE_PERCENT_FLOOR,
+            DEFAULT_DOMINANCE_PERCENT
         );
     }
 

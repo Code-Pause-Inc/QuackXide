@@ -78,8 +78,9 @@ uses [Semantic Versioning](https://semver.org/).
   platform claims, the image digest, the client's challenge, and the
   binding of the enclave's keys and the configuration the token reports,
   held to a compiled policy (`config::ConfigPolicy`). The bound names are
-  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED` and
-  `RESEARCH_MIN_COHORT_SIZE`; the enclave digests its own environment
+  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+  `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DOMINANCE_PERCENT` (at least
+  10 in every build); the enclave digests its own environment
   instead of `ENCLAVE_CONFIG_DIGEST_HEX`, and the key-release stand-in
   checks the token's configuration instead of
   `KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX`. Development builds hold the

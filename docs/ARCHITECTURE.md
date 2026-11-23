@@ -538,7 +538,8 @@ attestation bundle (`platform_enclave::evidence::verify_evidence`, which
 token's validity, the platform claims, the image digest, its own
 challenge, and the binding of the enclave's keys and of the configuration
 the token reports (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
-`RESEARCH_MIN_COHORT_SIZE`), held to the compiled policy. The query is
+`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`), held to the
+compiled policy. The query is
 then sealed to the bundle's request key (ADR 0010 "Sealed request"), so
 its SQL is plaintext only in the researcher's browser and inside the
 enclave. A sealed query runs in a task of its own, so a client that

@@ -248,10 +248,10 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   command line, where other users of the same machine can see it in the
   process list; it serves the simulated-TEE script, not researchers.
 * **Configuration bound so far.** Attestation binds
-  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED` and
-  `RESEARCH_MIN_COHORT_SIZE`. `RESEARCH_DEFAULT_QUERY_BUDGET`,
-  `JWT_ISSUER` and `JWT_AUDIENCE`, which ADR 0005 also names, are not bound
-  yet.
+  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+  `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DOMINANCE_PERCENT`.
+  `RESEARCH_DEFAULT_QUERY_BUDGET`, `JWT_ISSUER` and `JWT_AUDIENCE`, which
+  ADR 0005 also names, are not bound yet.
 * **Forged or rolled-back snapshots.** Connector objects, uploaded objects
   and snapshot manifests are sealed to the tenant's public key, which binds
   them to tenant, dataset and object or version but does not authenticate

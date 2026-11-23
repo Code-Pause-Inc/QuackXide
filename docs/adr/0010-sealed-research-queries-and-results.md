@@ -119,11 +119,11 @@ then checks that configuration by policy, as ADR 0005 decides: it reads
 the same compiled names from the token and refuses a value that loosens a
 control. `TEE_ATTESTATION_REQUIRED` and `FEATURE_ZK_ENABLED` must be
 absent or a value the platform reads as true, and
-`RESEARCH_MIN_COHORT_SIZE` absent or at least the compiled-in floor (P54). P14's policy may require more, never less. A
+`RESEARCH_MIN_COHORT_SIZE` absent or at least the compiled-in floor (P54), and `RESEARCH_DOMINANCE_PERCENT` absent or at least 10, its default (ADR 0015), in every build. P14's policy may require more, never less. A
 development build, which runs on the simulated TEE, compiles in the
 simulator's policy instead: `TEE_ATTESTATION_REQUIRED` may be `false`,
-since simulated tokens never satisfy required attestation, and the floor is
-2, the size the simulated-TEE script's cohorts are built around. The key
+since simulated tokens never satisfy required attestation, and the cohort
+floor is 2, the size the simulated-TEE script's cohorts are built around. The key
 release stand-in holds the same policy, so a loosened deployment gets no
 keys either (ADR 0005). No
 expected digest is published or compared: one frontend image serves every

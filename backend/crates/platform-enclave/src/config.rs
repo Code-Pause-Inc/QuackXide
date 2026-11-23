@@ -8,11 +8,16 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 /// The configuration names bound into attestation, in digest order.
-pub const BOUND_CONFIG_NAMES: [&str; 3] = [
+pub const BOUND_CONFIG_NAMES: [&str; 4] = [
     "TEE_ATTESTATION_REQUIRED",
     "FEATURE_ZK_ENABLED",
     "RESEARCH_MIN_COHORT_SIZE",
+    "RESEARCH_DOMINANCE_PERCENT",
 ];
+
+/// The lowest p% rule `p` any build accepts: the default, below which a
+/// dominated total is released (ADR 0015).
+pub const DOMINANCE_PERCENT_FLOOR: u64 = 10;
 
 /// `name`'s value as the platform reads it: trimmed, and unset when empty
 /// (`platform-config`'s rule).
@@ -52,7 +57,8 @@ pub fn config_digest(lookup: impl Fn(&str) -> Option<String>) -> [u8; 32] {
 
 /// What a verifier accepts in a deployment's bound configuration: the
 /// attestation requirement and the ZK gate on (unset means on), and a
-/// minimum cohort size of at least the floor (unset means the default).
+/// minimum cohort size and p% rule `p` of at least their floors (unset
+/// means the default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigPolicy {
     pub allow_attestation_off: bool,
@@ -82,23 +88,33 @@ impl ConfigPolicy {
     };
 
     pub fn check(&self, lookup: impl Fn(&str) -> Option<String>) -> Result<(), ConfigRefused> {
-        let [attestation, zk, min_cohort] = BOUND_CONFIG_NAMES;
+        let [attestation, zk, min_cohort, dominance] = BOUND_CONFIG_NAMES;
         if !flag(&lookup, attestation)? && !self.allow_attestation_off {
             return Err(ConfigRefused::Loosens(attestation));
         }
         if !flag(&lookup, zk)? {
             return Err(ConfigRefused::Loosens(zk));
         }
-        if let Some(raw) = bound_value(&lookup, min_cohort) {
-            let k: u64 = raw
-                .parse()
-                .map_err(|_| ConfigRefused::Unreadable(min_cohort))?;
-            if k < self.min_cohort_floor {
-                return Err(ConfigRefused::Loosens(min_cohort));
-            }
-        }
-        Ok(())
+        at_least(&lookup, min_cohort, self.min_cohort_floor)?;
+        at_least(&lookup, dominance, DOMINANCE_PERCENT_FLOOR)
     }
+}
+
+/// An integer as `platform-config` reads it; unset is its default, which
+/// meets the floor.
+fn at_least(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    floor: u64,
+) -> Result<(), ConfigRefused> {
+    let Some(raw) = bound_value(lookup, name) else {
+        return Ok(());
+    };
+    let value: u64 = raw.parse().map_err(|_| ConfigRefused::Unreadable(name))?;
+    if value < floor {
+        return Err(ConfigRefused::Loosens(name));
+    }
+    Ok(())
 }
 
 /// A boolean as `platform-config` reads it; unset is true (both bound flags
@@ -221,6 +237,27 @@ mod tests {
             check(&[("RESEARCH_MIN_COHORT_SIZE", "1")]),
             Err(ConfigRefused::Loosens("RESEARCH_MIN_COHORT_SIZE"))
         );
+    }
+
+    #[test]
+    fn dominance_percent_is_bound_and_held_to_its_floor() {
+        let p = |raw: &'static str| {
+            move |name: &str| (name == "RESEARCH_DOMINANCE_PERCENT").then(|| raw.to_owned())
+        };
+        assert_eq!(bound_env(p("10")).len(), 1);
+        assert_ne!(config_digest(p("10")), config_digest(|_| None));
+        for policy in [ConfigPolicy::RELEASE, ConfigPolicy::SIMULATOR] {
+            assert_eq!(
+                policy.check(p("9")),
+                Err(ConfigRefused::Loosens("RESEARCH_DOMINANCE_PERCENT"))
+            );
+            assert_eq!(policy.check(p("10")), Ok(()));
+            assert_eq!(policy.check(p("25")), Ok(()));
+            assert_eq!(
+                policy.check(p("ten")),
+                Err(ConfigRefused::Unreadable("RESEARCH_DOMINANCE_PERCENT"))
+            );
+        }
     }
 
     #[test]
