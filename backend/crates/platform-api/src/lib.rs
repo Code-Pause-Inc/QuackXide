@@ -453,13 +453,20 @@ pub fn build_apps_with(state: AppState, timeouts: edge::EdgeTimeouts) -> (Router
             .as_ref()
             .map(|query| query.plaintext_wait_metric()),
     ));
-    let api = edge::security_headers(routes(state, timeouts).layer(
-        middleware::from_fn_with_state(metrics.clone(), metrics::track),
-    ));
+    let api = wrap_edge(routes(state, timeouts), metrics.clone());
     let metrics_app = Router::new()
         .route("/metrics", get(metrics::render))
         .with_state(metrics);
     (api, metrics_app)
+}
+
+/// The layers around the routes, outermost first: security headers, request
+/// metrics, then panic containment, so a caught panic is counted and carries
+/// the headers.
+pub(crate) fn wrap_edge(inner: Router, metrics: Arc<metrics::Metrics>) -> Router {
+    edge::security_headers(
+        edge::catch_panics(inner).layer(middleware::from_fn_with_state(metrics, metrics::track)),
+    )
 }
 
 fn routes(state: AppState, timeouts: edge::EdgeTimeouts) -> Router {

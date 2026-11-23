@@ -13,6 +13,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
 use platform_core::QueryLimits;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutBody;
 
@@ -77,6 +78,21 @@ pub(crate) async fn body_gap(
         return StatusCode::REQUEST_TIMEOUT.into_response();
     }
     response
+}
+
+/// Answer a panicking handler with a generic 500. The panic payload may hold
+/// request data, so it is dropped unread and the log line is fixed.
+pub(crate) fn catch_panics(router: Router) -> Router {
+    router.layer(CatchPanicLayer::custom(
+        |_payload: Box<dyn std::any::Any + Send>| {
+            tracing::error!("request handler panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": "internal" })),
+            )
+                .into_response()
+        },
+    ))
 }
 
 /// Set the baseline security headers on every response of `router`,
@@ -186,5 +202,125 @@ mod tests {
             let all: Vec<_> = response.headers().get_all(&name).iter().collect();
             assert_eq!(all, [expected], "{name}");
         }
+    }
+
+    async fn boom() -> &'static str {
+        panic!("MARKER-secret")
+    }
+
+    /// A router that panics with a recognisable message, wrapped as the real
+    /// routes are, with the metrics router that reports on it.
+    ///
+    /// The tests share one callsite for the log event, and a scoped
+    /// subscriber only sees it when no other test is registering it, so the
+    /// guard serialises them.
+    async fn panicking_app() -> (Router, Router, tokio::sync::MutexGuard<'static, ()>) {
+        use axum::routing::get;
+
+        static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let serial = SERIAL.lock().await;
+
+        let metrics = Arc::new(crate::metrics::Metrics::new(None));
+        let app = crate::wrap_edge(Router::new().route("/boom", get(boom)), metrics.clone());
+        let report = Router::new()
+            .route("/metrics", get(crate::metrics::render))
+            .with_state(metrics);
+        (app, report, serial)
+    }
+
+    async fn get_body(app: &Router, uri: &str) -> (Response, String) {
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.expect("body").to_bytes();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (Response::from_parts(parts, Body::empty()), text)
+    }
+
+    #[tokio::test]
+    async fn panic_returns_a_generic_500() {
+        let (app, _, _serial) = panicking_app().await;
+        let (response, body) = get_body(&app, "/boom").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, r#"{"error":"internal"}"#);
+        assert!(!body.contains("MARKER"));
+        for (name, expected) in [
+            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CACHE_CONTROL, "no-store"),
+        ] {
+            let all: Vec<_> = response.headers().get_all(&name).iter().collect();
+            assert_eq!(all, [expected], "{name}");
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_is_logged_without_its_payload() {
+        let (app, _, _serial) = panicking_app().await;
+        let output = Captured::default();
+        let sink = output.clone();
+        // The test runtime is current-thread, so the thread-local default
+        // sees the event the layer emits.
+        let _guard = tracing::subscriber::set_default(platform_telemetry::build_subscriber(
+            "trace",
+            move || sink.clone(),
+        ));
+        // Another test's panic may have registered the callsite while no
+        // subscriber was set, caching it as disabled.
+        tracing::callsite::rebuild_interest_cache();
+        get_body(&app, "/boom").await;
+
+        let text = String::from_utf8(output.0.lock().expect("lock").clone()).expect("UTF-8");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON line"))
+            .collect();
+        let errors: Vec<_> = lines
+            .iter()
+            .filter(|line| line["level"] == "ERROR")
+            .collect();
+        assert_eq!(errors.len(), 1, "{text}");
+        assert_eq!(errors[0]["message"], "request handler panicked");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line["target"] != platform_telemetry::SECURITY_AUDIT_TARGET),
+            "{text}"
+        );
+        assert!(!text.contains("MARKER"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn panic_is_counted_by_request_metrics() {
+        let (app, report, _serial) = panicking_app().await;
+        get_body(&app, "/boom").await;
+        let (_, metrics) = get_body(&report, "/metrics").await;
+        assert!(
+            metrics.contains(r#"http_requests_total{method="GET",route="/boom",status="500"} 1"#),
+            "{metrics}"
+        );
     }
 }
