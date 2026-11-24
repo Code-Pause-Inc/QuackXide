@@ -882,6 +882,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+| `research.replay` | A sealed research query's envelope sent again: its stored response ("replayed") or a retry while it runs or after that response expired ("retry"). Never charged, so never `engine.query` |
 | `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope, upload or snapshot record whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
@@ -923,9 +924,10 @@ Rules, enforced by the capture tests:
    budget reads of unknown, foreign and malformed grant ids, and sealed
    research queries refused (an unsupported version, an unknown key set, a
    frame that does not open, a reused nonce), each an `auth.decision`
-   naming its reason, and key release refusing a deployment's configuration
+   naming its reason, key release refusing a deployment's configuration
    (a digest the token does not carry, or a loosened control), each a
-   `crypto.key_release` denial naming its reason.
+   `crypto.key_release` denial naming its reason, and a replayed stored
+   response (`research.replay` "replayed", with no second `engine.query`).
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on
@@ -982,15 +984,18 @@ router. Layers, outermost first:
    gap between body reads (408). Everything else: 60 s. A server timeout
    answers 503 with an empty body.
 
-The policy is one line in `backend/crates/platform-api/page-csp.txt`,
-embedded by `platform-api` (`PAGE_CSP`) and read by `vite.config.ts` for
-`vite preview`; no setting can widen it (ADR 0005: the environment may only
-tighten controls). Static files, which #181 will serve inside the header
-layer, get the first four headers but stay cacheable. `vite preview` stands
-in for that today, and `scripts/check-page-headers.sh` (part of
-`scripts/check.sh`) builds the release bundle, serves it and checks the
-page, `/index.html` and the crypto worker script for exactly the policy
-file's value and the other headers. `frontend/scripts/csp-smoke.mjs`
+The first four headers in layer 1 are the page headers, one `Name: value`
+line each in `backend/crates/platform-api/page-headers.txt`, embedded by
+`platform-api` (`edge::page_headers`) and read by `vite.config.ts` for
+`vite preview`; no setting can widen them (ADR 0005: the environment may
+only tighten controls). `Cache-Control: no-store` is not in the file: every
+response `platform-api` sends today is an API response, and #181, which
+will serve the static files, decides their caching. `vite preview` stands
+in for that and sends the page headers without `no-store`.
+`scripts/check-page-headers.sh` (part of `scripts/check.sh`) builds the
+release bundle, serves it and checks the page, `/index.html` and the
+crypto worker script for exactly one of each header in the file, with its
+value, and no `no-store`. `frontend/scripts/csp-smoke.mjs`
 (`check-page-headers.sh --smoke`, the `browser` workflow) loads the page in
 Chromium and runs a worker operation that instantiates the wasm module, and
 fails on any policy violation.

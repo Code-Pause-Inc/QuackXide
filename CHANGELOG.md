@@ -34,10 +34,10 @@ uses [Semantic Versioning](https://semver.org/).
   a manual run for each release candidate, with a proposed target. The
   data guard in `scripts/check.sh` accepts the repository's top-level
   `fixtures/` and tests itself.
-* HTTP edge hardening (#180). Every `platform-api` response carries a strict
-  page `Content-Security-Policy` (one file, `page-csp.txt`, also served by
-  `vite preview`), `X-Content-Type-Options`, `Referrer-Policy`,
-  `X-Frame-Options` and `Cache-Control: no-store`. Requests time out per
+* HTTP edge hardening (#180). Every `platform-api` response carries the page
+  headers (one file, `page-headers.txt`, also served by `vite preview`): a
+  strict `Content-Security-Policy`, `X-Content-Type-Options`,
+  `Referrer-Policy` and `X-Frame-Options`, plus `Cache-Control: no-store`. Requests time out per
   route group (query routes follow `QueryLimits`, uploads get a 30 s body gap
   answered with 408, the rest 60 s answered with 503), and a handler panic
   answers a generic 500 (the edge logs a fixed message).
@@ -105,7 +105,10 @@ uses [Semantic Versioning](https://semver.org/).
   the same envelope again gets the stored response, uncharged, for an hour;
   another envelope under the nonce, a retry while the query runs and an
   expired response are 409 `nonce_used`, `query_running` and
-  `response_expired`. A refused charge records nothing. A sealed query runs
+  `response_expired`. Only `nonce_used` is an `auth.decision` denial; the
+  other two are `research.replay` "retry", and a stored response sent
+  again is `research.replay` "replayed", never a metered `engine.query`. A refused charge
+  records nothing. A sealed query runs
   in a task of its own, so a client that disconnects does not cancel it.
   The plaintext body `{steward_tenant, connector, sql}` is compiled only
   into development builds and refuses unknown fields. `TokenVerifier`
