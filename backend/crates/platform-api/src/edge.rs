@@ -17,9 +17,26 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutBody;
 
-/// The page Content-Security-Policy, one line, defined once in
-/// `page-csp.txt` (also read by the frontend's `vite preview`).
-pub const PAGE_CSP: &str = include_str!("../page-csp.txt");
+/// The page headers, one `Name: value` line each, defined once in
+/// `page-headers.txt` (also read by the frontend's `vite preview` and
+/// `scripts/check-page-headers.sh`).
+const PAGE_HEADERS: &str = include_str!("../page-headers.txt");
+
+/// The page headers as (name, value) pairs, in file order.
+pub fn page_headers() -> impl Iterator<Item = (&'static str, &'static str)> {
+    PAGE_HEADERS.lines().map(|line| {
+        line.split_once(": ")
+            .unwrap_or_else(|| panic!("page-headers.txt: not a `Name: value` line: {line}"))
+    })
+}
+
+/// The page Content-Security-Policy, from `page-headers.txt`.
+pub fn page_csp() -> &'static str {
+    page_headers()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-security-policy"))
+        .map(|(_, value)| value)
+        .expect("page-headers.txt sets Content-Security-Policy")
+}
 
 /// Total time for every route that is neither a query nor an upload.
 pub const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -95,32 +112,21 @@ pub(crate) fn catch_panics(router: Router) -> Router {
     ))
 }
 
-/// Set the baseline security headers on every response of `router`,
-/// replacing any value a handler set, so each appears exactly once.
+/// Set the page headers and `Cache-Control: no-store` on every response of
+/// `router`, replacing any value a handler set, so each appears exactly once.
 pub(crate) fn security_headers(router: Router) -> Router {
     let set =
         |name: HeaderName, value: HeaderValue| SetResponseHeaderLayer::overriding(name, value);
-    router
-        .layer(set(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(PAGE_CSP),
-        ))
-        .layer(set(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(set(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        ))
-        .layer(set(
-            header::X_FRAME_OPTIONS,
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(set(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
+    let router = page_headers().fold(router, |router, (name, value)| {
+        let name = HeaderName::from_bytes(name.as_bytes()).expect("page-headers.txt: header name");
+        router.layer(set(name, HeaderValue::from_static(value)))
+    });
+    // Every response here is an API response; static files (#181) decide
+    // their own caching, so this is not in page-headers.txt.
+    router.layer(set(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    ))
 }
 
 #[cfg(test)]
@@ -150,19 +156,35 @@ mod tests {
     }
 
     #[test]
-    fn page_csp_file_is_one_clean_line() {
-        assert!(!PAGE_CSP.contains(['\n', '\r']));
-        assert_eq!(PAGE_CSP, PAGE_CSP.trim());
-        assert!(HeaderValue::from_str(PAGE_CSP).is_ok());
-        assert!(PAGE_CSP.contains("frame-ancestors 'none'"));
-        assert!(PAGE_CSP.contains("'wasm-unsafe-eval'"));
-        assert!(!PAGE_CSP.contains("unsafe-inline"));
-        assert!(
-            !PAGE_CSP
-                .replace("wasm-unsafe-eval", "")
-                .contains("unsafe-eval")
-        );
-        let connect = PAGE_CSP
+    fn page_headers_file_is_clean() {
+        assert!(!PAGE_HEADERS.contains('\r'));
+        let mut names = Vec::new();
+        for (name, value) in page_headers() {
+            let parsed = HeaderName::from_bytes(name.as_bytes()).expect("header name");
+            assert!(HeaderValue::from_str(value).is_ok(), "{name}");
+            assert_eq!(value, value.trim(), "{name}");
+            assert!(!names.contains(&parsed), "{name} twice");
+            names.push(parsed);
+        }
+        for required in [
+            header::CONTENT_SECURITY_POLICY,
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::REFERRER_POLICY,
+            header::X_FRAME_OPTIONS,
+        ] {
+            assert!(names.contains(&required), "{required}");
+        }
+        assert!(!names.contains(&header::CACHE_CONTROL));
+    }
+
+    #[test]
+    fn page_csp_is_strict() {
+        let csp = page_csp();
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("'wasm-unsafe-eval'"));
+        assert!(!csp.contains("unsafe-inline"));
+        assert!(!csp.replace("wasm-unsafe-eval", "").contains("unsafe-eval"));
+        let connect = csp
             .split("; ")
             .find_map(|d| d.strip_prefix("connect-src "))
             .expect("connect-src");
@@ -197,7 +219,7 @@ mod tests {
             .expect("response");
         for (name, expected) in [
             (header::CACHE_CONTROL, "no-store"),
-            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+            (header::CONTENT_SECURITY_POLICY, page_csp()),
         ] {
             let all: Vec<_> = response.headers().get_all(&name).iter().collect();
             assert_eq!(all, [expected], "{name}");
@@ -252,7 +274,7 @@ mod tests {
         assert_eq!(body, r#"{"error":"internal"}"#);
         assert!(!body.contains("MARKER"));
         for (name, expected) in [
-            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+            (header::CONTENT_SECURITY_POLICY, page_csp()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
             (header::X_FRAME_OPTIONS, "DENY"),

@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
-use platform_api::edge::{EdgeTimeouts, PAGE_CSP};
+use platform_api::edge::{EdgeTimeouts, page_csp};
 use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
 use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{ApiError, AppState, MAX_CHUNK_BODY_BYTES, build_app, build_apps_with};
@@ -43,7 +43,7 @@ fn state() -> AppState {
 
 fn assert_edge_headers(headers: &HeaderMap, context: &str) {
     let expected = [
-        ("content-security-policy", PAGE_CSP),
+        ("content-security-policy", page_csp()),
         ("x-content-type-options", "nosniff"),
         ("referrer-policy", "no-referrer"),
         ("x-frame-options", "DENY"),
