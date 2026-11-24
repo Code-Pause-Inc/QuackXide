@@ -79,7 +79,10 @@ uses [Semantic Versioning](https://semver.org/).
   the same envelope again gets the stored response, uncharged, for an hour;
   another envelope under the nonce, a retry while the query runs and an
   expired response are 409 `nonce_used`, `query_running` and
-  `response_expired`. A refused charge records nothing. A sealed query runs
+  `response_expired`. Only `nonce_used` is an `auth.decision` denial; the
+  other two are `research.replay` "retry", and a stored response sent
+  again is `research.replay` "replayed", never a metered `engine.query`. A refused charge
+  records nothing. A sealed query runs
   in a task of its own, so a client that disconnects does not cancel it.
   The plaintext body `{steward_tenant, connector, sql}` is compiled only
   into development builds and refuses unknown fields. `TokenVerifier`
