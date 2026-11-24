@@ -32,6 +32,18 @@ uses [Semantic Versioning](https://semver.org/).
   records the upload timed at the 64 MiB limit in a real browser (about
   0.6 s of browser work on an Apple M4, most of it the seal), with a
   proposed target.
+* HTTP edge hardening (#180). Every `platform-api` response carries a strict
+  page `Content-Security-Policy` (one file, `page-csp.txt`, also served by
+  `vite preview`), `X-Content-Type-Options`, `Referrer-Policy`,
+  `X-Frame-Options` and `Cache-Control: no-store`. Requests time out per
+  route group (query routes follow `QueryLimits`, uploads get a 30 s body gap
+  answered with 408, the rest 60 s answered with 503), and a handler panic
+  answers a generic 500 (the edge logs a fixed message).
+  `scripts/check-page-headers.sh` checks a release build's page and worker
+  headers in `scripts/check.sh`, and a Chromium smoke test in the `browser`
+  workflow runs a wasm operation under the policy. The frontend's release
+  build refuses a cross-origin `VITE_API_BASE_URL`. A client that sends its
+  request headers slowly is not bounded yet.
 * Data dictionary on published listings (P59): a catalog listing carries
   `data_dictionary`, the dataset's SQL table name and the columns its
   steward describes (name, type family and an optional description), so a
@@ -80,6 +92,40 @@ uses [Semantic Versioning](https://semver.org/).
   the audience `urn:platform:browser-attestation`, which key release
   refuses, so a caller who fetches it cannot open key release.
   ADR 0005 and ADR 0010 are accepted.
+* Research queries sealed to the enclave (ADR 0010; part of P85).
+  `POST /api/v1/research/query` takes `{version, key_id, grant_id,
+  envelope}`, the query sealed to the request key from the attestation
+  bundle under `research_query`. The enclave refuses a key set it no longer
+  holds (409 `reattest`), a frame that does not open or a malformed sealed
+  query (400), and a grant other than the one `grant_id` names (403), none
+  of them charged and each audited as an `auth.decision` denial. A replay
+  store, per key set, records each request nonce just before the charge:
+  the same envelope again gets the stored response, uncharged, for an hour;
+  another envelope under the nonce, a retry while the query runs and an
+  expired response are 409 `nonce_used`, `query_running` and
+  `response_expired`. A refused charge records nothing. A sealed query runs
+  in a task of its own, so a client that disconnects does not cancel it.
+  The plaintext body `{steward_tenant, connector, sql}` is compiled only
+  into development builds and refuses unknown fields. `TokenVerifier`
+  requires a token's nonces exactly and in order.
+* Enclave verification for research queries (ADR 0010; part of P85).
+  `platform-enclave` runs ADR 0010's five browser checks once
+  (`evidence::verify_evidence`): Google's signature and validity, the
+  platform claims, the image digest, the client's challenge, and the
+  binding of the enclave's keys and the configuration the token reports,
+  held to a compiled policy (`config::ConfigPolicy`). The bound names are
+  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+  `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DOMINANCE_PERCENT` (at least
+  10 in every build); the enclave digests its own environment
+  instead of `ENCLAVE_CONFIG_DIGEST_HEX`, and the key-release stand-in
+  checks the token's configuration instead of
+  `KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX`. Development builds hold the
+  simulator's policy (attestation may be off, k at least 2). New
+  `enclave-check` binary: `verify` checks a deployment, `seal-query` seals a
+  research query to it, and `keygen` (development builds) makes a
+  researcher key; a release build takes its trust anchors from the caller,
+  over `https`. The simulated-TEE script sends only sealed research
+  queries.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -336,6 +382,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* `README.md` and `docs/ARCHITECTURE.md` no longer describe live
+  connector sync or blind-index search as v1.0 capabilities; both say they
+  are not in v1.0 (`docs/PROJECT_SCOPE.md`).
 * A query's table is the dataset's exact slug. The engine registered it by
   parsing the slug as SQL, which cut a slug containing `--` short at the
   comment marker, so `a--b` was queried as `a`.
@@ -411,6 +460,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* The secret scan also reads every commit message in the history it scans
+  (`gitleaks stdin`), since a squash merge copies them onto main, and
+  `.github/workflows/secret-scan.yml` runs it on every push to every
+  branch, never cancelled, under that branch's own `.gitleaks.toml`. A
+  branch with no pull request, the intermediate commits of a branch
+  squash-merged over a red scan, and a key force-pushed away before its
+  run finished are now scanned. The self-test covers a key that is only
+  in a commit message.
+* `parquet` 59.3.3 (RUSTSEC-2026-0595: bloom filters were written in
+  plaintext in encrypted Parquet files), in `backend/Cargo.lock` and
+  `backend/fuzz/Cargo.lock`. The backend writes no encrypted Parquet.
 * A query decodes only the columns it reads, and nothing before its plan
   passes every gate (P53). `QueryScope` registers a table by reading only
   the Parquet footers, parsed without their column statistics, from its
@@ -638,6 +698,11 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The benchmark targets and regression threshold in `docs/BENCHMARKS.md`,
+  backend and browser, are agreed (no longer proposed).
+* `docs/DATA_POLICY.md` says test sign-in users are synthetic `.example`
+  identities with email verification off, and `docs/DEVELOPMENT.md` names
+  the development-only store for shared values.
 * Every dataset snapshot, a connector sync's included, writes a plaintext
   record (`platform_storage::SnapshotRecord`: its suite, and for an upload
   the declared row cap and schema) before its manifest, writes both

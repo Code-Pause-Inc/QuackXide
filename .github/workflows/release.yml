@@ -31,12 +31,17 @@ jobs:
       - run: scripts/check.sh
       # Replaces check.sh's development build of frontend/dist. Release mode
       # refuses the local vault and any baked-in development token (ADR 0009).
+      # The enclave trust values (ADR 0010) are repository variables, set
+      # once P49/P50 publish them; until then the release build refuses.
       - name: Build release frontend
         working-directory: frontend
         env:
           VITE_VAULT_MODE: http
           VITE_DEV_JWT: ""
           VITE_ADMIN_JWT: ""
+          VITE_ATTESTATION_ISSUER: ${{ vars.VITE_ATTESTATION_ISSUER }}
+          VITE_ATTESTATION_JWKS_URL: ${{ vars.VITE_ATTESTATION_JWKS_URL }}
+          VITE_ATTESTATION_IMAGE_DIGESTS: ${{ vars.VITE_ATTESTATION_IMAGE_DIGESTS }}
         run: npm run build:release
       - name: Build release artifacts
         run: |

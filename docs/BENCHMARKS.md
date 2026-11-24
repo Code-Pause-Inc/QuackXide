@@ -266,7 +266,7 @@ client.terminate();
 
 ## Targets and regression threshold
 
-**Proposed, needs @AxolDad.**
+Agreed with the maintainer (2026-11-23).
 
 **Regression threshold.** A benchmark regresses when the lower bound of the
 95 % confidence interval of its mean change against the base commit is
@@ -385,7 +385,7 @@ Wasm has no AES instructions, so the seal runs at about 50 MiB/s, against
 
 ### Targets
 
-**Proposed, needs @AxolDad.** On the machine above, in Chromium:
+Agreed with the maintainer (2026-11-23). On the machine above, in Chromium:
 
 * a 100 MiB payload seals in under 3 s (now 1.99 s);
 * the module's peak stays at most 3.1 times the payload at 100 MiB and above;
@@ -398,4 +398,4 @@ each, on one machine, in one session.
 
 ## Still to come (#185)
 
-* Targets and a regression run for the browser timings above.
+* A regression run for the browser timings above.

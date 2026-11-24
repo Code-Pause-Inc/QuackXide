@@ -261,6 +261,8 @@ fn example_sql() -> String {
 
 #[cfg(test)]
 mod tests {
+    use platform_api::query::ResearchRequest;
+
     use super::*;
 
     #[tokio::test]
@@ -288,12 +290,11 @@ mod tests {
         let granted = research.grant(steward, researcher, &connector, None).await;
         assert!(granted.is_ok(), "grant refused");
         let sql = example_sql();
-        let Ok(result) = service
-            .research_query(researcher, steward, &connector, &sql)
-            .await
-        else {
+        let request = ResearchRequest::plain(steward, connector.clone(), &sql);
+        let Ok(body) = service.research_query(researcher, request).await else {
             panic!("research query refused");
         };
+        let result: serde_json::Value = serde_json::from_slice(body.expose()).expect("json body");
         let suppressed = result["suppressed_rows"].as_u64().unwrap_or(0);
         let released = result["rows"].as_array().map(Vec::len).unwrap_or(0);
         assert!(suppressed >= 1, "nothing suppressed: {result}");

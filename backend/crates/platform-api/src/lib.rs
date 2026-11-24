@@ -26,24 +26,26 @@ use platform_storage::{StorageError, TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 pub mod admin;
+pub mod checker;
 mod datasets;
 #[cfg(feature = "dev")]
 pub mod dev;
+pub mod edge;
 pub mod key_release;
 mod metrics;
 pub mod query;
 mod readiness;
 pub mod research;
+mod research_replay;
 pub mod sealed;
 pub mod sweep;
 pub mod wiring;
 use admin::ProvisioningService;
-use query::{
-    ConnectorQueryService, GrantRequest, QueryRequest, ResearchQueryRequest, TopUpRequest,
-};
+use query::{ConnectorQueryService, GrantRequest, QueryRequest, ResearchRequest, TopUpRequest};
 use research::ResearchService;
 
 /// 4 MiB plaintext chunk + GCM tag + IV prefix, with headroom.
@@ -109,6 +111,7 @@ struct ListEntry {
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub enum ApiError {
     Unauthorized,
     Forbidden,
@@ -138,6 +141,18 @@ pub enum ApiError {
     WebhookNotConfigured,
     /// Query refused by the enclave attestation gate.
     AttestationUnavailable,
+    /// A sealed research query names a key set the enclave no longer holds:
+    /// the client attests again and re-sends (409, ADR 0010).
+    Reattest,
+    /// The sealed query's request nonce came with another envelope before:
+    /// re-seal under a new nonce (409).
+    NonceUsed,
+    /// The query under this request nonce is still running: send the same
+    /// request again later (409).
+    QueryRunning,
+    /// The stored response for this request nonce has expired: re-seal
+    /// under a new nonce (409).
+    ResponseExpired,
     /// Query rejected by the zero-knowledge policy gate.
     QueryRejected(&'static str),
     /// Research query refused: the grant's query budget is spent. The
@@ -211,6 +226,10 @@ impl ApiError {
             ApiError::ConnectorTogglesDisabled => "connector_toggles_disabled",
             ApiError::WebhookNotConfigured => "webhook_not_configured",
             ApiError::AttestationUnavailable => "attestation_unavailable",
+            ApiError::Reattest => "reattest",
+            ApiError::NonceUsed => "nonce_used",
+            ApiError::QueryRunning => "query_running",
+            ApiError::ResponseExpired => "response_expired",
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
             ApiError::ListTooLarge => "list_too_large",
@@ -301,6 +320,12 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "enclave attestation unavailable",
             ),
+            // The browser matches these messages to attest again, re-seal or
+            // wait (#239).
+            ApiError::Reattest => (StatusCode::CONFLICT, "reattest"),
+            ApiError::NonceUsed => (StatusCode::CONFLICT, "nonce_used"),
+            ApiError::QueryRunning => (StatusCode::CONFLICT, "query_running"),
+            ApiError::ResponseExpired => (StatusCode::CONFLICT, "response_expired"),
             ApiError::QueryRejected(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::BudgetExhausted => (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -439,52 +464,88 @@ pub fn build_app(state: AppState) -> Router {
 /// The API router and the metrics router. Serve the metrics router only on
 /// the loopback `METRICS_BIND_ADDR` listener, never on the API's.
 pub fn build_apps(state: AppState) -> (Router, Router) {
+    let timeouts = edge::EdgeTimeouts::from_limits(&state.config.enclave.query_limits);
+    build_apps_with(state, timeouts)
+}
+
+/// As [`build_apps`], with the route groups' timeouts given.
+pub fn build_apps_with(state: AppState, timeouts: edge::EdgeTimeouts) -> (Router, Router) {
     let metrics = Arc::new(metrics::Metrics::new(
         state
             .query
             .as_ref()
             .map(|query| query.plaintext_wait_metric()),
     ));
-    let api = routes(state).layer(middleware::from_fn_with_state(
-        metrics.clone(),
-        metrics::track,
-    ));
+    let api = wrap_edge(routes(state, timeouts), metrics.clone());
     let metrics_app = Router::new()
         .route("/metrics", get(metrics::render))
         .with_state(metrics);
     (api, metrics_app)
 }
 
-fn routes(state: AppState) -> Router {
+/// The layers around the routes, outermost first: security headers, request
+/// metrics, then panic containment, so a caught panic is counted and carries
+/// the headers.
+pub(crate) fn wrap_edge(inner: Router, metrics: Arc<metrics::Metrics>) -> Router {
+    edge::security_headers(
+        edge::catch_panics(inner).layer(middleware::from_fn_with_state(metrics, metrics::track)),
+    )
+}
+
+fn routes(state: AppState, timeouts: edge::EdgeTimeouts) -> Router {
+    // The status a server-side timeout answers with: the server took too
+    // long, so not 408, which blames the client.
+    let total = |limit| TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, limit);
+    // Only upload PUTs have no total timeout, just a gap between body reads;
+    // every other route, on the same routers too, gets the default total.
+    let body_gap = || middleware::from_fn_with_state(timeouts.body_gap, edge::body_gap);
     let tenant_auth = || middleware::from_fn_with_state(state.clone(), require_tenant);
 
     let drive = Router::new()
-        .route("/objects", get(list_objects))
+        .route("/objects", get(list_objects).layer(total(timeouts.default)))
         .route(
             "/objects/{object_id}/manifest",
-            put(put_manifest).get(get_manifest),
+            put(put_manifest)
+                .layer(body_gap())
+                .merge(get(get_manifest).layer(total(timeouts.default))),
         )
         .route(
             "/objects/{object_id}/chunks/{chunk_index}",
-            put(put_chunk).get(get_chunk),
+            put(put_chunk)
+                .layer(body_gap())
+                .merge(get(get_chunk).layer(total(timeouts.default))),
         )
-        .route("/objects/{object_id}", delete(delete_object))
-        .route("/enrollment", put(put_enrollment).get(get_enrollment))
+        .route(
+            "/objects/{object_id}",
+            delete(delete_object).layer(total(timeouts.default)),
+        )
+        .route(
+            "/enrollment",
+            put(put_enrollment)
+                .layer(body_gap())
+                .merge(get(get_enrollment).layer(total(timeouts.default))),
+        )
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES))
         .layer(tenant_auth());
 
     let query = Router::new()
         .route("/", post(run_query))
-        .layer(tenant_auth());
+        .layer(tenant_auth())
+        .layer(total(timeouts.query));
 
     let grants = Router::new()
         .route("/", get(list_grants).post(create_grant))
         .route("/{grant_id}", delete(revoke_grant))
         .route("/{grant_id}/budget", get(get_budget).post(top_up_budget))
-        .layer(tenant_auth());
+        .layer(tenant_auth())
+        .layer(total(timeouts.default));
+
+    let research_query = Router::new()
+        .route("/query", post(run_research_query))
+        .layer(tenant_auth())
+        .layer(total(timeouts.query));
 
     let research = Router::new()
-        .route("/query", post(run_research_query))
         .route("/requests", get(research::list_access_requests))
         .route(
             "/requests/{request_id}/approve",
@@ -494,14 +555,18 @@ fn routes(state: AppState) -> Router {
             "/requests/{request_id}/deny",
             post(research::deny_access_request),
         )
-        .layer(tenant_auth());
+        .layer(tenant_auth())
+        .layer(total(timeouts.default));
 
     // Steward uploads and the dataset listing need only the vault and the
     // configuration, so they work where research queries are not
     // configured.
     let datasets = Router::new()
-        .route("/", get(datasets::list_datasets))
-        .route("/{dataset}", put(datasets::put_dataset))
+        .route(
+            "/",
+            get(datasets::list_datasets).layer(total(timeouts.default)),
+        )
+        .route("/{dataset}", put(datasets::put_dataset).layer(body_gap()))
         .layer(DefaultBodyLimit::max(datasets::body_limit(&state.config)))
         .layer(tenant_auth());
 
@@ -515,13 +580,15 @@ fn routes(state: AppState) -> Router {
             "/{listing_id}/request",
             post(research::request_dataset_access),
         )
-        .layer(tenant_auth());
+        .layer(tenant_auth())
+        .layer(total(timeouts.default));
 
     // Static: the columns each built-in connector's mapper writes, which a
     // listing's data dictionary starts from.
     let connectors = Router::new()
         .route("/", get(research::connector_columns))
-        .layer(tenant_auth());
+        .layer(tenant_auth())
+        .layer(total(timeouts.default));
 
     let admin_tenants = Router::new()
         .route("/", get(admin_list_tenants))
@@ -529,12 +596,15 @@ fn routes(state: AppState) -> Router {
             "/{tenant_id}/connectors/{slug}",
             post(admin_toggle_connector),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), require_admin));
+        .layer(middleware::from_fn_with_state(state.clone(), require_admin))
+        .layer(total(timeouts.default));
 
     // Authorized by Paddle signature, not by JWT.
-    let webhooks = Router::new().route("/mor", post(mor_webhook));
+    let webhooks = Router::new()
+        .route("/mor", post(mor_webhook))
+        .layer(total(timeouts.default));
 
-    Router::new()
+    let top_level = Router::new()
         .route("/healthz", get(healthz))
         .route(
             "/readyz",
@@ -542,9 +612,14 @@ fn routes(state: AppState) -> Router {
         )
         .route("/api/v1/meta", get(meta))
         .route("/api/v1/attestation", get(get_attestation))
+        .layer(total(timeouts.default));
+
+    Router::new()
+        .merge(top_level)
         .nest("/api/v1/drive", drive)
         .nest("/api/v1/query", query)
         .nest("/api/v1/grants", grants)
+        .nest("/api/v1/research", research_query)
         .nest("/api/v1/research", research)
         .nest("/api/v1/datasets", datasets)
         .nest("/api/v1/catalog", catalog)
@@ -765,22 +840,51 @@ async fn list_grants(
     Ok(Json(research.list_grants(tenant).await?))
 }
 
+/// `POST /api/v1/research/query`'s body: sealed to the enclave (ADR 0010),
+/// or, only in `dev` builds, the plaintext query. A release build does not
+/// compile the plaintext shape, whatever its configuration.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResearchQueryBody {
+    Sealed(sealed::SealedQueryRequest),
+    #[cfg(feature = "dev")]
+    Plain(query::ResearchQueryRequest),
+}
+
 async fn run_research_query(
     State(state): State<AppState>,
     Extension(AuthedTenant(researcher)): Extension<AuthedTenant>,
-    Json(req): Json<ResearchQueryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Json(body): Json<ResearchQueryBody>,
+) -> Result<Response, ApiError> {
     let service = query_service(&state)?;
-    let steward: TenantId = req
-        .steward_tenant
-        .parse()
-        .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
-    let connector = ConnectorSlug::new(&req.connector)
-        .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
-    let result = service
-        .research_query(researcher, steward, &connector, &req.sql)
-        .await?;
-    Ok(Json(result))
+    let response = match body {
+        ResearchQueryBody::Sealed(request) => {
+            let opened = sealed::open_sealed(service.identity(), researcher, &request)?;
+            service
+                .run_detached(researcher, ResearchRequest::from(opened))
+                .await?
+        }
+        #[cfg(feature = "dev")]
+        ResearchQueryBody::Plain(request) => {
+            let steward: TenantId = request
+                .steward_tenant
+                .parse()
+                .map_err(|_| ApiError::BadRequest("invalid steward tenant id"))?;
+            let connector = ConnectorSlug::new(&request.connector)
+                .map_err(|_| ApiError::BadRequest("invalid connector slug"))?;
+            service
+                .research_query(
+                    researcher,
+                    ResearchRequest::plain(steward, connector, &request.sql),
+                )
+                .await?
+        }
+    };
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        response.expose().to_vec(),
+    )
+        .into_response())
 }
 
 // ── Drive ────────────────────────────────────────────────────────────────────

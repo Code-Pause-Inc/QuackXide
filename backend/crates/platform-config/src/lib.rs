@@ -148,6 +148,10 @@ pub struct EnclaveConfig {
     /// `SIM_ATTESTATION_URL` — the simulated attestation service. Dev only;
     /// `platform_enclave::provider_for` reads the same key.
     pub sim_attestation_url: Option<String>,
+    /// The bound configuration names (`platform_enclave::config`) as this
+    /// configuration read them: what attestation reports and binds, so it is
+    /// what the platform enforces (ADR 0010 check 5).
+    pub attested_env: std::collections::BTreeMap<String, String>,
 }
 
 /// Merchant-of-Record (Paddle) webhook settings. The secret is zeroized on
@@ -234,8 +238,9 @@ pub struct ServerConfig {
     pub metrics_bind_addr: SocketAddr,
 }
 
-/// GCS vault settings. Optional so the API boots in storage-less local dev;
-/// routes that need the vault refuse instead.
+/// GCS vault settings. With no bucket, a service in development uses an
+/// in-memory vault (logged as a warning; data is lost on restart), and in
+/// production it refuses to start ([`PlatformConfig::check_production`]).
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// `STORAGE_BUCKET` — bucket holding `tenants/{tenant_id}/…` paths.
@@ -561,6 +566,7 @@ impl PlatformConfig {
             query_max_concurrent: raw_max_concurrent as usize,
             query_limits,
             sim_attestation_url: get_nonempty(&get, "SIM_ATTESTATION_URL"),
+            attested_env: platform_enclave::config::bound_env(&get),
         };
 
         let features = FeatureFlags {
@@ -1258,6 +1264,88 @@ mod tests {
                 PlatformConfig::from_source(source(&[("FEATURE_ZK_ENABLED", raw)])).expect("loads");
             assert_eq!(cfg.features.zk.is_enabled(), expected, "raw={raw}");
         }
+    }
+
+    /// The bound names travel with the configuration exactly as it read them,
+    /// so what attestation reports is what the platform enforces.
+    #[test]
+    fn attested_env_is_what_the_config_read() {
+        let cfg = PlatformConfig::from_source(source(&[
+            ("RESEARCH_MIN_COHORT_SIZE", " 5 "),
+            ("FEATURE_ZK_ENABLED", ""),
+            ("PATH", "/bin"),
+        ]))
+        .expect("loads");
+        assert_eq!(
+            cfg.enclave.attested_env.into_iter().collect::<Vec<_>>(),
+            [("RESEARCH_MIN_COHORT_SIZE".to_owned(), "5".to_owned())]
+        );
+    }
+
+    /// The bound-configuration policy reads each value as this crate does:
+    /// what loads as on passes, what loads as off loosens a control, and
+    /// what fails to load is unreadable (ADR 0010, `platform_enclave::config`).
+    #[test]
+    fn the_attestation_policy_reads_values_as_config_does() {
+        use platform_enclave::config::{ConfigPolicy, ConfigRefused};
+        for raw in [
+            "1", "true", "TRUE", "on", "yes", "0", "false", "off", "no", "maybe", "", "  ",
+        ] {
+            let pairs = [("FEATURE_ZK_ENABLED", raw)];
+            let policy = ConfigPolicy::RELEASE.check(source(&pairs));
+            match PlatformConfig::from_source(source(&pairs)) {
+                Ok(cfg) if cfg.features.zk.is_enabled() => assert_eq!(policy, Ok(()), "{raw:?}"),
+                Ok(_) => assert_eq!(
+                    policy,
+                    Err(ConfigRefused::Loosens("FEATURE_ZK_ENABLED")),
+                    "{raw:?}"
+                ),
+                Err(_) => assert_eq!(
+                    policy,
+                    Err(ConfigRefused::Unreadable("FEATURE_ZK_ENABLED")),
+                    "{raw:?}"
+                ),
+            }
+        }
+        for raw in ["11", "+11", " 11 ", "10", "11.0", "0x0b", ""] {
+            let pairs = [("RESEARCH_MIN_COHORT_SIZE", raw)];
+            let policy = ConfigPolicy::RELEASE.check(source(&pairs));
+            match PlatformConfig::from_source(source(&pairs)) {
+                Ok(cfg) if cfg.research.min_cohort_size >= DEFAULT_MIN_COHORT_SIZE => {
+                    assert_eq!(policy, Ok(()), "{raw:?}")
+                }
+                Ok(_) => assert!(matches!(policy, Err(ConfigRefused::Loosens(_))), "{raw:?}"),
+                Err(_) => assert!(
+                    matches!(policy, Err(ConfigRefused::Unreadable(_))),
+                    "{raw:?}"
+                ),
+            }
+        }
+        for raw in ["10", "+10", " 25 ", "9", "0", "10.0", "ten", ""] {
+            let pairs = [("RESEARCH_DOMINANCE_PERCENT", raw)];
+            let policy = ConfigPolicy::RELEASE.check(source(&pairs));
+            match PlatformConfig::from_source(source(&pairs)) {
+                Ok(cfg) if cfg.research.dominance_percent >= DEFAULT_DOMINANCE_PERCENT => {
+                    assert_eq!(policy, Ok(()), "{raw:?}")
+                }
+                Ok(_) => assert!(matches!(policy, Err(ConfigRefused::Loosens(_))), "{raw:?}"),
+                Err(_) => assert!(
+                    matches!(policy, Err(ConfigRefused::Unreadable(_))),
+                    "{raw:?}"
+                ),
+            }
+        }
+        let absent = PlatformConfig::from_source(source(&[])).expect("defaults load");
+        assert!(absent.features.zk.is_enabled() && absent.features.tee_attestation_required);
+        assert_eq!(ConfigPolicy::RELEASE.check(source(&[])), Ok(()));
+        assert_eq!(
+            ConfigPolicy::RELEASE.min_cohort_floor,
+            DEFAULT_MIN_COHORT_SIZE
+        );
+        assert_eq!(
+            platform_enclave::config::DOMINANCE_PERCENT_FLOOR,
+            DEFAULT_DOMINANCE_PERCENT
+        );
     }
 
     #[test]

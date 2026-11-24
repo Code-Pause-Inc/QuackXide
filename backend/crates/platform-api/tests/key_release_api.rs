@@ -492,20 +492,26 @@ async fn replayed_challenge_is_refused() {
 
 /// Every value the token binds travels in the request, so the relying party
 /// rebuilds the same binding: a KMS key (P50), and byte fields whose
-/// base64url has `-` and `_` (ADR 0010).
+/// base64url has `-` and `_` (ADR 0010). The configuration digest is that of
+/// a reported k = 17, whose base64url has both.
 #[tokio::test]
 async fn a_binding_with_a_kms_key_and_url_safe_bytes_is_released() {
     let rp = static_rp();
     let tenant = enrolled(&rp);
     let identity = EnclaveIdentity::generate();
+    let env = std::collections::BTreeMap::from([(
+        "RESEARCH_MIN_COHORT_SIZE".to_owned(),
+        "17".to_owned(),
+    )]);
     let binding = EnclaveKeyBinding {
         kms_public_key: vec![0xfb; 40],
-        config_digest: [0xfb; 32],
+        config_digest: platform_enclave::config::config_digest(|n| env.get(n).cloned()),
         ..identity.binding().clone()
     };
+    let signer = signer().with_env(env);
     let challenge = rp.issue_challenge();
     let nonces = nonces_for(&binding, &challenge.nonce_b64);
-    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    let token = signer.sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
     let req = request_bound_to(tenant, &identity, &binding, &challenge.nonce_b64, token);
     assert!(
         req.config_digest_b64.contains(['-', '_']),
@@ -517,7 +523,7 @@ async fn a_binding_with_a_kms_key_and_url_safe_bytes_is_released() {
     // Without the KMS key the rebuilt binding differs from the token's.
     let challenge = rp.issue_challenge();
     let nonces = nonces_for(&binding, &challenge.nonce_b64);
-    let token = signer().sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
+    let token = signer.sign(SIMULATED_AUDIENCE, &nonces, Duration::from_secs(600));
     let mut req = request_bound_to(tenant, &identity, &binding, &challenge.nonce_b64, token);
     req.kms_public_key = None;
     assert!(matches!(
@@ -909,6 +915,178 @@ fn released_hpk1_key_is_refused_and_audited() {
         "{:?}",
         capture.events()
     );
+}
+
+/// A key set whose binding digests `env`, with a token from a signer that
+/// reports `reported`, both bound to a fresh challenge from `rp`.
+fn release_request_with_env(
+    rp: &KeyReleaseRelyingParty,
+    tenant: TenantId,
+    env: &[(&str, &str)],
+    reported: &[(&str, &str)],
+) -> KeyReleaseRequest {
+    let lookup = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let bound = lookup(env);
+    let identity = EnclaveIdentity::with_metadata(
+        None,
+        platform_enclave::config::config_digest(|n| bound.get(n).cloned()),
+    );
+    let challenge = rp.issue_challenge();
+    let nonces = binding_nonces(&identity, &challenge.nonce_b64);
+    let token = signer().with_env(lookup(reported)).sign(
+        SIMULATED_AUDIENCE,
+        &nonces,
+        Duration::from_secs(600),
+    );
+    request(tenant, &identity, &challenge.nonce_b64, token)
+}
+
+/// Key release checks the configuration the token reports (ADR 0005): the
+/// request's configuration digest must be the digest of that configuration.
+#[tokio::test]
+async fn release_refuses_a_config_digest_the_token_does_not_carry() {
+    let rp = relying_party(Arc::new(StaticKeySource(signer().jwks())));
+    let tenant = enrolled(&rp);
+    let req = release_request_with_env(&rp, tenant, &[("RESEARCH_MIN_COHORT_SIZE", "5")], &[]);
+    assert!(rp.release_key(&req).await.is_err());
+    assert_eq!(rp.release_count(), 0);
+}
+
+#[tokio::test]
+async fn release_accepts_the_digest_of_the_token_env() {
+    let rp = relying_party(Arc::new(StaticKeySource(signer().jwks())));
+    let tenant = enrolled(&rp);
+    let env = [("RESEARCH_MIN_COHORT_SIZE", "5")];
+    let req = release_request_with_env(&rp, tenant, &env, &env);
+    assert!(rp.release_key(&req).await.is_ok());
+}
+
+/// ... and holds it to the compiled policy: a deployment that lowers k below
+/// the floor gets no keys, even when its digest is consistent.
+#[tokio::test]
+async fn release_refuses_a_loosened_configuration() {
+    let rp = relying_party(Arc::new(StaticKeySource(signer().jwks())));
+    let tenant = enrolled(&rp);
+    let env = [("RESEARCH_MIN_COHORT_SIZE", "1")];
+    let req = release_request_with_env(&rp, tenant, &env, &env);
+    assert!(rp.release_key(&req).await.is_err());
+    assert_eq!(rp.release_count(), 0);
+}
+
+/// The evidence bundle's token binds the configuration the workload reports,
+/// and a client recomputes the key id from it (ADR 0010 check 5).
+#[tokio::test]
+async fn a_bundle_binds_the_workload_env() {
+    use platform_enclave::config::{ConfigPolicy, bound_env, config_digest};
+    use platform_enclave::evidence::{BoundKeys, EvidenceError, verify_evidence};
+    let env =
+        std::collections::BTreeMap::from([("RESEARCH_MIN_COHORT_SIZE".to_owned(), "5".to_owned())]);
+    let identity = EnclaveIdentity::with_metadata(None, config_digest(|n| env.get(n).cloned()));
+    let binding = identity.binding();
+    let keys = BoundKeys {
+        request_key: binding.request_key.clone(),
+        signing_ed25519: binding.signing_ed25519,
+        signing_ml_dsa_65: binding.signing_ml_dsa_65.clone(),
+        kms_public_key: binding.kms_public_key.clone(),
+        tls_spki_sha256: binding.tls_spki_sha256,
+    };
+    let verifier = TokenVerifier::new(
+        &signer().jwks(),
+        SIM_ISSUER,
+        BROWSER_ATTESTATION_AUDIENCE,
+        policy(),
+    )
+    .unwrap();
+    let challenge = [6u8; 32];
+    for (reported, expected) in [
+        (bound_env(|n| env.get(n).cloned()), Ok(())),
+        (
+            std::collections::BTreeMap::new(),
+            Err(EvidenceError::Binding),
+        ),
+    ] {
+        let provider = SimulatedTokenProvider::in_process(
+            Arc::new(signer().with_env(Default::default())),
+            policy(),
+        )
+        .with_workload_env(reported);
+        let evidence = provider
+            .produce_browser_evidence(&binding.report_data(&challenge))
+            .await
+            .unwrap();
+        let checked = verify_evidence(
+            &verifier,
+            &evidence.token,
+            &challenge,
+            &keys,
+            identity.key_id(),
+            ConfigPolicy::SIMULATOR,
+        )
+        .map(|_| ());
+        assert_eq!(checked, expected);
+    }
+}
+
+/// The simulator stands in for Confidential Space's launcher: a token carries
+/// the bound configuration the workload reports, in `submods.container.env`.
+#[tokio::test]
+async fn the_simulator_carries_the_reported_env() {
+    let sim = Arc::new(TokenSigner::generate(
+        SIM_ISSUER,
+        SimulatedClaims::default(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = sim_attestation_router(sim.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let env =
+        std::collections::BTreeMap::from([("RESEARCH_MIN_COHORT_SIZE".to_owned(), "2".to_owned())]);
+    let provider = SimulatedTokenProvider::from_url(&base, SIM_ISSUER, policy())
+        .with_workload_env(env.clone());
+    let nonce = [4u8; 32];
+    let evidence = provider.produce_browser_evidence(&nonce).await.unwrap();
+    let verifier = TokenVerifier::new(
+        &sim.jwks(),
+        SIM_ISSUER,
+        BROWSER_ATTESTATION_AUDIENCE,
+        policy(),
+    )
+    .unwrap();
+    let expected = nonces_from_bytes(&nonce).unwrap();
+    let verified = verifier.verify(&evidence.token, &expected).unwrap();
+    assert_eq!(verified.container_env(), &env);
+    server.abort();
+}
+
+/// Only bound configuration names can be reported to the simulator.
+#[tokio::test]
+async fn sim_token_route_refuses_unbound_names() {
+    let sim = Arc::new(TokenSigner::generate(
+        SIM_ISSUER,
+        SimulatedClaims::default(),
+    ));
+    let body = serde_json::json!({
+        "audience": BROWSER_ATTESTATION_AUDIENCE,
+        "nonces": [B64URL.encode([1u8; 32])],
+        "env": { "PATH": "/bin" },
+    });
+    let response = sim_attestation_router(sim)
+        .oneshot(
+            Request::post("/v1/token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

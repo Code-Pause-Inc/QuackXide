@@ -14,12 +14,16 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use parquet::arrow::ArrowWriter;
 use platform_api::dev::DevResearchStack;
+use platform_api::key_release::{AttestationBundle, KeyWire};
 use platform_api::research::{ResearchService, ResearchStores};
+use platform_api::sealed::{SealedQueryPlaintext, seal_query};
 use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
@@ -29,7 +33,7 @@ use platform_core::{
     ColumnType, ConnectorSlug, DeclaredColumn, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
     ZkMode,
 };
-use platform_crypto::{TenantKeypair, TenantPublicKey};
+use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
@@ -37,6 +41,7 @@ use platform_storage::{
 use quackxide_engine::{EngineSettings, QueryLimits};
 use sha2::Sha256;
 use tower::ServiceExt;
+use zeroize::Zeroizing;
 
 pub const ISS: &str = "urn:platform:auth";
 pub const AUD: &str = "urn:platform:drive";
@@ -618,5 +623,112 @@ impl VaultStore for FlakyVault {
     async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
         self.check(self.faults.usage)?;
         self.inner.usage(prefix).await
+    }
+}
+
+// ── Sealed research queries (ADR 0010) ──
+
+/// The steward's sealed `health` dataset (k = 5) behind the simulated
+/// enclave, whose evidence bundle carries the request key.
+pub async fn sealed_research_stack(
+    secret: &str,
+    steward: TenantId,
+) -> (Router, Arc<platform_enclave::simulated_token::TokenSigner>) {
+    let connector = ConnectorSlug::new("health").expect("slug");
+    let mut stack = DevResearchStack::new();
+    stack
+        .commit_snapshot(
+            steward,
+            TenantKeypair::generate(EnvelopeSuite::Hpk2),
+            &connector,
+            "cohorts",
+            &cohorts_parquet(),
+        )
+        .await
+        .expect("commit");
+    let vault = stack.vault();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
+    let settings = EngineSettings {
+        zk: ZkMode::Disabled,
+        max_concurrent_queries: 4,
+        limits: QueryLimits::default(),
+    };
+    let signer = Arc::new(platform_enclave::simulated_token::TokenSigner::generate(
+        "urn:devstack:sim",
+        platform_enclave::simulated_token::SimulatedClaims::default(),
+    ));
+    let service = stack.query_service_with_signer(settings, research.clone(), signer.clone());
+    let app = build_app(AppState {
+        research: Some(research),
+        query: Some(Arc::new(service)),
+        ..app_state(secret, vault)
+    });
+    (app, signer)
+}
+
+/// [`sealed_research_stack`]'s app.
+pub async fn sealed_research_app(secret: &str, steward: TenantId) -> Router {
+    sealed_research_stack(secret, steward).await.0
+}
+
+pub async fn attestation_bundle(app: &Router) -> AttestationBundle {
+    let (status, body) = call(
+        app,
+        "GET",
+        &format!("/api/v1/attestation?nonce={}", B64URL.encode([5u8; 32])),
+        "",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bundle: {body}");
+    serde_json::from_value(body).expect("bundle")
+}
+
+/// A sealed request body, as the researcher's browser builds it.
+pub struct Sealer {
+    pub bundle: AttestationBundle,
+    researcher: TenantId,
+    steward: TenantId,
+}
+
+impl Sealer {
+    pub async fn new(app: &Router, researcher: TenantId, steward: TenantId) -> Self {
+        Self {
+            bundle: attestation_bundle(app).await,
+            researcher,
+            steward,
+        }
+    }
+
+    /// `sql` sealed under `grant_id` with a request nonce of 32 `nonce`
+    /// bytes.
+    pub fn body(&self, grant_id: &str, nonce: u8, sql: &str) -> String {
+        let recipient = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+        let plaintext = SealedQueryPlaintext {
+            steward_tenant: self.steward.to_string(),
+            connector: "health".to_owned(),
+            sql: Zeroizing::new(sql.to_owned()),
+            request_nonce: B64URL.encode([nonce; 32]),
+            recipient_key: KeyWire::from_public_key(&recipient),
+        };
+        let request_key = self
+            .bundle
+            .request_key
+            .to_public_key(SuitePolicy::only(EnvelopeSuite::Hpk2))
+            .expect("request key");
+        let request = seal_query(
+            &request_key,
+            &self.bundle.key_id,
+            self.researcher,
+            grant_id,
+            &plaintext,
+        )
+        .expect("seal");
+        serde_json::to_string(&request).expect("json")
     }
 }

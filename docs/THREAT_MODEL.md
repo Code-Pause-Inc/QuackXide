@@ -90,7 +90,9 @@ could then decrypt; policy changes and break-glass access are audited
 | Run production on the simulated TEE, a development-only path whose memory the host can read | `TEE_ATTESTATION_REQUIRED=true` refuses simulated evidence; a verifier holding Google's keys rejects tokens signed by the simulator's key; responses report `tee_platform`. The simulator and the key-release stand-in, which accepts tenant private keys over HTTP, compile only with the `dev` feature; a build without it refuses to start when `KEY_RELEASE_URL` is set and refuses every attestation when `TEE_ATTESTATION_REQUIRED=false`. Production mode, the default unless `APP_ENV=development` is set in the process environment, refuses to start when `TEE_ATTESTATION_REQUIRED=false`, `SIM_ATTESTATION_URL` or `KEY_RELEASE_URL` is set, so production refuses these by default (ADR 0009); `APP_ENV=development` re-enables them (see residual risks) | Built, tested (CI `release build has no dev binaries`; `platform-api/tests/startup.rs`) |
 | Obtain a dataset's key for a query | Cloud KMS unwraps the dataset's data key only for the attested workload, per query, with nothing cached (ADR 0004); the steward's private key never leaves their browser | Seam built (`EnclaveKeyProvider`); **production key release to build** — returns 503 until then |
 | Authorize a modified image | The KMS key and its release policy live in a separate key project that no deployment identity administers (ADR 0004) | **Residual risk** for the key project's administrator — see below |
-| Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** — results currently leave as JSON over TLS |
+| Read queries at the API edge | The researcher's client checks the enclave's evidence (ADR 0010's five checks: Google's signature, the platform claims, the image digest, its own challenge, and the binding of the enclave's keys and bound configuration) and seals each research query to the attested request key; only the enclave opens it. A loosened bound configuration (attestation or ZK off, k below the floor) fails the check, and key release refuses it too (ADR 0005) | Built, tested (`platform_enclave::evidence`, `sealed_research_query.rs`, `enclave_check.rs`, the simulated-TEE script); the browser's own check is #239 |
+| Replay a researcher's sealed query to spend their budget | Each request nonce is recorded per key set just before the charge; the same envelope again gets the stored response uncharged, another envelope under the nonce is refused | Built, tested (`sealed_research_query.rs`) |
+| Read results at the API edge | Results sealed to the recipient's key inside the enclave | **To build** (P55) — results currently leave as JSON over TLS |
 | Swap or replay ciphertext between objects | HPKE `info` / AES-GCM AAD bind tenant, object, role, and chunk | Built, tested |
 
 ### A3. External attacker
@@ -106,6 +108,7 @@ Goal: gain access through the API.
 | Oversized or malformed connector input | NDJSON limits checked before allocation; a bad line fails the batch; connector and token-endpoint response bodies capped while streaming | Built, tested |
 | Oversized or malformed dataset uploads | A body limit from `DATASET_MAX_MIB` (bounded; an invalid value refuses startup); every length checked before it is read past; header bounded and validated; both envelopes must be complete frames of a known suite; refused with 413 or 422 and audited; uploads only into the caller's own `upload_` namespace; the enclave refuses data unlike its declared schema or row cap ([ADR 0012](adr/0012-steward-dataset-upload.md)) | Built, tested (`dataset_upload_api.rs`, fuzz target `upload_body`) |
 | Connector credentials sent in cleartext or redirected elsewhere | Token and connector endpoints must be `https` (loopback `http` for test servers); redirects refused | Built, tested |
+| Script injection in the app origin drives the crypto worker's non-extractable keys | The page CSP (`backend/crates/platform-api/page-csp.txt`): scripts, workers, styles and images only from the page's own origin plus `'wasm-unsafe-eval'` for the envelope module; `connect-src` adds only the attestation key set's exact URL; no inline script, no `eval`, no framing, no `<base>`, form or plugin. `platform-api` sends it on every response and `vite preview` on the page and worker script. The release build refuses a cross-origin `VITE_API_BASE_URL`. CSP does not stop a top-level navigation carrying data out; its job is that injected script cannot run | Built, tested (`edge_api.rs`, `check-page-headers.sh`, `csp-smoke.mjs`); [#181](https://github.com/Code-Pause-Inc/QuackXide/issues/181) serves the page under it |
 | Forged billing webhooks | Signature verification with replay tolerance | Built, tested |
 | Account takeover of a steward, researcher or administrator | Sign-in through Auth0, then the platform's TOTP before any `access` token is issued, for every role including administrators (ADR 0006); TOTP replay and rate limits; recovery only by audited administrator reset, with an out-of-band identity check, no self-reset and at least two administrators | **To build** (P29, P30) — TOTP module exists |
 | Theft of the token signing key, which can mint any `tid` and `adm` token | Key held in Cloud KMS and released only to the attested identity-service Confidential VM (ADR 0006, ADR 0004 option A); never on an API replica | **To build** (P29) |
@@ -146,7 +149,10 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   stops a running plan at its next batch boundary; one operator step,
   bounded by the memory pool, can run past it. Rate limiting and
   per-tenant fairness are outside v1: one tenant's queries can hold every
-  plaintext slot while others wait and are refused with 503.
+  plaintext slot while others wait and are refused with 503. The HTTP
+  edge bounds each route group's time (see "HTTP edge" in
+  `docs/ARCHITECTURE.md`), but the listener sets no header-read timeout,
+  so a client that sends its request headers slowly is not bounded yet.
 * **Correctness of the underlying libraries.** RustCrypto, `hpke`,
   DataFusion, and Web Crypto are trusted. QuackXide implements no
   cryptographic primitives. The post-quantum crates (`x-wing`, `ml-kem`,
@@ -229,11 +235,27 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   minutes ahead of the server's clock), and, in a plaintext record beside
   each snapshot, the envelope suite and the steward's declared row cap and
   schema: column names and type families (ADR 0012). A connector
-  snapshot's record holds only its suite. A published listing's data
-  dictionary, the columns its steward describes (names, type families
-  and free-text descriptions), is readable by every signed-in tenant as
-  well as the operator. It is what the steward chose to publish, and
-  nothing checks that a description holds no data values.
+  snapshot's record holds only its suite. For a sealed research query it
+  sees the grant id, sent in the clear so the enclave can open the frame,
+  and the sealed request's length, which bounds the SQL's. A published
+  listing's data dictionary, the columns its steward describes (names,
+  type families and free-text descriptions), is readable by every
+  signed-in tenant as well as the operator. It is what the steward chose
+  to publish, and nothing checks that a description holds no data values.
+* **The served client and its checker.** The checks run in code the
+  server delivers, so an operator who changes the served bundle can skip
+  them. `enclave-check` lets anyone check a deployment from outside; it
+  does not yet check the TLS key binding (P67) or the served bundle's
+  digest (P49), and a release build of it compiles in no trust anchors
+  until P49 and P50 publish them, so whoever runs it supplies the issuer,
+  key-set URL and image digests. Its `seal-query` takes the SQL on the
+  command line, where other users of the same machine can see it in the
+  process list; it serves the simulated-TEE script, not researchers.
+* **Configuration bound so far.** Attestation binds
+  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+  `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DOMINANCE_PERCENT`.
+  `RESEARCH_DEFAULT_QUERY_BUDGET`, `JWT_ISSUER` and `JWT_AUDIENCE`, which
+  ADR 0005 also names, are not bound yet.
 * **Forged or rolled-back snapshots.** Connector objects, uploaded objects
   and snapshot manifests are sealed to the tenant's public key, which binds
   them to tenant, dataset and object or version but does not authenticate
