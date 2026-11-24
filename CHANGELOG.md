@@ -8,6 +8,32 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Steward dataset upload in the browser (ADR 0014, P40): the research
+  portal's stewardship panel lists the steward's stored datasets from
+  `GET /api/v1/datasets` (id, object count, ciphertext size, suite, write
+  time) and uploads a Parquet file. A worker of its own reads only the
+  file's footer, with hyparquet's Thrift decoder (hyparquet 1.33.1, MIT, a
+  new runtime dependency), and declares each column's name and type family
+  by the rules of the enclave's Parquet reader, embedded Arrow schema
+  included; it refuses a file the enclave could not read or declare, a
+  schema unlike the dataset's recorded one, and a file over the upload
+  limit, before anything is sealed. The crypto worker's new `uploadDataset`
+  operation refuses unless the tenant's enrolled key is the device's own,
+  seals the object and the snapshot manifest under the session's tenant
+  (`HPK1`), and sends the upload body; 401 and 403 are shown clearly. The
+  form says that column names and types are stored in plaintext. The
+  publish form picks from the stored datasets instead of taking a slug,
+  and pre-fills an upload's data dictionary from the schema it declared.
+  `GET /api/v1/datasets` now gives each upload's declared `row_cap` and
+  `schema` and the upload size limit (`dataset_max_bytes`).
+  `fixtures/parquet/` holds Parquet schema vectors that the browser and the
+  enclave's own check read alike, and
+  `fixtures/envelope/hpk1-browser-upload.json` an upload body sealed by the
+  browser, which the backend stores and queries. `docs/BENCHMARKS.md` gives
+  the method for timing the upload at the 64 MiB limit in a real browser,
+  a manual run for each release candidate, with a proposed target. The
+  data guard in `scripts/check.sh` accepts the repository's top-level
+  `fixtures/` and tests itself.
 * HTTP edge hardening (#180). Every `platform-api` response carries the page
   headers (one file, `page-headers.txt`, also served by `vite preview`): a
   strict `Content-Security-Policy`, `X-Content-Type-Options`,
@@ -33,11 +59,11 @@ uses [Semantic Versioning](https://semver.org/).
   and 422 when not a dictionary's shape. A re-publish replaces the
   columns. `GET /api/v1/connectors` lists the built-in connectors with the
   columns each one's mapper writes, which the publish form pre-fills a
-  connector dataset's dictionary from; an upload's columns are entered by
-  hand. The portal shows the dictionary on every catalog listing and each
-  authorized dataset, with a `SELECT COUNT(*) AS n` example over the table
-  name to copy. The catalog is still in memory, so listings and their
-  dictionaries are lost on restart (P62).
+  connector dataset's dictionary from. The portal shows the dictionary on
+  every catalog listing and each authorized dataset, with a
+  `SELECT COUNT(*) AS n` example over the table name to copy. The catalog
+  is still in memory, so listings and their dictionaries are lost on
+  restart (P62).
 * Browser envelope seal benchmark (P34 checkpoint A, #171).
   `scripts/bench-wasm-seal.sh` seals synthetic Parquet from `synth-data`
   at about 1 MiB, 100 MiB and 1 GiB with the wasm module in a Chromium
@@ -135,7 +161,7 @@ uses [Semantic Versioning](https://semver.org/).
   `MAX_LISTED_OBJECTS` (1000) datasets, or objects across them, with 422,
   and answers a storage failure with 503 or 502, never an empty list; each
   listing is audited as `data.access`. `platform_connectors::snapshot`
-  gains `held_datasets`, `held_dataset` and `recorded_suite`, and
+  gains `held_datasets`, `held_dataset` and `read_record`, and
   `TenantPaths` gains `connectors_root` and `connector_of`.
 * Steward dataset upload (ADR 0012, P38): `PUT /api/v1/datasets/{dataset}`
   stores Parquet that the steward's browser sealed, with the snapshot

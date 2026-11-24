@@ -1,11 +1,13 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { ConnectorView } from "../../lib/research/client";
+import type { ConnectorView, DatasetView } from "../../lib/research/client";
 import PublishForm from "./PublishForm";
 
 const TITLE_MAX = 120;
 const DESCRIPTION_MAX = 2000;
+
+const STORED = ["health", "upload_cohorts"];
 
 const CONNECTORS: ConnectorView[] = [
   {
@@ -26,15 +28,43 @@ const CONNECTORS: ConnectorView[] = [
   { slug: "research_extract", display_name: "Research Extract", kind: "health", columns: [] },
 ];
 
-function setup(busy = false, connectors: ConnectorView[] = []) {
+/** The stored datasets as the listing gives them: an upload with the
+ *  schema it declared, and one with none. */
+const UPLOADS: Pick<DatasetView, "dataset" | "schema">[] = [
+  { dataset: "health", schema: null },
+  {
+    dataset: "upload_cohorts",
+    schema: [
+      { name: "condition", type: "string" },
+      { name: "age", type: "int64" },
+    ],
+  },
+];
+
+/** The steward holds `datasets`: by default the two stored ones and a
+ *  dataset for each connector. `uploads` gives the schemas uploads
+ *  declared. */
+function setup(
+  busy = false,
+  connectors: ConnectorView[] = [],
+  datasets = [...STORED, ...connectors.map((c) => c.slug)],
+  uploads: Pick<DatasetView, "dataset" | "schema">[] = [],
+) {
   const user = userEvent.setup();
   const onPublish = vi.fn();
   render(
-    <PublishForm busy={busy} currency="USD" connectors={connectors} onPublish={onPublish} />,
+    <PublishForm
+      busy={busy}
+      currency="USD"
+      datasets={datasets}
+      connectors={connectors}
+      uploads={uploads}
+      onPublish={onPublish}
+    />,
   );
   const field = (placeholder: RegExp) => screen.getByPlaceholderText(placeholder);
   const inputs = {
-    connector: field(/connector slug/),
+    connector: screen.getByLabelText("Dataset"),
     title: field(/listing title/),
     description: field(/description/),
     fee: field(/license fee \(USD\)/),
@@ -44,6 +74,10 @@ function setup(busy = false, connectors: ConnectorView[] = []) {
   const fill = async (values: Partial<Record<keyof typeof inputs, string>>) => {
     for (const [key, value] of Object.entries(values)) {
       const input = inputs[key as keyof typeof inputs];
+      if (key === "connector") {
+        await user.selectOptions(input, value ?? "");
+        continue;
+      }
       await user.clear(input);
       if (value) {
         await user.click(input);
@@ -76,7 +110,6 @@ describe("PublishForm", () => {
     const { user, fill, publish, onPublish } = setup();
     await fill({
       ...valid,
-      connector: "  health  ",
       title: "  Cohort outcomes ",
       description: " Aggregates ",
     });
@@ -99,9 +132,7 @@ describe("PublishForm", () => {
   });
 
   it.each([
-    ["an uppercase slug", { connector: "Health" }],
-    ["a slug with spaces", { connector: "health data" }],
-    ["a slug over 64 characters", { connector: "a".repeat(65) }],
+    ["no dataset", { connector: "" }],
     ["a blank title", { title: "   " }],
     ["a fee with three decimals", { fee: "1.234" }],
     ["a negative fee", { fee: "-5" }],
@@ -114,10 +145,26 @@ describe("PublishForm", () => {
     expect(publish()).toBeDisabled();
   });
 
-  it("accepts a 64-character slug and a zero allowance", async () => {
-    const { fill, publish } = setup();
-    await fill({ ...valid, connector: "a".repeat(64), queries: "0" });
-    expect(publish()).toBeEnabled();
+  it("offers exactly the stored datasets", () => {
+    setup();
+    const options = within(screen.getByLabelText("Dataset")).getAllByRole("option");
+    expect(options.map((o) => o.getAttribute("value"))).toEqual(["", ...STORED]);
+  });
+
+  it("publishes an uploaded dataset with a zero allowance", async () => {
+    const { user, fill, publish, onPublish } = setup();
+    await fill({ ...valid, connector: "upload_cohorts", queries: "0" });
+    await user.click(publish());
+    expect(onPublish).toHaveBeenCalledWith(
+      expect.objectContaining({ connector: "upload_cohorts", grant_budget: 0 }),
+    );
+  });
+
+  it("with no stored datasets, says to upload one and stays disabled", async () => {
+    const { fill, publish } = setup(false, [], []);
+    await fill({ title: valid.title, fee: valid.fee, rate: valid.rate });
+    expect(screen.getByText(/upload a dataset first/)).toBeInTheDocument();
+    expect(publish()).toBeDisabled();
   });
 
   it("caps the title and description lengths", async () => {
@@ -184,6 +231,36 @@ describe("PublishForm", () => {
     expect(
       screen.queryByRole("button", { name: /connector’s columns/ }),
     ).not.toBeInTheDocument();
+  });
+
+  it("pre-fills an upload's declared columns and publishes them as edited", async () => {
+    const { user, fill, publish, onPublish } = setup(false, CONNECTORS, undefined, UPLOADS);
+    await fill({ ...valid, connector: "upload_cohorts" });
+    expect(columnNames()).toEqual(["condition", "age"]);
+    expect(screen.getByRole("combobox", { name: "Column 2 type" })).toHaveValue("int64");
+    expect(screen.getByText(/Pre-filled from the uploaded file/)).toBeInTheDocument();
+    // A stored dataset that declared no schema starts empty.
+    await fill({ connector: "health" });
+    expect(columnNames()).toEqual([]);
+
+    await fill({ connector: "upload_cohorts" });
+    await user.type(screen.getByRole("textbox", { name: "Column 1 name" }), "_x");
+    await user.click(screen.getByRole("button", { name: "Use the uploaded file’s columns" }));
+    expect(columnNames()).toEqual(["condition", "age"]);
+    await user.click(screen.getByRole("textbox", { name: "Column 1 description" }));
+    await user.paste(" Diagnosis ");
+    await user.click(publish());
+    expect(onPublish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connector: "upload_cohorts",
+        data_dictionary: {
+          columns: [
+            { name: "condition", type: "string", description: "Diagnosis" },
+            { name: "age", type: "int64", description: "" },
+          ],
+        },
+      }),
+    );
   });
 
   it("takes an upload's columns by hand", async () => {

@@ -103,6 +103,46 @@ describe("ResearchClient.budget", () => {
   });
 });
 
+describe("ResearchClient.datasets", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("lists the stored datasets with the caller's token", async () => {
+    const listing = {
+      datasets: [
+        {
+          dataset: "upload_cohorts",
+          version: `01763116830123456789-${"0".repeat(32)}`,
+          written_at: "2025-11-14T10:40:30.123Z",
+          suite: "HPK1",
+          row_cap: 7,
+          schema: [{ name: "condition", type: "string" }],
+          object_count: 1,
+          ciphertext_bytes: 1932,
+          objects: ["00000000-aaaa-4bbb-8ccc-000000000001"],
+        },
+      ],
+      dataset_max_bytes: 67108864,
+    };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(listing)));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(new ResearchClient("https://api.example/", "tok").datasets()).resolves.toEqual(listing);
+    expect(fetchMock).toHaveBeenCalledWith("https://api.example/api/v1/datasets", {
+      headers: { Authorization: "Bearer tok" },
+    });
+  });
+
+  it.each([
+    [401, "not authenticated"],
+    [422, "too many datasets to list"],
+    [502, "storage is unavailable (502)"],
+    [503, "storage is unavailable (503)"],
+    [500, "failed to load your datasets (500)"],
+  ])("explains a %i", async (status, message) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
+    await expect(new ResearchClient("", "t").datasets()).rejects.toThrow(message);
+  });
+});
+
 describe("ResearchClient.connectors", () => {
   afterEach(() => vi.unstubAllGlobals());
 

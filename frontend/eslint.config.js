@@ -19,9 +19,10 @@ export default defineConfig(
   },
   {
     // The wasm envelope module runs only in the crypto worker, behind
-    // envelope.ts; nothing else may load its glue.
+    // envelope.ts; nothing else may load its glue. Tests of the crypto core
+    // load the module inline, since Node cannot fetch it by URL.
     files: ["src/**/*.{ts,tsx}"],
-    ignores: ["src/lib/crypto/envelope.ts", "src/lib/crypto/envelope.test.ts"],
+    ignores: ["src/lib/crypto/envelope.ts", "src/lib/crypto/*.test.ts"],
     rules: {
       "no-restricted-imports": [
         "error",

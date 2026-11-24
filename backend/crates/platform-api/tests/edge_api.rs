@@ -379,7 +379,8 @@ async fn cut_upload_commit_leaves_nothing_visible() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(listing, br#"{"datasets":[]}"#);
+    let listing: serde_json::Value = serde_json::from_slice(&listing).expect("json");
+    assert_eq!(listing["datasets"], serde_json::json!([]), "{listing}");
 }
 
 /// Stalls every drive listing for good.

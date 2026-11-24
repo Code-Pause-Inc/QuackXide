@@ -18,6 +18,15 @@ vi.mock("./keystore", () => ({
 // The envelope WebAssembly is a build artifact; sealing is not under test.
 vi.mock("./envelope", () => ({ loadEnvelopeModule: vi.fn(async () => undefined) }));
 
+// Key creation succeeds here, so a request that creates a key is seen.
+vi.mock("./devicekey", () => ({
+  createDeviceHpkeKey: vi.fn(async () => ({
+    seedKey: {} as CryptoKey,
+    publicKeyRaw: new ArrayBuffer(32),
+    sealedPrivateKey: { iv: new ArrayBuffer(12), data: new ArrayBuffer(48) },
+  })),
+}));
+
 // Stand-in drive layer: makes one vault request and reports the session
 // claims the worker handed to the crypto core.
 vi.mock("./drive", () => ({
@@ -121,5 +130,54 @@ describe("crypto worker session", () => {
     await send({ op: "session", token: "bad" });
     await send({ op: "list" });
     expect(JSON.stringify(responses)).not.toContain(token);
+  });
+});
+
+describe("crypto worker dataset uploads", () => {
+  const upload = {
+    op: "uploadDataset",
+    file: new File(["PAR1"], "cohort.parquet"),
+    dataset: "upload_cohorts",
+    schema: [{ name: "n", type: "int64" }],
+    rowCap: 1,
+    currentVersion: null,
+    maxBytes: 1024,
+  };
+
+  it("refuses an upload without a session, before any request", async () => {
+    expect(await send(upload)).toMatchObject({ type: "error", message: "no session token" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses an upload on a device without a data key, and creates none", async () => {
+    const { saveDeviceKeys } = await import("./keystore");
+    const { createDeviceHpkeKey } = await import("./devicekey");
+    await send({ op: "session", token: jwt("user-1", "6f2c8a2e-1111-4222-8333-444455556666") });
+    const response = await send(upload);
+    expect(response).toMatchObject({ type: "error" });
+    expect((response as { message: string }).message).toMatch(/no data key/);
+    expect(createDeviceHpkeKey).not.toHaveBeenCalled();
+    expect(saveDeviceKeys).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses an upload on a device with no key record, and creates none", async () => {
+    const { loadDeviceKeys, saveDeviceKeys } = await import("./keystore");
+    const { createDeviceHpkeKey } = await import("./devicekey");
+    vi.mocked(loadDeviceKeys).mockResolvedValueOnce(null);
+    await send({ op: "session", token: jwt("user-1", "6f2c8a2e-1111-4222-8333-444455556666") });
+    const response = await send(upload);
+    expect(response).toMatchObject({ type: "error" });
+    expect((response as { message: string }).message).toMatch(/no data key/);
+    expect(createDeviceHpkeKey).not.toHaveBeenCalled();
+    expect(saveDeviceKeys).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("ignores a malformed upload request", async () => {
+    const id = nextId++;
+    handler?.(new MessageEvent("message", { data: { ...upload, id, dataset: "health" } }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(responses.some((r) => r.id === id)).toBe(false);
   });
 });

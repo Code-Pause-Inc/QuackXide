@@ -1,6 +1,14 @@
 // UI thread <-> crypto worker protocol. The worker owns keys and ciphertext;
 // the UI sees only opaque ids, requested summaries, and download Blobs.
 
+import {
+  SNAPSHOT_VERSION,
+  UPLOAD_DATASET,
+  isDeclaredSchema,
+  isRowCap,
+  type DeclaredColumn,
+} from "../datasets/schema";
+
 export interface InitResult {
   /** True when device keys were generated for the first time in this call. */
   created: boolean;
@@ -23,6 +31,20 @@ export interface DriveFileSummary {
   createdAtIso: string;
 }
 
+/** A steward's dataset upload (ADR 0012): the Parquet file and what its
+ *  footer declares, sealed and sent by the worker (`datasetUpload.ts`). */
+export interface DatasetUploadFields {
+  file: File;
+  /** The dataset id, in the `upload_` namespace. */
+  dataset: string;
+  schema: DeclaredColumn[];
+  rowCap: number;
+  /** The dataset's current snapshot version, or null for a new dataset. */
+  currentVersion: string | null;
+  /** The upload size limit the listing gave. */
+  maxBytes: number;
+}
+
 export type WorkerRequest =
   | { id: number; op: "init" }
   | { id: number; op: "upload"; file: File }
@@ -30,7 +52,33 @@ export type WorkerRequest =
   | { id: number; op: "download"; objectId: string }
   | { id: number; op: "remove"; objectId: string }
   /** Deliver or replace the session bearer token. Held in worker memory only. */
-  | { id: number; op: "session"; token: string };
+  | { id: number; op: "session"; token: string }
+  | ({ id: number; op: "uploadDataset" } & DatasetUploadFields);
+
+function parseDatasetUpload(req: Record<string, unknown>): DatasetUploadFields | null {
+  const { file, dataset, schema, rowCap, currentVersion, maxBytes } = req;
+  const ok =
+    file instanceof File &&
+    typeof dataset === "string" &&
+    UPLOAD_DATASET.test(dataset) &&
+    isDeclaredSchema(schema) &&
+    typeof rowCap === "number" &&
+    isRowCap(rowCap) &&
+    (currentVersion === null || (typeof currentVersion === "string" && SNAPSHOT_VERSION.test(currentVersion))) &&
+    typeof maxBytes === "number" &&
+    Number.isSafeInteger(maxBytes) &&
+    maxBytes > 0;
+  if (!ok) return null;
+  return {
+    file,
+    dataset,
+    // A copy with only the declared fields, so nothing else is sent.
+    schema: schema.map(({ name, type }) => ({ name, type })),
+    rowCap,
+    currentVersion: currentVersion as string | null,
+    maxBytes,
+  };
+}
 
 /** Validate an untrusted message as a `WorkerRequest`; anything else is null. */
 export function parseWorkerRequest(data: unknown): WorkerRequest | null {
@@ -39,6 +87,10 @@ export function parseWorkerRequest(data: unknown): WorkerRequest | null {
   if (!Number.isSafeInteger(req.id)) return null;
   const id = req.id as number;
   switch (req.op) {
+    case "uploadDataset": {
+      const fields = parseDatasetUpload(req);
+      return fields ? { id, op: "uploadDataset", ...fields } : null;
+    }
     case "init":
     case "list":
       return { id, op: req.op };

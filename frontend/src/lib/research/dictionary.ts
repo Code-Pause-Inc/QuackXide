@@ -3,28 +3,8 @@
 // (`platform-api/src/research.rs`), so a dictionary the form accepts is one
 // the API accepts.
 
+import type { ColumnType, DeclaredColumn } from "../datasets/schema";
 import type { ConnectorView } from "./client";
-
-/** A column's type family (`platform_core::ColumnType`). */
-export const COLUMN_TYPES = [
-  "boolean",
-  "int8",
-  "int16",
-  "int32",
-  "int64",
-  "uint8",
-  "uint16",
-  "uint32",
-  "uint64",
-  "float32",
-  "float64",
-  "string",
-  "date",
-  "timestamp",
-  "decimal",
-] as const;
-
-export type ColumnType = (typeof COLUMN_TYPES)[number];
 
 export interface DictionaryColumn {
   name: string;
@@ -85,19 +65,38 @@ export function dictionaryProblem(columns: readonly DictionaryColumn[]): string 
   return null;
 }
 
-/** What a dataset's dictionary starts from: the columns its connector's
- *  mapper writes, undescribed, and the connector's name. Null for a dataset
- *  no connector maps (an upload, or a connector with no mapper), whose
- *  columns the steward enters. */
-export function connectorPrefill(
-  connectors: readonly ConnectorView[],
-  dataset: string,
-): { source: string; columns: DictionaryColumn[] } | null {
+/** Columns a dictionary can start from, undescribed, and where they came
+ *  from, as a phrase ("the QuickBooks connector"). */
+export interface Prefill {
+  source: string;
+  columns: DictionaryColumn[];
+}
+
+/** What a connector dataset's dictionary starts from: the columns its
+ *  connector's mapper writes. Null for a dataset no connector maps (an
+ *  upload, or a connector with no mapper). */
+export function connectorPrefill(connectors: readonly ConnectorView[], dataset: string): Prefill | null {
   const connector = connectors.find((c) => c.slug === dataset && c.columns.length > 0);
   if (!connector) return null;
   return {
-    source: connector.display_name,
+    source: `the ${connector.display_name} connector`,
     columns: connector.columns.map(({ name, type }) => ({ name, type, description: "" })),
+  };
+}
+
+/** What an uploaded dataset's dictionary starts from: the schema its
+ *  upload declared, which the browser read from the file's footer before
+ *  sealing it (ADR 0014) and the dataset listing gives back. Null without a
+ *  declared schema: a connector's dataset, or an unreadable record. */
+export function uploadPrefill(
+  datasets: readonly { dataset: string; schema: readonly DeclaredColumn[] | null }[],
+  dataset: string,
+): Prefill | null {
+  const schema = datasets.find((d) => d.dataset === dataset)?.schema;
+  if (!schema || schema.length === 0) return null;
+  return {
+    source: "the uploaded file",
+    columns: schema.map(({ name, type }) => ({ name, type, description: "" })),
   };
 }
 

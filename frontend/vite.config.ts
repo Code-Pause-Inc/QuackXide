@@ -59,6 +59,10 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy,
+      // Tests load the shared vectors in the repository's fixtures/ (the
+      // Parquet schema vectors of ADR 0014 among them); nothing else may
+      // reach files outside frontend/.
+      ...(mode === "test" ? { fs: { allow: [".", "../fixtures"] } } : {}),
     },
     // Stands in for static serving (#181): the page headers, without the
     // API's Cache-Control: no-store.
