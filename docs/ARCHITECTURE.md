@@ -509,10 +509,16 @@ The research product is the query path with a second principal. The
 upload; the **researcher** may run aggregate queries but never read rows.
 
 ```
-Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
-                 grant check (GrantRegistry): active steward→researcher grant?  ──no──▶ 403 + audit
+Researcher ──▶ POST /api/v1/research/query {version, key_id, grant_id, envelope}
+                 key_id names the enclave's key set?  ──no──▶ 409 reattest
+                 open envelope with the request key (research-query info)  ──no──▶ 400
+                 grant check (GrantRegistry): active steward→researcher grant,
+                     the one grant_id names?  ──no──▶ 403 + audit
                  attestation gate
                  snapshot record: valid, names the key's suite?  ──no──▶ 502 + audit
+                 replay store: request nonce new?  ──same envelope──▶ stored response, uncharged
+                                                   ──otherwise──▶ 409 nonce_used /
+                                                       query_running / response_expired
                  budget charge (BudgetLedger): remaining ≥ cost?  ──no──▶ 429 + audit
                  slot, time and size limits as in Query, gated (charged)  ──no──▶ 503 / 422 + audit
                  key released into enclave → decrypt steward's Parquet (RAM)
@@ -525,6 +531,16 @@ Researcher ──▶ POST /api/v1/research/query {steward, connector, sql}
                  zeroize plaintext; Drop releases frames
                ─▶ aggregate rows + suppressed_rows + budget_remaining + metering audit event
 ```
+
+The query is sealed to the enclave's request key from the attestation
+bundle (ADR 0010 "Sealed request"), so its SQL is plaintext only in the
+researcher's browser and inside the enclave. A sealed query runs in a task
+of its own, so a client that disconnects does not cancel it: its response
+is stored for an hour, and the same envelope sent again gets it with no new
+charge. A stored error replays unchanged, `Retry-After` included, so a
+client retries an error under a new nonce. A refused charge spends nothing,
+so its nonce is not kept. Development builds also take the plaintext body
+`{steward_tenant, connector, sql}`; a release build does not compile it.
 
 Four enforcement layers at one choke point, all in code:
 
@@ -858,7 +874,10 @@ Rules, enforced by the capture tests:
    and the refused retry and deny, and research grants and budgets (ok +
    denied): grant, revoke, the query refused without a grant (before the
    attestation gate), top-up, exhaustion, and refused revokes, top-ups and
-   budget reads of unknown, foreign and malformed grant ids.
+   budget reads of unknown, foreign and malformed grant ids, and sealed
+   research queries refused (an unsupported version, an unknown key set, a
+   frame that does not open, a reused nonce), each an `auth.decision`
+   naming its reason.
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on

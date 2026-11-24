@@ -26,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -48,10 +49,13 @@ use quackxide_engine::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, SemaphorePermit};
+use zeroize::Zeroizing;
 
 use crate::ApiError;
 use crate::key_release::{AttestationBundle, EnclaveIdentity};
 use crate::research::ResearchService;
+use crate::research_replay::{Begin, ReplayStore, StoredOutcome};
+use crate::sealed::OpenedQuery;
 
 /// Per-query handle holding a tenant's released key in enclave RAM for the
 /// duration of a single query.
@@ -206,6 +210,9 @@ pub struct ConnectorQueryService {
     keys: Arc<dyn EnclaveKeyProvider>,
     attestation: Arc<dyn AttestationProvider>,
     identity: Arc<EnclaveIdentity>,
+    /// Sealed research queries' nonces and responses under `identity`'s key
+    /// set (ADR 0010); replaced with the key set.
+    replay: ReplayStore,
     settings: EngineSettings,
     require_attestation: bool,
     /// The `Arc` `AppState::research` also holds. None ⇒ research queries
@@ -231,6 +238,51 @@ pub struct ConnectorQueryService {
 /// Budget units one research query consumes.
 const RESEARCH_QUERY_COST: u64 = 1;
 
+/// A research query over `steward`'s `connector`: sealed to the enclave
+/// (ADR 0010), or, in `dev` builds only, sent as plaintext.
+pub struct ResearchRequest {
+    steward: TenantId,
+    connector: ConnectorSlug,
+    sql: Zeroizing<String>,
+    sealed: Option<SealedMeta>,
+}
+
+/// What a sealed request adds: the grant it names and what the replay store
+/// records.
+struct SealedMeta {
+    grant_id: String,
+    request_nonce: [u8; 32],
+    envelope_digest: [u8; 32],
+}
+
+impl ResearchRequest {
+    /// A plaintext query: the `dev` route and in-process callers.
+    #[cfg(feature = "dev")]
+    pub fn plain(steward: TenantId, connector: ConnectorSlug, sql: &str) -> Self {
+        Self {
+            steward,
+            connector,
+            sql: Zeroizing::new(sql.to_owned()),
+            sealed: None,
+        }
+    }
+}
+
+impl From<OpenedQuery> for ResearchRequest {
+    fn from(opened: OpenedQuery) -> Self {
+        Self {
+            steward: opened.steward,
+            connector: opened.connector,
+            sql: opened.sql,
+            sealed: Some(SealedMeta {
+                grant_id: opened.grant_id,
+                request_nonce: opened.request_nonce,
+                envelope_digest: opened.envelope_digest,
+            }),
+        }
+    }
+}
+
 impl ConnectorQueryService {
     pub fn new(
         vault: Arc<dyn VaultStore>,
@@ -251,6 +303,7 @@ impl ConnectorQueryService {
             keys,
             attestation,
             identity: Arc::new(EnclaveIdentity::generate()),
+            replay: ReplayStore::new(),
             settings,
             require_attestation,
             research: None,
@@ -266,7 +319,13 @@ impl ConnectorQueryService {
     /// and key release report the identical ephemeral public keys).
     pub fn with_enclave_identity(mut self, identity: Arc<EnclaveIdentity>) -> Self {
         self.identity = identity;
+        self.replay = ReplayStore::new();
         self
+    }
+
+    /// The enclave's key set, which opens sealed research queries.
+    pub(crate) fn identity(&self) -> &EnclaveIdentity {
+        &self.identity
     }
 
     /// Produce an [`AttestationBundle`] whose token binds `nonce` and this
@@ -724,20 +783,33 @@ impl ConnectorQueryService {
     }
 
     /// Run a disclosure-controlled aggregate query by `researcher` over
-    /// `steward`'s connector data. Requires an active grant; aggregate-only
-    /// and min-cohort suppression are applied unconditionally.
+    /// `request`'s dataset and return the JSON response body. Requires an
+    /// active grant, for a sealed request the one it names; aggregate-only
+    /// and min-cohort suppression are applied unconditionally. A sealed
+    /// request passes the replay store just before the charge (ADR 0010):
+    /// the same envelope again gets the stored response, uncharged.
     pub async fn research_query(
         &self,
         researcher: TenantId,
-        steward: TenantId,
-        connector: &ConnectorSlug,
-        sql: &str,
-    ) -> Result<Value, ApiError> {
+        request: ResearchRequest,
+    ) -> Result<SecretBytes, ApiError> {
+        let ResearchRequest {
+            steward,
+            connector,
+            sql,
+            sealed,
+        } = request;
+        let connector = &connector;
         let research = self.research()?;
         // Grant check first — no data is touched without authorization.
         let grant = research
             .find_active_grant(researcher, steward, connector)
-            .await?;
+            .await?
+            .filter(|grant| {
+                sealed
+                    .as_ref()
+                    .is_none_or(|meta| meta.grant_id == grant.grant_id)
+            });
         let Some(grant) = grant else {
             security_audit_event(
                 AuditKind::AuthDecision,
@@ -755,110 +827,172 @@ impl ConnectorQueryService {
         // the query reads the snapshot that is current once it holds a slot.
         self.current_snapshot(steward, connector).await?;
 
-        // Budget charge — after the attestation gate so operator
-        // infrastructure failures never burn researcher budget, but before
-        // any data is opened: an accepted query consumes budget even if the
-        // plan gate later rejects it, so probing the aggregate-only boundary
-        // costs budget. Charges are not refunded.
-        let budget = match research.charge(&grant.grant_id, RESEARCH_QUERY_COST).await {
-            Ok(state) => state,
-            Err(err) => {
-                let detail = match &err {
-                    BudgetError::Exhausted(state) => format!(
-                        "exhausted steward={steward} connector={connector} limit={} spent={}",
-                        state.limit, state.spent
-                    ),
-                    BudgetError::UnknownGrant => {
-                        format!("no ledger entry steward={steward} connector={connector}")
+        let guard = match &sealed {
+            None => None,
+            Some(meta) => {
+                match self
+                    .replay
+                    .begin(meta.request_nonce, meta.envelope_digest, Instant::now())
+                {
+                    Begin::New(guard) => Some(guard),
+                    Begin::Stored(StoredOutcome::Ok(body)) => return Ok(body),
+                    Begin::Stored(StoredOutcome::Err(err)) => return Err(err),
+                    Begin::Refused(refusal) => {
+                        security_audit_event(
+                            AuditKind::AuthDecision,
+                            Some(researcher),
+                            "denied",
+                            &format!(
+                                "sealed research query refused reason={} steward={steward} \
+                             connector={connector}",
+                                refusal.kind()
+                            ),
+                        );
+                        return Err(refusal);
                     }
-                };
-                security_audit_event(
-                    AuditKind::ResearchBudget,
-                    Some(researcher),
-                    "denied",
-                    &detail,
-                );
-                return Err(ApiError::BudgetExhausted);
+                }
             }
         };
+        let outcome = async {
+            // Budget charge — after the attestation gate so operator
+            // infrastructure failures never burn researcher budget, but before
+            // any data is opened: an accepted query consumes budget even if the
+            // plan gate later rejects it, so probing the aggregate-only boundary
+            // costs budget. Charges are not refunded.
+            let budget = match research.charge(&grant.grant_id, RESEARCH_QUERY_COST).await {
+                Ok(state) => state,
+                Err(err) => {
+                    let detail = match &err {
+                        BudgetError::Exhausted(state) => format!(
+                            "exhausted steward={steward} connector={connector} limit={} spent={}",
+                            state.limit, state.spent
+                        ),
+                        BudgetError::UnknownGrant => {
+                            format!("no ledger entry steward={steward} connector={connector}")
+                        }
+                    };
+                    security_audit_event(
+                        AuditKind::ResearchBudget,
+                        Some(researcher),
+                        "denied",
+                        &detail,
+                    );
+                    return Err(ApiError::BudgetExhausted);
+                }
+            };
 
-        // The steward's key is released into the enclave to decrypt their
-        // data. A dataset that does not match its declaration, and every
-        // resource-limit refusal from the slot wait on, are refused after
-        // this charge (ADR 0012; P54 decides whether that stays). Research
-        // mode always enforces aggregate-only and disclosure control.
-        let research_settings = EngineSettings {
-            zk: platform_core::ZkMode::Enabled,
-            ..self.settings.clone()
-        };
-        let ran = self
-            .decrypt_and_run(
-                steward,
-                connector,
-                research_settings,
-                Some(self.disclosure()),
-                sql,
-            )
-            .await
-            // Still charged, so the failed or refused attempt appears in the
-            // meter. Research mode is always gated.
-            .map_err(|stopped| {
-                gated_refusal(stopped.audit(
-                    researcher,
-                    &format!("research steward={steward} connector={connector}"),
-                    &format!("budget_remaining={}", budget.remaining()),
-                ))
-            })?;
-        let Ran {
-            objects: object_count,
-            rows,
-            suppressed,
-        } = ran;
+            // The steward's key is released into the enclave to decrypt their
+            // data. A dataset that does not match its declaration, and every
+            // resource-limit refusal from the slot wait on, are refused after
+            // this charge (ADR 0012; P54 decides whether that stays). Research
+            // mode always enforces aggregate-only and disclosure control.
+            let research_settings = EngineSettings {
+                zk: platform_core::ZkMode::Enabled,
+                ..self.settings.clone()
+            };
+            let ran = self
+                .decrypt_and_run(
+                    steward,
+                    connector,
+                    research_settings,
+                    Some(self.disclosure()),
+                    &sql,
+                )
+                .await
+                // Still charged, so the failed or refused attempt appears in the
+                // meter. Research mode is always gated.
+                .map_err(|stopped| {
+                    gated_refusal(stopped.audit(
+                        researcher,
+                        &format!("research steward={steward} connector={connector}"),
+                        &format!("budget_remaining={}", budget.remaining()),
+                    ))
+                })?;
+            let Ran {
+                objects: object_count,
+                rows,
+                suppressed,
+            } = ran;
 
-        if object_count == 0 {
+            if object_count == 0 {
+                security_audit_event(
+                    AuditKind::QueryExecuted,
+                    Some(researcher),
+                    "ok",
+                    &format!(
+                        "research steward={steward} connector={connector} objects=0 \
+                         budget_remaining={}",
+                        budget.remaining()
+                    ),
+                );
+                return Ok(json!({
+                    "rows": [], "row_count": 0, "suppressed_rows": 0,
+                    "object_count": 0, "min_cohort": self.min_cohort, "mode": "research",
+                    "budget_remaining": budget.remaining(), "tee_platform": tee_platform,
+                }));
+            }
+            let row_count = rows.as_array().map(Vec::len).unwrap_or(0);
+
+            // Billing meters research access from this audit record.
             security_audit_event(
                 AuditKind::QueryExecuted,
                 Some(researcher),
                 "ok",
                 &format!(
-                    "research steward={steward} connector={connector} objects=0 \
+                    "research steward={steward} connector={connector} objects={object_count} \
+                     rows={row_count} suppressed={suppressed} k={} budget_spent={} \
                      budget_remaining={}",
+                    self.min_cohort,
+                    RESEARCH_QUERY_COST,
                     budget.remaining()
                 ),
             );
-            return Ok(json!({
-                "rows": [], "row_count": 0, "suppressed_rows": 0,
-                "object_count": 0, "min_cohort": self.min_cohort, "mode": "research",
-                "budget_remaining": budget.remaining(), "tee_platform": tee_platform,
-            }));
+
+            Ok(json!({
+                "rows": rows,
+                "row_count": row_count,
+                "suppressed_rows": suppressed,
+                "object_count": object_count,
+                "min_cohort": self.min_cohort,
+                "mode": "research",
+                "budget_remaining": budget.remaining(),
+                "tee_platform": tee_platform,
+            }))
         }
-        let row_count = rows.as_array().map(Vec::len).unwrap_or(0);
+        .await
+        .and_then(|body| {
+            serde_json::to_vec(&body)
+                .map(SecretBytes::new)
+                .map_err(|_| ApiError::Backend)
+        });
+        if let Some(guard) = guard {
+            // A refused charge spent nothing: the nonce is dropped, so an
+            // exhausted grant cannot grow the store (ADR 0010).
+            if matches!(outcome, Err(ApiError::BudgetExhausted)) {
+                guard.forget();
+                return outcome;
+            }
+            let stored = match &outcome {
+                Ok(body) => StoredOutcome::Ok(SecretBytes::new(body.expose().to_vec())),
+                Err(err) => StoredOutcome::Err(err.clone()),
+            };
+            guard.finish(stored, Instant::now());
+        }
+        outcome
+    }
 
-        // Billing meters research access from this audit record.
-        security_audit_event(
-            AuditKind::QueryExecuted,
-            Some(researcher),
-            "ok",
-            &format!(
-                "research steward={steward} connector={connector} objects={object_count} \
-                 rows={row_count} suppressed={suppressed} k={} budget_spent={} \
-                 budget_remaining={}",
-                self.min_cohort,
-                RESEARCH_QUERY_COST,
-                budget.remaining()
-            ),
-        );
-
-        Ok(json!({
-            "rows": rows,
-            "row_count": row_count,
-            "suppressed_rows": suppressed,
-            "object_count": object_count,
-            "min_cohort": self.min_cohort,
-            "mode": "research",
-            "budget_remaining": budget.remaining(),
-            "tee_platform": tee_platform,
-        }))
+    /// [`research_query`](Self::research_query) in a task of its own, so a
+    /// client that disconnects never cancels a charged query: it finishes and
+    /// stores its response for the client's retry (ADR 0010).
+    pub async fn run_detached(
+        self: &Arc<Self>,
+        researcher: TenantId,
+        request: ResearchRequest,
+    ) -> Result<SecretBytes, ApiError> {
+        let service = Arc::clone(self);
+        tokio::spawn(async move { service.research_query(researcher, request).await })
+            .await
+            .unwrap_or_else(|_| Err(ApiError::QueryUnavailable))
     }
 }
 
@@ -1050,7 +1184,12 @@ pub struct TopUpRequest {
     pub additional: u64,
 }
 
+/// The `dev` route's plaintext research query. Unknown fields are refused,
+/// so a sealed body carrying these fields too is neither shape and never
+/// runs unsealed.
+#[cfg(feature = "dev")]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResearchQueryRequest {
     /// Steward tenant id (UUID) whose data is being queried.
     pub steward_tenant: String,
@@ -1200,5 +1339,160 @@ mod tests {
             rows["rows"],
             serde_json::json!([{ "condition": "flu", "n": 3 }])
         );
+    }
+
+    /// A disclosure policy that reports each query reaching it, waits to be
+    /// released, then applies the real threshold: a query held mid-run.
+    struct Holds {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        k: i64,
+    }
+
+    impl DisclosurePolicy for Holds {
+        fn apply(&self, batches: Vec<RecordBatch>) -> Result<DisclosureOutcome, QueryError> {
+            // The test stops listening once the first query has arrived.
+            let _ = self.entered.send(());
+            self.release.lock().unwrap().recv().expect("released");
+            MinCountThreshold { k: self.k }.apply(batches)
+        }
+    }
+
+    /// A client that disconnects after its sealed query was charged does not
+    /// cancel the query: it finishes and stores its response, and the retry
+    /// of the same request gets that response, charged once (ADR 0010).
+    /// The client drops while the query waits for the only plaintext slot,
+    /// which a first query holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_disconnected_client_still_gets_its_result_on_retry() {
+        let (steward, researcher) = (TenantId::generate(), TenantId::generate());
+        let connector = ConnectorSlug::new("cohorts").expect("slug");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "condition",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values([
+                "flu", "flu", "flu",
+            ]))],
+        )
+        .expect("batch");
+        let mut parquet = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut parquet, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let mut stack = crate::dev::DevResearchStack::new();
+        stack
+            .commit_snapshot(
+                steward,
+                TenantKeypair::generate(EnvelopeSuite::Hpk2),
+                &connector,
+                "cohorts",
+                &parquet,
+            )
+            .await
+            .expect("commit");
+        let research = Arc::new(ResearchService::new(
+            crate::research::ResearchStores::in_memory(),
+            stack.vault(),
+            2,
+            100,
+        ));
+        let grant = research
+            .grant(steward, researcher, &connector, Some(100))
+            .await
+            .ok()
+            .expect("grant");
+        let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
+        let mut service = stack.query_service(
+            EngineSettings {
+                zk: ZkMode::Disabled,
+                max_concurrent_queries: 1,
+                limits: QueryLimits::default(),
+            },
+            research.clone(),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        service.disclosure_for_tests = Some(Arc::new(Holds {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            k: 2,
+        }));
+        let service = Arc::new(service);
+        let spent = || async {
+            research
+                .budget_state(steward, &grant_id)
+                .await
+                .ok()
+                .expect("budget")["spent"]
+                .as_u64()
+                .expect("spent")
+        };
+        let sealed = || ResearchRequest {
+            steward,
+            connector: connector.clone(),
+            sql: Zeroizing::new(COHORT_SQL.to_owned()),
+            sealed: Some(SealedMeta {
+                grant_id: grant_id.clone(),
+                request_nonce: [4; 32],
+                envelope_digest: [5; 32],
+            }),
+        };
+
+        // A first query takes the only plaintext slot and holds it.
+        let holder = tokio::spawn({
+            let service = service.clone();
+            let request = ResearchRequest::plain(steward, connector.clone(), COHORT_SQL);
+            async move { service.research_query(researcher, request).await }
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join")
+            .expect("the first query holds the slot");
+
+        // The sealed query is charged, then waits for the slot; its client
+        // goes away.
+        let client = tokio::spawn({
+            let (service, request) = (service.clone(), sealed());
+            async move { service.run_detached(researcher, request).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while spent().await < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sealed query was charged");
+        client.abort();
+        assert!(client.await.is_err_and(|e| e.is_cancelled()));
+
+        release_tx.send(()).expect("first query waiting");
+        release_tx.send(()).expect("policy alive");
+        holder.await.expect("join").ok().expect("first query");
+
+        let body = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match service.run_detached(researcher, sealed()).await {
+                    Err(ApiError::QueryRunning) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    other => break other,
+                }
+            }
+        })
+        .await
+        .expect("the sealed query finished")
+        .ok()
+        .expect("the stored result");
+        let body: serde_json::Value = serde_json::from_slice(body.expose()).expect("json");
+        assert_eq!(
+            body["rows"],
+            serde_json::json!([{ "condition": "flu", "n": 3 }])
+        );
+        assert_eq!(spent().await, 2, "charged once each");
     }
 }

@@ -59,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(verified) = VERIFIER.verify(&token, &[NONCE.into()]) {
         assert_eq!(verified.image_digest(), SIMULATED_IMAGE_DIGEST);
         assert_eq!(verified.hwmodel(), "GCP_INTEL_TDX");
-        assert!(verified.nonces().iter().any(|n| n == NONCE));
+        assert_eq!(verified.nonces(), [String::from(NONCE)]);
         assert_eq!(claims["swname"], "CONFIDENTIAL_SPACE");
         assert_eq!(claims["dbgstat"], "disabled-since-boot");
         let attributes = &claims["submods"]["confidential_space"]["support_attributes"];
