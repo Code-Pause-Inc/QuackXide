@@ -7,13 +7,31 @@ const DIGEST_A = `sha256:${"a".repeat(64)}`;
 const DIGEST_B = `sha256:${"b".repeat(64)}`;
 
 describe("resolveAttestationTrust", () => {
-  it("falls back to the simulator defaults outside release", () => {
-    expect(resolveAttestationTrust({}, "development")).toEqual({
-      issuer: "http://sim-attestation:8070",
-      jwksUrl: "/sim-attestation/jwks",
-      imageDigests: ["sha256:5155a7ab1d7e4c94d5bb3e1c6f0a3a4d6c7b8e9f00112233445566778899aabb"],
-      release: false,
-    });
+  it("falls back to the simulator defaults in development and test", () => {
+    for (const mode of ["development", "test"]) {
+      expect(resolveAttestationTrust({}, mode)).toEqual({
+        issuer: "http://sim-attestation:8070",
+        jwksUrl: "/sim-attestation/jwks",
+        imageDigests: ["sha256:5155a7ab1d7e4c94d5bb3e1c6f0a3a4d6c7b8e9f00112233445566778899aabb"],
+        release: false,
+      });
+    }
+  });
+
+  it("refuses every other mode without the values", () => {
+    for (const mode of ["production", "release", "staging", ""]) {
+      expect(resolveAttestationTrust({}, mode)).toBeNull();
+    }
+  });
+
+  it("applies the release policy in every mode but development and test", () => {
+    const full = {
+      VITE_ATTESTATION_ISSUER: "https://attest.example",
+      VITE_ATTESTATION_JWKS_URL: "https://attest.example/jwks",
+      VITE_ATTESTATION_IMAGE_DIGESTS: DIGEST_A,
+    };
+    expect(resolveAttestationTrust(full, "production")?.release).toBe(true);
+    expect(resolveAttestationTrust(full, "development")?.release).toBe(false);
   });
 
   it("keeps the dev defaults equal to the Rust simulator constants", () => {

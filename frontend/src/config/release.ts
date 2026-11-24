@@ -3,8 +3,6 @@
 // a baked-in development token, or an API base URL (the page calls its own
 // origin only). Pure, so vite.config.ts and tests share it.
 
-import { SIMULATOR_ISSUER } from "./attestation";
-
 export interface ReleaseEnv {
   readonly VITE_VAULT_MODE?: string;
   readonly VITE_DEV_JWT?: string;
@@ -37,8 +35,9 @@ export function releaseEnvProblems(env: ReleaseEnv): string[] {
   const digests = env.VITE_ATTESTATION_IMAGE_DIGESTS?.trim();
   if (!issuer) {
     problems.push("VITE_ATTESTATION_ISSUER must be set (the enclave attestation issuer to trust)");
-  } else if (issuer === SIMULATOR_ISSUER) {
-    problems.push("VITE_ATTESTATION_ISSUER must not be the simulator's issuer");
+  } else if (!issuer.startsWith("https://")) {
+    // The simulator's issuer is http://, so this refuses it too.
+    problems.push("VITE_ATTESTATION_ISSUER must be an https:// URL");
   }
   if (!jwksUrl) {
     problems.push("VITE_ATTESTATION_JWKS_URL must be set (the issuer's key set)");

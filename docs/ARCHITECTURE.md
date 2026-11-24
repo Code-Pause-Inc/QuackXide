@@ -581,9 +581,13 @@ enclave's keys and of the configuration the token reports
 (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
 `RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`). Two inputs
 steer them, both set by the build.
-The configuration policy (`ConfigPolicy`) is the release one or the
-simulator's. The trust values (the issuer, the key-set URL and the image
-digests) come, in a release frontend build, from `VITE_ATTESTATION_*`.
+The configuration policy (`ConfigPolicy`) is the simulator's in development
+and test builds and the release one in every other. The trust values (the
+issuer, the key-set URL and the image digests) come from
+`VITE_ATTESTATION_*`; only development and test builds fall back to the
+simulator's, and any other build without them refuses to verify. The worker
+reads the key set through the browser's HTTP cache and fetches it once more,
+past the cache, when the token names a key the set does not hold.
 
 The worker has no seal operation yet (#239 part 2). Sealing a query to the
 bundle's request key (ADR 0010 "Sealed request") is done by

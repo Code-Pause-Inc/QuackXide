@@ -72,13 +72,12 @@ describe("releaseEnvProblems", () => {
     expect(problems[0]).toContain("VITE_ATTESTATION_JWKS_URL");
   });
 
-  it("refuses the simulator's issuer", () => {
-    const problems = releaseEnvProblems({
-      ...VALID,
-      VITE_ATTESTATION_ISSUER: "http://sim-attestation:8070",
-    });
-    expect(problems).toHaveLength(1);
-    expect(problems[0]).toContain("VITE_ATTESTATION_ISSUER");
+  it("refuses an issuer that is not https, the simulator's included", () => {
+    for (const issuer of ["http://sim-attestation:8070", "http://sim-attestation:8070/", "http://attest.example"]) {
+      const problems = releaseEnvProblems({ ...VALID, VITE_ATTESTATION_ISSUER: issuer });
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("VITE_ATTESTATION_ISSUER");
+    }
   });
 
   it("refuses a malformed image digest", () => {
