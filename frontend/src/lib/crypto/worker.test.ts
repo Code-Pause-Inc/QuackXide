@@ -43,15 +43,6 @@ vi.mock("./devicekey", () => ({
 // The envelope WebAssembly is a build artifact; sealing is not under test.
 vi.mock("./envelope", () => ({ loadEnvelopeModule: vi.fn(async () => undefined) }));
 
-// Key creation succeeds here, so a request that creates a key is seen.
-vi.mock("./devicekey", () => ({
-  createDeviceHpkeKey: vi.fn(async () => ({
-    seedKey: {} as CryptoKey,
-    publicKeyRaw: new ArrayBuffer(32),
-    sealedPrivateKey: { iv: new ArrayBuffer(12), data: new ArrayBuffer(48) },
-  })),
-}));
-
 // Stand-in drive layer: makes one vault request and reports the session
 // claims the worker handed to the crypto core.
 vi.mock("./drive", () => ({

@@ -35,6 +35,7 @@ const otherRecipient = vectors.recipients.find((r) => r.name === "b")!;
 
 function keysFor(publicB64: string): DeviceKeys {
   return {
+    identity: { iss: "local", sub: "local", tid: "local-device-id" },
     tenantId: "local-device-id",
     kek: {} as CryptoKey,
     hpke: {

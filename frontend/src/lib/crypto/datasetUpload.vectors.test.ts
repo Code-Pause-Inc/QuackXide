@@ -75,6 +75,7 @@ async function seal(): Promise<UploadVector> {
   const result = await uploadDataset(
     {
       keys: {
+        identity: { iss: "local", sub: "local", tid: "local-device-id" },
         tenantId: "local-device-id",
         kek: {} as CryptoKey,
         hpke: {
