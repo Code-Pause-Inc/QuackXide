@@ -8,6 +8,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Create-once key enrollment (P33, #175; ADR 0004). An enrollment record
+  carries `key_id` (the lowercase hex SHA-256 of the raw public key), the
+  key's suite and `created_at_unix`, and `verify_enrollment_record`
+  refuses one that fails any check. `POST /api/v1/drive/enrollment/rotate`
+  is the only way to replace a key and refuses (403, audited) until it
+  requires a fresh second factor (P30). The drive's key setup screen
+  refuses a second device, since v1 has no multi-device keys or recovery.
 * Data dictionary on published listings (P59): a catalog listing carries
   `data_dictionary`, the dataset's SQL table name and the columns its
   steward describes (name, type family and an optional description), so a
@@ -614,6 +621,17 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `PUT /api/v1/drive/enrollment` no longer replaces an enrolled key: the
+  same key again succeeds, a different key is 409 (audited
+  `crypto.key_enrollment` "denied"), and a stored record that fails
+  verification is 502 (audited "failed"). Records written before this
+  change have no key id or creation time and fail verification; delete
+  them in development (see #175). In development only, an `HPK1` key may
+  still be replaced by an `HPK2` key (P36).
+* The browser key store is keyed by verified identity (`iss`, `sub`,
+  `tid`), and the tenant id in every AAD is the session's `tid`. The
+  previous single `device` row and data sealed under its random tenant id
+  are no longer read.
 * Every dataset snapshot, a connector sync's included, writes a plaintext
   record (`platform_storage::SnapshotRecord`: its suite, and for an upload
   the declared row cap and schema) before its manifest, writes both

@@ -435,6 +435,54 @@ async fn enrollment_is_create_once_and_rotation_fails_closed() {
 }
 
 #[tokio::test]
+async fn an_enrollment_record_that_fails_verification_is_a_backend_fault() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let mut state = common::app_state(SECRET, vault.clone());
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let key = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    let key_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(key.to_raw())
+    };
+    // A record written before create-once enrollment: no key id or time.
+    let legacy = serde_json::json!({
+        "hpke_public_key_b64": key_b64,
+        "suite": EnvelopeSuite::Hpk2.name(),
+    });
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(tenant),
+            serde_json::to_vec(&legacy).expect("json").into(),
+        )
+        .await
+        .expect("seed record");
+
+    // Not a 409: no other device holds a key; the stored record is at fault.
+    let body = format!(r#"{{"hpke_public_key_b64":"{key_b64}"}}"#);
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token_for(tenant)), json_header()],
+        body.into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        capture.events().iter().any(|e| {
+            e.audit_kind == "crypto.key_enrollment"
+                && e.outcome == "failed"
+                && e.detail.contains("fails verification")
+        }),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
 async fn query_path_audits_attestation_and_execution_including_failure() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();

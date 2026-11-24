@@ -1270,6 +1270,13 @@ async fn put_enrollment(
                 // The P36 migration: a development-only X25519 key moves to
                 // X-Wing. Allowed only where X25519 is still accepted, so
                 // never in production, which refuses `HPK1` keys outright.
+                //
+                // Known race, development only: this reads the record and
+                // then writes it unconditionally, because `VaultStore` has
+                // no compare-and-swap write. Two devices migrating at once
+                // both succeed and the last write wins. Production cannot
+                // reach this branch. A conditional write (if-generation-match)
+                // would close it if the migration outlives P36.
                 Ok(current)
                     if current.suite == platform_crypto::EnvelopeSuite::Hpk1.name()
                         && key.suite() == platform_crypto::EnvelopeSuite::Hpk2
@@ -1294,9 +1301,19 @@ async fn put_enrollment(
                     ));
                     Err(ApiError::Conflict)
                 }
+                // A record this server wrote that does not verify (for
+                // example one written before create-once enrollment) is a
+                // backend fault, not another device's key: answering 409
+                // would tell the browser the wrong reason, and the tenant
+                // could never enroll. See the PR for clearing old records.
                 Err(err) => {
-                    denied(&format!("stored enrollment fails verification: {err:?}"));
-                    Err(ApiError::Conflict)
+                    security_audit_event(
+                        AuditKind::KeyEnrollment,
+                        Some(tenant),
+                        "failed",
+                        &format!("stored enrollment fails verification: {err:?}"),
+                    );
+                    Err(ApiError::Backend)
                 }
             }
         }
