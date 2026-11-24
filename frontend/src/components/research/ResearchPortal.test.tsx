@@ -7,6 +7,7 @@ import type {
   CatalogView,
   ConnectorView,
   DataDictionaryView,
+  DatasetListingView,
   GrantView,
   ListingView,
 } from "../../lib/research/client";
@@ -26,7 +27,30 @@ const api = vi.hoisted(() => ({
   denyRequest: vi.fn(),
   topUpBudget: vi.fn(),
   revokeGrant: vi.fn(),
+  datasets: vi.fn(),
 }));
+
+const worker = vi.hoisted(() => ({
+  constructed: vi.fn(),
+  setSession: vi.fn(async () => null),
+  uploadDataset: vi.fn(),
+  terminate: vi.fn(),
+}));
+
+vi.mock("../../lib/crypto/workerClient", () => ({
+  DriveWorkerClient: class {
+    constructor() {
+      worker.constructed();
+    }
+    setSession = worker.setSession;
+    uploadDataset = worker.uploadDataset;
+    terminate = worker.terminate;
+  },
+}));
+
+const footer = vi.hoisted(() => ({ read: vi.fn() }));
+
+vi.mock("../../lib/datasets/footerClient", () => ({ readFooterInWorker: footer.read }));
 
 vi.mock("../../lib/research/client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../lib/research/client")>()),
@@ -46,6 +70,7 @@ vi.mock("../../lib/research/client", async (importOriginal) => ({
     denyRequest = api.denyRequest;
     topUpBudget = api.topUpBudget;
     revokeGrant = api.revokeGrant;
+    datasets = api.datasets;
   },
 }));
 
@@ -161,7 +186,48 @@ const budgets: Record<string, BudgetView> = {
   "g-issued": { grant_id: "g-issued", limit: 20, spent: 5, remaining: 15 },
 };
 
+const STORED_VERSION = `01763116830123456789-${"0".repeat(32)}`;
+const storedDatasets: DatasetListingView = {
+  datasets: [
+    {
+      dataset: "survey",
+      version: STORED_VERSION,
+      written_at: "2025-11-14T10:40:30.123Z",
+      suite: "HPK2",
+      row_cap: null,
+      schema: null,
+      object_count: 1,
+      ciphertext_bytes: 4096,
+      objects: ["00000000-aaaa-4bbb-8ccc-000000000001"],
+    },
+    {
+      dataset: "upload_cohorts",
+      version: STORED_VERSION,
+      written_at: "2025-11-14T10:40:30.123Z",
+      suite: "HPK1",
+      row_cap: 7,
+      schema: [
+        { name: "condition", type: "string" },
+        { name: "age", type: "int64" },
+      ],
+      object_count: 1,
+      ciphertext_bytes: 1932,
+      objects: ["00000000-aaaa-4bbb-8ccc-000000000002"],
+    },
+  ],
+  dataset_max_bytes: 64 * 1024 * 1024,
+};
+/** The stored datasets and a QuickBooks connector's. */
+const withQuickbooks: DatasetListingView = {
+  ...storedDatasets,
+  datasets: [
+    ...storedDatasets.datasets,
+    { ...storedDatasets.datasets[0]!, dataset: "quickbooks", suite: "HPK2" },
+  ],
+};
+
 function seed() {
+  api.datasets.mockResolvedValue(storedDatasets);
   api.catalog.mockResolvedValue(leakyCatalog);
   api.connectors.mockResolvedValue([quickbooks]);
   api.grants.mockResolvedValue([myGrant, issuedGrant, unmeteredGrant]);
@@ -427,7 +493,7 @@ describe("ResearchPortal", () => {
     const user = await openPortal();
 
     await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
-    await user.type(screen.getByPlaceholderText(/connector slug/), "survey");
+    await user.selectOptions(screen.getByLabelText("Dataset"), "survey");
     await user.type(screen.getByPlaceholderText(/listing title/), "Survey waves");
     await user.type(screen.getByPlaceholderText(/license fee/), "100");
     await user.type(screen.getByPlaceholderText(/rate per query/), "0.25");
@@ -442,7 +508,65 @@ describe("ResearchPortal", () => {
       data_dictionary: { columns: [] },
     });
     expect(await screen.findByRole("button", { name: "Publish a dataset" })).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText(/connector slug/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Dataset")).not.toBeInTheDocument();
+  });
+
+  it("lists the stored datasets as ciphertext, from the listing route on every load", async () => {
+    const user = await openPortal();
+    const list = await screen.findByRole("list", { name: "Stored datasets" });
+    expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      expect.stringContaining("survey1 object · 4 KB ciphertext · HPK2 · written 2025-11-14 10:40 UTC"),
+      expect.stringContaining("upload_cohorts1 object · 1.9 KB ciphertext · HPK1"),
+    ]);
+    // A reload reads the route again.
+    await user.click(screen.getByRole("button", { name: "Open portal" }));
+    await waitFor(() => expect(api.datasets).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("list", { name: "Stored datasets" })).toBeInTheDocument();
+  });
+
+  it("keeps the portal usable when the dataset listing fails", async () => {
+    api.datasets.mockRejectedValue(new Error("storage is unavailable (503); try again later"));
+    await openPortal();
+    expect(await screen.findByText(/your datasets could not be loaded/i)).toHaveTextContent(
+      "storage is unavailable (503)",
+    );
+    expect(screen.getByRole("button", { name: "Upload a dataset" })).toBeDisabled();
+    expect(screen.getByRole("heading", { name: "Research data access" })).toBeInTheDocument();
+  });
+
+  it("seals an upload in the crypto worker under the portal's token, then reloads", async () => {
+    const file = new File(["PAR1"], "cohort.parquet");
+    footer.read.mockResolvedValue({
+      ok: true,
+      schema: storedDatasets.datasets[1]!.schema,
+      rows: 7,
+      footerBytes: 100,
+    });
+    worker.uploadDataset.mockResolvedValue({
+      dataset: "upload_cohorts",
+      version: `01800000000000000000-${"1".repeat(32)}`,
+      object: "00000000-aaaa-4bbb-8ccc-000000000003",
+      suite: "HPK1",
+      ciphertextBytes: 56,
+    });
+    const user = await openPortal();
+    await user.click(await screen.findByRole("button", { name: /re-upload upload_cohorts/i }));
+    expect(screen.getByLabelText("Dataset name")).toHaveValue("upload_cohorts");
+    await user.upload(screen.getByLabelText("Parquet file"), file);
+    await user.click(await screen.findByRole("button", { name: "Seal and upload" }));
+
+    await waitFor(() => expect(worker.uploadDataset).toHaveBeenCalledTimes(1));
+    expect(worker.setSession).toHaveBeenCalledWith(TOKEN);
+    expect(worker.uploadDataset).toHaveBeenCalledWith({
+      file,
+      dataset: "upload_cohorts",
+      schema: storedDatasets.datasets[1]!.schema,
+      rowCap: 7,
+      currentVersion: STORED_VERSION,
+      maxBytes: storedDatasets.dataset_max_bytes,
+    });
+    await waitFor(() => expect(api.datasets).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("status")).toHaveTextContent("Stored upload_cohorts");
   });
 
   it("tops up and revokes issued access", async () => {
@@ -525,11 +649,12 @@ describe("ResearchPortal", () => {
   });
 
   it("pre-fills a connector dataset's dictionary in the publish form", async () => {
+    api.datasets.mockResolvedValue(withQuickbooks);
     api.publishListing.mockResolvedValue(ownListing);
     const user = await openPortal();
 
     await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
-    await user.type(screen.getByPlaceholderText(/connector slug/), "quickbooks");
+    await user.selectOptions(screen.getByLabelText("Dataset"), "quickbooks");
     expect(screen.getByRole("textbox", { name: "Column 1 name" })).toHaveValue("id");
     expect(screen.getByRole("textbox", { name: "Column 2 name" })).toHaveValue("total");
     await user.type(screen.getByPlaceholderText(/listing title/), "Invoices");
@@ -550,12 +675,38 @@ describe("ResearchPortal", () => {
     );
   });
 
+  it("pre-fills an upload's dictionary from the schema it declared", async () => {
+    api.publishListing.mockResolvedValue(ownListing);
+    const user = await openPortal();
+
+    await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
+    await user.selectOptions(screen.getByLabelText("Dataset"), "upload_cohorts");
+    expect(screen.getByText(/Pre-filled from the uploaded file/)).toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/listing title/), "Cohorts");
+    await user.type(screen.getByPlaceholderText(/license fee/), "0");
+    await user.type(screen.getByPlaceholderText(/rate per query/), "0");
+    await user.click(screen.getByRole("button", { name: "Publish listing" }));
+
+    expect(api.publishListing).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connector: "upload_cohorts",
+        data_dictionary: {
+          columns: [
+            { name: "condition", type: "string", description: "" },
+            { name: "age", type: "int64", description: "" },
+          ],
+        },
+      }),
+    );
+  });
+
   it("opens without connector columns, leaving them to the steward", async () => {
+    api.datasets.mockResolvedValue(withQuickbooks);
     api.connectors.mockRejectedValue(new Error("failed to load connector columns (502)"));
     const user = await openPortal();
 
     await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
-    await user.type(screen.getByPlaceholderText(/connector slug/), "quickbooks");
+    await user.selectOptions(screen.getByLabelText("Dataset"), "quickbooks");
     expect(screen.queryByRole("textbox", { name: "Column 1 name" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add column" })).toBeEnabled();
     expect(screen.queryByText(/failed to load connector columns/)).not.toBeInTheDocument();

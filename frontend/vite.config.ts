@@ -1,9 +1,12 @@
 /// <reference types="vitest/config" />
+import { readFileSync } from "node:fs";
+
 import tailwindcss from "@tailwindcss/vite";
 import { playwright } from "@vitest/browser-playwright";
 import react from "@vitejs/plugin-react";
 import { defineConfig, loadEnv } from "vite";
 
+import { parsePageHeaders } from "./src/config/pageHeaders";
 import { releaseEnvProblems } from "./src/config/release";
 
 // Browsers for the `browser` test project: a comma list in BROWSERS
@@ -22,6 +25,12 @@ function browserInstances(list: string | undefined): { browser: Browser }[] {
       return { browser };
     });
 }
+
+// The page headers the backend also sends (one source of truth). Resolved
+// from this file, not the shell's working directory.
+const PAGE_HEADERS = parsePageHeaders(
+  readFileSync(new URL("../backend/crates/platform-api/page-headers.txt", import.meta.url), "utf8"),
+);
 
 // Branding and endpoints come from VITE_* env vars (see .env.example).
 export default defineConfig(({ mode }) => {
@@ -50,6 +59,17 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy,
+      // Tests load the shared vectors in the repository's fixtures/ (the
+      // Parquet schema vectors of ADR 0014 among them); nothing else may
+      // reach files outside frontend/.
+      ...(mode === "test" ? { fs: { allow: [".", "../fixtures"] } } : {}),
+    },
+    // Stands in for static serving (#181): the page headers, without the
+    // API's Cache-Control: no-store.
+    // Release preview must not inherit server.proxy: the page is same-origin.
+    preview: {
+      headers: PAGE_HEADERS,
+      proxy: mode === "release" ? {} : undefined,
     },
     test: {
       projects: [

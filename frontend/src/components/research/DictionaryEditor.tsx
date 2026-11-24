@@ -1,6 +1,5 @@
+import { COLUMN_TYPES, type ColumnType } from "../../lib/datasets/schema";
 import {
-  COLUMN_TYPES,
-  type ColumnType,
   type DictionaryColumn,
   MAX_COLUMN_DESCRIPTION_CHARS,
   MAX_DICTIONARY_COLUMNS,
@@ -18,9 +17,10 @@ export default function DictionaryEditor({
 }: {
   columns: DictionaryColumn[];
   onChange: (columns: DictionaryColumn[]) => void;
-  /** The connector the columns can start from, if the dataset has one. */
+  /** Where the columns can start from, as a phrase ("the QuickBooks
+   *  connector", "the uploaded file"), if the dataset has such columns. */
   source: string | null;
-  /** Puts that connector's columns back; shown once the columns differ. */
+  /** Puts those columns back; shown once the columns differ. */
   onUseSource?: () => void;
 }) {
   const problem = dictionaryProblem(columns);
@@ -33,7 +33,7 @@ export default function DictionaryEditor({
       <p className="text-xs text-slate-500">
         Researchers see the dataset’s table name and these columns, never its rows.{" "}
         {source && !onUseSource
-          ? `Pre-filled from the ${source} connector; edit as needed.`
+          ? `Pre-filled from ${source}; edit as needed.`
           : "Describe the columns researchers can query."}
       </p>
       {columns.length > 0 && (
@@ -90,7 +90,7 @@ export default function DictionaryEditor({
         </button>
         {source && onUseSource && (
           <button type="button" onClick={onUseSource} className={quietBtnCls}>
-            Use the {source} connector’s columns
+            Use {source}’s columns
           </button>
         )}
       </div>

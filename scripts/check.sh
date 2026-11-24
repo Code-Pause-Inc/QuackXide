@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # check.sh — full validation: backend fmt/check/clippy/test, the browser
-# envelope module (wasm), frontend typecheck/lint/test/build, the white-label
-# guards, the secret scan, and the attribution guard.
+# envelope module (wasm), frontend typecheck/lint/test/build, the release
+# build's page headers, the white-label guards, the secret scan, and the
+# attribution guard.
 # Must pass before every push.
 # =============================================================================
 set -euo pipefail
@@ -46,6 +47,9 @@ echo "== frontend: unit tests =="
 echo "== frontend: production build =="
 (cd "$ROOT/frontend" && npm run build)
 
+echo "== release build: page headers (CSP file, policy headers, worker script) =="
+"$ROOT/scripts/check-page-headers.sh"
+
 echo "== white-label guard: the engine name must not reach the shipped bundle =="
 if grep -riq "quackxide" "$ROOT/frontend/dist"; then
     echo "FAIL: engine name leaked into the customer-facing bundle"
@@ -72,9 +76,22 @@ if grep -rn "Confidential Drive" "$ROOT/backend/crates" "$ROOT/frontend/src" 2>/
 fi
 
 echo "== data guard: data files live only in fixtures/ (docs/DATA_POLICY.md) =="
-if git -C "$ROOT" ls-files \
-    | grep -iE '\.(csv|tsv|parquet|ndjson|jsonl|xlsx?|sav|dta|sas7bdat|xpt|rds|rdata|feather|arrow|avro|orc|vcf|bam|cram|fastq|dcm|hl7|sqlite|db)$' \
-    | grep -v '/fixtures/'; then
+# The data files among the paths on stdin that are outside a fixtures/
+# directory at any depth, the repository's top-level one included.
+data_outside_fixtures() {
+    grep -iE '\.(csv|tsv|parquet|ndjson|jsonl|xlsx?|sav|dta|sas7bdat|xpt|rds|rdata|feather|arrow|avro|orc|vcf|bam|cram|fastq|dcm|hl7|sqlite|db)$' \
+        | grep -vE '(^|/)fixtures/' || true
+}
+# Selftest: what the guard must flag and what it must let through.
+selftest="$(printf '%s\n' fixtures/a.parquet backend/fixtures/b.csv data.csv notfixtures/c.parquet \
+    fixtures-old/d.ndjson README.md | data_outside_fixtures)"
+if [ "$selftest" != "$(printf '%s\n' data.csv notfixtures/c.parquet fixtures-old/d.ndjson)" ]; then
+    echo "FAIL: data guard selftest flagged: $selftest"
+    exit 1
+fi
+outside="$(git -C "$ROOT" ls-files | data_outside_fixtures)"
+if [ -n "$outside" ]; then
+    printf '%s\n' "$outside"
     echo "FAIL: data file outside a fixtures/ directory"
     exit 1
 fi

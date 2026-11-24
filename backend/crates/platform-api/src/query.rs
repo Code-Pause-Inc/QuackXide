@@ -835,20 +835,52 @@ impl ConnectorQueryService {
                     .begin(meta.request_nonce, meta.envelope_digest, Instant::now())
                 {
                     Begin::New(guard) => Some(guard),
-                    Begin::Stored(StoredOutcome::Ok(body)) => return Ok(body),
-                    Begin::Stored(StoredOutcome::Err(err)) => return Err(err),
-                    Begin::Refused(refusal) => {
+                    // Uncharged, so not `engine.query`, which meters charges.
+                    Begin::Stored(stored) => {
+                        let (reply, kind) = match stored {
+                            StoredOutcome::Ok(body) => (Ok(body), "ok"),
+                            StoredOutcome::Err(err) => {
+                                let kind = err.kind();
+                                (Err(err), kind)
+                            }
+                        };
+                        security_audit_event(
+                            AuditKind::ResearchReplay,
+                            Some(researcher),
+                            "replayed",
+                            &format!(
+                                "research replay steward={steward} connector={connector} \
+                                 stored={kind}"
+                            ),
+                        );
+                        return reply;
+                    }
+                    // Another envelope under the nonce is a denial; the same
+                    // envelope too early or too late is a retry.
+                    Begin::Refused(ApiError::NonceUsed) => {
                         security_audit_event(
                             AuditKind::AuthDecision,
                             Some(researcher),
                             "denied",
                             &format!(
-                                "sealed research query refused reason={} steward={steward} \
-                             connector={connector}",
-                                refusal.kind()
+                                "sealed research query refused reason=nonce_used \
+                                 steward={steward} connector={connector}"
                             ),
                         );
-                        return Err(refusal);
+                        return Err(ApiError::NonceUsed);
+                    }
+                    Begin::Refused(retry) => {
+                        security_audit_event(
+                            AuditKind::ResearchReplay,
+                            Some(researcher),
+                            "retry",
+                            &format!(
+                                "sealed research query retry reason={} steward={steward} \
+                                 connector={connector}",
+                                retry.kind()
+                            ),
+                        );
+                        return Err(retry);
                     }
                 }
             }
@@ -1362,7 +1394,8 @@ mod tests {
     /// cancel the query: it finishes and stores its response, and the retry
     /// of the same request gets that response, charged once (ADR 0010).
     /// The client drops while the query waits for the only plaintext slot,
-    /// which a first query holds.
+    /// which a first query holds. A retry while it waits is refused as a
+    /// retry, not an authorization denial.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_disconnected_client_still_gets_its_result_on_retry() {
         let (steward, researcher) = (TenantId::generate(), TenantId::generate());
@@ -1469,6 +1502,31 @@ mod tests {
         .expect("the sealed query was charged");
         client.abort();
         assert!(client.await.is_err_and(|e| e.is_cancelled()));
+
+        // Called on this thread, so the thread-local capture sees its events.
+        let capture = platform_telemetry::capture::AuditCapture::install();
+        assert!(matches!(
+            service.research_query(researcher, sealed()).await,
+            Err(ApiError::QueryRunning)
+        ));
+        let events = capture.events();
+        drop(capture);
+        assert!(
+            events.iter().any(|e| e.audit_kind == "research.replay"
+                && e.outcome == "retry"
+                && e.detail
+                    == format!(
+                        "sealed research query retry reason=query_running steward={steward} \
+                         connector={connector}"
+                    )),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.audit_kind == "auth.decision" || e.audit_kind == "engine.query"),
+            "{events:?}"
+        );
 
         release_tx.send(()).expect("first query waiting");
         release_tx.send(()).expect("policy alive");

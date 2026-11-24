@@ -167,6 +167,85 @@ The wasm envelope module is 97 838 bytes, 39 200 gzipped.
 * Like the backend numbers, these vary from run to run and are a reference,
   not a gate.
 
+## Steward upload in the browser
+
+The browser side of a steward upload (ADR 0014), timed end to end at the
+upload limit (`DATASET_MAX_MIB`, 64 by default). It is a manual run, for
+each release candidate: the upload needs a running API, which the browser
+test job does not start. Its times depend on the machine it runs on, so
+none are recorded here. The seal, most of its cost, is tracked on CI by the
+browser envelope seal benchmark below.
+
+**Method.** `synth-data --schema wide --seed 1 --rows 346000` writes the
+largest such file whose sealed object fits 64 MiB: 66 968 978 bytes, 23
+columns, a 4 905-byte footer. The page runs the app's own code in its dev
+server, against a development build of `platform-api` on the same machine
+(in-memory vault): the footer worker reads the footer, then the crypto
+worker's upload operation checks the enrolled key, reads the file, seals it
+and its manifest, and sends the body through the dev server's proxy. Six
+uploads of the file in a row, each replacing the last; the first starts a
+fresh crypto worker, so it includes the wasm module's cold start. The body
+crosses loopback, so the steward's uplink, which a real upload waits on, is
+not part of the measure.
+
+Whatever the machine, the sealed object is 66 969 030 bytes, 52 more than
+the file, and a file of 350 000 rows (67 691 400 bytes) is refused before
+anything is read, sealed or sent.
+
+The footer reader is a worker chunk of its own: 15 620 bytes minified,
+5 147 gzipped, of which hyparquet's Thrift decoder is 1 327 bytes (636
+gzipped). It adds nothing to the UI or crypto worker chunks (`npm run
+build`).
+
+**Target, proposed, needs @AxolDad:** on the machine the browser envelope
+seal's targets are read on, in Chromium, the footer read within 100 ms and
+the upload within 3 s once the module is loaded, at `DATASET_MAX_MIB`,
+network excluded. The seal target, 100 MiB in under 3 s, covers most of it.
+
+**To repeat it**, from `backend/`, write the file, then start the API:
+
+```sh
+cargo run -p synth-data -- --schema wide --seed 1 --rows 346000 --out ../frontend/node_modules/.cache/upload-bench.parquet
+APP_ENV=development cargo run -p platform-api
+```
+
+From `frontend/` in a second terminal, start the dev server with a
+development token:
+
+```sh
+VITE_VAULT_MODE=http VITE_DEV_JWT="$(cd ../backend && APP_ENV=development cargo run -q -p platform-api --features dev --bin devtoken 2>/dev/null)" npm run dev
+```
+
+Open `http://localhost:5173` (the Drive tab enrolls the browser's key),
+switch to the Research tab, and run this in the browser console:
+
+```js
+const { readFooterInWorker } = await import("/src/lib/datasets/footerClient.ts");
+const { DriveWorkerClient } = await import("/src/lib/crypto/workerClient.ts");
+const token = document.querySelector('input[type="password"]').value;
+const blob = await (await fetch("/node_modules/.cache/upload-bench.parquet")).blob();
+const file = new File([blob], "bench.parquet");
+const client = new DriveWorkerClient();
+await client.setSession(token);
+let current = null;
+for (let i = 0; i < 6; i += 1) {
+  const t0 = performance.now();
+  const reading = await readFooterInWorker(file);
+  const t1 = performance.now();
+  const stored = await client.uploadDataset({
+    file,
+    dataset: "upload_bench",
+    schema: reading.schema,
+    rowCap: reading.rows,
+    currentVersion: current,
+    maxBytes: 64 * 1024 * 1024,
+  });
+  current = stored.version;
+  console.log(`footer ${Math.round(t1 - t0)} ms, upload ${Math.round(performance.now() - t1)} ms`);
+}
+client.terminate();
+```
+
 ## Targets and regression threshold
 
 Agreed with the maintainer (2026-11-23).

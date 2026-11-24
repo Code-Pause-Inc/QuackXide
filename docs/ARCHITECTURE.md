@@ -94,7 +94,11 @@ Client key architecture:
   enrolled key reads it through `verify_enrollment_record`.
 * **Worker isolation** — all key handling, encryption, and vault I/O run in a
   dedicated Web Worker (`lib/crypto/worker.ts`). The DOM/UI thread exchanges
-  only opaque ids, decrypted summaries it asked for, and download Blobs.
+  only opaque ids, decrypted summaries it asked for, and download Blobs. A
+  steward upload's Parquet footer is read in a short-lived worker of its own
+  (`lib/datasets/footer.worker.ts`, ADR 0014), so the footer is parsed only
+  there: the UI thread gets the declared schema and row count, and the
+  key-holding worker reads the file only to seal it.
 * **AAD discipline** — every AES-GCM operation binds
   `tenant|object|role(|chunk-index)`, so a vault cannot reorder chunks,
   splice records across objects, or re-attach wrapped keys undetected.
@@ -106,8 +110,9 @@ Client key architecture:
   device's HPKE private key (`openWithDeviceKey`), and derives the public
   key it enrolls. The module never sees the KEK or file keys. The frame
   magic names the suite, so a new suite changes no caller. Only the worker
-  loads the module (an ESLint rule refuses its glue elsewhere); no worker
-  operation exposes sealing or opening to the UI yet.
+  loads the module (an ESLint rule refuses its glue elsewhere). One worker
+  operation seals: `uploadDataset`, a steward's upload (section 2); none
+  exposes opening to the UI.
 * **Vault backends** — the worker picks by `VITE_VAULT_MODE`: `LocalVault`
   (IndexedDB, offline) or `HttpVault` (drive API), both behind the same
   ciphertext-only `VaultClient` interface. Server side, one
@@ -179,9 +184,15 @@ it does not know filenames, content, or keys.
 ### 2. Steward upload (confidential ingress from the browser)
 
 ```
+Browser footer worker
+─────────────────────
+Parquet file (device only): read the footer tail only
+declare schema and row cap, or refuse
+  (the rules of the enclave's reader, ADR 0014)
+                │
 Browser crypto worker                API (Axum)                                   Object store
 ─────────────────────                ──────────                                   ────────────
-Parquet file (device only)
+enrolled key == device key?  ──no──▶ refused before sealing
 seal object to steward key
   steward-upload-v1|t|ds|obj           (-v2 under HPK2)
 seal manifest {version, [obj]}
@@ -257,7 +268,10 @@ header: version, obj, row cap,
   its version and write time, the ids, count and total ciphertext bytes
   of the objects stored at that version, and the suite the record names
   (`null` if the record is missing at the current version, malformed or
-  names a suite this build does not read). Superseded snapshots and
+  names a suite this build does not read) and, for an upload, the row cap
+  and schema the same record declares, which a re-upload must declare
+  again. The response also gives the upload size limit
+  (`dataset_max_bytes`). Superseded snapshots and
   uploads that have not committed are not counted. If a snapshot's record
   is gone when it is read, because an upload or sync committed during the
   listing and pruned it, the dataset is read again, once, and described
@@ -268,8 +282,31 @@ header: version, obj, row cap,
   event.
 
 Both routes need only the vault and the configuration, so they work
-where the query service is not configured. The browser half (sealing and
-the upload form) is not built yet (P40).
+where the query service is not configured.
+
+The browser half ([ADR 0014](adr/0014-browser-upload-footer-reader.md)) is
+the research portal's stewardship panel, which lists the stored datasets
+from `GET /api/v1/datasets` and publishes listings for them only:
+
+* **Footer first.** A worker of its own reads only the file's tail (the
+  8-byte trailer, then a footer of at most 1 MiB) with hyparquet's Thrift
+  decoder, and declares each column's name and type family by the rules of
+  the enclave's Parquet reader, refined by the file's embedded Arrow
+  schema. A file the enclave could not read, a column no family covers, and
+  a flat column whose embedded type is nested are refused; so is a schema
+  unlike the dataset's recorded one, a
+  re-upload whose recorded schema is unreadable, and a file whose sealed
+  object would exceed `dataset_max_bytes`. `fixtures/parquet/` holds files
+  both sides must read alike. The enclave checks again.
+* **Sealed in the crypto worker.** The upload operation uses the device's
+  existing key and never creates one, and refuses before reading the file
+  unless the tenant's enrolled key is that key. It draws the object id and
+  version, binds the session's `tid`, seals the object and the manifest
+  (`HPK1` until P36, so an upload opens only under development's test key
+  providers until then), zeroes its copy of the plaintext and sends the body
+  under the session's token. Refusals are shown in the form, 401 and 403
+  included. The form says, before the upload, that column names and types
+  are stored in plaintext.
 
 The operator can see the tenant id, the dataset name, the object id, the
 snapshot versions and their times, ciphertext lengths, the suite, and the
@@ -688,8 +725,9 @@ hold or one given twice, or a description over 500 characters (400), and
 a dictionary not of that shape (422); a re-publish replaces the columns.
 `GET /api/v1/connectors` gives the columns each built-in connector's
 mapper writes, which the publish form starts a connector dataset's
-dictionary from; an upload's are entered by hand. The portal shows the
-dictionary on every listing and each authorized dataset, with a
+dictionary from; an upload's starts from the schema it declared, as the
+dataset listing gives it (ADR 0014). The portal shows the dictionary on
+every listing and each authorized dataset, with a
 `SELECT COUNT(*) AS n` example over the table name.
 
 Researchers file
@@ -865,6 +903,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+| `research.replay` | A sealed research query's envelope sent again: its stored response ("replayed") or a retry while it runs or after that response expired ("retry"). Never charged, so never `engine.query` |
 | `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope, upload or snapshot record whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
@@ -906,9 +945,10 @@ Rules, enforced by the capture tests:
    budget reads of unknown, foreign and malformed grant ids, and sealed
    research queries refused (an unsupported version, an unknown key set, a
    frame that does not open, a reused nonce), each an `auth.decision`
-   naming its reason, and key release refusing a deployment's configuration
+   naming its reason, key release refusing a deployment's configuration
    (a digest the token does not carry, or a loosened control), each a
-   `crypto.key_release` denial naming its reason.
+   `crypto.key_release` denial naming its reason, and a replayed stored
+   response (`research.replay` "replayed", with no second `engine.query`).
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on
@@ -938,6 +978,52 @@ OpenMetrics text format (which Prometheus scrapes) on a loopback-only
 listener (`METRICS_BIND_ADDR`, default `127.0.0.1:9464`), never on the
 API's port. Labels are route patterns, methods, status codes and error
 kinds only: no tenant ids, paths, messages, SQL text or engine name.
+
+## HTTP edge
+
+`platform_api::build_apps` wraps every route `routes()` defines
+(`/api/v1/*`, `/admin/*`, `/healthz`, `/readyz`), not the loopback metrics
+router. Layers, outermost first:
+
+1. **Headers.** `Content-Security-Policy`, `X-Content-Type-Options:
+   nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and
+   `Cache-Control: no-store`, each overriding anything a handler set, so
+   every response (auth rejections, 404s, timeouts and panics included)
+   carries exactly one of each.
+2. **Request metrics** (`metrics::track`), so timeouts and caught panics
+   are counted.
+3. **Panic containment.** A handler panic answers 500 `{"error":"internal"}`
+   and the edge logs one `tracing::error!` with a fixed message and no
+   panic text (not a security audit event). Rust's default panic hook still
+   prints the panic message to stderr. The release profile unwinds, so this
+   catches.
+4. **Timeouts, per route group.** Query routes (`POST /api/v1/query`,
+   `POST /api/v1/research/query`): `QUERY_SLOT_WAIT_SECS` plus
+   `QUERY_TIMEOUT_SECS` plus a 60 s margin for key release, storage reads
+   and writing the response, so the query's own limits end it first. Upload
+   routes (drive `PUT`s, `PUT /api/v1/datasets/{dataset}`): no total, a 30 s
+   gap between body reads (408). Everything else: 60 s. A server timeout
+   answers 503 with an empty body.
+
+The first four headers in layer 1 are the page headers, one `Name: value`
+line each in `backend/crates/platform-api/page-headers.txt`, embedded by
+`platform-api` (`edge::page_headers`) and read by `vite.config.ts` for
+`vite preview`; no setting can widen them (ADR 0005: the environment may
+only tighten controls). `Cache-Control: no-store` is not in the file: every
+response `platform-api` sends today is an API response, and #181, which
+will serve the static files, decides their caching. `vite preview` stands
+in for that and sends the page headers without `no-store`.
+`scripts/check-page-headers.sh` (part of `scripts/check.sh`) builds the
+release bundle, serves it and checks the page, `/index.html` and the
+crypto worker script for exactly one of each header in the file, with its
+value, and no `no-store`. `frontend/scripts/csp-smoke.mjs`
+(`check-page-headers.sh --smoke`, the `browser` workflow) loads the page in
+Chromium and runs a worker operation that instantiates the wasm module, and
+fails on any policy violation.
+
+There is no CORS layer: the page and the API share one origin (ADR 0005),
+so no cross-origin caller is allowed. The release build refuses a non-empty
+`VITE_API_BASE_URL`.
 
 ## Production mode
 

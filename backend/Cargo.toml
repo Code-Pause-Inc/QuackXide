@@ -49,7 +49,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 axum = "0.8"
 prometheus-client = "0.26"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "cors", "limit"] }
+tower-http = { version = "0.7", features = ["trace", "limit", "set-header", "timeout", "catch-panic"] }
 
 # ── serialization + core types ───────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }

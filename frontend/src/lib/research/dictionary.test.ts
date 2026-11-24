@@ -6,6 +6,7 @@ import {
   MAX_DICTIONARY_COLUMNS,
   connectorPrefill,
   dictionaryProblem,
+  uploadPrefill,
   exampleQuery,
   isColumnName,
   quotedTableName,
@@ -94,7 +95,7 @@ describe("connectorPrefill", () => {
 
   it("starts a connector dataset from its mapper's columns, undescribed", () => {
     expect(connectorPrefill(connectors, "quickbooks")).toEqual({
-      source: "QuickBooks",
+      source: "the QuickBooks connector",
       columns: [
         { name: "id", type: "string", description: "" },
         { name: "total", type: "float64", description: "" },
@@ -106,6 +107,36 @@ describe("connectorPrefill", () => {
     expect(connectorPrefill(connectors, "upload_cohorts")).toBeNull();
     expect(connectorPrefill(connectors, "research_extract")).toBeNull();
     expect(connectorPrefill([], "quickbooks")).toBeNull();
+  });
+});
+
+describe("uploadPrefill", () => {
+  const datasets = [
+    {
+      dataset: "upload_cohorts",
+      schema: [
+        { name: "condition", type: "string" as const },
+        { name: "age", type: "int64" as const },
+      ],
+    },
+    { dataset: "quickbooks", schema: null },
+    { dataset: "upload_broken", schema: null },
+  ];
+
+  it("starts an upload from the schema it declared, undescribed", () => {
+    expect(uploadPrefill(datasets, "upload_cohorts")).toEqual({
+      source: "the uploaded file",
+      columns: [
+        { name: "condition", type: "string", description: "" },
+        { name: "age", type: "int64", description: "" },
+      ],
+    });
+  });
+
+  it("has nothing without a declared schema", () => {
+    expect(uploadPrefill(datasets, "quickbooks")).toBeNull();
+    expect(uploadPrefill(datasets, "upload_broken")).toBeNull();
+    expect(uploadPrefill(datasets, "upload_unknown")).toBeNull();
   });
 });
 
