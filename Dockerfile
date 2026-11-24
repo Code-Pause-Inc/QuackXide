@@ -29,11 +29,13 @@ RUN cargo build --release --locked -p platform-api --features dev \
         --bin key-release \
         --bin query-demo \
         --bin seal-upload \
+        --bin enclave-check \
         --bin sim-attestation \
     && strip target/release/platform-api \
              target/release/key-release \
              target/release/query-demo \
              target/release/seal-upload \
+             target/release/enclave-check \
              target/release/sim-attestation
 
 # ── Target 1: simulated enclave workload (platform-api) ─────────────────────
@@ -94,3 +96,16 @@ COPY --from=builder /workspace/backend/target/release/seal-upload /usr/local/bin
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/seal-upload"]
+
+# ── Target 5: the researcher's browser, verifying the enclave and sealing a
+#    research query (run on demand) ──────────────────────────────────────────
+FROM debian:bookworm-slim AS enclave-check
+
+# It talks plain HTTP to the simulated stack's internal network only.
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --shell /usr/sbin/nologin --no-create-home nonroot
+
+COPY --from=builder /workspace/backend/target/release/enclave-check /usr/local/bin/enclave-check
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/enclave-check"]

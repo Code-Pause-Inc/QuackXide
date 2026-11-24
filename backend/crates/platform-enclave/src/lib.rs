@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use rand::Rng;
 
 pub mod binding;
+pub mod config;
+pub mod evidence;
 #[cfg(feature = "simulated")]
 pub mod simulated_token;
 pub mod token;
@@ -171,21 +173,6 @@ impl AttestationProvider for SnpAttestation {
     }
 }
 
-/// Decode a fixed-length hex string into `[u8; N]`.
-pub fn decode_hex_array<const N: usize>(hex: &str) -> Option<[u8; N]> {
-    let hex = hex.trim();
-    if hex.len() != N * 2 {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi = (chunk[0] as char).to_digit(16)?;
-        let lo = (chunk[1] as char).to_digit(16)?;
-        out[i] = ((hi << 4) | lo) as u8;
-    }
-    Some(out)
-}
-
 /// A fresh 32-byte attestation nonce from the operating system's RNG.
 pub fn fresh_nonce() -> [u8; 32] {
     rand::rngs::OsRng.r#gen()
@@ -250,7 +237,10 @@ impl AttestationProvider for RejectingProvider {
 /// The SNP provider when attestation is required. Otherwise the simulated
 /// token provider, in builds with the `simulated` feature and
 /// `SIM_ATTESTATION_URL` set, and a provider that refuses in all other cases.
-pub fn provider_for(attestation_required: bool) -> std::sync::Arc<dyn AttestationProvider> {
+pub fn provider_for(
+    attestation_required: bool,
+    workload_env: std::collections::BTreeMap<String, String>,
+) -> std::sync::Arc<dyn AttestationProvider> {
     if attestation_required {
         return std::sync::Arc::new(SnpAttestation::new());
     }
@@ -265,12 +255,16 @@ pub fn provider_for(attestation_required: bool) -> std::sync::Arc<dyn Attestatio
         let policy = token::ReleasePolicy {
             allowed_image_digests: vec![simulated_token::SIMULATED_IMAGE_DIGEST.to_owned()],
         };
-        return std::sync::Arc::new(simulated_token::SimulatedTokenProvider::from_url(
-            url.trim(),
-            &issuer,
-            policy,
-        ));
+        // As Confidential Space's launcher would, the tokens report the
+        // workload's bound configuration.
+        return std::sync::Arc::new(
+            simulated_token::SimulatedTokenProvider::from_url(url.trim(), &issuer, policy)
+                .with_workload_env(workload_env),
+        );
     }
+    // Only the simulator reports it: a real launcher reads the container's.
+    #[cfg(not(feature = "simulated"))]
+    drop(workload_env);
     std::sync::Arc::new(RejectingProvider)
 }
 

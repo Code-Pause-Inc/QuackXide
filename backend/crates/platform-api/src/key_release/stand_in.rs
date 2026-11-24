@@ -21,13 +21,14 @@
 //!    session ([`QueryKeySession`]), opens the snapshot manifest and objects,
 //!    and drops the key as soon as decryption completes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -36,6 +37,7 @@ use platform_core::TenantId;
 use platform_crypto::{
     EnvelopeSuite, SecretBytes, SuitePolicy, TenantKeypair, hpke_seal_to_tenant,
 };
+use platform_enclave::config::{BOUND_CONFIG_NAMES, config_digest};
 use platform_enclave::simulated_token::TokenSigner;
 use platform_enclave::token::{
     JwkSet, ReleasePolicy, SIMULATED_AUDIENCE, TokenError, TokenVerifier, nonces_from_bytes,
@@ -44,8 +46,8 @@ use platform_enclave::{AttestationProvider, EnclaveKeyBinding, fresh_nonce};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use subtle::ConstantTimeEq;
 
+use super::compiled_config_policy;
 use super::{EnclaveIdentity, KeyWire, SigningKeysWire, decode_b64url_32};
 use crate::ApiError;
 use crate::query::{EnclaveKeyProvider, QueryKeySession, open_tenant_envelope};
@@ -161,7 +163,6 @@ pub struct KeyReleaseRelyingParty {
     verifier: RwLock<Option<Arc<TokenVerifier>>>,
     last_fetch: Mutex<Option<Instant>>,
     refetch_interval: Duration,
-    expected_config_digest: Option<[u8; 32]>,
     challenge_ttl: Duration,
     challenges: Mutex<HashMap<[u8; 32], Instant>>,
     keys: RwLock<HashMap<TenantId, SecretBytes>>,
@@ -181,7 +182,6 @@ impl KeyReleaseRelyingParty {
             verifier: RwLock::new(None),
             last_fetch: Mutex::new(None),
             refetch_interval: KEY_REFETCH_INTERVAL,
-            expected_config_digest: None,
             challenge_ttl: CHALLENGE_TTL,
             challenges: Mutex::new(HashMap::new()),
             keys: RwLock::new(HashMap::new()),
@@ -191,11 +191,6 @@ impl KeyReleaseRelyingParty {
 
     pub fn with_refetch_interval(mut self, interval: Duration) -> Self {
         self.refetch_interval = interval;
-        self
-    }
-
-    pub fn with_expected_config_digest(mut self, digest: [u8; 32]) -> Self {
-        self.expected_config_digest = Some(digest);
         self
     }
 
@@ -370,17 +365,10 @@ impl KeyReleaseRelyingParty {
                 ApiError::Forbidden
             })?),
         };
-        let config_digest = decode_b64url_32(&req.config_digest_b64).ok_or_else(|| {
+        let config_digest_bound = decode_b64url_32(&req.config_digest_b64).ok_or_else(|| {
             self.audit_denial(tenant, "malformed config digest");
             ApiError::Forbidden
         })?;
-
-        if let Some(expected_cfg) = &self.expected_config_digest
-            && !bool::from(expected_cfg.ct_eq(&config_digest))
-        {
-            self.audit_denial(tenant, "deployment config digest mismatch");
-            return Err(ApiError::Forbidden);
-        }
 
         // Recompute the binding the token's nonces must carry.
         let expected_binding = EnclaveKeyBinding {
@@ -389,7 +377,7 @@ impl KeyReleaseRelyingParty {
             signing_ml_dsa_65: signing_keys.ml_dsa_65_bytes(),
             kms_public_key,
             tls_spki_sha256,
-            config_digest,
+            config_digest: config_digest_bound,
         };
         let expected_nonces = nonces_from_bytes(&expected_binding.report_data(&nonce))
             .map_err(|_| ApiError::AttestationUnavailable)?;
@@ -407,12 +395,27 @@ impl KeyReleaseRelyingParty {
             );
             status
         })?;
-        verifier
+        let verified = verifier
             .verify(&req.token, &expected_nonces)
             .map_err(|err| {
                 self.audit_denial(tenant, &err.to_string());
                 ApiError::Forbidden
             })?;
+        // The configuration the token reports must be the one the request
+        // bound, and must pass this build's policy (ADR 0005): an allowed
+        // image under a loosened configuration gets no keys.
+        let env = verified.container_env();
+        if config_digest(|name| env.get(name).cloned()) != config_digest_bound {
+            self.audit_denial(tenant, "deployment config digest mismatch");
+            return Err(ApiError::Forbidden);
+        }
+        if let Err(refused) = compiled_config_policy().check(|name| env.get(name).cloned()) {
+            self.audit_denial(
+                tenant,
+                &format!("deployment configuration refused: {refused}"),
+            );
+            return Err(ApiError::Forbidden);
+        }
 
         let keys = self
             .keys
@@ -712,6 +715,10 @@ impl EnclaveKeyProvider for AttestedKeyProvider {
 struct TokenRequest {
     audience: String,
     nonces: Vec<String>,
+    /// The workload's bound configuration, which the simulator puts in
+    /// `submods.container.env` as Confidential Space's launcher would.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// The `sim-attestation` service: `POST /v1/token` signs a token for the
@@ -727,8 +734,19 @@ pub fn sim_attestation_router(signer: Arc<TokenSigner>) -> Router {
             "/v1/token",
             post(
                 |State(signer): State<Arc<TokenSigner>>, Json(req): Json<TokenRequest>| async move {
-                    let token = signer.sign(&req.audience, &req.nonces, Duration::from_secs(3600));
-                    Json(json!({ "token": token }))
+                    if req
+                        .env
+                        .keys()
+                        .any(|name| !BOUND_CONFIG_NAMES.contains(&name.as_str()))
+                    {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    let token = signer.with_env(req.env).sign(
+                        &req.audience,
+                        &req.nonces,
+                        Duration::from_secs(3600),
+                    );
+                    Ok(Json(json!({ "token": token })))
                 },
             ),
         )

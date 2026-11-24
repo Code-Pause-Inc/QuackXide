@@ -72,6 +72,24 @@ uses [Semantic Versioning](https://semver.org/).
   The plaintext body `{steward_tenant, connector, sql}` is compiled only
   into development builds and refuses unknown fields. `TokenVerifier`
   requires a token's nonces exactly and in order.
+* Enclave verification for research queries (ADR 0010; part of P85).
+  `platform-enclave` runs ADR 0010's five browser checks once
+  (`evidence::verify_evidence`): Google's signature and validity, the
+  platform claims, the image digest, the client's challenge, and the
+  binding of the enclave's keys and the configuration the token reports,
+  held to a compiled policy (`config::ConfigPolicy`). The bound names are
+  `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
+  `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DOMINANCE_PERCENT` (at least
+  10 in every build); the enclave digests its own environment
+  instead of `ENCLAVE_CONFIG_DIGEST_HEX`, and the key-release stand-in
+  checks the token's configuration instead of
+  `KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX`. Development builds hold the
+  simulator's policy (attestation may be off, k at least 2). New
+  `enclave-check` binary: `verify` checks a deployment, `seal-query` seals a
+  research query to it, and `keygen` (development builds) makes a
+  researcher key; a release build takes its trust anchors from the caller,
+  over `https`. The simulated-TEE script sends only sealed research
+  queries.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals

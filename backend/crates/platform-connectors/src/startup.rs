@@ -51,7 +51,9 @@ pub fn build(config: &PlatformConfig) -> anyhow::Result<WorkerStartup> {
     };
 
     let require_attestation = config.features.tee_attestation_required;
-    let attestation = platform_enclave::provider_for(require_attestation);
+    // Syncs only gate on attestation; the worker serves no evidence bundle
+    // and releases no keys, so it reports no bound configuration.
+    let attestation = platform_enclave::provider_for(require_attestation, Default::default());
     if !require_attestation {
         tracing::warn!(
             "TEE_ATTESTATION_REQUIRED=false — syncs attest through the simulated TEE (dev builds with SIM_ATTESTATION_URL) or are refused"

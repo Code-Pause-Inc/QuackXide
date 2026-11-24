@@ -23,3 +23,5 @@ platform-core.workspace = true
 dotenvy.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+# The configuration names attestation binds (`EnclaveConfig::attested_env`).
+platform-enclave.workspace = true

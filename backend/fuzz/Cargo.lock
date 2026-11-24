@@ -2091,6 +2091,7 @@ version = "0.1.0"
 dependencies = [
  "dotenvy",
  "platform-core",
+ "platform-enclave",
  "platform-telemetry",
  "thiserror",
  "zeroize",

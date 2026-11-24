@@ -12,8 +12,6 @@
 //!   `http://sim-attestation:8070`).
 //! - `KEY_RELEASE_ALLOWED_IMAGE_DIGEST`: image digest the release policy
 //!   allows (default: the simulator's built-in digest).
-//! - `KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX`: optional 64-char hex (32-byte)
-//!   expected deployment configuration digest.
 //! - `TEE_ATTESTATION_REQUIRED`: must be `false`; the stand-in verifies
 //!   simulated tokens only.
 
@@ -21,7 +19,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use platform_api::key_release::{HttpKeySource, KeyReleaseRelyingParty};
-use platform_enclave::decode_hex_array;
 use platform_enclave::simulated_token::{DEFAULT_SIM_ISSUER, SIMULATED_IMAGE_DIGEST};
 use platform_enclave::token::ReleasePolicy;
 
@@ -59,20 +56,11 @@ async fn main() -> anyhow::Result<()> {
             SIMULATED_IMAGE_DIGEST,
         )],
     };
-    let mut relying_party = KeyReleaseRelyingParty::new(
+    let relying_party = KeyReleaseRelyingParty::new(
         Arc::new(HttpKeySource::new(&sim_url)),
         env_or("SIM_ATTESTATION_ISSUER", DEFAULT_SIM_ISSUER),
         policy,
     );
-    let cfg = env_or("KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX", "");
-    if !cfg.is_empty() {
-        let digest = decode_hex_array::<32>(&cfg).ok_or_else(|| {
-            anyhow::anyhow!(
-                "KEY_RELEASE_EXPECTED_CONFIG_DIGEST_HEX must be exactly 64 hex chars (32 bytes)"
-            )
-        })?;
-        relying_party = relying_party.with_expected_config_digest(digest);
-    }
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "key-release stand-in listening");

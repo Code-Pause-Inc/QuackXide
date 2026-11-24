@@ -717,6 +717,78 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
     );
 }
 
+/// Key release refuses a deployment whose token reports another
+/// configuration than the request binds, or one that loosens a control
+/// (ADR 0005), and each refusal is a `crypto.key_release` denial naming why.
+#[tokio::test]
+async fn key_release_refusals_of_the_configuration_are_audited() {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use platform_api::key_release::{
+        EnclaveIdentity, KeyReleaseRelyingParty, KeyReleaseRequest, KeyWire, StaticKeySource,
+    };
+    use platform_enclave::config::config_digest;
+    use platform_enclave::token::{SIMULATED_AUDIENCE, nonces_from_bytes};
+
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let rp = KeyReleaseRelyingParty::new(
+        Arc::new(StaticKeySource(sim_signer().jwks())),
+        sim_signer().issuer(),
+        sim_policy(),
+    );
+    rp.insert_tenant_key(
+        tenant,
+        &TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk2),
+    )
+    .expect("HPK2 key");
+    let env = |k: &str| BTreeMap::from([("RESEARCH_MIN_COHORT_SIZE".to_owned(), k.to_owned())]);
+    // (the configuration the key set binds, the one the token reports)
+    let cases = [
+        (
+            env("5"),
+            BTreeMap::new(),
+            "deployment config digest mismatch",
+        ),
+        (
+            env("1"),
+            env("1"),
+            "deployment configuration refused: RESEARCH_MIN_COHORT_SIZE loosens a control",
+        ),
+    ];
+    for (bound, reported, detail) in cases {
+        let identity =
+            EnclaveIdentity::with_metadata(None, config_digest(|n| bound.get(n).cloned()));
+        let challenge = rp.issue_challenge();
+        let nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&challenge.nonce_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let nonces = nonces_from_bytes(&identity.binding().report_data(&nonce)).unwrap();
+        let token = sim_signer().with_env(reported).sign(
+            SIMULATED_AUDIENCE,
+            &nonces,
+            Duration::from_secs(600),
+        );
+        let request = KeyReleaseRequest {
+            tenant_id: tenant.to_string(),
+            nonce_b64: challenge.nonce_b64,
+            token,
+            request_key: KeyWire::from_public_key(&identity.request_public_key()),
+            signing_keys: identity.signing_keys().clone(),
+            kms_public_key: None,
+            tls_spki_sha256: None,
+            config_digest_b64: URL_SAFE_NO_PAD.encode(identity.binding().config_digest),
+        };
+        assert!(rp.release_key(&request).await.is_err(), "{detail}");
+        assert_tenant_event(&capture, "crypto.key_release", "denied", tenant, detail);
+    }
+}
+
 #[tokio::test]
 async fn drive_listing_past_the_cap_is_audited() {
     let capture = AuditCapture::install();

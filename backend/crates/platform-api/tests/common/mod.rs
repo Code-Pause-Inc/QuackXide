@@ -23,6 +23,7 @@ use parquet::arrow::ArrowWriter;
 use platform_api::dev::DevResearchStack;
 use platform_api::key_release::{AttestationBundle, KeyWire};
 use platform_api::research::{ResearchService, ResearchStores};
+use platform_api::sealed::{SealedQueryPlaintext, seal_query};
 use platform_api::{AppState, build_app};
 use platform_auth::{GeneratedKeypair, JwtVerifier, TokenSigner, TokenType};
 use platform_config::PlatformConfig;
@@ -32,17 +33,15 @@ use platform_core::{
     ColumnType, ConnectorSlug, DeclaredColumn, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
     ZkMode,
 };
-use platform_crypto::{
-    EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey, hpke_seal_to_tenant, info,
-};
+use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
     ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
 };
 use quackxide_engine::{EngineSettings, QueryLimits};
-use serde_json::json;
 use sha2::Sha256;
 use tower::ServiceExt;
+use zeroize::Zeroizing;
 
 pub const ISS: &str = "urn:platform:auth";
 pub const AUD: &str = "urn:platform:drive";
@@ -631,7 +630,10 @@ impl VaultStore for FlakyVault {
 
 /// The steward's sealed `health` dataset (k = 5) behind the simulated
 /// enclave, whose evidence bundle carries the request key.
-pub async fn sealed_research_app(secret: &str, steward: TenantId) -> Router {
+pub async fn sealed_research_stack(
+    secret: &str,
+    steward: TenantId,
+) -> (Router, Arc<platform_enclave::simulated_token::TokenSigner>) {
     let connector = ConnectorSlug::new("health").expect("slug");
     let mut stack = DevResearchStack::new();
     stack
@@ -656,12 +658,22 @@ pub async fn sealed_research_app(secret: &str, steward: TenantId) -> Router {
         max_concurrent_queries: 4,
         limits: QueryLimits::default(),
     };
-    let service = stack.query_service(settings, research.clone());
-    build_app(AppState {
+    let signer = Arc::new(platform_enclave::simulated_token::TokenSigner::generate(
+        "urn:devstack:sim",
+        platform_enclave::simulated_token::SimulatedClaims::default(),
+    ));
+    let service = stack.query_service_with_signer(settings, research.clone(), signer.clone());
+    let app = build_app(AppState {
         research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)
-    })
+    });
+    (app, signer)
+}
+
+/// [`sealed_research_stack`]'s app.
+pub async fn sealed_research_app(secret: &str, steward: TenantId) -> Router {
+    sealed_research_stack(secret, steward).await.0
 }
 
 pub async fn attestation_bundle(app: &Router) -> AttestationBundle {
@@ -697,33 +709,26 @@ impl Sealer {
     /// bytes.
     pub fn body(&self, grant_id: &str, nonce: u8, sql: &str) -> String {
         let recipient = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
-        let plaintext = json!({
-            "steward_tenant": self.steward.to_string(),
-            "connector": "health",
-            "sql": sql,
-            "request_nonce": B64URL.encode([nonce; 32]),
-            "recipient_key": KeyWire::from_public_key(&recipient),
-        });
+        let plaintext = SealedQueryPlaintext {
+            steward_tenant: self.steward.to_string(),
+            connector: "health".to_owned(),
+            sql: Zeroizing::new(sql.to_owned()),
+            request_nonce: B64URL.encode([nonce; 32]),
+            recipient_key: KeyWire::from_public_key(&recipient),
+        };
         let request_key = self
             .bundle
             .request_key
             .to_public_key(SuitePolicy::only(EnvelopeSuite::Hpk2))
             .expect("request key");
-        let info =
-            info::research_query(EnvelopeSuite::Hpk2, &self.researcher.to_string(), grant_id)
-                .expect("info");
-        let frame = hpke_seal_to_tenant(
+        let request = seal_query(
             &request_key,
-            &info,
-            &serde_json::to_vec(&plaintext).expect("json"),
+            &self.bundle.key_id,
+            self.researcher,
+            grant_id,
+            &plaintext,
         )
         .expect("seal");
-        json!({
-            "version": 1,
-            "key_id": self.bundle.key_id,
-            "grant_id": grant_id,
-            "envelope": B64URL.encode(frame),
-        })
-        .to_string()
+        serde_json::to_string(&request).expect("json")
     }
 }
