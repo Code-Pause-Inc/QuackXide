@@ -63,7 +63,8 @@ key that opens the data.
    file the enclave could not read (ADR 0014). Each upload replaces the
    dataset's snapshot, and its size is capped by `DATASET_MAX_MIB`.
    `GET /api/v1/datasets` lists the steward's stored datasets as
-   ciphertext: object ids and sizes, suite and upload time. Connector
+   ciphertext: object ids and sizes, suite and upload time, and, for an
+   upload, the row cap and schema it declares in plaintext. Connector
    pipelines sync external sources into attested enclave memory, shape
    them into Parquet, and seal them to the tenant's HPKE key before
    anything persists. Live connector sync is not in v1.0

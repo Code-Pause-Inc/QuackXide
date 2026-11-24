@@ -44,6 +44,14 @@ export const SNAPSHOT_VERSION = /^\d{20}-[0-9a-f]{32}$/;
  *  fit the upload limit. */
 export const ENVELOPE_OVERHEAD_BYTES = 4 + 32 + 16;
 
+/** Largest Parquet footer the browser reads before it refuses the file
+ *  (ADR 0014). A real file's footer grows with its row groups and columns,
+ *  and stays in the hundreds of kilobytes even at the 512 MiB ceiling of
+ *  `DATASET_MAX_MIB`. The footer is decoded whole, so a crafted one within
+ *  the cap costs the footer worker at most about 64 MiB of heap, and the
+ *  worker's timeout bounds its time. */
+export const FOOTER_MAX_BYTES = 1024 * 1024;
+
 /** Most columns a declaration may list (`MAX_DECLARED_COLUMNS`). */
 export const MAX_DECLARED_COLUMNS = 512;
 /** Longest column name, in UTF-8 bytes (`MAX_COLUMN_NAME_BYTES`). */

@@ -42,8 +42,10 @@ export const ArrowType = {
   LargeListView: 26,
 } as const;
 
-/** What a field's type can change about a column's family. Every other
- *  type is `other`: no hint of it changes a family. */
+/** What a field's type can change about a column's family. `nested` is a
+ *  type a flat column cannot have (a list, struct, map, union or run-end
+ *  encoding), or any type with child fields. Every other type is `other`:
+ *  no hint of it changes a family. */
 export type HintKind =
   | "timestamp"
   | "date32"
@@ -52,6 +54,7 @@ export type HintKind =
   | "time64"
   | "duration"
   | "string"
+  | "nested"
   | "other";
 
 export interface HintField {
@@ -102,7 +105,8 @@ interface Table {
   tableSize: number;
 }
 
-const utf8 = new TextDecoder("utf-8", { fatal: true });
+// A leading byte-order mark is part of the string, as the enclave reads it.
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Bounds- and alignment-checked reads of one flatbuffer. */
 class Flatbuffer {
@@ -208,6 +212,12 @@ class Flatbuffer {
     }
   }
 
+  /** How many elements the vector in field `slot` holds; 0 when absent. */
+  vectorLength(t: Table, slot: number): number {
+    const pos = this.target(t, slot);
+    return pos === null ? 0 : this.u32(pos);
+  }
+
   tables(t: Table, slot: number): Table[] | null {
     const pos = this.target(t, slot);
     if (pos === null) return null;
@@ -232,13 +242,29 @@ function checkInt(fb: Flatbuffer, int: Table | null): void {
   if (![8, 16, 32, 64].includes(bitWidth)) throw new ArrowSchemaError("integer bit width");
 }
 
-/** A field's type, as far as the type families need it. Throws on a type
- *  the enclave's Arrow reader would not accept (arrow-ipc panics or
- *  refuses on each of these). */
+/** Types only a nested column has: their fields hold child fields. */
+const NESTED_TYPES: readonly number[] = [
+  ArrowType.List,
+  ArrowType.Struct,
+  ArrowType.Union,
+  ArrowType.FixedSizeList,
+  ArrowType.Map,
+  ArrowType.LargeList,
+  ArrowType.RunEndEncoded,
+  ArrowType.ListView,
+  ArrowType.LargeListView,
+];
+
+/** A field's type, as far as the type families need it. Throws on a flat
+ *  type the enclave's Arrow reader would not accept (arrow-ipc panics or
+ *  refuses on each of these). A nested type, or any type with child fields,
+ *  is `nested` and goes unchecked: no flat column may have it, and the
+ *  footer reader refuses a nested column whatever its hint says. */
 function fieldKind(fb: Flatbuffer, field: Table, bigEndian: boolean): HintKind {
   const dictionary = fb.childTable(field, 4);
   if (dictionary) checkInt(fb, fb.childTable(dictionary, 1));
   const tag = fb.scalarU8(field, 2, 0);
+  if (NESTED_TYPES.includes(tag) || fb.vectorLength(field, 5) > 0) return "nested";
   const type = fb.childTable(field, 3);
   const unit = (fallback: number) => {
     if (!type) throw new ArrowSchemaError("type without its table");
@@ -288,6 +314,15 @@ function fieldKind(fb: Flatbuffer, field: Table, bigEndian: boolean): HintKind {
     case ArrowType.Duration:
       timeUnit(unit(UNIT_MILLISECOND));
       return "duration";
+    case ArrowType.Interval: {
+      const value = unit(0);
+      // YEAR_MONTH, DAY_TIME or MONTH_DAY_NANO.
+      if (value < 0 || value > 2) throw new ArrowSchemaError("interval unit");
+      return "other";
+    }
+    case ArrowType.FixedSizeBinary:
+      if (!type) throw new ArrowSchemaError("fixed-size binary type without its table");
+      return "other";
     case ArrowType.Utf8:
     case ArrowType.LargeUtf8:
     case ArrowType.Utf8View:

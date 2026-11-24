@@ -170,11 +170,11 @@ The wasm envelope module is 97 838 bytes, 39 200 gzipped.
 ## Steward upload in the browser
 
 The browser side of a steward upload (ADR 0014), timed end to end at the
-upload limit (`DATASET_MAX_MIB`, 64 by default). It is a recorded manual
-run: the upload needs a running API, which the browser test job does not
-start, so it is repeated by hand for each release candidate. The seal,
-most of its cost, joins the regression run through the wasm seal benchmark
-(#171's checkpoint A, #255).
+upload limit (`DATASET_MAX_MIB`, 64 by default). It is a manual run, for
+each release candidate: the upload needs a running API, which the browser
+test job does not start. Its times depend on the machine it runs on, so
+none are recorded here. The seal, most of its cost, is tracked on CI by the
+browser envelope seal benchmark below.
 
 **Method.** `synth-data --schema wide --seed 1 --rows 346000` writes the
 largest such file whose sealed object fits 64 MiB: 66 968 978 bytes, 23
@@ -184,41 +184,23 @@ server, against a development build of `platform-api` on the same machine
 worker's upload operation checks the enrolled key, reads the file, seals it
 and its manifest, and sends the body through the dev server's proxy. Six
 uploads of the file in a row, each replacing the last; the first starts a
-fresh crypto worker, so it includes the wasm module's cold start. Reading
-the file and sealing it are also timed alone, on the page's main thread.
+fresh crypto worker, so it includes the wasm module's cold start. The body
+crosses loopback, so the steward's uplink, which a real upload waits on, is
+not part of the measure.
 
-**Results**, 2026-11-21, Apple M4 (10 cores, 16 GiB), Chromium 156.0.8078.75:
+Whatever the machine, the sealed object is 66 969 030 bytes, 52 more than
+the file, and a file of 350 000 rows (67 691 400 bytes) is refused before
+anything is read, sealed or sent.
 
-| Step | First | Then (median of 5) |
-| --- | --- | --- |
-| Footer read, in a fresh worker each time | 11 ms | 6 ms |
-| Upload: key check, read, seal, manifest, send, stored | 1 455 ms | 606 ms |
-| Reading the 63.9 MiB file alone | 7 ms | 7 ms |
-| Sealing it alone (`HPK1`) | 1 378 ms | 552 ms |
-
-* The sealed object is 66 969 030 bytes, 52 more than the file. A file of
-  350 000 rows (67 691 400 bytes) is refused in 1 ms, before anything is
-  read, sealed or sent.
-* The seal is about 90 % of the browser's work, about 116 MiB/s here. #255
-  measured about 50 MiB/s on an i7-1355U, which puts this file's seal near
-  1.3 s there. The key check, the manifest, the body and the loopback send
-  took about 50 ms together. Over a real network the send takes what the
-  steward's uplink takes, about 5 s at 100 Mbit/s; that is not measured.
-* The seal is single-shot, so the file, its envelope and the module's
-  copies are in memory at once; #255 measures the module's peak at about
-  three times the payload, about 200 MB here.
-* Nothing in the browser path argues for lowering `DATASET_MAX_MIB` from
-  64.
-
-The footer reader is a worker chunk of its own: 14 914 bytes minified,
-4 938 gzipped, of which hyparquet's Thrift decoder is 1 327 bytes (636
+The footer reader is a worker chunk of its own: 15 620 bytes minified,
+5 147 gzipped, of which hyparquet's Thrift decoder is 1 327 bytes (636
 gzipped). It adds nothing to the UI or crypto worker chunks (`npm run
-build` on the change that added it).
+build`).
 
-**Target, proposed, needs @AxolDad:** in Chromium on a laptop of the
-i7-1355U class or better, the footer read within 100 ms, and the upload
-within 3 s once the module is loaded, at `DATASET_MAX_MIB`, network
-excluded.
+**Target, proposed, needs @AxolDad:** on the machine the browser envelope
+seal's targets are read on, in Chromium, the footer read within 100 ms and
+the upload within 3 s once the module is loaded, at `DATASET_MAX_MIB`,
+network excluded. The seal target, 100 MiB in under 3 s, covers most of it.
 
 **To repeat it**, from `backend/`, write the file, then start the API:
 

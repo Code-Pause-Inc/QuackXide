@@ -145,7 +145,7 @@ describe("DatasetUploadForm", () => {
   it.each<[string, () => File, string]>([
     ["a file that is not Parquet", () => bytes("condition,n\nflu,6\n"), "not a Parquet file"],
     ["a footer longer than the file", () => bytes(cohort.subarray(0, cohort.length - 8), trailer(cohort.length)), "truncated"],
-    ["a footer longer than the cap", () => bytes(new Uint8Array(FOOTER_MAX_BYTES + 1), trailer(FOOTER_MAX_BYTES + 1)), "larger than 16 MiB"],
+    ["a footer longer than the cap", () => bytes(new Uint8Array(FOOTER_MAX_BYTES + 1), trailer(FOOTER_MAX_BYTES + 1)), "larger than 1 MiB"],
     [
       "a truncated footer",
       () =>

@@ -28,10 +28,11 @@ uses [Semantic Versioning](https://semver.org/).
   `fixtures/parquet/` holds Parquet schema vectors that the browser and the
   enclave's own check read alike, and
   `fixtures/envelope/hpk1-browser-upload.json` an upload body sealed by the
-  browser, which the backend stores and queries. `docs/BENCHMARKS.md`
-  records the upload timed at the 64 MiB limit in a real browser (about
-  0.6 s of browser work on an Apple M4, most of it the seal), with a
-  proposed target.
+  browser, which the backend stores and queries. `docs/BENCHMARKS.md` gives
+  the method for timing the upload at the 64 MiB limit in a real browser,
+  a manual run for each release candidate, with a proposed target. The
+  data guard in `scripts/check.sh` accepts the repository's top-level
+  `fixtures/` and tests itself.
 * HTTP edge hardening (#180). Every `platform-api` response carries a strict
   page `Content-Security-Policy` (one file, `page-csp.txt`, also served by
   `vite preview`), `X-Content-Type-Options`, `Referrer-Policy`,

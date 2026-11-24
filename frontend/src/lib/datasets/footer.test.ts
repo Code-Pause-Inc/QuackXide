@@ -352,6 +352,14 @@ describe("declarations", () => {
     expect(await readFooter(parquet(max))).toMatchObject({ ok: true, rows: Number.MAX_SAFE_INTEGER });
   });
 
+  it("keeps a leading byte-order mark in a column name, as parquet-rs does", async () => {
+    const footer = metadata([root(1), column("\uFEFFid", INT64)]);
+    expect(await readFooter(parquet(footer))).toMatchObject({
+      ok: true,
+      schema: [{ name: "\uFEFFid", type: "int64" }],
+    });
+  });
+
   it("refuses an empty schema", async () => {
     expect(await refusal(parquet(metadata([root(0)])))).toBe("no_columns");
   });

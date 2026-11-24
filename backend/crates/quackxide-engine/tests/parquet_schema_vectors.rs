@@ -856,6 +856,30 @@ fn hint_last_wins() -> Vec<u8> {
     )
 }
 
+/// A flat `INT64` column that the embedded Arrow schema names a list.
+fn hint_list_on_int64() -> Vec<u8> {
+    raw_file(
+        vec![int64_column("n")],
+        vec![arrow_hint(vec![Field::new(
+            "n",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            false,
+        )])],
+    )
+}
+
+/// A column whose name starts with a byte-order mark, as rows read from a
+/// UTF-8 CSV with Python's `csv` module carry it.
+fn bom_name() -> Vec<u8> {
+    arrow_file(
+        vec![(
+            Field::new("\u{feff}id", DataType::Int64, false),
+            arc(Int64Array::from(vec![1, 2, 3])),
+        )],
+        true,
+    )
+}
+
 fn duplicate_names() -> Vec<u8> {
     raw_file(vec![int64_column("a"), int64_column("a")], Vec::new())
 }
@@ -1144,6 +1168,26 @@ fn cases() -> Vec<Case> {
             "arrow_schema",
             hint_not_a_schema,
         ),
+        Case {
+            file: "hint-list-on-int64.parquet",
+            about: "A flat INT64 column that the embedded Arrow schema names a list. The enclave reads an \
+                    INT64; the browser refuses a nested type on a flat column, on which the enclave's Arrow \
+                    reader can panic.",
+            enclave: Enclave::Declares,
+            declared: vec![("n", Int64)],
+            rows: 3,
+            browser: "arrow_schema",
+            write: hint_list_on_int64,
+        },
+        Case {
+            file: "bom-name.parquet",
+            about: "A column whose name starts with a byte-order mark (U+FEFF), which both sides keep.",
+            enclave: Enclave::Declares,
+            declared: vec![("\u{feff}id", Int64)],
+            rows: 3,
+            browser: "declares",
+            write: bom_name,
+        },
         refused(
             "duplicate-names.parquet",
             "Two columns named a.",

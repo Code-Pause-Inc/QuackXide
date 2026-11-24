@@ -1,9 +1,10 @@
 // Reads an upload's Parquet footer in a worker of its own (ADR 0014), so the
-// footer's bytes, its column statistics included, never reach the UI thread
-// or the key-holding crypto worker. The UI starts one per file
-// (`footerClient.ts`), posts the File and terminates the worker after one
-// answer, which discards everything it read. Only the declaration (column
-// names, type families, row count) or a refusal code comes back.
+// footer is parsed only here: its column statistics, decoded with the rest
+// of it, never reach the UI thread, and the key-holding crypto worker reads
+// the file only to seal it. The UI starts one per file (`footerClient.ts`),
+// posts the File and terminates the worker after one answer, which discards
+// everything it read. Only the declaration (column names, type families,
+// row count) or a refusal code comes back.
 
 import { readFooter } from "./footer";
 

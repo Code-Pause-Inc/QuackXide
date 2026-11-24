@@ -4,6 +4,7 @@ import type { DatasetUploadFields } from "../../lib/crypto/protocol";
 import type { FooterReading, FooterRefusal } from "../../lib/datasets/footer";
 import {
   ENVELOPE_OVERHEAD_BYTES,
+  FOOTER_MAX_BYTES,
   MAX_DECLARED_COLUMNS,
   UPLOAD_DATASET,
   sameSchema,
@@ -22,11 +23,11 @@ export function refusalMessage(refusal: FooterRefusal): string {
     case "footer_length":
       return "This file is truncated: its Parquet footer is longer than the file.";
     case "footer_too_large":
-      return "This file's Parquet footer is larger than 16 MiB.";
+      return `This file's Parquet footer is larger than ${FOOTER_MAX_BYTES / (1024 * 1024)} MiB. Write it with fewer, larger row groups.`;
     case "malformed_footer":
       return "This file's Parquet footer is malformed.";
     case "arrow_schema":
-      return "The Arrow schema embedded in this file is malformed or does not match its columns.";
+      return "The Arrow schema embedded in this file is malformed, does not match its columns, or gives a flat column a nested type.";
     case "nested_column":
       return `Column “${refusal.column}” is nested (a list, map or struct). Only flat columns can be uploaded.`;
     case "unsupported_type":

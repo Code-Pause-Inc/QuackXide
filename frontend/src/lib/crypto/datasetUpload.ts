@@ -113,24 +113,33 @@ function u32be(n: number): Uint8Array<ArrayBuffer> {
 
 const encoder = new TextEncoder();
 
-/** The upload body (`platform_connectors::upload`): magic, header length,
- *  header JSON, manifest length, sealed manifest, sealed object. */
-export function uploadBody(
-  header: { version: string; object: string; row_cap: number; schema: DeclaredColumn[] },
-  manifest: ArrayBuffer,
-  object: ArrayBuffer,
-): Blob {
-  const json = encoder.encode(JSON.stringify(header));
+/** The upload header as JSON, refused if it is over the route's limit. A
+ *  declaration within its bounds can still exceed it when its names are
+ *  long and need escaping. Nothing in it depends on the file's bytes, so it
+ *  is built before the file is read. */
+export function uploadHeader(header: {
+  version: string;
+  object: string;
+  row_cap: number;
+  schema: DeclaredColumn[];
+}): Uint8Array<ArrayBuffer> {
+  const json = encoder.encode(JSON.stringify(header)) as Uint8Array<ArrayBuffer>;
   if (json.length < 1 || json.length > MAX_HEADER_BYTES) {
     throw new UploadRefused("The declared schema is too large to upload.");
   }
+  return json;
+}
+
+/** The upload body (`platform_connectors::upload`): magic, header length,
+ *  header JSON, manifest length, sealed manifest, sealed object. */
+export function uploadBody(header: Uint8Array<ArrayBuffer>, manifest: ArrayBuffer, object: ArrayBuffer): Blob {
   if (manifest.byteLength < 1 || manifest.byteLength > MAX_MANIFEST_BYTES) {
     throw new Error("sealed manifest out of bounds");
   }
   return new Blob([
     UPLOAD_MAGIC,
-    u32be(json.length),
-    json,
+    u32be(header.length),
+    header,
     u32be(manifest.byteLength),
     manifest,
     object,
@@ -194,18 +203,21 @@ async function checkEnrolledKey(
   const response = await fetch(`${apiBaseUrl}/api/v1/drive/enrollment`, { headers: bearer(token) });
   if (response.status === 401 || response.status === 403) throw await refusalFor(response, "");
   if (response.status === 404) {
+    // The drive enrolls this key on its next load wherever the deployment
+    // accepts the key's suite; production accepts only the hybrid suite,
+    // which this browser cannot create until P36.
     throw new UploadRefused(
-      "This browser's data key is not enrolled for your tenant. Open the Drive tab to enroll it, then upload.",
+      "This browser's data key is not enrolled for your tenant, so a query could never open an upload sealed here. Opening the Drive tab enrolls it if this deployment accepts the browser's key suite.",
     );
   }
-  if (!response.ok) throw new Error(`could not read the enrolled key (${response.status})`);
+  if (!response.ok) throw new UploadRefused(`Could not read the enrolled key (${response.status}); try again later.`);
   let enrolled: ArrayBuffer;
   try {
     const body = (await response.json()) as { hpke_public_key_b64?: unknown };
     if (typeof body.hpke_public_key_b64 !== "string") throw new Error("no key");
     enrolled = fromB64(body.hpke_public_key_b64.trim());
   } catch {
-    throw new Error("the enrolled key record is malformed");
+    throw new UploadRefused("The enrolled key record is malformed.");
   }
   if (!sameBytes(enrolled, publicKeyRaw)) {
     throw new UploadRefused(
@@ -216,7 +228,9 @@ async function checkEnrolledKey(
 
 /** Seal `request.file` to the device's key and upload it as the tenant's
  *  dataset `request.dataset`. Every refusal before the seal is an
- *  `UploadRefused`, and nothing is sealed or sent when one is thrown. */
+ *  `UploadRefused`; when one is thrown nothing is sealed and no upload is
+ *  sent, and every one but the read of the file itself comes before the
+ *  file is read. */
 export async function uploadDataset(
   ctx: UploadContext,
   request: DatasetUploadRequest,
@@ -228,7 +242,7 @@ export async function uploadDataset(
   if (currentVersion !== null && !isSnapshotVersion(currentVersion)) {
     throw new UploadRefused("The dataset's current version is malformed; reload your datasets.");
   }
-  if (!ctx.session) throw new Error("no session token");
+  if (!ctx.session) throw new UploadRefused("no session token");
   const { token, claims } = ctx.session;
   if (!CANONICAL_UUID.test(claims.tid)) {
     throw new UploadRefused("The session's tenant id is not one the API issues.");
@@ -245,8 +259,6 @@ export async function uploadDataset(
   if (!Number.isSafeInteger(maxBytes) || file.size + ENVELOPE_OVERHEAD_BYTES > maxBytes) {
     throw new UploadRefused("The file is larger than this deployment's upload limit.");
   }
-  await checkEnrolledKey(ctx.apiBaseUrl, token, key.publicKeyRaw);
-
   const tenant = claims.tid;
   const object = crypto.randomUUID();
   const version = nextSnapshotVersion(
@@ -254,10 +266,13 @@ export async function uploadDataset(
     (ctx.now ?? Date.now)(),
     crypto.getRandomValues(new Uint8Array(16)),
   );
+  const header = uploadHeader({ version, object, row_cap: rowCap, schema });
+  await checkEnrolledKey(ctx.apiBaseUrl, token, key.publicKeyRaw);
+
   const plaintext = await file.arrayBuffer();
   let sealedObject: ArrayBuffer;
   try {
-    if (plaintext.byteLength !== file.size) throw new Error("the file changed while it was read");
+    if (plaintext.byteLength !== file.size) throw new UploadRefused("The file changed while it was read.");
     sealedObject = await sealToTenant(
       key.publicKeyRaw,
       await envelopeInfo.stewardUpload(tenant, dataset, object),
@@ -271,7 +286,7 @@ export async function uploadDataset(
     await envelopeInfo.snapshotManifest(tenant, dataset, version),
     encoder.encode(JSON.stringify({ version, objects: [object] })).buffer as ArrayBuffer,
   );
-  const body = uploadBody({ version, object, row_cap: rowCap, schema }, manifest, sealedObject);
+  const body = uploadBody(header, manifest, sealedObject);
 
   const response = await fetch(`${ctx.apiBaseUrl}/api/v1/datasets/${encodeURIComponent(dataset)}`, {
     method: "PUT",

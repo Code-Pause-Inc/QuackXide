@@ -109,6 +109,8 @@ interface FieldSpec {
   type?: Array<Slot | undefined>;
   /** The dictionary's index type slots, for a dictionary-encoded field. */
   dictionaryIndex?: Array<Slot | undefined>;
+  /** Child fields. */
+  children?: FieldSpec[];
 }
 
 const u8 = (value: number): Scalar => ({ size: 1, value });
@@ -121,7 +123,7 @@ function schema(
   { header = 1, endianness = 0, continuation = false } = {},
 ): string {
   const w = new Writer();
-  const field = (spec: FieldSpec) => () =>
+  const field: (spec: FieldSpec) => Child = (spec) => () =>
     w.table([
       spec.name === undefined ? undefined : { child: () => w.string(spec.name!) },
       undefined,
@@ -130,6 +132,7 @@ function schema(
       spec.dictionaryIndex
         ? { child: () => w.table([undefined, { child: () => w.table(spec.dictionaryIndex!) }]) }
         : undefined,
+      spec.children ? { child: () => w.vector(spec.children!.map(field)) } : undefined,
     ]);
   const message = w.table([
     i16(4),
@@ -198,6 +201,45 @@ describe("schemas Arrow writers embed", () => {
       { name: "d", kind: "date64" },
     ]);
   });
+
+  it("keeps a leading byte-order mark in a name, as the enclave does", () => {
+    expect(readArrowSchema(schema([{ name: "\uFEFFid", tag: ArrowType.Utf8 }]))).toEqual([
+      { name: "\uFEFFid", kind: "string" },
+    ]);
+  });
+
+  it("reads an interval and a fixed-size binary as other", () => {
+    const fields = [
+      { name: "gap", tag: ArrowType.Interval, type: [i16(1)] },
+      { name: "id", tag: ArrowType.FixedSizeBinary, type: [i32(16)] },
+    ];
+    expect(readArrowSchema(schema(fields))).toEqual([
+      { name: "gap", kind: "other" },
+      { name: "id", kind: "other" },
+    ]);
+  });
+});
+
+describe("types a flat column cannot have", () => {
+  it.each([
+    ["a list", ArrowType.List],
+    ["a struct", ArrowType.Struct],
+    ["a union", ArrowType.Union],
+    ["a fixed-size list", ArrowType.FixedSizeList],
+    ["a map", ArrowType.Map],
+    ["a large list", ArrowType.LargeList],
+    ["a run-end encoding", ArrowType.RunEndEncoded],
+    ["a list view", ArrowType.ListView],
+    ["a large list view", ArrowType.LargeListView],
+  ])("reads %s as nested, with no child field at all", (_what, tag) => {
+    // A list with no child is what makes the enclave's Arrow reader panic.
+    expect(readArrowSchema(schema([{ name: "n", tag }]))).toEqual([{ name: "n", kind: "nested" }]);
+  });
+
+  it("reads a flat type with child fields as nested", () => {
+    const withChild = { ...int64, children: [{ name: "c", tag: ArrowType.Utf8 }] };
+    expect(readArrowSchema(schema([withChild]))).toEqual([{ name: "n", kind: "nested" }]);
+  });
 });
 
 describe("refusals", () => {
@@ -219,6 +261,9 @@ describe("refusals", () => {
     ["a time of 64 bits in seconds", schema([{ name: "x", tag: ArrowType.Time, type: [i16(0), i32(64)] }])],
     ["a timestamp of unknown unit", schema([{ name: "x", tag: ArrowType.Timestamp, type: [i16(4)] }])],
     ["a duration of unknown unit", schema([{ name: "x", tag: ArrowType.Duration, type: [i16(-1)] }])],
+    ["an interval of unknown unit", schema([{ name: "x", tag: ArrowType.Interval, type: [i16(3)] }])],
+    ["an interval without its table", schema([{ name: "x", tag: ArrowType.Interval }])],
+    ["a fixed-size binary without its table", schema([{ name: "x", tag: ArrowType.FixedSizeBinary }])],
     ["a decimal of 100 bits", schema([{ name: "x", tag: ArrowType.Decimal, type: [i32(10), i32(2), i32(100)] }])],
     ["a decimal of 300 digits", schema([{ name: "x", tag: ArrowType.Decimal, type: [i32(300), i32(2)] }])],
     [

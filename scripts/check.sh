@@ -76,10 +76,22 @@ if grep -rn "Confidential Drive" "$ROOT/backend/crates" "$ROOT/frontend/src" 2>/
 fi
 
 echo "== data guard: data files live only in fixtures/ (docs/DATA_POLICY.md) =="
-# A fixtures/ directory at any depth, the repository's top-level one included.
-if git -C "$ROOT" ls-files \
-    | grep -iE '\.(csv|tsv|parquet|ndjson|jsonl|xlsx?|sav|dta|sas7bdat|xpt|rds|rdata|feather|arrow|avro|orc|vcf|bam|cram|fastq|dcm|hl7|sqlite|db)$' \
-    | grep -vE '(^|/)fixtures/'; then
+# The data files among the paths on stdin that are outside a fixtures/
+# directory at any depth, the repository's top-level one included.
+data_outside_fixtures() {
+    grep -iE '\.(csv|tsv|parquet|ndjson|jsonl|xlsx?|sav|dta|sas7bdat|xpt|rds|rdata|feather|arrow|avro|orc|vcf|bam|cram|fastq|dcm|hl7|sqlite|db)$' \
+        | grep -vE '(^|/)fixtures/' || true
+}
+# Selftest: what the guard must flag and what it must let through.
+selftest="$(printf '%s\n' fixtures/a.parquet backend/fixtures/b.csv data.csv notfixtures/c.parquet \
+    fixtures-old/d.ndjson README.md | data_outside_fixtures)"
+if [ "$selftest" != "$(printf '%s\n' data.csv notfixtures/c.parquet fixtures-old/d.ndjson)" ]; then
+    echo "FAIL: data guard selftest flagged: $selftest"
+    exit 1
+fi
+outside="$(git -C "$ROOT" ls-files | data_outside_fixtures)"
+if [ -n "$outside" ]; then
+    printf '%s\n' "$outside"
     echo "FAIL: data file outside a fixtures/ directory"
     exit 1
 fi

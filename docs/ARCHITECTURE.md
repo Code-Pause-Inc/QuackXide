@@ -75,8 +75,9 @@ Client key architecture:
   dedicated Web Worker (`lib/crypto/worker.ts`). The DOM/UI thread exchanges
   only opaque ids, decrypted summaries it asked for, and download Blobs. A
   steward upload's Parquet footer is read in a short-lived worker of its own
-  (`lib/datasets/footer.worker.ts`, ADR 0014), so the footer's bytes reach
-  neither the UI thread nor the key-holding worker.
+  (`lib/datasets/footer.worker.ts`, ADR 0014), so the footer is parsed only
+  there: the UI thread gets the declared schema and row count, and the
+  key-holding worker reads the file only to seal it.
 * **AAD discipline** — every AES-GCM operation binds
   `tenant|object|role(|chunk-index)`, so a vault cannot reorder chunks,
   splice records across objects, or re-attach wrapped keys undetected.
@@ -267,11 +268,12 @@ the research portal's stewardship panel, which lists the stored datasets
 from `GET /api/v1/datasets` and publishes listings for them only:
 
 * **Footer first.** A worker of its own reads only the file's tail (the
-  8-byte trailer, then a footer of at most 16 MiB) with hyparquet's Thrift
+  8-byte trailer, then a footer of at most 1 MiB) with hyparquet's Thrift
   decoder, and declares each column's name and type family by the rules of
   the enclave's Parquet reader, refined by the file's embedded Arrow
-  schema. A file the enclave could not read, or a column no family covers,
-  is refused; so is a schema unlike the dataset's recorded one, a
+  schema. A file the enclave could not read, a column no family covers, and
+  a flat column whose embedded type is nested are refused; so is a schema
+  unlike the dataset's recorded one, a
   re-upload whose recorded schema is unreadable, and a file whose sealed
   object would exceed `dataset_max_bytes`. `fixtures/parquet/` holds files
   both sides must read alike. The enclave checks again.
@@ -279,7 +281,8 @@ from `GET /api/v1/datasets` and publishes listings for them only:
   existing key and never creates one, and refuses before reading the file
   unless the tenant's enrolled key is that key. It draws the object id and
   version, binds the session's `tid`, seals the object and the manifest
-  (`HPK1` until P36), zeroes its copy of the plaintext and sends the body
+  (`HPK1` until P36, so an upload opens only under development's test key
+  providers until then), zeroes its copy of the plaintext and sends the body
   under the session's token. Refusals are shown in the form, 401 and 403
   included. The form says, before the upload, that column names and types
   are stored in plaintext.

@@ -3,10 +3,10 @@
 //
 // Only the tail of the file is read (`Blob.slice`): the 8-byte trailer, then
 // the footer it points to, at most FOOTER_MAX_BYTES. The footer's Thrift
-// encoding is decoded by hyparquet's compact-protocol reader; this module
-// interprets the result itself and reads only the schema, the row counts and
-// the embedded Arrow schema. Column statistics, which hold plaintext values,
-// are never decoded.
+// encoding is decoded by hyparquet's compact-protocol reader, column
+// statistics included; this module interprets the result itself and reads
+// only the schema, the row counts and the embedded Arrow schema. The
+// statistics, which hold plaintext values, are never read, kept or sent.
 //
 // The enclave checks an upload's Parquet against what the browser declares
 // (`QueryScope::register_parquet_declared`): its Parquet reader (parquet-rs)
@@ -25,6 +25,7 @@ import { deserializeTCompactProtocol } from "hyparquet/src/thrift.js";
 
 import { ArrowSchemaError, readArrowSchema, type HintField, type HintKind } from "./arrowSchema";
 import {
+  FOOTER_MAX_BYTES,
   declarationProblem,
   isRowCap,
   type ColumnType,
@@ -32,9 +33,7 @@ import {
   type DeclaredColumn,
 } from "./schema";
 
-/** Largest footer the browser reads. Footers of real files are kilobytes
- *  to a few megabytes; a larger length is a corrupt file. */
-export const FOOTER_MAX_BYTES = 16 * 1024 * 1024;
+export { FOOTER_MAX_BYTES };
 
 /** The 8-byte trailer: the footer's length, then the magic. */
 const TRAILER_BYTES = 8;
@@ -113,7 +112,9 @@ function bool(value: unknown): boolean {
   return value;
 }
 
-const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+// A leading byte-order mark is part of the string: parquet-rs keeps it, so
+// a column named "\uFEFFid" is declared with it.
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** A Thrift string, which parquet-rs requires to be UTF-8. */
 function text(value: unknown): string {
@@ -756,6 +757,10 @@ function declare(metadata: Thrift): { schema: DeclaredColumn[]; rows: number } {
     if (group || el.repetition === Repetition.REPEATED) {
       throw new Refused({ code: "nested_column", column: el.name });
     }
+    // A flat column whose embedded type is nested, or has child fields, is
+    // not a file any writer makes, and the enclave's Arrow reader can panic
+    // on it.
+    if (hints?.[i]?.kind === "nested") throw new Refused({ code: "arrow_schema" });
     const family = refined(kindOf(el), hints?.[i]?.kind);
     if (!family) throw new Refused({ code: "unsupported_type", column: el.name });
     schema.push({ name: el.name, type: family });

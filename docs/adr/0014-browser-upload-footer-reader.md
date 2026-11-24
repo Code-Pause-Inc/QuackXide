@@ -47,7 +47,8 @@ dependencies; MIT is on the allow list in `backend/deny.toml` and not on
 dependency review's deny list), pinned exactly in `frontend/package.json`.
 Only `hyparquet/src/thrift.js` is imported. `frontend/src/lib/datasets/footer.ts`
 interprets the decoded `FileMetaData` itself and reads only the schema, the
-row counts and the key-value metadata; it never decodes column statistics.
+row counts and the key-value metadata. The decoder parses the whole footer,
+column statistics included, but nothing reads, keeps or sends them.
 
 Rejected:
 
@@ -65,10 +66,15 @@ Rejected:
 `footer.worker.ts` reads one file and is terminated after one answer, or
 after 30 seconds. It reads only the file's tail with `Blob.slice`: the
 8-byte trailer, then the footer it points to, at most `FOOTER_MAX_BYTES`
-(16 MiB; real footers are kilobytes to a few megabytes). It returns the
-declaration (column names, type families, row count) or a refusal code.
-Neither the UI thread nor the key-holding crypto worker sees the footer's
-bytes, and terminating the worker discards everything it read.
+(1 MiB). A real file's footer grows with its row groups and columns and
+stays in the hundreds of kilobytes even at the 512 MiB ceiling of
+`DATASET_MAX_MIB`. The decoder parses the whole footer, so a crafted one
+within the cap costs the worker at most about 64 MiB of heap, and the
+timeout bounds its time. The worker returns the declaration (column names,
+type families, row count) or a refusal code. The footer is parsed only
+there: the UI thread gets the declaration, and the key-holding crypto
+worker reads the file only to seal it. Terminating the worker discards
+everything it read.
 
 ### The enclave's rules, refusing where they cannot be followed
 
@@ -89,14 +95,19 @@ bytes, and terminating the worker discards everything it read.
   integer column no family. A dictionary-encoded field refines as its value
   type does. Like parquet-rs, the last `ARROW:schema` entry counts;
 * `column_type_of`'s families, and the row count the engine checks: the
-  larger of the file's count and its row groups' sum.
+  larger of the file's count and its row groups' sum;
+* its strings: UTF-8, with a leading byte-order mark kept as part of a
+  name, so a column named `\uFEFFid` is declared with it.
 
 The embedded schema is read by `frontend/src/lib/datasets/arrowSchema.ts`,
 which decodes the base64 Arrow IPC message and its Schema flatbuffer as far
 as the top-level fields' names and types, with every offset bounds- and
 alignment-checked. parquet-rs refuses a file whose embedded schema does not
 decode or does not name the same columns in the same order, and so does
-the browser.
+the browser. It also refuses a flat column whose embedded type is nested
+(a list, struct, map, union or run-end encoding) or has child fields: no
+writer makes one, and the enclave's Arrow reader can panic on it (a list
+without its child field).
 
 The browser refuses whatever parquet-rs would refuse or map to no family:
 a nested or repeated column, a binary, time-of-day, duration, interval,
@@ -160,22 +171,32 @@ Every refusal before step 4 happens before the file is read. The suite is
   disagree. The shared vectors fail when the enclave's side changes, and a
   new writer behaviour needs a new vector.
 * Some files the enclave could read are refused, for example one whose
-  embedded schema the browser cannot decode. The steward re-exports them.
+  embedded schema the browser cannot decode, or a flat column with a
+  nested embedded type. The steward re-exports them.
+* hyparquet reads each Thrift field by its wire type, where parquet-rs
+  reads it by the schema's type. A crafted footer that re-encodes a field
+  (an `INT32` column's `type` as a byte, a value as an overlong varint) can
+  therefore be declared differently from what the enclave reads. No writer
+  emits such encodings, the enclave refuses the data, and only the
+  steward's own dataset is affected. A decoder of our own for just the
+  fields read would close this and drop the dependency.
 * The listing shows the steward their datasets' declared row caps and
   schemas.
 * The browser holds the whole file, its envelope and the wasm module's
   copies in memory at once, since the seal is single-shot. P34's benchmark
   (#255) measures the module's peak at about three times the payload.
-* At `DATASET_MAX_MIB` (64 MiB) the browser's work takes about 0.6 s once
-  the module is loaded, on an Apple M4, most of it the seal
-  (`docs/BENCHMARKS.md`, a recorded manual run), so the default stands.
-* Production refuses `HPK1` uploads, so uploads work in development until
-  P36. Until P32, the research portal's pasted development token is the
-  crypto worker's session for the upload.
+* At `DATASET_MAX_MIB` (64 MiB) the seal is most of the browser's work
+  (a recorded manual run; `docs/BENCHMARKS.md` has the method). The
+  browser envelope seal benchmark tracks the seal, and its target, 100 MiB
+  in under 3 s, leaves room at 64 MiB, so the default stands.
+* Production refuses `HPK1` keys and uploads, so until P36 a browser upload
+  is stored and listed only in development, and it opens only under the
+  test key providers (`DevKeyProvider`, `MultiTenantDevKeyProvider`),
+  since development key release is `HPK2`-only (ADR 0012). Until P32, the
+  research portal's pasted development token is the crypto worker's
+  session for the upload.
 
 ## Open questions
 
-1. Is 16 MiB the right footer cap, or should it follow the largest footer a
-   file at `DATASET_MAX_MIB` can have?
-2. The proposed target for the upload benchmark in `docs/BENCHMARKS.md`,
+1. The proposed target for the upload benchmark in `docs/BENCHMARKS.md`,
    to agree with @AxolDad.

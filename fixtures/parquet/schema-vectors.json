@@ -500,6 +500,32 @@
       "file": "hint-not-a-schema.parquet"
     },
     {
+      "about": "A flat INT64 column that the embedded Arrow schema names a list. The enclave reads an INT64; the browser refuses a nested type on a flat column, on which the enclave's Arrow reader can panic.",
+      "browser": "arrow_schema",
+      "declared": [
+        {
+          "name": "n",
+          "type": "int64"
+        }
+      ],
+      "enclave": "declares",
+      "file": "hint-list-on-int64.parquet",
+      "rows": 3
+    },
+    {
+      "about": "A column whose name starts with a byte-order mark (U+FEFF), which both sides keep.",
+      "browser": "declares",
+      "declared": [
+        {
+          "name": "﻿id",
+          "type": "int64"
+        }
+      ],
+      "enclave": "declares",
+      "file": "bom-name.parquet",
+      "rows": 3
+    },
+    {
       "about": "Two columns named a.",
       "browser": "duplicate_column",
       "enclave": "undeclarable",

@@ -279,6 +279,41 @@ describe("refusals before anything is sealed", () => {
     });
   }
 
+  it("refuses a header over the route's limit before it reads the file or checks the key", async () => {
+    // 512 distinct 128-byte names that JSON escapes to nearly twice that:
+    // a valid declaration whose header is over 128 KiB.
+    const schema: DeclaredColumn[] = Array.from({ length: 512 }, (_, i) => ({
+      name: `${'"'.repeat(124)}${String(i).padStart(4, "0")}`,
+      type: "int64",
+    }));
+    let read = false;
+    class Watched extends File {
+      override async arrayBuffer(): Promise<ArrayBuffer> {
+        read = true;
+        return super.arrayBuffer();
+      }
+    }
+    const file = new Watched([parquetFixture("upload-cohort.parquet")], "c");
+    await expect(uploadDataset(context(), request({ file, schema }))).rejects.toThrow("too large to upload");
+    expect(read).toBe(false);
+    expect(sent).toEqual([]);
+    expect(envelope.sealToTenant).not.toHaveBeenCalled();
+  });
+
+  it("refuses every case above with an UploadRefused", async () => {
+    for (const run of [
+      () => uploadDataset(context({ session: null }), request()),
+      () => uploadDataset(context({ keys: null }), request()),
+      () => uploadDataset(context(), request({ dataset: "health" })),
+    ]) {
+      await expect(run()).rejects.toBeInstanceOf(UploadRefused);
+    }
+    for (const answer of [() => json({}, 404), () => json({ error: "storage" }, 502), () => json({ key: "x" })]) {
+      enrollment = answer;
+      await expect(uploadDataset(context(), request())).rejects.toBeInstanceOf(UploadRefused);
+    }
+  });
+
   it("accepts a file exactly at the size limit", async () => {
     const size = parquetFixture("upload-cohort.parquet").length;
     await expect(uploadDataset(context(), request({ maxBytes: size + ENVELOPE_OVERHEAD_BYTES }))).resolves.toMatchObject({
@@ -291,7 +326,7 @@ describe("refusals before anything is sealed", () => {
     ["another enrolled key", () => json({ hpke_public_key_b64: otherRecipient.public_b64 }), "not this browser's key"],
     ["a session the API rejects", () => json({ error: "unauthorized" }, 401), "Not authenticated"],
     ["a malformed enrollment record", () => json({ key: "x" }), "malformed"],
-    ["an enrollment it cannot read", () => json({ error: "storage" }, 502), "could not read the enrolled key"],
+    ["an enrollment it cannot read", () => json({ error: "storage" }, 502), "Could not read the enrolled key"],
   ];
   for (const [what, answer, message] of keyCases) {
     it(`refuses ${what} before sealing`, async () => {
