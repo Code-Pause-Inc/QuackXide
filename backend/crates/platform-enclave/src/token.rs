@@ -12,7 +12,7 @@
 //! each decision, accepted or refused, as a `SECURITY_AUDIT_EVENT` and cover
 //! it in `platform-api/tests/audit_coverage.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -108,6 +108,7 @@ pub struct VerifiedToken {
     image_digest: String,
     hwmodel: String,
     nonces: Vec<String>,
+    container_env: BTreeMap<String, String>,
 }
 
 impl VerifiedToken {
@@ -121,6 +122,12 @@ impl VerifiedToken {
 
     pub fn nonces(&self) -> &[String] {
         &self.nonces
+    }
+
+    /// The workload's environment as the token reports it
+    /// (`submods.container.env`; empty when absent).
+    pub fn container_env(&self) -> &BTreeMap<String, String> {
+        &self.container_env
     }
 }
 
@@ -159,6 +166,8 @@ struct ConfidentialSpace {
 #[derive(Deserialize)]
 struct Container {
     image_digest: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// Verifies RS256 attestation tokens against a fixed key set and policy.
@@ -225,6 +234,17 @@ impl TokenVerifier {
         token: &str,
         expected_nonces: &[String],
     ) -> Result<VerifiedToken, TokenError> {
+        let verified = self.verify_claims(token)?;
+        if expected_nonces.is_empty() || verified.nonces != expected_nonces {
+            return Err(TokenError::Nonce);
+        }
+        Ok(verified)
+    }
+
+    /// Every check of [`verify`](Self::verify) but the nonces: for a caller
+    /// that must read the token before it knows its expected nonces, and
+    /// then checks them itself (`evidence::verify_evidence`).
+    pub(crate) fn verify_claims(&self, token: &str) -> Result<VerifiedToken, TokenError> {
         if token.len() > MAX_TOKEN_BYTES {
             return Err(TokenError::TooLarge);
         }
@@ -266,9 +286,6 @@ impl TokenVerifier {
             Nonces::One(n) => vec![n],
             Nonces::Many(ns) => ns,
         };
-        if expected_nonces.is_empty() || nonces != expected_nonces {
-            return Err(TokenError::Nonce);
-        }
         if claims.hwmodel != HWMODEL_TDX {
             return Err(TokenError::Hardware);
         }
@@ -282,14 +299,19 @@ impl TokenVerifier {
         if !attributes.iter().any(|a| a == SUPPORT_STABLE) {
             return Err(TokenError::SupportAttributes);
         }
-        let digest = claims.submods.container.image_digest;
-        if !self.policy.allowed_image_digests.contains(&digest) {
+        let container = claims.submods.container;
+        if !self
+            .policy
+            .allowed_image_digests
+            .contains(&container.image_digest)
+        {
             return Err(TokenError::ImageDigest);
         }
         Ok(VerifiedToken {
-            image_digest: digest,
+            image_digest: container.image_digest,
             hwmodel: claims.hwmodel,
             nonces,
+            container_env: container.env,
         })
     }
 }
@@ -516,6 +538,38 @@ mod tests {
         );
         assert!(verifier().verify(&one, &[nonce()]).is_ok());
         assert!(verifier().verify(&two, &[nonce(), second]).is_ok());
+    }
+
+    #[test]
+    fn container_env_is_exposed() {
+        let env = std::collections::BTreeMap::from([(
+            "FEATURE_ZK_ENABLED".to_owned(),
+            "true".to_owned(),
+        )]);
+        let token = token_with(SimulatedClaims {
+            env: env.clone(),
+            ..SimulatedClaims::default()
+        });
+        let verified = verifier().verify(&token, &[nonce()]).unwrap();
+        assert_eq!(verified.container_env(), &env);
+        let plain = verifier().verify(&valid_token(), &[nonce()]).unwrap();
+        assert!(plain.container_env().is_empty());
+    }
+
+    #[test]
+    fn verify_claims_skips_only_the_nonce() {
+        let other = URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let token = signer().sign(SIMULATED_AUDIENCE, &[other], Duration::from_secs(600));
+        assert!(verifier().verify_claims(&token).is_ok());
+        assert_eq!(err(&token), TokenError::Nonce);
+        let debug = token_with(SimulatedClaims {
+            dbgstat: "enabled".into(),
+            ..SimulatedClaims::default()
+        });
+        assert_eq!(
+            verifier().verify_claims(&debug).unwrap_err(),
+            TokenError::Debug
+        );
     }
 
     #[test]

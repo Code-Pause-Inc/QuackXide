@@ -121,6 +121,17 @@ impl DevResearchStack {
             SIM_ISSUER,
             SimulatedClaims::default(),
         ));
+        self.query_service_with_signer(settings, research, signer)
+    }
+
+    /// As [`Self::query_service`], with tokens from `signer`, for tests that
+    /// also serve its key set (`key_release::sim_attestation_router`).
+    pub fn query_service_with_signer(
+        self,
+        settings: EngineSettings,
+        research: Arc<ResearchService>,
+        signer: Arc<TokenSigner>,
+    ) -> ConnectorQueryService {
         let policy = ReleasePolicy {
             allowed_image_digests: vec![SIMULATED_IMAGE_DIGEST.into()],
         };

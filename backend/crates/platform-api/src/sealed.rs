@@ -6,7 +6,10 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use platform_core::{ConnectorSlug, TenantId};
-use platform_crypto::{CryptoError, EnvelopeSuite, ResultSignature, SuitePolicy, info};
+use platform_crypto::{
+    CryptoError, EnvelopeSuite, ResultSignature, SuitePolicy, TenantPublicKey, hpke_seal_to_tenant,
+    info,
+};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,7 +36,7 @@ pub const MAX_SEALED_QUERY_PLAINTEXT_BYTES: usize = 64 * 1024;
 /// only here (ADR 0010): `Debug` redacts it, and it is wiped on drop, also
 /// when a later field fails to parse. Best-effort: serde_json's scratch copy
 /// of a string with JSON escapes is freed without wiping.
-#[derive(PartialEq, Eq, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealedQueryPlaintext {
     pub steward_tenant: String,
@@ -70,6 +73,28 @@ impl SealedQueryPlaintext {
             "request nonce must be 32 bytes of base64url",
         ))
     }
+}
+
+/// `plaintext` sealed to the enclave's `request_key` as `researcher` sends
+/// it under `grant_id`: the client's side of [`open_sealed`]. The serialized
+/// plaintext, SQL included, is wiped once sealed.
+pub fn seal_query(
+    request_key: &TenantPublicKey,
+    key_id: &str,
+    researcher: TenantId,
+    grant_id: &str,
+    plaintext: &SealedQueryPlaintext,
+) -> Result<SealedQueryRequest, CryptoError> {
+    let info = info::research_query(request_key.suite(), &researcher.to_string(), grant_id)?;
+    let bytes =
+        Zeroizing::new(serde_json::to_vec(plaintext).map_err(|_| CryptoError::InvalidEnvelope)?);
+    let frame = hpke_seal_to_tenant(request_key, &info, &bytes)?;
+    Ok(SealedQueryRequest {
+        version: 1,
+        key_id: key_id.to_owned(),
+        grant_id: grant_id.to_owned(),
+        envelope: URL_SAFE_NO_PAD.encode(frame),
+    })
 }
 
 /// A sealed query, opened and parsed inside the enclave.
@@ -417,6 +442,37 @@ mod tests {
                 opened.envelope_digest,
                 <[u8; 32]>::from(Sha256::digest(frame))
             );
+        }
+
+        /// What `seal_query` seals, the enclave opens: one sealing path for
+        /// `enclave-check` and the tests.
+        #[test]
+        fn seal_query_round_trips() {
+            let identity = EnclaveIdentity::generate();
+            let (researcher, steward) = (TenantId::generate(), TenantId::generate());
+            let recipient = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+            let plaintext = SealedQueryPlaintext {
+                steward_tenant: steward.to_string(),
+                connector: "health".to_owned(),
+                sql: Zeroizing::new("SELECT 1".to_owned()),
+                request_nonce: URL_SAFE_NO_PAD.encode([6u8; 32]),
+                recipient_key: KeyWire::from_public_key(&recipient),
+            };
+            let request = seal_query(
+                &identity.request_public_key(),
+                identity.key_id(),
+                researcher,
+                GRANT,
+                &plaintext,
+            )
+            .expect("seals");
+            assert_eq!((request.version, request.grant_id.as_str()), (1, GRANT));
+            let opened = open_sealed(&identity, researcher, &request)
+                .ok()
+                .expect("opens");
+            assert_eq!(opened.steward, steward);
+            assert_eq!(opened.sql.as_str(), "SELECT 1");
+            assert_eq!(opened.request_nonce, [6u8; 32]);
         }
 
         #[test]
