@@ -8,6 +8,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* HTTP edge hardening (#180). Every `platform-api` response carries a strict
+  page `Content-Security-Policy` (one file, `page-csp.txt`, also served by
+  `vite preview`), `X-Content-Type-Options`, `Referrer-Policy`,
+  `X-Frame-Options` and `Cache-Control: no-store`. Requests time out per
+  route group (query routes follow `QueryLimits`, uploads get a 30 s body gap
+  answered with 408, the rest 60 s answered with 503), and a handler panic
+  answers a generic 500 (the edge logs a fixed message).
+  `scripts/check-page-headers.sh` checks a release build's page and worker
+  headers in `scripts/check.sh`, and a Chromium smoke test in the `browser`
+  workflow runs a wasm operation under the policy. The frontend's release
+  build refuses a cross-origin `VITE_API_BASE_URL`. A client that sends its
+  request headers slowly is not bounded yet.
 * Data dictionary on published listings (P59): a catalog listing carries
   `data_dictionary`, the dataset's SQL table name and the columns its
   steward describes (name, type family and an optional description), so a

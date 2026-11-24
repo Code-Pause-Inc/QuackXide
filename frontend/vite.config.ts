@@ -1,4 +1,6 @@
 /// <reference types="vitest/config" />
+import { readFileSync } from "node:fs";
+
 import tailwindcss from "@tailwindcss/vite";
 import { playwright } from "@vitest/browser-playwright";
 import react from "@vitejs/plugin-react";
@@ -22,6 +24,13 @@ function browserInstances(list: string | undefined): { browser: Browser }[] {
       return { browser };
     });
 }
+
+// The page CSP the backend also sends (one source of truth). Resolved from
+// this file, not the shell's working directory.
+const PAGE_CSP = readFileSync(
+  new URL("../backend/crates/platform-api/page-csp.txt", import.meta.url),
+  "utf8",
+);
 
 // Branding and endpoints come from VITE_* env vars (see .env.example).
 export default defineConfig(({ mode }) => {
@@ -50,6 +59,17 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy,
+    },
+    // Stands in for static serving (#181): the policy headers, but cacheable.
+    // Release preview must not inherit server.proxy: the page is same-origin.
+    preview: {
+      headers: {
+        "Content-Security-Policy": PAGE_CSP,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+      },
+      proxy: mode === "release" ? {} : undefined,
     },
     test: {
       projects: [

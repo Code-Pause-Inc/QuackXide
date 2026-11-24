@@ -69,6 +69,9 @@ jobs:
           name: browser-${{ matrix.browser }}
           path: frontend/.vitest/
           if-no-files-found: ignore
+      - name: Page CSP smoke in ${{ matrix.browser }}
+        if: ${{ matrix.browser == 'chromium' }}
+        run: scripts/check-page-headers.sh --smoke
       # Report only (#185): browser timings and the wasm module's size. Runs
       # after the tests, also when they failed, but not when a setup step
       # failed. Never a required check.
