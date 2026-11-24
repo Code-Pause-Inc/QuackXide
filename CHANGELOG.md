@@ -136,9 +136,12 @@ uses [Semantic Versioning](https://semver.org/).
   `platform_enclave::bundle::verify_bundle`, and the crypto worker's
   `verifyEnclave` fetches the attestation bundle and the issuer's key set,
   verifies them and keeps the enclave in worker memory until its token
-  nears expiry. Release builds take their trust values from
-  `VITE_ATTESTATION_ISSUER`, `VITE_ATTESTATION_JWKS_URL` and
-  `VITE_ATTESTATION_IMAGE_DIGESTS` and are refused without them.
+  nears expiry. It fetches the key set once more, past the HTTP cache, when
+  the token names a key the set does not hold. Release builds take their
+  trust values from `VITE_ATTESTATION_ISSUER` (https://),
+  `VITE_ATTESTATION_JWKS_URL` and `VITE_ATTESTATION_IMAGE_DIGESTS` and are
+  refused without them; only development and test builds fall back to the
+  simulator's.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
