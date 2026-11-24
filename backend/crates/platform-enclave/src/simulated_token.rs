@@ -9,6 +9,7 @@
 //! [`TamperedTokenProvider`] produces the tokens refusal tests need. Compiled
 //! only with the `simulated` feature.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,9 @@ pub struct SimulatedClaims {
     pub dbgstat: String,
     pub support_attributes: Vec<String>,
     pub image_digest: String,
+    /// `submods.container.env`: the bound configuration the workload
+    /// reports (`config::bound_env`).
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for SimulatedClaims {
@@ -60,6 +64,7 @@ impl Default for SimulatedClaims {
             dbgstat: "disabled-since-boot".into(),
             support_attributes: vec!["STABLE".into()],
             image_digest: SIMULATED_IMAGE_DIGEST.into(),
+            env: BTreeMap::new(),
         }
     }
 }
@@ -133,6 +138,15 @@ impl TokenSigner {
         }
     }
 
+    /// The same key and claims, reporting `env` as the workload's bound
+    /// configuration.
+    pub fn with_env(&self, env: BTreeMap<String, String>) -> Self {
+        self.with_claims(SimulatedClaims {
+            env,
+            ..self.claims.clone()
+        })
+    }
+
     pub fn issuer(&self) -> &str {
         &self.issuer
     }
@@ -188,7 +202,10 @@ impl TokenSigner {
             "dbgstat": self.claims.dbgstat,
             "submods": {
                 "confidential_space": { "support_attributes": self.claims.support_attributes },
-                "container": { "image_digest": self.claims.image_digest },
+                "container": {
+                    "image_digest": self.claims.image_digest,
+                    "env": self.claims.env,
+                },
             },
         })
     }
@@ -213,6 +230,9 @@ enum TokenSource {
 /// nonces, verified against the signer's key set and `policy`.
 pub struct SimulatedTokenProvider {
     source: TokenSource,
+    /// The bound configuration this workload reports in each token, as
+    /// Confidential Space's launcher would from the container's env.
+    workload_env: BTreeMap<String, String>,
     issuer: String,
     policy: ReleasePolicy,
     verifiers: RwLock<Option<Verifiers>>,
@@ -245,6 +265,7 @@ impl SimulatedTokenProvider {
         Self {
             issuer: signer.issuer().to_owned(),
             source: TokenSource::InProcess(signer),
+            workload_env: BTreeMap::new(),
             policy,
             verifiers: RwLock::new(verifiers),
         }
@@ -261,17 +282,29 @@ impl SimulatedTokenProvider {
                 base_url: base_url.trim_end_matches('/').to_owned(),
                 client,
             },
+            workload_env: BTreeMap::new(),
             issuer: issuer.to_owned(),
             policy,
             verifiers: RwLock::new(None),
         }
     }
 
+    /// Report `env` (the workload's bound configuration) in every token.
+    pub fn with_workload_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.workload_env = env;
+        self
+    }
+
     async fn token(&self, audience: &str, nonces: &[String]) -> Result<String, EnclaveError> {
         match &self.source {
-            TokenSource::InProcess(signer) => {
+            TokenSource::InProcess(signer) if self.workload_env.is_empty() => {
                 Ok(signer.sign(audience, nonces, Duration::from_secs(3600)))
             }
+            TokenSource::InProcess(signer) => Ok(signer.with_env(self.workload_env.clone()).sign(
+                audience,
+                nonces,
+                Duration::from_secs(3600),
+            )),
             TokenSource::Http { base_url, client } => {
                 #[derive(serde::Deserialize)]
                 struct TokenResponse {
@@ -280,6 +313,7 @@ impl SimulatedTokenProvider {
                 let body = json!({
                     "audience": audience,
                     "nonces": nonces,
+                    "env": self.workload_env,
                     "token_type": "OIDC",
                 });
                 let response = client

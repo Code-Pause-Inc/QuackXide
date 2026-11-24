@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# secret-scan.sh — gitleaks over every diff in HEAD's history, under
-# .gitleaks.toml. CI runs it on a pull request's merge with main, and
-# scripts/check.sh on the checked-out branch. Fails closed: a scan that git
-# cut short, which gitleaks alone reports as clean, is a failure.
+# secret-scan.sh — gitleaks over every diff and every commit message in
+# HEAD's history, under .gitleaks.toml. CI runs it on a pull request's merge
+# with main and on every push to every branch, and scripts/check.sh on the
+# checked-out branch. Fails closed: a scan that git cut short, which gitleaks
+# alone reports as clean, is a failure.
 #
 #   secret-scan.sh            scan HEAD's history
 #   secret-scan.sh selftest   check the scan catches known cases
@@ -20,9 +21,11 @@ fail() { echo "FAIL: $1"; exit 1; }
 # apply. Merges are diffed against their first parent, so a conflict
 # resolution is scanned too. --text --no-textconv diff every file's real
 # content, so attributes (-diff, binary, a textconv driver, in the repo or
-# the user's config) and NUL bytes can't hide a secret.
+# the user's config) and NUL bytes can't hide a secret. The diffs never
+# include commit messages, which a squash merge copies onto main, so those
+# go through `gitleaks stdin` too.
 scan() {
-    local rev out status=0
+    local rev out messages status=0 message_status=0
     rev="$(git -C "$1" rev-parse --verify --quiet 'HEAD^{commit}')" \
         || { echo "FAIL: no commit at HEAD in $1"; return 1; }
     out="$("$GITLEAKS" git --no-banner --no-color --redact -v \
@@ -39,7 +42,18 @@ scan() {
         echo "FAIL: no commits were scanned, so the scan is incomplete"
         return 1
     fi
-    return "$status"
+
+    messages="$(git -C "$1" log --no-color --format='commit %H%n%B' "$rev" --)" \
+        || { echo "FAIL: git could not list the commit messages, so the scan is incomplete"; return 1; }
+    out="$(printf '%s\n' "$messages" | "$GITLEAKS" stdin --no-banner --no-color --redact -v \
+        --config "$ROOT/.gitleaks.toml" 2>&1)" || message_status=$?
+    printf '%s\n' "$out"
+    if grep -qE '^[^ ]+ ERR ' <<<"$out"; then
+        echo "FAIL: the commit-message scan stopped partway, so the scan is incomplete"
+        return 1
+    fi
+    if (( status != 0 )); then return "$status"; fi
+    return "$message_status"
 }
 
 case "${1:-}" in
@@ -80,6 +94,12 @@ case "${1:-}" in
 
         (repo tip && echo "aws_key = \"$leak\"" >a.txt && commit a)
         expect leak tip
+
+        # The key is only in a commit message, which a squash merge copies
+        # onto main.
+        (repo message && echo ok >a.txt && commit "aws_key = \"$leak\"" \
+            && echo b >b.txt && commit b)
+        expect leak message
 
         # A top-level file named HEAD makes a bare HEAD revision ambiguous.
         (repo head-path && echo "aws_key = \"$leak\"" >a.txt && echo x >HEAD && commit a)

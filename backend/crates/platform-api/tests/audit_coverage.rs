@@ -13,7 +13,9 @@ use axum::Router;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use platform_api::admin::{ProvisioningService, default_connector_slugs};
-use platform_api::query::{ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider};
+use platform_api::query::{
+    ConnectorQueryService, DevKeyProvider, EnclaveKeyProvider, ResearchRequest,
+};
 use platform_api::research::{ResearchService, ResearchStores};
 use platform_api::{ApiError, AppState, build_app};
 use platform_connectors::pipeline::{EnclavePipeline, SyncJob};
@@ -847,6 +849,78 @@ async fn key_release_handshake_audits_ok_and_denied_outcomes() {
     );
 }
 
+/// Key release refuses a deployment whose token reports another
+/// configuration than the request binds, or one that loosens a control
+/// (ADR 0005), and each refusal is a `crypto.key_release` denial naming why.
+#[tokio::test]
+async fn key_release_refusals_of_the_configuration_are_audited() {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use platform_api::key_release::{
+        EnclaveIdentity, KeyReleaseRelyingParty, KeyReleaseRequest, KeyWire, StaticKeySource,
+    };
+    use platform_enclave::config::config_digest;
+    use platform_enclave::token::{SIMULATED_AUDIENCE, nonces_from_bytes};
+
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let rp = KeyReleaseRelyingParty::new(
+        Arc::new(StaticKeySource(sim_signer().jwks())),
+        sim_signer().issuer(),
+        sim_policy(),
+    );
+    rp.insert_tenant_key(
+        tenant,
+        &TenantKeypair::generate(platform_crypto::EnvelopeSuite::Hpk2),
+    )
+    .expect("HPK2 key");
+    let env = |k: &str| BTreeMap::from([("RESEARCH_MIN_COHORT_SIZE".to_owned(), k.to_owned())]);
+    // (the configuration the key set binds, the one the token reports)
+    let cases = [
+        (
+            env("5"),
+            BTreeMap::new(),
+            "deployment config digest mismatch",
+        ),
+        (
+            env("1"),
+            env("1"),
+            "deployment configuration refused: RESEARCH_MIN_COHORT_SIZE loosens a control",
+        ),
+    ];
+    for (bound, reported, detail) in cases {
+        let identity =
+            EnclaveIdentity::with_metadata(None, config_digest(|n| bound.get(n).cloned()));
+        let challenge = rp.issue_challenge();
+        let nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&challenge.nonce_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let nonces = nonces_from_bytes(&identity.binding().report_data(&nonce)).unwrap();
+        let token = sim_signer().with_env(reported).sign(
+            SIMULATED_AUDIENCE,
+            &nonces,
+            Duration::from_secs(600),
+        );
+        let request = KeyReleaseRequest {
+            tenant_id: tenant.to_string(),
+            nonce_b64: challenge.nonce_b64,
+            token,
+            request_key: KeyWire::from_public_key(&identity.request_public_key()),
+            signing_keys: identity.signing_keys().clone(),
+            kms_public_key: None,
+            tls_spki_sha256: None,
+            config_digest_b64: URL_SAFE_NO_PAD.encode(identity.binding().config_digest),
+        };
+        assert!(rp.release_key(&request).await.is_err(), "{detail}");
+        assert_tenant_event(&capture, "crypto.key_release", "denied", tenant, detail);
+    }
+}
+
 #[tokio::test]
 async fn drive_listing_past_the_cap_is_audited() {
     let capture = AuditCapture::install();
@@ -1297,6 +1371,77 @@ fn count_outcome(capture: &AuditCapture, kind: &str, outcome: &str) -> usize {
         .iter()
         .filter(|e| e.audit_kind == kind && e.outcome == outcome)
         .count()
+}
+
+/// Each refusal of a sealed research query is an `auth.decision` denial
+/// (ARCHITECTURE "Security telemetry", rule 2): opening the frame reads the
+/// enclave's key, so even a 400 there is more than input validation.
+#[tokio::test]
+async fn sealed_research_query_refusals_are_audited() {
+    let capture = AuditCapture::install();
+    let (steward, researcher) = (TenantId::generate(), TenantId::generate());
+    let app = common::sealed_research_app(SECRET, steward).await;
+    let (status, grant) = post(
+        &app,
+        "/api/v1/grants",
+        &token_for(steward),
+        &format!(r#"{{"researcher_tenant":"{researcher}","connector":"health"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    let grant_id = grant["grant_id"].as_str().expect("grant id");
+    let sealer = common::Sealer::new(&app, researcher, steward).await;
+    let sql = "SELECT condition, COUNT(*) AS n FROM health GROUP BY condition";
+    let rtoken = token_for(researcher);
+    let with = |field: &str, value: serde_json::Value| {
+        let mut body: serde_json::Value =
+            serde_json::from_str(&sealer.body(grant_id, 1, sql)).unwrap();
+        body[field] = value;
+        body.to_string()
+    };
+
+    let cases = [
+        (with("version", serde_json::json!(2)), "unsupported_version"),
+        (with("key_id", serde_json::json!("stale")), "unknown_key_id"),
+        (with("envelope", serde_json::json!("AAAA")), "does_not_open"),
+    ];
+    for (body, reason) in cases {
+        let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &body).await;
+        assert!(status.is_client_error(), "{reason}: {status}");
+        assert_tenant_event(
+            &capture,
+            "auth.decision",
+            "denied",
+            researcher,
+            &format!("sealed research query refused reason={reason}"),
+        );
+    }
+
+    let (status, _) = post(
+        &app,
+        "/api/v1/research/query",
+        &rtoken,
+        &sealer.body(grant_id, 2, sql),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(
+        &app,
+        "/api/v1/research/query",
+        &rtoken,
+        &sealer.body(grant_id, 2, sql),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_tenant_event(
+        &capture,
+        "auth.decision",
+        "denied",
+        researcher,
+        &format!(
+            "sealed research query refused reason=nonce_used steward={steward} connector=health"
+        ),
+    );
 }
 
 #[tokio::test]
@@ -1960,7 +2105,10 @@ async fn resource_limit_refusals_are_audited() {
     let research_sql = "SELECT currency, COUNT(*) AS n FROM quickbooks GROUP BY currency";
     assert!(
         service
-            .research_query(researcher, steward, &connector, research_sql)
+            .research_query(
+                researcher,
+                ResearchRequest::plain(steward, connector.clone(), research_sql)
+            )
             .await
             .is_err()
     );

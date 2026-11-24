@@ -64,7 +64,9 @@ key that opens the data.
    ciphertext: object ids and sizes, suite and upload time. Connector
    pipelines sync external sources into attested enclave memory, shape
    them into Parquet, and seal them to the tenant's HPKE key before
-   anything persists.
+   anything persists. Live connector sync is not in v1.0
+   (`docs/PROJECT_SCOPE.md`): `connector-worker` runs fixture jobs for
+   development only.
 2. **Storage.** Ciphertext only, in HPKE envelopes with versioned framing
    and context binding. Storage paths are built only from typed tenant ids,
    so cross-tenant access cannot be expressed.
@@ -73,7 +75,9 @@ key that opens the data.
    queries; each must carry a genuine `COUNT(*) AS n`, and cohorts below
    `RESEARCH_MIN_COHORT_SIZE` are suppressed. A sum or mean that one or
    two rows dominate is released as null (`RESEARCH_DOMINANCE_PERCENT`).
-   Blind indexes support equality search without decryption.
+   The engine library can match blind indexes for equality search without
+   decryption, but blind-index search is not in v1.0: no route produces
+   the indexed column (`docs/PROJECT_SCOPE.md`).
 4. **Research access.** A steward publishes a dataset's listing, with a
    data dictionary of its table name and the columns the steward
    describes, and grants a researcher a finite query budget, spent before
@@ -208,10 +212,12 @@ curl -s -X POST "$API/api/v1/research/requests/$REQ/approve" -H "Authorization: 
 curl -s "$API/api/v1/research/query" -H "Authorization: Bearer $R_TOKEN" -H 'Content-Type: application/json' -d "{\"steward_tenant\":\"$STEWARD\",\"connector\":\"health\",\"sql\":\"SELECT condition, COUNT(*) AS n FROM health GROUP BY condition ORDER BY condition\"}"
 ```
 
-The query releases only conditions with at least `RESEARCH_MIN_COHORT_SIZE`
-rows and counts the rest in `suppressed_rows`: with the default of 11, seven
-are released and two suppressed. The frontend has no research-query form yet,
-so these steps use `curl`.
+The local stack is a development build, so it takes this plaintext query; a
+release build takes only a query sealed to the enclave (ADR 0010). The query
+releases only conditions with at least `RESEARCH_MIN_COHORT_SIZE` rows and
+counts the rest in `suppressed_rows`: with the default of 11, seven are
+released and two suppressed. The frontend has no research-query form yet, so
+these steps use `curl`.
 
 ### Simulated TEE (local Docker)
 

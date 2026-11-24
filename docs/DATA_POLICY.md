@@ -13,7 +13,11 @@ test environment use **synthetic or public data only**.
 2. **No other personal data.** No real names, email addresses, phone
    numbers, addresses, government identifiers, or financial records.
    Fixtures use obviously fake values (for example `alex@lead-one.example`,
-   "Alex Sample") on reserved `.example` domains.
+   "Alex Sample") on reserved `.example` domains. Test sign-in users in
+   the provider's development tenant are synthetic too: `.example`
+   addresses with email verification off, never a team member's own
+   address or phone number. Their passwords and TOTP seeds are kept in the
+   development secret store (`docs/DEVELOPMENT.md`), never committed.
 3. **No credentials.** No API keys, tokens, private keys, passwords, or
    `.env` files. Only `*.env.example` templates with empty values are
    committed. Cross-implementation test vectors are the one exception: they
@@ -32,10 +36,12 @@ test environment use **synthetic or public data only**.
 
 * `scripts/check.sh` fails if a data file is tracked outside a `fixtures/`
   directory.
-* gitleaks scans every diff in the history being merged for credentials
-  on every pull request (`.gitleaks.toml`, `scripts/secret-scan.sh`), and
-  `scripts/check.sh` runs a similar scan of the branch when gitleaks is
-  installed. Commit messages are not scanned. A synthetic test literal
+* gitleaks scans every diff and every commit message in the history being
+  merged for credentials on every pull request, and in the pushed history
+  on every push to every branch, with no run cancelled (`.gitleaks.toml`,
+  `scripts/secret-scan.sh`, `.github/workflows/secret-scan.yml`).
+  `scripts/check.sh` runs the same scan of the branch when gitleaks is
+  installed. A synthetic test literal
   that trips a rule is allowed in `.gitleaks.toml` by exact value or path,
   never by disabling a rule.
 * Pull requests are reviewed for data content.
