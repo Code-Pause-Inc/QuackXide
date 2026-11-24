@@ -22,7 +22,8 @@ uses [Semantic Versioning](https://semver.org/).
   seals the object and the snapshot manifest under the session's tenant
   (`HPK1`), and sends the upload body; 401 and 403 are shown clearly. The
   form says that column names and types are stored in plaintext. The
-  publish form picks from the stored datasets instead of taking a slug.
+  publish form picks from the stored datasets instead of taking a slug,
+  and pre-fills an upload's data dictionary from the schema it declared.
   `GET /api/v1/datasets` now gives each upload's declared `row_cap` and
   `schema` and the upload size limit (`dataset_max_bytes`).
   `fixtures/parquet/` holds Parquet schema vectors that the browser and the
@@ -58,11 +59,11 @@ uses [Semantic Versioning](https://semver.org/).
   and 422 when not a dictionary's shape. A re-publish replaces the
   columns. `GET /api/v1/connectors` lists the built-in connectors with the
   columns each one's mapper writes, which the publish form pre-fills a
-  connector dataset's dictionary from; an upload's columns are entered by
-  hand. The portal shows the dictionary on every catalog listing and each
-  authorized dataset, with a `SELECT COUNT(*) AS n` example over the table
-  name to copy. The catalog is still in memory, so listings and their
-  dictionaries are lost on restart (P62).
+  connector dataset's dictionary from. The portal shows the dictionary on
+  every catalog listing and each authorized dataset, with a
+  `SELECT COUNT(*) AS n` example over the table name to copy. The catalog
+  is still in memory, so listings and their dictionaries are lost on
+  restart (P62).
 * Browser envelope seal benchmark (P34 checkpoint A, #171).
   `scripts/bench-wasm-seal.sh` seals synthetic Parquet from `synth-data`
   at about 1 MiB, 100 MiB and 1 GiB with the wasm module in a Chromium

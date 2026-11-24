@@ -136,6 +136,8 @@ size limit (`DATASET_MAX_MIB`). Both are already visible to the operator
 (ADR 0012). Before sealing, the browser refuses a schema unlike the
 recorded one, a re-upload whose recorded schema is unreadable (the route
 would refuse it), and a file whose sealed object would exceed the limit.
+The publish form also starts an upload's data dictionary from the recorded
+schema, the columns undescribed, for the steward to edit.
 
 ### The seal
 

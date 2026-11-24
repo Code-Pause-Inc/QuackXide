@@ -1,14 +1,17 @@
 import { useId, useState } from "react";
 import {
   type ConnectorView,
+  type DatasetView,
   dollarsToCents,
   type PublishListingBody,
 } from "../../lib/research/client";
 import {
   type DictionaryColumn,
+  type Prefill,
   connectorPrefill,
   dictionaryProblem,
   sameColumns,
+  uploadPrefill,
 } from "../../lib/research/dictionary";
 import DictionaryEditor from "./DictionaryEditor";
 import { inputCls, primaryBtnCls } from "./styles";
@@ -20,13 +23,14 @@ const DESCRIPTION_MAX = 2000;
  *  for one of the steward's stored datasets (`GET /api/v1/datasets`):
  *  publishing is refused for a dataset the steward does not hold, so the
  *  form offers only those. A connector dataset's dictionary starts from the
- *  columns its connector's mapper writes; any other dataset's is entered by
- *  hand. */
+ *  columns its connector's mapper writes, an uploaded one's from the schema
+ *  its upload declared; any other dataset's is entered by hand. */
 export default function PublishForm({
   busy,
   currency,
   datasets,
   connectors = [],
+  uploads = [],
   onPublish,
 }: {
   busy: boolean;
@@ -35,6 +39,9 @@ export default function PublishForm({
   datasets: string[];
   /** The built-in connectors and their columns (`GET /api/v1/connectors`). */
   connectors?: ConnectorView[];
+  /** The stored datasets with the schema each upload declared
+   *  (`GET /api/v1/datasets`). */
+  uploads?: readonly { dataset: string; schema: DatasetView["schema"] }[];
   onPublish: (body: PublishListingBody) => void;
 }) {
   const datasetId = useId();
@@ -46,14 +53,16 @@ export default function PublishForm({
   const [queries, setQueries] = useState("");
   const [columns, setColumns] = useState<DictionaryColumn[]>([]);
 
-  const prefill = connectorPrefill(connectors, connector.trim());
+  const prefillFor = (dataset: string): Prefill | null =>
+    connectorPrefill(connectors, dataset) ?? uploadPrefill(uploads, dataset);
+  const prefill = prefillFor(connector.trim());
   /** Columns that are empty or still the pre-fill follow the dataset;
    *  once the steward edits them they stay. */
   const chooseDataset = (value: string) => {
     const untouched =
       columns.length === 0 || (prefill !== null && sameColumns(columns, prefill.columns));
     setConnector(value);
-    if (untouched) setColumns(connectorPrefill(connectors, value.trim())?.columns ?? []);
+    if (untouched) setColumns(prefillFor(value.trim())?.columns ?? []);
   };
 
   const feeCents = dollarsToCents(fee);

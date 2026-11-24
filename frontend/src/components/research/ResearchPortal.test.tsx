@@ -675,6 +675,31 @@ describe("ResearchPortal", () => {
     );
   });
 
+  it("pre-fills an upload's dictionary from the schema it declared", async () => {
+    api.publishListing.mockResolvedValue(ownListing);
+    const user = await openPortal();
+
+    await user.click(await screen.findByRole("button", { name: "Publish a dataset" }));
+    await user.selectOptions(screen.getByLabelText("Dataset"), "upload_cohorts");
+    expect(screen.getByText(/Pre-filled from the uploaded file/)).toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/listing title/), "Cohorts");
+    await user.type(screen.getByPlaceholderText(/license fee/), "0");
+    await user.type(screen.getByPlaceholderText(/rate per query/), "0");
+    await user.click(screen.getByRole("button", { name: "Publish listing" }));
+
+    expect(api.publishListing).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connector: "upload_cohorts",
+        data_dictionary: {
+          columns: [
+            { name: "condition", type: "string", description: "" },
+            { name: "age", type: "int64", description: "" },
+          ],
+        },
+      }),
+    );
+  });
+
   it("opens without connector columns, leaving them to the steward", async () => {
     api.datasets.mockResolvedValue(withQuickbooks);
     api.connectors.mockRejectedValue(new Error("failed to load connector columns (502)"));

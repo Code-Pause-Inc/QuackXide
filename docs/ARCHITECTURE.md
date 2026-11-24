@@ -704,8 +704,9 @@ hold or one given twice, or a description over 500 characters (400), and
 a dictionary not of that shape (422); a re-publish replaces the columns.
 `GET /api/v1/connectors` gives the columns each built-in connector's
 mapper writes, which the publish form starts a connector dataset's
-dictionary from; an upload's are entered by hand. The portal shows the
-dictionary on every listing and each authorized dataset, with a
+dictionary from; an upload's starts from the schema it declared, as the
+dataset listing gives it (ADR 0014). The portal shows the dictionary on
+every listing and each authorized dataset, with a
 `SELECT COUNT(*) AS n` example over the table name.
 
 Researchers file

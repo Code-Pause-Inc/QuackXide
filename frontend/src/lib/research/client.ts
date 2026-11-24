@@ -2,8 +2,8 @@
 // the steward's stored datasets, and the connector columns a listing's
 // data dictionary starts from.
 
-import type { DeclaredColumn } from "../datasets/schema";
-import type { ColumnType, DictionaryColumn } from "./dictionary";
+import type { ColumnType, DeclaredColumn } from "../datasets/schema";
+import type { DictionaryColumn } from "./dictionary";
 
 /** One dataset the steward holds, as `GET /api/v1/datasets` describes its
  *  current snapshot: what storage holds, never its contents. */

@@ -582,6 +582,7 @@ export default function ResearchPortal() {
                 currency={data.catalog.currency}
                 datasets={data.datasets?.datasets.map((d) => d.dataset) ?? []}
                 connectors={data.connectors}
+                uploads={data.datasets?.datasets ?? []}
                 onPublish={(body) =>
                   act("publish", () => client().publishListing(body)).then(
                     (ok) => ok && setShowPublishForm(false),
