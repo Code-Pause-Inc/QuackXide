@@ -13,6 +13,7 @@ import type { AttestationTrust } from "../../config/attestation";
 import envelopeWasmUrl from "./wasm/envelope_bg.wasm?url";
 import init, {
   connectorObjectInfo,
+  keySetHoldsTokenKey as wasmKeySetHoldsTokenKey,
   openEnvelope,
   publicKeyFromPrivateKey,
   researchQueryBinding,
@@ -136,6 +137,13 @@ export async function verifyAttestationBundle(
       mlDsa65: verified.signing_keys.ml_dsa_65,
     },
   };
+}
+
+/** Whether the key set holds the key the bundle's token names; false when
+ *  either doesn't parse. */
+export async function keySetHoldsTokenKey(bundleJson: string, jwksJson: string): Promise<boolean> {
+  await loadEnvelopeModule();
+  return wasmKeySetHoldsTokenKey(bundleJson, jwksJson);
 }
 
 /** HPKE `info` strings, defined once in the backend (`platform_crypto::info`)

@@ -130,11 +130,6 @@ describe("attestEnclave", () => {
       "check 1",
     ],
     [
-      "unknown kid",
-      async () => ({ signer: await testIssuer("other-kid") }),
-      "check 1",
-    ],
-    [
       "two hours old",
       { claimOverrides: { iat: nowSecs() - 7200, nbf: nowSecs() - 7200, exp: nowSecs() - 6600 } },
       "check 1",
@@ -160,6 +155,28 @@ describe("attestEnclave", () => {
     // The cache stayed empty: the next call attests again.
     await cache.current().catch(() => undefined);
     expect(s.calls).toHaveLength(4);
+  });
+
+  it("refuses an unknown kid after fetching the key set once more, past the cache", async () => {
+    const s = await stub({ signer: await testIssuer("other-kid") });
+    await expect(attestEnclave(deps(s.fetch))).rejects.toThrow(/^check 1/);
+    expect(s.calls.map((c) => c.url)).toEqual([expect.stringContaining(API), JWKS_URL, JWKS_URL]);
+    expect(s.calls[1]!.init?.cache).toBeUndefined();
+    expect(s.calls[2]!.init?.cache).toBe("reload");
+    expect(s.calls[2]!.init?.credentials).toBe("omit");
+  });
+
+  it("verifies against a key set rotated since it was cached", async () => {
+    const cached = await testIssuer();
+    const rotated = await testIssuer("other-kid");
+    let keySetFetches = 0;
+    const s = await stub({
+      signer: rotated,
+      jwksResponse: () => new Response(keySetFetches++ === 0 ? cached.jwks : rotated.jwks),
+    });
+    const enclave = await attestEnclave(deps(s.fetch));
+    expect(enclave.keyId).toBe(bound.bundle.key_id);
+    expect(keySetFetches).toBe(2);
   });
 
   it("bundle_unavailable", async () => {

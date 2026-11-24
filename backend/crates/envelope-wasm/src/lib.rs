@@ -180,6 +180,24 @@ pub fn verify_attestation(
     verify_bundle(&bundle, challenge, &verifier, policy).map_err(|e| e.to_string())
 }
 
+/// Whether the key set holds the key the bundle's token names, by
+/// `TokenVerifier`'s rule; false when either doesn't parse. ADR 0010: when it
+/// doesn't, the browser fetches the key set once more, past its HTTP cache.
+pub fn key_set_holds_token_key(bundle_json: &str, jwks_json: &str) -> bool {
+    let (Ok(bundle), Ok(jwks)) = (
+        serde_json::from_str::<AttestationBundle>(bundle_json),
+        serde_json::from_str::<JwkSet>(jwks_json),
+    ) else {
+        return false;
+    };
+    // `knows_kid` reads only the key set, so the issuer and policy are unused.
+    let policy = ReleasePolicy {
+        allowed_image_digests: Vec::new(),
+    };
+    TokenVerifier::new(&jwks, "", BROWSER_ATTESTATION_AUDIENCE, policy)
+        .is_ok_and(|verifier| verifier.knows_kid(&bundle.token))
+}
+
 // ── wasm exports ─────────────────────────────────────────────────────────────
 //
 // Error messages are `CryptoError`'s, or for `verifyAttestation` the failed
@@ -280,6 +298,11 @@ pub fn verify_attestation_js(
     )
     .map_err(|message| JsError::new(&message))?;
     serde_json::to_string(&verified).map_err(|e| JsError::new(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = keySetHoldsTokenKey)]
+pub fn key_set_holds_token_key_js(bundle_json: &str, jwks_json: &str) -> bool {
+    key_set_holds_token_key(bundle_json, jwks_json)
 }
 
 #[cfg(test)]
@@ -444,6 +467,16 @@ mod tests {
             let err = verify_attestation(&bundle, &CHALLENGE, "<html>", ISSUER, vec![], false)
                 .expect_err("refused");
             assert!(err.starts_with("attestation key set"), "{err}");
+        }
+
+        #[test]
+        fn the_key_set_holds_the_token_key_only_when_its_kid_matches() {
+            let (bundle, jwks) = minted("bound");
+            let (_, other_jwks) = minted("bound");
+            assert!(key_set_holds_token_key(&bundle, &jwks));
+            assert!(!key_set_holds_token_key(&bundle, &other_jwks));
+            assert!(!key_set_holds_token_key(&bundle, "<html>"));
+            assert!(!key_set_holds_token_key("{}", &jwks));
         }
 
         #[test]

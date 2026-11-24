@@ -5,7 +5,7 @@
 
 import type { AttestationTrust } from "../../config/attestation";
 import { toB64 } from "../encoding";
-import { verifyAttestationBundle, type VerifiedEnclave } from "./envelope";
+import { keySetHoldsTokenKey, verifyAttestationBundle, type VerifiedEnclave } from "./envelope";
 
 export type { VerifiedEnclave };
 
@@ -95,12 +95,17 @@ async function fetchBundle(deps: AttestationDeps, challenge: Uint8Array): Promis
   }
 }
 
-async function fetchKeySet(deps: AttestationDeps): Promise<string> {
+/** The issuer's key set, from the HTTP cache unless `reload` (ADR 0010). */
+async function fetchKeySet(deps: AttestationDeps, reload = false): Promise<string> {
   const unreachable = new Error("attestation key set unreachable");
   let body: string | null;
   try {
     body = await withTimeout(async (signal) => {
-      const response = await deps.fetch(deps.trust.jwksUrl, { credentials: "omit", signal });
+      const response = await deps.fetch(deps.trust.jwksUrl, {
+        credentials: "omit",
+        signal,
+        ...(reload && { cache: "reload" as const }),
+      });
       if (!response.ok) throw unreachable;
       return readCapped(response);
     });
@@ -112,7 +117,8 @@ async function fetchKeySet(deps: AttestationDeps): Promise<string> {
 }
 
 /** Fetch the enclave's bundle for a fresh challenge and the issuer's key set,
- *  then verify. Rejects with the refusal's message. */
+ *  then verify, fetching the key set again once if it lacks the token's key.
+ *  Rejects with the refusal's message. */
 export async function attestEnclave(deps: AttestationDeps): Promise<VerifiedEnclave> {
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const [bundle, keySet] = await Promise.allSettled([
@@ -121,7 +127,16 @@ export async function attestEnclave(deps: AttestationDeps): Promise<VerifiedEncl
   ]);
   if (bundle.status === "rejected") throw bundle.reason as Error;
   if (keySet.status === "rejected") throw keySet.reason as Error;
-  const enclave = await verifyAttestationBundle(bundle.value, challenge, keySet.value, deps.trust);
+  let enclave: VerifiedEnclave;
+  try {
+    enclave = await verifyAttestationBundle(bundle.value, challenge, keySet.value, deps.trust);
+  } catch (err) {
+    // After the issuer rotates its keys the cached set lacks the token's
+    // key: fetch it once more, past the cache (ADR 0010).
+    if (await keySetHoldsTokenKey(bundle.value, keySet.value)) throw err;
+    const fresh = await fetchKeySet(deps, true);
+    enclave = await verifyAttestationBundle(bundle.value, challenge, fresh, deps.trust);
+  }
   if (isExpiring(enclave, deps)) {
     throw new Error("the enclave's attestation expires too soon; check this device's clock");
   }
