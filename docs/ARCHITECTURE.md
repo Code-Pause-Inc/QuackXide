@@ -944,15 +944,18 @@ router. Layers, outermost first:
    gap between body reads (408). Everything else: 60 s. A server timeout
    answers 503 with an empty body.
 
-The policy is one line in `backend/crates/platform-api/page-csp.txt`,
-embedded by `platform-api` (`PAGE_CSP`) and read by `vite.config.ts` for
-`vite preview`; no setting can widen it (ADR 0005: the environment may only
-tighten controls). Static files, which #181 will serve inside the header
-layer, get the first four headers but stay cacheable. `vite preview` stands
-in for that today, and `scripts/check-page-headers.sh` (part of
-`scripts/check.sh`) builds the release bundle, serves it and checks the
-page, `/index.html` and the crypto worker script for exactly the policy
-file's value and the other headers. `frontend/scripts/csp-smoke.mjs`
+The first four headers in layer 1 are the page headers, one `Name: value`
+line each in `backend/crates/platform-api/page-headers.txt`, embedded by
+`platform-api` (`edge::page_headers`) and read by `vite.config.ts` for
+`vite preview`; no setting can widen them (ADR 0005: the environment may
+only tighten controls). `Cache-Control: no-store` is not in the file: every
+response `platform-api` sends today is an API response, and #181, which
+will serve the static files, decides their caching. `vite preview` stands
+in for that and sends the page headers without `no-store`.
+`scripts/check-page-headers.sh` (part of `scripts/check.sh`) builds the
+release bundle, serves it and checks the page, `/index.html` and the
+crypto worker script for exactly one of each header in the file, with its
+value, and no `no-store`. `frontend/scripts/csp-smoke.mjs`
 (`check-page-headers.sh --smoke`, the `browser` workflow) loads the page in
 Chromium and runs a worker operation that instantiates the wasm module, and
 fails on any policy violation.

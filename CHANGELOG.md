@@ -8,10 +8,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-* HTTP edge hardening (#180). Every `platform-api` response carries a strict
-  page `Content-Security-Policy` (one file, `page-csp.txt`, also served by
-  `vite preview`), `X-Content-Type-Options`, `Referrer-Policy`,
-  `X-Frame-Options` and `Cache-Control: no-store`. Requests time out per
+* HTTP edge hardening (#180). Every `platform-api` response carries the page
+  headers (one file, `page-headers.txt`, also served by `vite preview`): a
+  strict `Content-Security-Policy`, `X-Content-Type-Options`,
+  `Referrer-Policy` and `X-Frame-Options`, plus `Cache-Control: no-store`. Requests time out per
   route group (query routes follow `QueryLimits`, uploads get a 30 s body gap
   answered with 408, the rest 60 s answered with 503), and a handler panic
   answers a generic 500 (the edge logs a fixed message).

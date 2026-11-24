@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import policy from "../../../backend/crates/platform-api/page-csp.txt?raw";
+import file from "../../../backend/crates/platform-api/page-headers.txt?raw";
 import { GOOGLE_CS_JWKS_URL } from "./attestation";
+import { parsePageHeaders } from "./pageHeaders";
+
+const policy = parsePageHeaders(file)["Content-Security-Policy"] ?? "";
 
 describe("page CSP", () => {
   it("lets the page connect only to itself and the attestation key set", () => {

@@ -4,11 +4,11 @@
 #
 # Builds the frontend in release mode, serves it with `vite preview`, and
 # checks `/`, `/index.html` and the crypto worker script: status, content
-# type, exactly one Content-Security-Policy equal to
-# backend/crates/platform-api/page-csp.txt, and the other three policy
-# headers. Static files stay cacheable, so Cache-Control: no-store must be
-# absent. With --smoke it then loads the page in Chromium and runs one
-# wasm-backed worker operation under the policy (frontend/scripts/csp-smoke.mjs;
+# type, and exactly one of each header in
+# backend/crates/platform-api/page-headers.txt, with the file's value.
+# Cache-Control: no-store is the API's, not in the file, and must be absent.
+# With --smoke it then loads the page in Chromium and runs one wasm-backed
+# worker operation under the policy (frontend/scripts/csp-smoke.mjs;
 # needs `npx playwright install chromium`). Needs the wasm module
 # (scripts/build-wasm.sh) and `npm ci` first.
 # =============================================================================
@@ -62,7 +62,7 @@ for f in "$OUT"/assets/worker-*.js; do [ -e "$f" ] && workers+=("${f#"$OUT"/}");
 [ "${#workers[@]}" -eq 1 ] || { echo "FAIL: want exactly one crypto worker script under $OUT/assets, found ${#workers[@]}"; exit 1; }
 worker="${workers[0]}"
 
-expected_csp="$(cat "$ROOT/backend/crates/platform-api/page-csp.txt")"
+page_headers="$ROOT/backend/crates/platform-api/page-headers.txt"
 fail=0
 check() { # path content-type-prefix
     local path="$1" type="$2" head status
@@ -70,10 +70,9 @@ check() { # path content-type-prefix
     status="$(printf '%s\n' "$head" | awk 'NR==1 {print $2}')"
     [ "$status" = 200 ] || { echo "FAIL $path: status $status, want 200"; fail=1; }
     header_is "$path" "$head" Content-Type "$type" prefix
-    header_is "$path" "$head" Content-Security-Policy "$expected_csp" exact
-    header_is "$path" "$head" X-Content-Type-Options nosniff exact
-    header_is "$path" "$head" Referrer-Policy no-referrer exact
-    header_is "$path" "$head" X-Frame-Options DENY exact
+    while IFS= read -r line; do
+        header_is "$path" "$head" "${line%%: *}" "${line#*: }" exact
+    done <"$page_headers"
     if printf '%s\n' "$head" | grep -iq '^cache-control:[[:space:]]*no-store'; then
         echo "FAIL $path: Cache-Control: no-store on a static file"; fail=1
     fi
