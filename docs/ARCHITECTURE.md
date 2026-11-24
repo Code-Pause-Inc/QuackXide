@@ -836,6 +836,7 @@ record per security-relevant action, `target: SECURITY_AUDIT_EVENT`, fields
 | `auth.decision` | Every rejected token, admin denial, signature rejection, and research query without an active grant |
 | `research.budget` | Budget top-ups, exhaustion refusals, and refused top-ups and budget reads |
 | `research.catalog` | Listing and access-request lifecycle, including a refused publish |
+| `research.replay` | A sealed research query's envelope sent again: its stored response ("replayed") or a retry while it runs or after that response expired ("retry"). Never charged, so never `engine.query` |
 | `crypto.suite_refused` | A key or envelope of a suite the deployment refuses (`HPK1` in production), or an envelope, upload or snapshot record whose suite does not match its key |
 
 Grant events stay under `tenant.provisioned` rather than a `research.grant`
@@ -877,7 +878,8 @@ Rules, enforced by the capture tests:
    budget reads of unknown, foreign and malformed grant ids, and sealed
    research queries refused (an unsupported version, an unknown key set, a
    frame that does not open, a reused nonce), each an `auth.decision`
-   naming its reason.
+   naming its reason, and a replayed stored response (`research.replay`
+   "replayed", with no second `engine.query`).
 
 Audit records ignore `RUST_LOG`. `platform_telemetry::init_from_env`
 installs the subscriber that `build_subscriber` returns: two JSON layers on

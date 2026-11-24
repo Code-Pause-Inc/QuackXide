@@ -1160,6 +1160,15 @@ fn assert_tenant_event(
     );
 }
 
+/// The number of `kind` events, whatever their outcome.
+fn count_kind(capture: &AuditCapture, kind: &str) -> usize {
+    capture
+        .events()
+        .iter()
+        .filter(|e| e.audit_kind == kind)
+        .count()
+}
+
 /// The number of `kind` events with this outcome.
 fn count_outcome(capture: &AuditCapture, kind: &str, outcome: &str) -> usize {
     capture
@@ -1171,7 +1180,9 @@ fn count_outcome(capture: &AuditCapture, kind: &str, outcome: &str) -> usize {
 
 /// Each refusal of a sealed research query is an `auth.decision` denial
 /// (ARCHITECTURE "Security telemetry", rule 2): opening the frame reads the
-/// enclave's key, so even a 400 there is more than input validation.
+/// enclave's key, so even a 400 there is more than input validation. A
+/// stored response sent again is a `research.replay` "replayed" and adds
+/// no `engine.query` event, which would meter a second charge.
 #[tokio::test]
 async fn sealed_research_query_refusals_are_audited() {
     let capture = AuditCapture::install();
@@ -1238,6 +1249,21 @@ async fn sealed_research_query_refusals_are_audited() {
             "sealed research query refused reason=nonce_used steward={steward} connector=health"
         ),
     );
+
+    let body = sealer.body(grant_id, 3, sql);
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let metered = count_kind(&capture, "engine.query");
+    let (status, _) = post(&app, "/api/v1/research/query", &rtoken, &body).await;
+    assert_eq!(status, StatusCode::OK, "the stored response");
+    assert_tenant_event(
+        &capture,
+        "research.replay",
+        "replayed",
+        researcher,
+        &format!("research replay steward={steward} connector=health stored=ok"),
+    );
+    assert_eq!(count_kind(&capture, "engine.query"), metered);
 }
 
 #[tokio::test]
