@@ -14,8 +14,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use platform_core::TenantId;
 use platform_crypto::{EnvelopeSuite, SuitePolicy};
-use platform_enclave::config::ConfigPolicy;
-use platform_enclave::evidence::{BoundKeys, VerifiedEnclave, verify_evidence};
+use platform_enclave::bundle::{VerifiedBundle, verify_bundle};
 use platform_enclave::fresh_nonce;
 use platform_enclave::token::{BROWSER_ATTESTATION_AUDIENCE, JwkSet, ReleasePolicy, TokenVerifier};
 use zeroize::Zeroizing;
@@ -149,61 +148,12 @@ fn trust_from(flags: &Flags, api: &str, defaults: Option<Trust>) -> Result<Trust
     Ok(trust)
 }
 
-/// Decode `bundle`'s keys and run [`verify_evidence`] against `challenge`.
-pub fn verify_bundle(
-    bundle: &AttestationBundle,
-    challenge: &[u8; 32],
-    verifier: &TokenVerifier,
-    policy: ConfigPolicy,
-) -> Result<VerifiedEnclave, String> {
-    if bundle.version != 1 {
-        return Err(format!("unsupported bundle version {}", bundle.version));
-    }
-    // Either suite parses here; `verify_evidence` refuses all but HPK2.
-    let request_key = bundle
-        .request_key
-        .to_public_key(SuitePolicy::DEVELOPMENT)
-        .map_err(|_| "malformed request key in the bundle".to_owned())?;
-    let signing = bundle
-        .signing_keys
-        .to_verifying_keys()
-        .map_err(|_| "malformed signing keys in the bundle".to_owned())?;
-    let kms_public_key = match &bundle.kms_public_key {
-        None => Vec::new(),
-        Some(b64) => URL_SAFE_NO_PAD
-            .decode(b64)
-            .map_err(|_| "malformed KMS public key in the bundle".to_owned())?,
-    };
-    let tls_spki_sha256 = match &bundle.tls_spki_sha256 {
-        None => None,
-        Some(b64) => {
-            Some(decode_b64url_32(b64).ok_or("malformed TLS key digest in the bundle".to_owned())?)
-        }
-    };
-    let keys = BoundKeys {
-        request_key: request_key.to_framed(),
-        signing_ed25519: signing.ed25519_bytes(),
-        signing_ml_dsa_65: signing.ml_dsa_65_bytes(),
-        kms_public_key,
-        tls_spki_sha256,
-    };
-    verify_evidence(
-        verifier,
-        &bundle.token,
-        challenge,
-        &keys,
-        &bundle.key_id,
-        policy,
-    )
-    .map_err(|e| e.to_string())
-}
-
 /// Fetch the bundle for a fresh challenge and the key set, and verify.
 async fn attest(
     http: &reqwest::Client,
     api: &str,
     trust: &Trust,
-) -> Result<(AttestationBundle, VerifiedEnclave), String> {
+) -> Result<(AttestationBundle, VerifiedBundle), String> {
     let challenge = fresh_nonce();
     let url = format!(
         "{}/api/v1/attestation?nonce={}",
@@ -225,7 +175,8 @@ async fn attest(
         },
     )
     .map_err(|e| format!("attestation key set: {e}"))?;
-    let verified = verify_bundle(&bundle, &challenge, &verifier, compiled_config_policy())?;
+    let verified = verify_bundle(&bundle, &challenge, &verifier, compiled_config_policy())
+        .map_err(|e| e.to_string())?;
     Ok((bundle, verified))
 }
 
@@ -312,8 +263,7 @@ async fn run_with(
                  checks 1-5 passed: signature, platform, image {}, challenge, binding and configuration\n\
                  not checked: TLS key binding (needs P67)\n\
                  not checked: served frontend digest (needs P49)",
-                verified.key_id,
-                verified.token.image_digest(),
+                verified.key_id, verified.image_digest,
             ))
         }
         "seal-query" => {
@@ -371,8 +321,10 @@ async fn run_with(
 
 #[cfg(test)]
 mod tests {
+    use platform_enclave::config::ConfigPolicy;
+
     use super::*;
-    use crate::key_release::EnclaveIdentity;
+    use crate::key_release::{EnclaveIdentity, attestation_bundle};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
@@ -492,11 +444,13 @@ mod tests {
     #[test]
     fn an_hpk1_request_key_is_refused() {
         let identity = EnclaveIdentity::generate();
-        let mut bundle = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bundle = attestation_bundle(&identity, "token".to_owned());
         let hpk1 = platform_crypto::TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
         bundle.request_key = KeyWire::from_public_key(&hpk1);
         let verifier = test_verifier();
-        let err = verify_bundle(&bundle, &[0; 32], &verifier, ConfigPolicy::SIMULATOR).unwrap_err();
+        let err = verify_bundle(&bundle, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not HPK2"), "{err}");
     }
 
@@ -504,18 +458,20 @@ mod tests {
     fn a_malformed_bundle_field_is_refused() {
         let identity = EnclaveIdentity::generate();
         let verifier = test_verifier();
-        let mut bad_signing = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_signing = attestation_bundle(&identity, "token".to_owned());
         bad_signing.signing_keys.ed25519 = "!!".to_owned();
         assert!(
             verify_bundle(&bad_signing, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("signing keys")
         );
-        let mut bad_tls = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_tls = attestation_bundle(&identity, "token".to_owned());
         bad_tls.tls_spki_sha256 = Some("AAAA".to_owned());
         assert!(
             verify_bundle(&bad_tls, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("TLS")
         );
         let mut bad_version = AttestationBundle::new(&identity, "token".to_owned());
