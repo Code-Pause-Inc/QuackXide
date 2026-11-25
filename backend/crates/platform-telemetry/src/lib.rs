@@ -50,13 +50,31 @@ where
 }
 
 /// Install [`build_subscriber`] process-wide, writing to stdout, with the
-/// operational filter from `RUST_LOG` (default `info`). Audit records are
-/// written whatever `RUST_LOG` says. Later calls are no-ops.
+/// operational filter from `RUST_LOG` (default `info`), and the panic hook
+/// ([`install_panic_hook`]). Audit records are written whatever `RUST_LOG`
+/// says. Later calls install nothing new.
 pub fn init_from_env() {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_FILTER.to_owned());
     let _ = build_subscriber(&filter, std::io::stdout).try_init();
+    install_panic_hook();
+}
+
+/// Replace Rust's default panic hook, which prints the panic's message to
+/// stderr, with one `tracing` error event: a fixed message and the panic's
+/// location, never its message. The message can be an `expect` text or an
+/// error's `Debug` output, which may carry request or customer data.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()));
+        tracing::error!(
+            location = location.as_deref().unwrap_or("unknown"),
+            "a thread panicked"
+        );
+    }));
 }
 
 /// Fixed audit vocabulary; every variant is part of the compliance surface.
