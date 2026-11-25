@@ -387,6 +387,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* `POST /admin/webhooks/mor` answers a body over its 256 KiB limit with
+  413, not 400.
 * `README.md` and `docs/ARCHITECTURE.md` no longer describe live
   connector sync or blind-index search as v1.0 capabilities; both say they
   are not in v1.0 (`docs/PROJECT_SCOPE.md`).
