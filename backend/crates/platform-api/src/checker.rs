@@ -232,8 +232,13 @@ async fn attest(
 /// The HTTP client the binary uses: `https` only in a release build, on
 /// redirects too, so "over `https`" holds past the first hop.
 pub fn client() -> Result<reqwest::Client, String> {
+    client_for(!cfg!(feature = "dev"))
+}
+
+/// [`client`] with the `https`-only rule passed in: tests build with `dev`.
+fn client_for(https_only: bool) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .https_only(!cfg!(feature = "dev"))
+        .https_only(https_only)
         .build()
         .map_err(|e| format!("HTTP client: {e}"))
 }
@@ -512,6 +517,122 @@ mod tests {
             verify_bundle(&bad_tls, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
                 .contains("TLS")
+        );
+        let mut bad_version = AttestationBundle::new(&identity, "token".to_owned());
+        bad_version.version = 2;
+        assert!(
+            verify_bundle(&bad_version, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+                .unwrap_err()
+                .contains("unsupported bundle version 2")
+        );
+        let mut bad_request = AttestationBundle::new(&identity, "token".to_owned());
+        bad_request.request_key.public_key = "!!".to_owned();
+        assert!(
+            verify_bundle(&bad_request, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+                .unwrap_err()
+                .contains("malformed request key")
+        );
+        let mut bad_kms = AttestationBundle::new(&identity, "token".to_owned());
+        bad_kms.kms_public_key = Some("!!".to_owned());
+        assert!(
+            verify_bundle(&bad_kms, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+                .unwrap_err()
+                .contains("malformed KMS public key")
+        );
+    }
+
+    /// `seal-query` refuses a bad researcher, recipient key or nonce before
+    /// it contacts the deployment.
+    #[tokio::test]
+    async fn seal_query_refuses_bad_arguments_before_attesting() {
+        let key = |suite| {
+            URL_SAFE_NO_PAD.encode(
+                platform_crypto::TenantKeypair::generate(suite)
+                    .public_key()
+                    .to_raw(),
+            )
+        };
+        let (hpk2, hpk1) = (key(EnvelopeSuite::Hpk2), key(EnvelopeSuite::Hpk1));
+        let nonce = URL_SAFE_NO_PAD.encode(fresh_nonce());
+        let short_nonce = URL_SAFE_NO_PAD.encode(&fresh_nonce()[..16]);
+        let researcher = "6f2c8a2e-1111-4222-8333-444455556666";
+        let seal = |researcher: &str, key: &str, nonce: &str| {
+            let list = args(&[
+                "seal-query",
+                "--api",
+                "http://127.0.0.1:1",
+                "--researcher",
+                researcher,
+                "--grant",
+                "g",
+                "--steward",
+                researcher,
+                "--connector",
+                "c",
+                "--recipient-key",
+                key,
+                "--nonce",
+                nonce,
+                "--sql",
+                "SELECT 1",
+            ]);
+            let defaults = Trust {
+                issuer: "urn:sim".to_owned(),
+                jwks_url: "http://127.0.0.1:1/jwks".to_owned(),
+                image_digests: vec!["sha256:sim".to_owned()],
+            };
+            async move {
+                run_with(&list, &reqwest::Client::new(), Some(defaults))
+                    .await
+                    .unwrap_err()
+            }
+        };
+        for (r, k, n, want) in [
+            (
+                "not-a-uuid",
+                &*hpk2,
+                &*nonce,
+                "--researcher is not a tenant id",
+            ),
+            (
+                researcher,
+                "!!",
+                &nonce,
+                "--recipient-key is not a raw HPK2",
+            ),
+            (
+                researcher,
+                &hpk1,
+                &nonce,
+                "--recipient-key is not a raw HPK2",
+            ),
+            (researcher, &hpk2, "!!", "--nonce must be 32 bytes"),
+            (researcher, &hpk2, &short_nonce, "--nonce must be 32 bytes"),
+            // Valid arguments get as far as fetching the bundle.
+            (researcher, &hpk2, &nonce, "attestation bundle"),
+        ] {
+            let err = seal(r, k, n).await;
+            assert!(err.contains(want), "{want}: {err}");
+        }
+    }
+
+    /// A release build's client refuses plain `http`.
+    #[tokio::test]
+    async fn the_release_client_refuses_http() {
+        let router = axum::Router::new().route("/k", axum::routing::get(|| async { "{}" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/k", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let fetch = |https_only| {
+            let url = url.clone();
+            async move { fetch_json::<serde_json::Value>(&client_for(https_only).unwrap(), &url).await }
+        };
+        assert!(fetch(true).await.is_err());
+        assert!(
+            fetch(false).await.is_ok(),
+            "the same server answers over http"
         );
     }
 
