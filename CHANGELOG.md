@@ -703,6 +703,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* The pinned Rust toolchain moves from 1.94.1 to 1.100.0
+  (`rust-toolchain.toml` and the simulated-TEE `Dockerfile`). `rust-version`
+  stays 1.94.
 * The benchmark targets and regression threshold in `docs/BENCHMARKS.md`,
   backend and browser, are agreed (no longer proposed).
 * `docs/DATA_POLICY.md` says test sign-in users are synthetic `.example`
