@@ -465,6 +465,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* Every binary replaces Rust's default panic hook, which printed a
+  panic's message to stderr, outside the JSON logs: a panic now logs one
+  error event with its location and never its message, which can carry
+  request or customer data (`platform_telemetry::install_panic_hook`).
 * The secret scan also reads every commit message in the history it scans
   (`gitleaks stdin`), since a squash merge copies them onto main, and
   `.github/workflows/secret-scan.yml` runs it on every push to every
