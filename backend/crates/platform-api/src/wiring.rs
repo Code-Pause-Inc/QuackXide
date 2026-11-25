@@ -268,8 +268,6 @@ mod tests {
         .expect("config loads")
     }
 
-    // Production never seeds the fixture (it refuses the simulated TEE this
-    // runs under, so no `crypto.suite_refused` event is reachable); the
     /// The enclave's key set binds the configuration the platform enforces,
     /// from the config, not from whatever the process environment holds.
     #[tokio::test]
@@ -306,6 +304,8 @@ mod tests {
         );
     }
 
+    // Production never seeds the fixture (it refuses the simulated TEE this
+    // runs under, so no `crypto.suite_refused` event is reachable); the
     // suite policy is the second guard, should a caller reach the loader.
     #[tokio::test]
     async fn production_refuses_to_seed_a_demo_fixture_for_a_classical_key() {
