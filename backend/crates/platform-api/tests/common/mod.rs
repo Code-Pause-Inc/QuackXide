@@ -634,8 +634,23 @@ pub async fn sealed_research_stack(
     secret: &str,
     steward: TenantId,
 ) -> (Router, Arc<platform_enclave::simulated_token::TokenSigner>) {
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let (state, signer) = sealed_research_state(secret, steward, vault).await;
+    (build_app(state), signer)
+}
+
+/// [`sealed_research_stack`]'s state over `vault`, for tests that build the
+/// router themselves.
+pub async fn sealed_research_state(
+    secret: &str,
+    steward: TenantId,
+    vault: Arc<dyn VaultStore>,
+) -> (
+    AppState,
+    Arc<platform_enclave::simulated_token::TokenSigner>,
+) {
     let connector = ConnectorSlug::new("health").expect("slug");
-    let mut stack = DevResearchStack::new();
+    let mut stack = DevResearchStack::with_vault(vault);
     stack
         .commit_snapshot(
             steward,
@@ -663,12 +678,12 @@ pub async fn sealed_research_stack(
         platform_enclave::simulated_token::SimulatedClaims::default(),
     ));
     let service = stack.query_service_with_signer(settings, research.clone(), signer.clone());
-    let app = build_app(AppState {
+    let state = AppState {
         research: Some(research),
         query: Some(Arc::new(service)),
         ..app_state(secret, vault)
-    });
-    (app, signer)
+    };
+    (state, signer)
 }
 
 /// [`sealed_research_stack`]'s app.

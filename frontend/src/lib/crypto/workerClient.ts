@@ -7,6 +7,7 @@ import type {
   DatasetUploadFields,
   DownloadResult,
   DriveFileSummary,
+  EnclaveStatus,
   InitResult,
   WorkerRequest,
   WorkerResponse,
@@ -77,6 +78,15 @@ export class DriveWorkerClient {
    *  effect for the next vault request without restarting the worker. */
   setSession(token: string): Promise<null> {
     return this.call<null>({ op: "session", token });
+  }
+
+  /** Verify the enclave (cached) and report its key id and expiry. */
+  verifyEnclave(): Promise<EnclaveStatus> {
+    return this.call<EnclaveStatus>({ op: "verifyEnclave" });
+  }
+
+  invalidateEnclave(): Promise<void> {
+    return this.call<void>({ op: "invalidateEnclave" });
   }
 
   init(): Promise<InitResult> {

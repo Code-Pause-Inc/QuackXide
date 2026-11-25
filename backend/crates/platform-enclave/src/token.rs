@@ -105,6 +105,7 @@ pub struct ReleasePolicy {
 /// A token that passed every check. Only [`TokenVerifier`] constructs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedToken {
+    exp: u64,
     image_digest: String,
     hwmodel: String,
     nonces: Vec<String>,
@@ -112,6 +113,11 @@ pub struct VerifiedToken {
 }
 
 impl VerifiedToken {
+    /// When the token expires, seconds since the epoch.
+    pub fn expires_at(&self) -> u64 {
+        self.exp
+    }
+
     pub fn image_digest(&self) -> &str {
         &self.image_digest
     }
@@ -308,6 +314,7 @@ impl TokenVerifier {
             return Err(TokenError::ImageDigest);
         }
         Ok(VerifiedToken {
+            exp: claims.exp,
             image_digest: container.image_digest,
             hwmodel: claims.hwmodel,
             nonces,
@@ -321,7 +328,6 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     use super::*;

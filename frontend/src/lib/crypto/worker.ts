@@ -2,6 +2,7 @@
 // file bytes. The UI thread talks to it through protocol.ts and can neither
 // reach the key store nor observe key material.
 
+import { resolveAttestationTrust } from "../../config/attestation";
 import { resolveBrand } from "../../config/brand";
 import { resolveVaultConfig } from "../../config/vault";
 import { toB64 } from "../encoding";
@@ -9,6 +10,7 @@ import { errorMessage } from "../format";
 import { EnrollmentRefusedError, HttpVault } from "../vault/httpVault";
 import { LocalVault } from "../vault/localVault";
 import type { VaultClient } from "../vault/types";
+import { EnclaveCache } from "./attestation";
 import { generateMasterKey, keyFingerprint } from "./core";
 import { uploadDataset } from "./datasetUpload";
 import { createDeviceHpkeKey } from "./devicekey";
@@ -23,7 +25,7 @@ import {
   type KeyIdentity,
 } from "./keystore";
 import { decodeSessionClaims, parseWorkerRequest } from "./protocol";
-import type { InitResult, SessionClaims, WorkerRequest, WorkerResponse } from "./protocol";
+import type { EnclaveStatus, InitResult, SessionClaims, WorkerRequest, WorkerResponse } from "./protocol";
 
 type WorkerScope = {
   addEventListener(type: "message", cb: (ev: MessageEvent) => void): void;
@@ -40,14 +42,35 @@ let vaultInstance: VaultClient | null = null;
  *  written to localStorage or IndexedDB. Replaced by each session message. */
 let session: { token: string; claims: SessionClaims } | null = null;
 
+/** The verified enclave, in worker memory only. Uses the plain global
+ *  fetch: the attestation endpoint is public, so no token or credentials. */
+const enclave = new EnclaveCache(() => {
+  const trust = resolveAttestationTrust(import.meta.env, import.meta.env.MODE);
+  if (!trust) return null;
+  return {
+    apiBaseUrl: resolveBrand(import.meta.env).apiBaseUrl,
+    trust,
+    fetch: (input, init) => fetch(input, init),
+    now: Date.now,
+  };
+});
+
+async function handleVerifyEnclave(): Promise<EnclaveStatus> {
+  const { keyId, expiresAt } = await enclave.current();
+  return { keyId, expiresAtIso: new Date(expiresAt * 1000).toISOString() };
+}
+
 function handleSession(token: string): null {
   const claims = decodeSessionClaims(token);
   if (!claims) {
     // Clear rather than keep the previous session, so a broken refresh can
     // never leave stale credentials in use.
     session = null;
+    enclave.clear();
     throw new Error("malformed session token");
   }
+  // A verified enclave is not carried across tenants.
+  if (session?.claims.tid !== claims.tid) enclave.clear();
   session = { token, claims };
   return null;
 }
@@ -222,6 +245,11 @@ async function dispatch(req: WorkerRequest): Promise<unknown> {
         },
         req,
       );
+    case "verifyEnclave":
+      return handleVerifyEnclave();
+    case "invalidateEnclave":
+      enclave.invalidate();
+      return null;
     case "init":
       return handleInit();
     case "upload":

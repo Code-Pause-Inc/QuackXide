@@ -138,6 +138,19 @@ uses [Semantic Versioning](https://semver.org/).
   researcher key; a release build takes its trust anchors from the caller,
   over `https`. The simulated-TEE script sends only sealed research
   queries.
+* The researcher's browser verifies the enclave (ADR 0010; part of P85, #239
+  part 1). `envelope-wasm` exports `verifyAttestation`, the five checks of
+  `platform_enclave::bundle::verify_bundle`, and the crypto worker's
+  `verifyEnclave` fetches the attestation bundle and the issuer's key set,
+  verifies them and keeps the enclave in worker memory until its token
+  nears expiry. It fetches the key set once more, past the HTTP cache, when
+  the token names a key the set does not hold. Release builds take their
+  trust values from `VITE_ATTESTATION_ISSUER` (https://),
+  `VITE_ATTESTATION_JWKS_URL` and `VITE_ATTESTATION_IMAGE_DIGESTS` and are
+  refused without them; only development and test builds fall back to the
+  simulator's. A release build accepts only Google Confidential Space's
+  key-set URL, exactly (the one the page CSP allows), and the key-set
+  fetch refuses redirects.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals
@@ -394,6 +407,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+* `POST /admin/webhooks/mor` answers a body over its 256 KiB limit with
+  413, not 400.
 * `README.md` and `docs/ARCHITECTURE.md` no longer describe live
   connector sync or blind-index search as v1.0 capabilities; both say they
   are not in v1.0 (`docs/PROJECT_SCOPE.md`).
@@ -472,6 +487,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+* Every binary replaces Rust's default panic hook, which printed a
+  panic's message to stderr, outside the JSON logs: a panic now logs one
+  error event with its location and never its message, which can carry
+  request or customer data (`platform_telemetry::install_panic_hook`).
 * The secret scan also reads every commit message in the history it scans
   (`gitleaks stdin`), since a squash merge copies them onto main, and
   `.github/workflows/secret-scan.yml` runs it on every push to every
@@ -722,6 +741,9 @@ uses [Semantic Versioning](https://semver.org/).
   `tid`), and the tenant id in every AAD is the session's `tid`. The
   previous single `device` row and data sealed under its random tenant id
   are no longer read.
+* The pinned Rust toolchain moves from 1.94.1 to 1.100.0
+  (`rust-toolchain.toml` and the simulated-TEE `Dockerfile`). `rust-version`
+  stays 1.94.
 * The benchmark targets and regression threshold in `docs/BENCHMARKS.md`,
   backend and browser, are agreed (no longer proposed).
 * `docs/DATA_POLICY.md` says test sign-in users are synthetic `.example`

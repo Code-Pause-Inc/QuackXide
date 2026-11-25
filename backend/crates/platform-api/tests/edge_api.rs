@@ -85,29 +85,44 @@ async fn oversized_bodies_are_refused_with_headers() {
     });
     let token = common::token_for(SECRET, TenantId::generate());
     let auth = bearer(&token);
+    let admin = bearer(&common::admin_token(SECRET));
     let object = "00000000-0000-0000-0000-000000000001";
+    let tenant = "00000000-0000-0000-0000-000000000002";
+    let octets = |method, uri: String, size| (method, uri, "application/octet-stream", size);
+    // JSON routes keep axum's default limit.
+    let json = |method, uri: &str| (method, uri.to_owned(), "application/json", 2 * MIB + 1);
     let cases = [
-        (
+        octets(
             "PUT",
             format!("/api/v1/drive/objects/{object}/chunks/0"),
-            "application/octet-stream",
             MAX_CHUNK_BODY_BYTES + 1,
         ),
-        (
+        octets(
             "PUT",
             "/api/v1/datasets/upload_cohorts".to_owned(),
-            "application/octet-stream",
             dataset_limit + 1,
         ),
-        (
-            "POST",
-            "/api/v1/catalog".to_owned(),
-            "application/json",
-            2 * MIB + 1,
-        ),
+        json("POST", "/api/v1/catalog"),
+        json("POST", "/api/v1/query"),
+        json("POST", "/api/v1/grants"),
+        json("POST", "/api/v1/grants/g1/budget"),
+        json("POST", "/api/v1/research/query"),
+        json("POST", "/api/v1/research/requests/r1/approve"),
     ];
-    for (method, uri, mime, size) in cases {
-        let headers = [auth.clone(), content_type(mime)];
+    let admin_cases = [json(
+        "POST",
+        &format!("/admin/tenants/{tenant}/connectors/quickbooks"),
+    )];
+    let with_auth = |auth: &(&'static str, String)| {
+        let auth = auth.clone();
+        move |case| (auth.clone(), case)
+    };
+    let cases = cases
+        .into_iter()
+        .map(with_auth(&auth))
+        .chain(admin_cases.into_iter().map(with_auth(&admin)));
+    for (auth, (method, uri, mime, size)) in cases {
+        let headers = [auth, content_type(mime)];
         let (status, response, _) =
             send_with_headers(&app, method, &uri, &headers, vec![b'a'; size]).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method} {uri}");

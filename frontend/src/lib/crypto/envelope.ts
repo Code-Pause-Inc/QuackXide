@@ -9,9 +9,11 @@
 // zeroizes its own (ADR 0007, "Browser private-key storage"). The KEK and
 // file keys never enter wasm memory.
 
+import type { AttestationTrust } from "../../config/attestation";
 import envelopeWasmUrl from "./wasm/envelope_bg.wasm?url";
 import init, {
   connectorObjectInfo,
+  keySetHoldsTokenKey as wasmKeySetHoldsTokenKey,
   openEnvelope,
   publicKeyFromPrivateKey,
   researchQueryBinding,
@@ -20,6 +22,7 @@ import init, {
   sealEnvelope,
   snapshotManifestInfo,
   stewardUploadInfo,
+  verifyAttestation,
 } from "./wasm/envelope";
 
 let loading: Promise<void> | null = null;
@@ -89,6 +92,58 @@ export async function openWithPrivateKey(
 export async function publicKeyOf(privateKey: Uint8Array): Promise<ArrayBuffer> {
   await loadEnvelopeModule();
   return publicKeyFromPrivateKey(privateKey).buffer as ArrayBuffer;
+}
+
+/** What a verified attestation bundle vouches for. */
+export interface VerifiedEnclave {
+  keyId: string;
+  /** Seconds since the epoch. */
+  expiresAt: number;
+  requestKey: { suite: string; publicKey: string };
+  signingKeys: { ed25519: string; mlDsa65: string };
+}
+
+/** Run the five attestation checks (the wasm export does all of them) on a
+ *  fetched bundle and key set against `challenge`. Rejects with the failed
+ *  check's message; nothing is returned for a bundle that fails any. */
+export async function verifyAttestationBundle(
+  bundleJson: string,
+  challenge: Uint8Array,
+  jwksJson: string,
+  trust: AttestationTrust,
+): Promise<VerifiedEnclave> {
+  await loadEnvelopeModule();
+  const verified = JSON.parse(
+    verifyAttestation(
+      bundleJson,
+      challenge,
+      jwksJson,
+      trust.issuer,
+      trust.imageDigests,
+      !trust.release,
+    ),
+  ) as {
+    key_id: string;
+    expires_at: number;
+    request_key: { suite: string; public_key: string };
+    signing_keys: { ed25519: string; ml_dsa_65: string };
+  };
+  return {
+    keyId: verified.key_id,
+    expiresAt: verified.expires_at,
+    requestKey: { suite: verified.request_key.suite, publicKey: verified.request_key.public_key },
+    signingKeys: {
+      ed25519: verified.signing_keys.ed25519,
+      mlDsa65: verified.signing_keys.ml_dsa_65,
+    },
+  };
+}
+
+/** Whether the key set holds the key the bundle's token names; false when
+ *  either doesn't parse. */
+export async function keySetHoldsTokenKey(bundleJson: string, jwksJson: string): Promise<boolean> {
+  await loadEnvelopeModule();
+  return wasmKeySetHoldsTokenKey(bundleJson, jwksJson);
 }
 
 /** HPKE `info` strings, defined once in the backend (`platform_crypto::info`)

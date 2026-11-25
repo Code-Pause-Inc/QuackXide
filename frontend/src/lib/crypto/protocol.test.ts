@@ -24,6 +24,18 @@ describe("parseWorkerRequest", () => {
     });
   });
 
+  it("accepts the enclave operations and drops their extra fields", () => {
+    expect(parseWorkerRequest({ id: 7, op: "verifyEnclave" })).toEqual({ id: 7, op: "verifyEnclave" });
+    expect(parseWorkerRequest({ id: 8, op: "invalidateEnclave" })).toEqual({
+      id: 8,
+      op: "invalidateEnclave",
+    });
+    expect(parseWorkerRequest({ id: 9, op: "verifyEnclave", extra: 1 })).toEqual({
+      id: 9,
+      op: "verifyEnclave",
+    });
+  });
+
   it("drops extra fields", () => {
     expect(parseWorkerRequest({ id: 1, op: "list", extra: "x" })).toEqual({ id: 1, op: "list" });
   });

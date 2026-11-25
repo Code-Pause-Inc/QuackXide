@@ -14,8 +14,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use platform_core::TenantId;
 use platform_crypto::{EnvelopeSuite, SuitePolicy};
-use platform_enclave::config::ConfigPolicy;
-use platform_enclave::evidence::{BoundKeys, VerifiedEnclave, verify_evidence};
+use platform_enclave::bundle::{VerifiedBundle, verify_bundle};
 use platform_enclave::fresh_nonce;
 use platform_enclave::token::{BROWSER_ATTESTATION_AUDIENCE, JwkSet, ReleasePolicy, TokenVerifier};
 use zeroize::Zeroizing;
@@ -149,61 +148,12 @@ fn trust_from(flags: &Flags, api: &str, defaults: Option<Trust>) -> Result<Trust
     Ok(trust)
 }
 
-/// Decode `bundle`'s keys and run [`verify_evidence`] against `challenge`.
-pub fn verify_bundle(
-    bundle: &AttestationBundle,
-    challenge: &[u8; 32],
-    verifier: &TokenVerifier,
-    policy: ConfigPolicy,
-) -> Result<VerifiedEnclave, String> {
-    if bundle.version != 1 {
-        return Err(format!("unsupported bundle version {}", bundle.version));
-    }
-    // Either suite parses here; `verify_evidence` refuses all but HPK2.
-    let request_key = bundle
-        .request_key
-        .to_public_key(SuitePolicy::DEVELOPMENT)
-        .map_err(|_| "malformed request key in the bundle".to_owned())?;
-    let signing = bundle
-        .signing_keys
-        .to_verifying_keys()
-        .map_err(|_| "malformed signing keys in the bundle".to_owned())?;
-    let kms_public_key = match &bundle.kms_public_key {
-        None => Vec::new(),
-        Some(b64) => URL_SAFE_NO_PAD
-            .decode(b64)
-            .map_err(|_| "malformed KMS public key in the bundle".to_owned())?,
-    };
-    let tls_spki_sha256 = match &bundle.tls_spki_sha256 {
-        None => None,
-        Some(b64) => {
-            Some(decode_b64url_32(b64).ok_or("malformed TLS key digest in the bundle".to_owned())?)
-        }
-    };
-    let keys = BoundKeys {
-        request_key: request_key.to_framed(),
-        signing_ed25519: signing.ed25519_bytes(),
-        signing_ml_dsa_65: signing.ml_dsa_65_bytes(),
-        kms_public_key,
-        tls_spki_sha256,
-    };
-    verify_evidence(
-        verifier,
-        &bundle.token,
-        challenge,
-        &keys,
-        &bundle.key_id,
-        policy,
-    )
-    .map_err(|e| e.to_string())
-}
-
 /// Fetch the bundle for a fresh challenge and the key set, and verify.
 async fn attest(
     http: &reqwest::Client,
     api: &str,
     trust: &Trust,
-) -> Result<(AttestationBundle, VerifiedEnclave), String> {
+) -> Result<(AttestationBundle, VerifiedBundle), String> {
     let challenge = fresh_nonce();
     let url = format!(
         "{}/api/v1/attestation?nonce={}",
@@ -225,15 +175,21 @@ async fn attest(
         },
     )
     .map_err(|e| format!("attestation key set: {e}"))?;
-    let verified = verify_bundle(&bundle, &challenge, &verifier, compiled_config_policy())?;
+    let verified = verify_bundle(&bundle, &challenge, &verifier, compiled_config_policy())
+        .map_err(|e| e.to_string())?;
     Ok((bundle, verified))
 }
 
 /// The HTTP client the binary uses: `https` only in a release build, on
 /// redirects too, so "over `https`" holds past the first hop.
 pub fn client() -> Result<reqwest::Client, String> {
+    client_for(!cfg!(feature = "dev"))
+}
+
+/// [`client`] with the `https`-only rule passed in: tests build with `dev`.
+fn client_for(https_only: bool) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .https_only(!cfg!(feature = "dev"))
+        .https_only(https_only)
         .build()
         .map_err(|e| format!("HTTP client: {e}"))
 }
@@ -307,8 +263,7 @@ async fn run_with(
                  checks 1-5 passed: signature, platform, image {}, challenge, binding and configuration\n\
                  not checked: TLS key binding (needs P67)\n\
                  not checked: served frontend digest (needs P49)",
-                verified.key_id,
-                verified.token.image_digest(),
+                verified.key_id, verified.image_digest,
             ))
         }
         "seal-query" => {
@@ -366,8 +321,10 @@ async fn run_with(
 
 #[cfg(test)]
 mod tests {
+    use platform_enclave::config::ConfigPolicy;
+
     use super::*;
-    use crate::key_release::EnclaveIdentity;
+    use crate::key_release::{EnclaveIdentity, attestation_bundle};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
@@ -487,11 +444,13 @@ mod tests {
     #[test]
     fn an_hpk1_request_key_is_refused() {
         let identity = EnclaveIdentity::generate();
-        let mut bundle = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bundle = attestation_bundle(&identity, "token".to_owned());
         let hpk1 = platform_crypto::TenantKeypair::generate(EnvelopeSuite::Hpk1).public_key();
         bundle.request_key = KeyWire::from_public_key(&hpk1);
         let verifier = test_verifier();
-        let err = verify_bundle(&bundle, &[0; 32], &verifier, ConfigPolicy::SIMULATOR).unwrap_err();
+        let err = verify_bundle(&bundle, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not HPK2"), "{err}");
     }
 
@@ -499,19 +458,140 @@ mod tests {
     fn a_malformed_bundle_field_is_refused() {
         let identity = EnclaveIdentity::generate();
         let verifier = test_verifier();
-        let mut bad_signing = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_signing = attestation_bundle(&identity, "token".to_owned());
         bad_signing.signing_keys.ed25519 = "!!".to_owned();
         assert!(
             verify_bundle(&bad_signing, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("signing keys")
         );
-        let mut bad_tls = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_tls = attestation_bundle(&identity, "token".to_owned());
         bad_tls.tls_spki_sha256 = Some("AAAA".to_owned());
         assert!(
             verify_bundle(&bad_tls, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("TLS")
+        );
+        let mut bad_version = attestation_bundle(&identity, "token".to_owned());
+        bad_version.version = 2;
+        assert!(
+            verify_bundle(&bad_version, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported bundle version 2")
+        );
+        let mut bad_request = attestation_bundle(&identity, "token".to_owned());
+        bad_request.request_key.public_key = "!!".to_owned();
+        assert!(
+            verify_bundle(&bad_request, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed request key")
+        );
+        let mut bad_kms = attestation_bundle(&identity, "token".to_owned());
+        bad_kms.kms_public_key = Some("!!".to_owned());
+        assert!(
+            verify_bundle(&bad_kms, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed KMS public key")
+        );
+    }
+
+    /// `seal-query` refuses a bad researcher, recipient key or nonce before
+    /// it contacts the deployment.
+    #[tokio::test]
+    async fn seal_query_refuses_bad_arguments_before_attesting() {
+        let key = |suite| {
+            URL_SAFE_NO_PAD.encode(
+                platform_crypto::TenantKeypair::generate(suite)
+                    .public_key()
+                    .to_raw(),
+            )
+        };
+        let (hpk2, hpk1) = (key(EnvelopeSuite::Hpk2), key(EnvelopeSuite::Hpk1));
+        let nonce = URL_SAFE_NO_PAD.encode(fresh_nonce());
+        let short_nonce = URL_SAFE_NO_PAD.encode(&fresh_nonce()[..16]);
+        let researcher = "6f2c8a2e-1111-4222-8333-444455556666";
+        let seal = |researcher: &str, key: &str, nonce: &str| {
+            let list = args(&[
+                "seal-query",
+                "--api",
+                "http://127.0.0.1:1",
+                "--researcher",
+                researcher,
+                "--grant",
+                "g",
+                "--steward",
+                researcher,
+                "--connector",
+                "c",
+                "--recipient-key",
+                key,
+                "--nonce",
+                nonce,
+                "--sql",
+                "SELECT 1",
+            ]);
+            let defaults = Trust {
+                issuer: "urn:sim".to_owned(),
+                jwks_url: "http://127.0.0.1:1/jwks".to_owned(),
+                image_digests: vec!["sha256:sim".to_owned()],
+            };
+            async move {
+                run_with(&list, &reqwest::Client::new(), Some(defaults))
+                    .await
+                    .unwrap_err()
+            }
+        };
+        for (r, k, n, want) in [
+            (
+                "not-a-uuid",
+                &*hpk2,
+                &*nonce,
+                "--researcher is not a tenant id",
+            ),
+            (
+                researcher,
+                "!!",
+                &nonce,
+                "--recipient-key is not a raw HPK2",
+            ),
+            (
+                researcher,
+                &hpk1,
+                &nonce,
+                "--recipient-key is not a raw HPK2",
+            ),
+            (researcher, &hpk2, "!!", "--nonce must be 32 bytes"),
+            (researcher, &hpk2, &short_nonce, "--nonce must be 32 bytes"),
+            // Valid arguments get as far as fetching the bundle.
+            (researcher, &hpk2, &nonce, "attestation bundle"),
+        ] {
+            let err = seal(r, k, n).await;
+            assert!(err.contains(want), "{want}: {err}");
+        }
+    }
+
+    /// A release build's client refuses plain `http`.
+    #[tokio::test]
+    async fn the_release_client_refuses_http() {
+        let router = axum::Router::new().route("/k", axum::routing::get(|| async { "{}" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/k", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let fetch = |https_only| {
+            let url = url.clone();
+            async move { fetch_json::<serde_json::Value>(&client_for(https_only).unwrap(), &url).await }
+        };
+        assert!(fetch(true).await.is_err());
+        assert!(
+            fetch(false).await.is_ok(),
+            "the same server answers over http"
         );
     }
 

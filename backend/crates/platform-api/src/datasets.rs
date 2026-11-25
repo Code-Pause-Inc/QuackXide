@@ -124,7 +124,7 @@ pub(crate) async fn put_dataset(
                 "denied",
                 UploadError::TooLarge.reason(),
             );
-            return Err(ApiError::PayloadTooLarge);
+            return Err(ApiError::PayloadTooLarge(UploadError::TooLarge.message()));
         }
         Err(_) => return Err(ApiError::BadRequest("could not read the request body")),
     };
@@ -133,7 +133,7 @@ pub(crate) async fn put_dataset(
         upload::parse_upload_body(body, state.config.datasets.max_bytes).map_err(|err| {
             audit_refusal(steward, dataset.as_str(), "denied", err.reason());
             match err {
-                UploadError::TooLarge => ApiError::PayloadTooLarge,
+                UploadError::TooLarge => ApiError::PayloadTooLarge(err.message()),
                 other => ApiError::MalformedUpload(other.message()),
             }
         })?;

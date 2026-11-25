@@ -8,7 +8,7 @@
 
 # cargo-chef builds the dependencies in their own layer, keyed on the
 # manifests and Cargo.lock, so a source-only change reuses them.
-FROM rust:1.94.1-bookworm AS chef
+FROM rust:1.100.0-bookworm AS chef
 RUN cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /workspace
 COPY rust-toolchain.toml ./rust-toolchain.toml

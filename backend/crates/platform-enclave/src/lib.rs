@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use rand::Rng;
 
 pub mod binding;
+pub mod bundle;
 pub mod config;
 pub mod evidence;
 #[cfg(feature = "simulated")]

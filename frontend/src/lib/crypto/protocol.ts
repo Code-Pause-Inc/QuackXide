@@ -54,12 +54,22 @@ export interface DatasetUploadFields {
   maxBytes: number;
 }
 
+/** What the UI may learn about the verified enclave; never its keys. */
+export interface EnclaveStatus {
+  keyId: string;
+  expiresAtIso: string;
+}
+
 export type WorkerRequest =
   | { id: number; op: "init" }
   | { id: number; op: "upload"; file: File }
   | { id: number; op: "list" }
   | { id: number; op: "download"; objectId: string }
   | { id: number; op: "remove"; objectId: string }
+  /** Run (or reuse) the enclave attestation checks. */
+  | { id: number; op: "verifyEnclave" }
+  /** Drop the verified enclave so the next use re-checks it. */
+  | { id: number; op: "invalidateEnclave" }
   /** Deliver or replace the session bearer token. Held in worker memory only. */
   | { id: number; op: "session"; token: string }
   | ({ id: number; op: "uploadDataset" } & DatasetUploadFields);
@@ -102,6 +112,8 @@ export function parseWorkerRequest(data: unknown): WorkerRequest | null {
     }
     case "init":
     case "list":
+    case "verifyEnclave":
+    case "invalidateEnclave":
       return { id, op: req.op };
     case "upload":
       return req.file instanceof File ? { id, op: "upload", file: req.file } : null;
