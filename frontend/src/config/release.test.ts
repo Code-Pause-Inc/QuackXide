@@ -1,18 +1,20 @@
 import { describe, expect, it } from "vitest";
 
+import { GOOGLE_CS_JWKS_URL } from "./attestation";
 import { releaseEnvProblems, type ReleaseEnv } from "./release";
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
 const VALID: ReleaseEnv = {
   VITE_VAULT_MODE: "http",
   VITE_ATTESTATION_ISSUER: "https://attest.example",
-  VITE_ATTESTATION_JWKS_URL: "https://attest.example/jwks",
+  VITE_ATTESTATION_JWKS_URL: GOOGLE_CS_JWKS_URL,
   VITE_ATTESTATION_IMAGE_DIGESTS: DIGEST,
 };
 
 describe("releaseEnvProblems", () => {
   it("accepts the http vault with no tokens", () => {
     expect(releaseEnvProblems(VALID)).toEqual([]);
+    expect(releaseEnvProblems({ ...VALID, VITE_ATTESTATION_JWKS_URL: ` ${GOOGLE_CS_JWKS_URL} ` })).toEqual([]);
     expect(releaseEnvProblems({ ...VALID, VITE_VAULT_MODE: " HTTP ", VITE_DEV_JWT: "  " })).toEqual([]);
   });
 
@@ -63,13 +65,20 @@ describe("releaseEnvProblems", () => {
     }
   });
 
-  it("refuses a key-set URL that is not https", () => {
-    const problems = releaseEnvProblems({
-      ...VALID,
-      VITE_ATTESTATION_JWKS_URL: "http://attest.example/jwks",
-    });
-    expect(problems).toHaveLength(1);
-    expect(problems[0]).toContain("VITE_ATTESTATION_JWKS_URL");
+  it("refuses any key-set URL but Google's, without echoing it", () => {
+    for (const bad of [
+      "https://attest.example/jwks",
+      "http://attest.example/jwks",
+      `${GOOGLE_CS_JWKS_URL}/`,
+      `${GOOGLE_CS_JWKS_URL}?x=1`,
+      `${GOOGLE_CS_JWKS_URL}#f`,
+      GOOGLE_CS_JWKS_URL.replace("jwk", "JWK"),
+    ]) {
+      const problems = releaseEnvProblems({ ...VALID, VITE_ATTESTATION_JWKS_URL: bad });
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("VITE_ATTESTATION_JWKS_URL");
+      expect(problems[0]).not.toContain(bad);
+    }
   });
 
   it("refuses an issuer that is not https, the simulator's included", () => {

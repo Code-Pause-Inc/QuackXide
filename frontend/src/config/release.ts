@@ -1,7 +1,10 @@
 // Release build gate (ADR 0009). `vite build --mode release` refuses a
 // bundle that would ship development paths: the IndexedDB-only local vault,
-// a baked-in development token, or an API base URL (the page calls its own
-// origin only). Pure, so vite.config.ts and tests share it.
+// a baked-in development token, an API base URL (the page calls its own
+// origin only), or any attestation key-set URL but Google's (the page CSP
+// allows only that one). Pure, so vite.config.ts and tests share it.
+
+import { GOOGLE_CS_JWKS_URL } from "./attestation";
 
 export interface ReleaseEnv {
   readonly VITE_VAULT_MODE?: string;
@@ -41,8 +44,8 @@ export function releaseEnvProblems(env: ReleaseEnv): string[] {
   }
   if (!jwksUrl) {
     problems.push("VITE_ATTESTATION_JWKS_URL must be set (the issuer's key set)");
-  } else if (!jwksUrl.startsWith("https://")) {
-    problems.push("VITE_ATTESTATION_JWKS_URL must be an https:// URL");
+  } else if (jwksUrl !== GOOGLE_CS_JWKS_URL) {
+    problems.push("VITE_ATTESTATION_JWKS_URL must be Google Confidential Space's key-set URL exactly");
   }
   if (!digests) {
     problems.push("VITE_ATTESTATION_IMAGE_DIGESTS must be set (comma-separated enclave image digests)");

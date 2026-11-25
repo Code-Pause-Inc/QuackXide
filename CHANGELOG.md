@@ -141,7 +141,9 @@ uses [Semantic Versioning](https://semver.org/).
   trust values from `VITE_ATTESTATION_ISSUER` (https://),
   `VITE_ATTESTATION_JWKS_URL` and `VITE_ATTESTATION_IMAGE_DIGESTS` and are
   refused without them; only development and test builds fall back to the
-  simulator's.
+  simulator's. A release build accepts only Google Confidential Space's
+  key-set URL, exactly (the one the page CSP allows), and the key-set
+  fetch refuses redirects.
 * `scripts/test-simulated-tee.sh` uploads the steward's dataset instead of
   seeding it at startup. The dev-only `seal-upload` binary, run on demand
   as its own image with no network, plays the steward's browser: it seals

@@ -103,6 +103,7 @@ async function fetchKeySet(deps: AttestationDeps, reload = false): Promise<strin
     body = await withTimeout(async (signal) => {
       const response = await deps.fetch(deps.trust.jwksUrl, {
         credentials: "omit",
+        redirect: "error",
         signal,
         ...(reload && { cache: "reload" as const }),
       });

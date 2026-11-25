@@ -5,10 +5,6 @@
 // fixtures/attestation/bundles.json; any other build without them verifies
 // nothing.
 
-/** Google Confidential Space's attestation signing key set (the page CSP allows only this exact URL beyond `'self'`). */
-export const GOOGLE_CS_JWKS_URL =
-  "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com";
-
 export interface AttestationTrust {
   issuer: string;
   jwksUrl: string;
@@ -19,6 +15,10 @@ export interface AttestationTrust {
 
 /** The simulator's issuer, the development default. */
 const SIMULATOR_ISSUER = "http://sim-attestation:8070";
+/** Google Confidential Space's key set: the only URL release builds accept,
+ *  and the one the page CSP allows. */
+export const GOOGLE_CS_JWKS_URL =
+  "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com";
 const DEV_JWKS_URL = "/sim-attestation/jwks";
 const DEV_IMAGE_DIGEST = "sha256:5155a7ab1d7e4c94d5bb3e1c6f0a3a4d6c7b8e9f00112233445566778899aabb";
 

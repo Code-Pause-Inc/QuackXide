@@ -6,11 +6,21 @@
 //! envelope under a used nonce is refused.
 mod common;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+use bytes::Bytes;
+use platform_api::build_apps_with;
+use platform_api::edge::EdgeTimeouts;
 use platform_core::TenantId;
+use platform_storage::{
+    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+};
 use serde_json::{Value, json};
 
 use common::{Sealer, call, post};
@@ -28,8 +38,14 @@ fn token_for(tenant: TenantId) -> String {
 async fn granted(budget: u64) -> (Router, TenantId, TenantId, String) {
     let (steward, researcher) = (TenantId::generate(), TenantId::generate());
     let app = common::sealed_research_app(SECRET, steward).await;
+    let grant_id = grant(&app, steward, researcher, budget).await;
+    (app, steward, researcher, grant_id)
+}
+
+/// The id of a new grant of `budget` units on `health` to `researcher`.
+async fn grant(app: &Router, steward: TenantId, researcher: TenantId, budget: u64) -> String {
     let (status, grant) = post(
-        &app,
+        app,
         "/api/v1/grants",
         &token_for(steward),
         &format!(
@@ -38,8 +54,7 @@ async fn granted(budget: u64) -> (Router, TenantId, TenantId, String) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "grant: {grant}");
-    let grant_id = grant["grant_id"].as_str().expect("grant id").to_owned();
-    (app, steward, researcher, grant_id)
+    grant["grant_id"].as_str().expect("grant id").to_owned()
 }
 
 async fn query(app: &Router, researcher: TenantId, body: &str) -> (StatusCode, Value) {
@@ -201,4 +216,87 @@ async fn a_refused_charge_is_not_recorded() {
     let (status, body) = query(&app, researcher, &refused).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(remaining(&app, steward, &grant_id).await, 0);
+}
+
+/// Delays every read of a snapshot's Parquet object by `delay`. Only the
+/// query reads them, after the charge; the check before it reads only
+/// manifests and records.
+struct SlowSnapshotReads {
+    inner: ObjectStoreVault,
+    delay: Duration,
+}
+
+#[async_trait]
+impl VaultStore for SlowSnapshotReads {
+    async fn put(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.inner.put(path, ciphertext).await
+    }
+    async fn put_if_absent(&self, path: &VaultPath, ciphertext: Bytes) -> Result<(), StorageError> {
+        self.inner.put_if_absent(path, ciphertext).await
+    }
+    async fn get(&self, path: &VaultPath) -> Result<Bytes, StorageError> {
+        if path.as_str().ends_with(".parquet") {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.get(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<(), StorageError> {
+        self.inner.delete(path).await
+    }
+    async fn list(&self, prefix: &VaultPath) -> Result<Vec<VaultPath>, StorageError> {
+        self.inner.list(prefix).await
+    }
+    async fn list_entries(&self, prefix: &VaultPath) -> Result<Vec<VaultEntry>, StorageError> {
+        self.inner.list_entries(prefix).await
+    }
+    async fn usage(&self, prefix: &VaultPath) -> Result<StorageUsage, StorageError> {
+        self.inner.usage(prefix).await
+    }
+}
+
+/// The edge's query timeout ends the request, not the charged query: the
+/// query finishes in its own task, and the same envelope gets the stored
+/// response with no second charge (ADR 0010 "Sealed request").
+#[tokio::test]
+async fn timed_out_sealed_query_is_retrievable() {
+    let (steward, researcher) = (TenantId::generate(), TenantId::generate());
+    let vault = Arc::new(SlowSnapshotReads {
+        inner: ObjectStoreVault::new_in_memory(),
+        delay: Duration::from_millis(500),
+    });
+    let (state, _) = common::sealed_research_state(SECRET, steward, vault).await;
+    let timeouts = EdgeTimeouts {
+        default: Duration::from_secs(10),
+        query: Duration::from_millis(100),
+        body_gap: Duration::from_secs(10),
+    };
+    let (app, _) = build_apps_with(state, timeouts);
+    let grant_id = grant(&app, steward, researcher, 100).await;
+    let sealer = Sealer::new(&app, researcher, steward).await;
+    let body = sealer.body(&grant_id, 1, AGG_SQL);
+
+    let (status, _) = query(&app, researcher, &body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "cut by the edge");
+
+    // Until the query finishes, the same envelope is told it still runs.
+    let (status, stored) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, response) = query(&app, researcher, &body).await;
+            if status == StatusCode::CONFLICT && response == json!({ "error": "query_running" }) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            break (status, response);
+        }
+    })
+    .await
+    .expect("the query finished");
+    assert_eq!(status, StatusCode::OK, "stored response: {stored}");
+    assert_eq!(stored["rows"], json!([{ "condition": "flu", "n": 6 }]));
+    assert_eq!(stored["budget_remaining"], 99);
+    assert_eq!(
+        remaining(&app, steward, &grant_id).await,
+        99,
+        "charged once"
+    );
 }

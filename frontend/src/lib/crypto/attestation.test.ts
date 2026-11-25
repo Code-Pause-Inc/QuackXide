@@ -163,6 +163,7 @@ describe("attestEnclave", () => {
     expect(s.calls.map((c) => c.url)).toEqual([expect.stringContaining(API), JWKS_URL, JWKS_URL]);
     expect(s.calls[1]!.init?.cache).toBeUndefined();
     expect(s.calls[2]!.init?.cache).toBe("reload");
+    expect(s.calls[2]!.init?.redirect).toBe("error");
     expect(s.calls[2]!.init?.credentials).toBe("omit");
   });
 
@@ -200,6 +201,23 @@ describe("attestEnclave", () => {
 
   it("key_set_fetch_failure", async () => {
     const s = await stub({ jwksResponse: () => new Response("", { status: 500 }) });
+    await expect(attestEnclave(deps(s.fetch))).rejects.toThrow("attestation key set unreachable");
+  });
+
+  it("key_set_fetch_refuses_redirects", async () => {
+    const s = await stub();
+    await attestEnclave(deps(s.fetch));
+    const init = s.calls.find((c) => c.url === JWKS_URL)?.init;
+    expect(init?.redirect).toBe("error");
+    expect(init?.credentials).toBe("omit");
+  });
+
+  it("key_set_redirect_is_unreachable", async () => {
+    const s = await stub({
+      jwksResponse: () => {
+        throw new TypeError("redirect mode is set to error");
+      },
+    });
     await expect(attestEnclave(deps(s.fetch))).rejects.toThrow("attestation key set unreachable");
   });
 
