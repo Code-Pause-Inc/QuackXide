@@ -125,6 +125,10 @@ pub enum ApiError {
     BadRequest(&'static str),
     /// A backend failed in a way retrying does not fix (502).
     Backend,
+    /// The server's own state is wrong, for example a stored enrollment
+    /// record that fails verification (500). Not a backend fault, and not
+    /// something the client can fix by retrying.
+    Internal,
     /// Storage failed transiently; the client may retry after
     /// [`STORAGE_RETRY_AFTER_SECS`] (503 with `Retry-After`).
     StorageUnavailable,
@@ -219,6 +223,7 @@ impl ApiError {
             ApiError::Conflict | ApiError::ConflictWith(_) => "conflict",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Backend => "backend",
+            ApiError::Internal => "internal",
             ApiError::StorageUnavailable => "storage_unavailable",
             ApiError::QueryUnavailable => "query_unavailable",
             ApiError::ResearchUnavailable => "research_unavailable",
@@ -292,6 +297,7 @@ impl IntoResponse for ApiError {
             ApiError::ConflictWith(msg) => (StatusCode::CONFLICT, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Backend => (StatusCode::BAD_GATEWAY, "storage backend error"),
+            ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
             ApiError::StorageUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage temporarily unavailable",
@@ -1245,7 +1251,8 @@ pub struct EnrollmentRecord {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnrollmentError {
     Malformed,
-    UnknownSuite,
+    /// The record's suite is not the suite of its key.
+    SuiteMismatch,
     /// The key's suite is one this deployment does not accept.
     SuiteRefused,
     InvalidPublicKey,
@@ -1277,7 +1284,7 @@ pub fn verify_enrollment_record(
         Err(_) => return Err(EnrollmentError::InvalidPublicKey),
     };
     if record.suite != key.suite().name() {
-        return Err(EnrollmentError::UnknownSuite);
+        return Err(EnrollmentError::SuiteMismatch);
     }
     if record.key_id != key.fingerprint() {
         return Err(EnrollmentError::KeyIdMismatch);
@@ -1409,8 +1416,8 @@ async fn put_enrollment(
                     Err(ApiError::Conflict)
                 }
                 // A record this server wrote that does not verify (for
-                // example one written before create-once enrollment) is a
-                // backend fault, not another device's key: answering 409
+                // example one written before create-once enrollment) is an
+                // internal fault (500), not another device's key: answering 409
                 // would tell the browser the wrong reason, and the tenant
                 // could never enroll. See the PR for clearing old records.
                 Err(err) => {
@@ -1420,7 +1427,7 @@ async fn put_enrollment(
                         "failed",
                         &format!("stored enrollment fails verification: {err:?}"),
                     );
-                    Err(ApiError::Backend)
+                    Err(ApiError::Internal)
                 }
             }
         }
@@ -1503,7 +1510,7 @@ mod tests {
         for wrong in ["HPK9", EnvelopeSuite::Hpk1.name()] {
             assert_eq!(
                 verify_enrollment_record(&record_json(&b64, &id, wrong, now), dev),
-                Err(EnrollmentError::UnknownSuite)
+                Err(EnrollmentError::SuiteMismatch)
             );
         }
         assert_eq!(

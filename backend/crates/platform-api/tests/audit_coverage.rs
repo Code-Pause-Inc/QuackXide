@@ -472,7 +472,7 @@ async fn an_enrollment_record_that_fails_verification_is_a_backend_fault() {
         body.into_bytes(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
         capture.events().iter().any(|e| {
             e.audit_kind == "crypto.key_enrollment"
@@ -1965,7 +1965,7 @@ async fn an_unreadable_enrollment_record_is_audited_on_upload() {
         sealed.body,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_tenant_event(
         &capture,
         "data.access",

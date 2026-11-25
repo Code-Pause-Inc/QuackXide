@@ -26,7 +26,6 @@ use axum::Json;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use base64::Engine as _;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use platform_config::PlatformConfig;
@@ -35,15 +34,15 @@ use platform_connectors::upload::{self, UploadCommitError, UploadError};
 use platform_core::{
     ConnectorSlug, DatasetKind, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
 };
-use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantPublicKey};
+use platform_crypto::{EnvelopeSuite, SuitePolicy};
 use platform_storage::{StorageError, TenantPaths, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    ApiError, AppState, AuthedTenant, B64, EnrollmentBody, LIST_READ_CONCURRENCY,
-    MAX_LISTED_OBJECTS,
+    ApiError, AppState, AuthedTenant, LIST_READ_CONCURRENCY, MAX_LISTED_OBJECTS,
+    verify_enrollment_record,
 };
 
 /// The request body limit for uploads: the dataset size limit
@@ -71,8 +70,12 @@ fn audit_refusal(steward: TenantId, dataset: &str, outcome: &str, reason: &str) 
 }
 
 /// The suite of the steward's enrolled key, or `None` when no key is
-/// enrolled. Enrollment is the only writer of the record and validates the
-/// key first, so a record that does not parse is a backend fault.
+/// enrolled. The record is read through [`verify_enrollment_record`], like
+/// every other reader, so a record enrollment would refuse (one written
+/// before create-once enrollment, say) is refused here too: an internal
+/// fault (500), since enrollment is the only writer of the record. The
+/// development policy accepts every suite; the upload's own suite is
+/// checked against the deployment's policy separately.
 async fn enrolled_suite(
     state: &AppState,
     steward: TenantId,
@@ -86,12 +89,14 @@ async fn enrolled_suite(
         Err(StorageError::NotFound) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let key = serde_json::from_slice::<EnrollmentBody>(&stored)
-        .ok()
-        .and_then(|record| B64.decode(record.hpke_public_key_b64).ok())
-        .and_then(|raw| TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT).ok())
-        .ok_or(ApiError::Backend)?;
-    Ok(Some(key.suite()))
+    let record = verify_enrollment_record(&stored, SuitePolicy::DEVELOPMENT)
+        .map_err(|_| ApiError::Internal)?;
+    // `verify_enrollment_record` has checked that the suite is the key's own.
+    [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2]
+        .into_iter()
+        .find(|suite| suite.name() == record.suite)
+        .map(Some)
+        .ok_or(ApiError::Internal)
 }
 
 /// `PUT /api/v1/datasets/{dataset}` — store a browser-sealed upload as the

@@ -713,7 +713,8 @@ uses [Semantic Versioning](https://semver.org/).
 * `PUT /api/v1/drive/enrollment` no longer replaces an enrolled key: the
   same key again succeeds, a different key is 409 (audited
   `crypto.key_enrollment` "denied"), and a stored record that fails
-  verification is 502 (audited "failed"). Records written before this
+  verification is 500 (audited "failed"), as is a
+  dataset upload whose enrolled record fails it. Records written before this
   change have no key id or creation time and fail verification; delete
   them in development (see #175). In development only, an `HPK1` key may
   still be replaced by an `HPK2` key (P36).
