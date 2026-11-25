@@ -575,7 +575,7 @@ attestation bundle (`platform_enclave::evidence::verify_evidence`, which
 token's validity, the platform claims, the image digest, its own
 challenge, and the binding of the enclave's keys and of the configuration
 the token reports (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
-`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`), held to the
+`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`, `APP_ENV`), held to the
 compiled policy. The query is
 then sealed to the bundle's request key (ADR 0010 "Sealed request"), so
 its SQL is plaintext only in the researcher's browser and inside the
@@ -1017,9 +1017,13 @@ At startup each service calls `PlatformConfig::check_production` before it
 builds anything. In production it refuses to start, with every reason
 listed and a `service.start` "denied" audit event naming keys only, when:
 
+* the bound configuration fails the release attestation policy
+  (`ConfigPolicy::RELEASE`, ADR 0010): `TEE_ATTESTATION_REQUIRED` or
+  `FEATURE_ZK_ENABLED` off, `RESEARCH_MIN_COHORT_SIZE` below 11, or
+  `RESEARCH_DOMINANCE_PERCENT` below 10, so production runs only a
+  configuration a release verifier accepts;
 * `JWT_HS256_SECRET` is set (shared-secret tokens are development-only);
 * `STORAGE_BUCKET` is unset (the in-memory vault);
-* `TEE_ATTESTATION_REQUIRED=false` (development or simulated attestation);
 * `SIM_ATTESTATION_URL` is set (the simulated attestation provider);
 * `KEY_RELEASE_URL` is set (the key-release stand-in, which trusts only the
   simulated root);

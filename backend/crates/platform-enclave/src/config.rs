@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 /// The configuration names bound into attestation, in digest order.
-pub const BOUND_CONFIG_NAMES: [&str; 4] = [
+pub const BOUND_CONFIG_NAMES: [&str; 5] = [
     "TEE_ATTESTATION_REQUIRED",
     "FEATURE_ZK_ENABLED",
     "RESEARCH_MIN_COHORT_SIZE",
     "RESEARCH_DOMINANCE_PERCENT",
+    "APP_ENV",
 ];
 
 /// The lowest p% rule `p` any build accepts: the default, below which a
@@ -56,13 +57,14 @@ pub fn config_digest(lookup: impl Fn(&str) -> Option<String>) -> [u8; 32] {
 }
 
 /// What a verifier accepts in a deployment's bound configuration: the
-/// attestation requirement and the ZK gate on (unset means on), and a
-/// minimum cohort size and p% rule `p` of at least their floors (unset
-/// means the default).
+/// attestation requirement and the ZK gate on (unset means on), a minimum
+/// cohort size and p% rule `p` of at least their floors (unset means the
+/// default), and production mode (unset means production).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigPolicy {
     pub allow_attestation_off: bool,
     pub min_cohort_floor: u64,
+    pub allow_development: bool,
 }
 
 /// A bound value the policy refuses.
@@ -79,25 +81,54 @@ impl ConfigPolicy {
     pub const RELEASE: Self = Self {
         allow_attestation_off: false,
         min_cohort_floor: 11,
+        allow_development: false,
     };
-    /// Development builds, which run on the simulated TEE: simulated tokens
-    /// never satisfy required attestation, and its cohorts are built for k = 2.
+    /// Development builds, which run on the simulated TEE in development
+    /// mode: simulated tokens never satisfy required attestation, and its
+    /// cohorts are built for k = 2.
     pub const SIMULATOR: Self = Self {
         allow_attestation_off: true,
         min_cohort_floor: 2,
+        allow_development: true,
     };
 
+    /// The first value [`Self::refusals`] reports, if any.
     pub fn check(&self, lookup: impl Fn(&str) -> Option<String>) -> Result<(), ConfigRefused> {
-        let [attestation, zk, min_cohort, dominance] = BOUND_CONFIG_NAMES;
-        if !flag(&lookup, attestation)? && !self.allow_attestation_off {
-            return Err(ConfigRefused::Loosens(attestation));
+        match self.refusals(lookup).into_iter().next() {
+            Some(refused) => Err(refused),
+            None => Ok(()),
         }
-        if !flag(&lookup, zk)? {
-            return Err(ConfigRefused::Loosens(zk));
-        }
-        at_least(&lookup, min_cohort, self.min_cohort_floor)?;
-        at_least(&lookup, dominance, DOMINANCE_PERCENT_FLOOR)
     }
+
+    /// Every bound value the policy refuses, in [`BOUND_CONFIG_NAMES`] order.
+    pub fn refusals(&self, lookup: impl Fn(&str) -> Option<String>) -> Vec<ConfigRefused> {
+        let [attestation, zk, min_cohort, dominance, app_env] = BOUND_CONFIG_NAMES;
+        let mut refused = Vec::new();
+        match flag(&lookup, attestation) {
+            Ok(false) if !self.allow_attestation_off => {
+                refused.push(ConfigRefused::Loosens(attestation));
+            }
+            Err(err) => refused.push(err),
+            Ok(_) => {}
+        }
+        match flag(&lookup, zk) {
+            Ok(false) => refused.push(ConfigRefused::Loosens(zk)),
+            Err(err) => refused.push(err),
+            Ok(true) => {}
+        }
+        refused.extend(at_least(&lookup, min_cohort, self.min_cohort_floor).err());
+        refused.extend(at_least(&lookup, dominance, DOMINANCE_PERCENT_FLOOR).err());
+        if development(&lookup, app_env) && !self.allow_development {
+            refused.push(ConfigRefused::Loosens(app_env));
+        }
+        refused
+    }
+}
+
+/// Whether `APP_ENV` selects development as `platform-config` reads it: only
+/// `development`, in any case; unset and every other value are production.
+fn development(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
+    bound_value(lookup, name).is_some_and(|v| v.eq_ignore_ascii_case("development"))
 }
 
 /// An integer as `platform-config` reads it; unset is its default, which
@@ -258,6 +289,63 @@ mod tests {
                 Err(ConfigRefused::Unreadable("RESEARCH_DOMINANCE_PERCENT"))
             );
         }
+    }
+
+    #[test]
+    fn app_env_is_bound_and_release_requires_production() {
+        let app_env =
+            |raw: &'static str| move |name: &str| (name == "APP_ENV").then(|| raw.to_owned());
+        assert_eq!(bound_env(app_env("development")).len(), 1);
+        assert_ne!(
+            config_digest(app_env("development")),
+            config_digest(|_| None)
+        );
+        for dev in ["development", " Development ", "DEVELOPMENT"] {
+            assert_eq!(
+                ConfigPolicy::RELEASE.check(app_env(dev)),
+                Err(ConfigRefused::Loosens("APP_ENV")),
+                "{dev:?}"
+            );
+            assert_eq!(
+                ConfigPolicy::SIMULATOR.check(app_env(dev)),
+                Ok(()),
+                "{dev:?}"
+            );
+        }
+        // The platform reads every other value as production.
+        for prod in ["production", "staging", "dev"] {
+            assert_eq!(
+                ConfigPolicy::RELEASE.check(app_env(prod)),
+                Ok(()),
+                "{prod:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refusals_lists_every_refused_value_in_order() {
+        let loose = env(&[
+            ("TEE_ATTESTATION_REQUIRED", "false"),
+            ("FEATURE_ZK_ENABLED", "off"),
+            ("RESEARCH_MIN_COHORT_SIZE", "5"),
+            ("RESEARCH_DOMINANCE_PERCENT", "ten"),
+            ("APP_ENV", "development"),
+        ]);
+        assert_eq!(
+            ConfigPolicy::RELEASE.refusals(&loose),
+            [
+                ConfigRefused::Loosens("TEE_ATTESTATION_REQUIRED"),
+                ConfigRefused::Loosens("FEATURE_ZK_ENABLED"),
+                ConfigRefused::Loosens("RESEARCH_MIN_COHORT_SIZE"),
+                ConfigRefused::Unreadable("RESEARCH_DOMINANCE_PERCENT"),
+                ConfigRefused::Loosens("APP_ENV"),
+            ]
+        );
+        assert_eq!(
+            ConfigPolicy::RELEASE.check(&loose),
+            Err(ConfigRefused::Loosens("TEE_ATTESTATION_REQUIRED"))
+        );
+        assert_eq!(ConfigPolicy::RELEASE.refusals(|_| None), []);
     }
 
     #[test]
