@@ -474,25 +474,28 @@ mod tests {
                 .to_string()
                 .contains("TLS")
         );
-        let mut bad_version = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_version = attestation_bundle(&identity, "token".to_owned());
         bad_version.version = 2;
         assert!(
             verify_bundle(&bad_version, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("unsupported bundle version 2")
         );
-        let mut bad_request = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_request = attestation_bundle(&identity, "token".to_owned());
         bad_request.request_key.public_key = "!!".to_owned();
         assert!(
             verify_bundle(&bad_request, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("malformed request key")
         );
-        let mut bad_kms = AttestationBundle::new(&identity, "token".to_owned());
+        let mut bad_kms = attestation_bundle(&identity, "token".to_owned());
         bad_kms.kms_public_key = Some("!!".to_owned());
         assert!(
             verify_bundle(&bad_kms, &[0; 32], &verifier, ConfigPolicy::SIMULATOR)
                 .unwrap_err()
+                .to_string()
                 .contains("malformed KMS public key")
         );
     }
