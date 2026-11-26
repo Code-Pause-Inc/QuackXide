@@ -100,6 +100,26 @@ async fn valid_webhook_provisions_a_tenant() {
     assert_eq!(record.connectors.get("quickbooks"), Some(&false));
 }
 
+/// A webhook body over the limit is refused as too large (413), not as
+/// malformed, and provisions nothing.
+#[tokio::test]
+async fn an_oversized_webhook_is_413_and_provisions_nothing() {
+    let (app, registry) = build(true);
+    let body = vec![b' '; platform_api::admin::MAX_WEBHOOK_BYTES + 1];
+    let sig = paddle_signature(&body);
+    let (status, json) = send_json(
+        &app,
+        "POST",
+        "/admin/webhooks/mor",
+        &[("Paddle-Signature", sig), json_header()],
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "json: {json}");
+    assert_eq!(json["error"], "webhook body exceeds the size limit");
+    assert!(registry.list().await.expect("list").is_empty());
+}
+
 #[tokio::test]
 async fn webhook_with_bad_signature_is_401_and_provisions_nothing() {
     let (app, registry) = build(true);

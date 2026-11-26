@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import tailwindcss from "@tailwindcss/vite";
 import { playwright } from "@vitest/browser-playwright";
 import react from "@vitejs/plugin-react";
-import { defineConfig, loadEnv } from "vite";
+import { defineConfig, loadEnv, type ProxyOptions } from "vite";
 
 import { parsePageHeaders } from "./src/config/pageHeaders";
 import { releaseEnvProblems } from "./src/config/release";
@@ -48,9 +48,15 @@ export default defineConfig(({ mode }) => {
       throw new Error(`release build refused:\n- ${problems.join("\n- ")}`);
     }
   }
-  const proxy = Object.fromEntries(
+  const proxy: Record<string, ProxyOptions> = Object.fromEntries(
     ["/api", "/admin", "/healthz"].map((prefix) => [prefix, { target, changeOrigin: true }]),
   );
+  // Dev only: the simulator's key set (compose publishes it on 127.0.0.1:8070).
+  proxy["/sim-attestation"] = {
+    target: "http://127.0.0.1:8070",
+    changeOrigin: true,
+    rewrite: (path) => path.replace(/^\/sim-attestation/, ""),
+  };
 
   return {
     plugins: [react(), tailwindcss()],

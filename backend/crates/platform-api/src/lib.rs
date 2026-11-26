@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -161,8 +162,9 @@ pub enum ApiError {
     /// A listing would return more than [`MAX_LISTED_OBJECTS`] drive
     /// objects, datasets, or dataset objects (422).
     ListTooLarge,
-    /// A dataset upload over the dataset size limit (413).
-    PayloadTooLarge,
+    /// A request body over its route's limit (413). A fixed reason, never
+    /// input.
+    PayloadTooLarge(&'static str),
     /// A dataset upload body that is malformed (422). A fixed reason, never
     /// input.
     MalformedUpload(&'static str),
@@ -233,7 +235,7 @@ impl ApiError {
             ApiError::QueryRejected(_) => "query_rejected",
             ApiError::BudgetExhausted => "budget_exhausted",
             ApiError::ListTooLarge => "list_too_large",
-            ApiError::PayloadTooLarge => "payload_too_large",
+            ApiError::PayloadTooLarge(_) => "payload_too_large",
             ApiError::MalformedUpload(_) => "malformed_upload",
             ApiError::SchemaMismatch => "schema_mismatch",
             ApiError::StaleSnapshot => "stale_snapshot",
@@ -334,10 +336,7 @@ impl IntoResponse for ApiError {
             ApiError::ListTooLarge => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "too many objects to list")
             }
-            ApiError::PayloadTooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "upload exceeds the dataset size limit",
-            ),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
             ApiError::MalformedUpload(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::SchemaMismatch => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -602,6 +601,7 @@ fn routes(state: AppState, timeouts: edge::EdgeTimeouts) -> Router {
     // Authorized by Paddle signature, not by JWT.
     let webhooks = Router::new()
         .route("/mor", post(mor_webhook))
+        .layer(DefaultBodyLimit::max(admin::MAX_WEBHOOK_BYTES))
         .layer(total(timeouts.default));
 
     let top_level = Router::new()
@@ -676,21 +676,29 @@ async fn get_attestation(
 // ── Admin console + MoR webhook handlers ─────────────────────────────────────
 
 /// `POST /admin/webhooks/mor` — Paddle webhook. Reads the raw body (required
-/// for HMAC) and the `Paddle-Signature` header.
-async fn mor_webhook(State(state): State<AppState>, req: Request) -> Response {
+/// for HMAC), at most [`admin::MAX_WEBHOOK_BYTES`], and the
+/// `Paddle-Signature` header.
+async fn mor_webhook(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
     let provisioning = match provisioning_service(&state) {
         Ok(provisioning) => provisioning,
         Err(err) => return err.into_response(),
     };
-    let signature = req
-        .headers()
+    let signature = headers
         .get("Paddle-Signature")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let raw_body = match axum::body::to_bytes(req.into_body(), admin::MAX_WEBHOOK_BYTES).await {
+    let raw_body = match body {
         Ok(bytes) => bytes,
-        Err(_) => return ApiError::BadRequest("body too large").into_response(),
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return ApiError::PayloadTooLarge("webhook body exceeds the size limit")
+                .into_response();
+        }
+        Err(_) => return ApiError::BadRequest("could not read the request body").into_response(),
     };
 
     let result = admin::handle_mor_webhook(

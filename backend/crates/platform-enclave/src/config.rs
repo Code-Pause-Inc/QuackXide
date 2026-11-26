@@ -45,8 +45,9 @@ pub fn config_digest(lookup: impl Fn(&str) -> Option<String>) -> [u8; 32] {
     for name in BOUND_CONFIG_NAMES {
         if let Some(value) = bound_value(&lookup, name) {
             let name_len = u16::try_from(name.len()).expect("bound names are short");
-            // A value over 4 GiB cannot come from an environment variable.
-            let value_len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+            // Values come from the environment or from a token capped at
+            // `MAX_TOKEN_BYTES`, never near 4 GiB.
+            let value_len = u32::try_from(value.len()).expect("bound values are short");
             hasher.update(name_len.to_be_bytes());
             hasher.update(name.as_bytes());
             hasher.update(value_len.to_be_bytes());

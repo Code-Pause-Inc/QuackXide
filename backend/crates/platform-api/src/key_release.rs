@@ -15,10 +15,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use platform_crypto::{
     CryptoError, EnvelopeSuite, ResultSignature, ResultSigningKey, ResultVerifyingKeys,
-    SecretBytes, SuitePolicy, TenantKeypair, TenantPublicKey,
+    SecretBytes, TenantKeypair, TenantPublicKey,
 };
 use platform_enclave::EnclaveKeyBinding;
-use serde::{Deserialize, Serialize};
+pub use platform_enclave::bundle::{AttestationBundle, KeyWire, SigningKeysWire, decode_b64url_32};
 
 #[cfg(feature = "dev")]
 use crate::ApiError;
@@ -120,7 +120,7 @@ impl EnclaveIdentity {
             .map_err(|_| ApiError::AttestationUnavailable)?;
         TenantKeypair::from_private_key_bytes(
             raw_sk.expose(),
-            SuitePolicy::only(EnvelopeSuite::Hpk2),
+            platform_crypto::SuitePolicy::only(EnvelopeSuite::Hpk2),
         )
         .map_err(|e| {
             if matches!(e, CryptoError::SuiteRefused) {
@@ -161,105 +161,25 @@ impl std::fmt::Debug for EnclaveIdentity {
     }
 }
 
-/// A public key on the wire: its suite name and its raw bytes, base64url
-/// without padding (ADR 0010).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeyWire {
-    pub suite: String,
-    pub public_key: String,
-}
-
-impl KeyWire {
-    pub fn from_public_key(key: &TenantPublicKey) -> Self {
-        Self {
-            suite: key.suite().id().to_owned(),
-            public_key: B64URL.encode(key.to_raw()),
-        }
+/// The bundle for `identity`, carrying `token`.
+pub fn attestation_bundle(identity: &EnclaveIdentity, token: String) -> AttestationBundle {
+    let binding = identity.binding();
+    AttestationBundle {
+        version: 1,
+        key_id: identity.key_id().to_owned(),
+        token,
+        request_key: KeyWire::from_public_key(&identity.request_public_key()),
+        signing_keys: identity.signing_keys().clone(),
+        kms_public_key: (!binding.kms_public_key.is_empty())
+            .then(|| B64URL.encode(&binding.kms_public_key)),
+        tls_spki_sha256: binding.tls_spki_sha256.map(|d| B64URL.encode(d)),
     }
-
-    /// Parse under `policy`. The named suite must be the key's own.
-    pub fn to_public_key(&self, policy: SuitePolicy) -> Result<TenantPublicKey, CryptoError> {
-        let suite = EnvelopeSuite::from_id(&self.suite)?;
-        let raw = B64URL
-            .decode(&self.public_key)
-            .map_err(|_| CryptoError::InvalidPublicKey)?;
-        let key = TenantPublicKey::from_raw(&raw, policy)?;
-        if key.suite() != suite {
-            return Err(CryptoError::SuiteMismatch);
-        }
-        Ok(key)
-    }
-}
-
-/// The two result-signing keys, base64url without padding (ADR 0010). The
-/// signatures over a result are [`SignatureWire`](crate::sealed::SignatureWire),
-/// so neither can stand in for the other.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SigningKeysWire {
-    pub ed25519: String,
-    pub ml_dsa_65: String,
-}
-
-impl SigningKeysWire {
-    pub fn from_verifying_keys(keys: &ResultVerifyingKeys) -> Self {
-        Self {
-            ed25519: B64URL.encode(keys.ed25519_bytes()),
-            ml_dsa_65: B64URL.encode(keys.ml_dsa_65_bytes()),
-        }
-    }
-
-    pub fn to_verifying_keys(&self) -> Result<ResultVerifyingKeys, CryptoError> {
-        let decode = |b64: &str| {
-            B64URL
-                .decode(b64)
-                .map_err(|_| CryptoError::InvalidPublicKey)
-        };
-        ResultVerifyingKeys::from_bytes(&decode(&self.ed25519)?, &decode(&self.ml_dsa_65)?)
-    }
-}
-
-/// `GET /api/v1/attestation`'s evidence bundle (ADR 0010 "Evidence bundle").
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AttestationBundle {
-    pub version: u32,
-    pub key_id: String,
-    pub token: String,
-    pub request_key: KeyWire,
-    pub signing_keys: SigningKeysWire,
-    pub kms_public_key: Option<String>,
-    pub tls_spki_sha256: Option<String>,
-}
-
-impl AttestationBundle {
-    /// The bundle for `identity`, carrying `token`.
-    pub fn new(identity: &EnclaveIdentity, token: String) -> Self {
-        let binding = identity.binding();
-        Self {
-            version: 1,
-            key_id: identity.key_id().to_owned(),
-            token,
-            request_key: KeyWire::from_public_key(&identity.request_public_key()),
-            signing_keys: identity.signing_keys().clone(),
-            kms_public_key: (!binding.kms_public_key.is_empty())
-                .then(|| B64URL.encode(&binding.kms_public_key)),
-            tls_spki_sha256: binding.tls_spki_sha256.map(|d| B64URL.encode(d)),
-        }
-    }
-}
-
-/// 32 bytes of base64url without padding (ADR 0010's byte fields), or
-/// `None` for anything else.
-pub(crate) fn decode_b64url_32(b64: &str) -> Option<[u8; 32]> {
-    B64URL.decode(b64).ok()?.try_into().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platform_crypto::hpke_seal_to_tenant;
+    use platform_crypto::{SuitePolicy, hpke_seal_to_tenant};
 
     #[test]
     fn generate_binds_an_empty_configuration() {

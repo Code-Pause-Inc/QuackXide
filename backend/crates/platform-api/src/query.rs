@@ -52,7 +52,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use zeroize::Zeroizing;
 
 use crate::ApiError;
-use crate::key_release::{AttestationBundle, EnclaveIdentity};
+use crate::key_release::{AttestationBundle, EnclaveIdentity, attestation_bundle};
 use crate::research::ResearchService;
 use crate::research_replay::{Begin, ReplayStore, StoredOutcome};
 use crate::sealed::OpenedQuery;
@@ -345,7 +345,7 @@ impl ConnectorQueryService {
             .verify_browser_evidence(&evidence, &report_data)
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
-        Ok(AttestationBundle::new(&self.identity, evidence.token))
+        Ok(attestation_bundle(&self.identity, evidence.token))
     }
 
     /// Enable research queries, which check grants and charge budgets

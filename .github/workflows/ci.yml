@@ -26,7 +26,7 @@ jobs:
           workspaces: backend
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: wasm-bindgen@0.2.126
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -53,7 +53,7 @@ jobs:
       - run: cargo test --manifest-path backend/Cargo.toml --workspace --locked
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: wasm-bindgen@0.2.126
       - run: scripts/build-wasm.sh
@@ -71,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           manifest-path: backend/Cargo.toml
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -92,7 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-llvm-cov
       - name: Backend coverage
@@ -107,7 +107,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-bindgen CLI (the version backend/Cargo.lock pins)
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: wasm-bindgen@0.2.126
       - run: scripts/build-wasm.sh
