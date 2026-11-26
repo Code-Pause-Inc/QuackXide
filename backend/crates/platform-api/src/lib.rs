@@ -1464,10 +1464,11 @@ async fn rotate_enrollment(
     Err(ApiError::Forbidden)
 }
 
-/// The key enrolled for `tenant`, or `None` when none is. Enrollment is the
-/// only writer of the record and validates the key under the deployment's
-/// suite policy first, so a record that does not parse is a backend fault
-/// (502), never "not enrolled".
+/// The key enrolled for `tenant`, or `None` when none is. The record is read
+/// through [`verify_enrollment_record`], so a record enrollment would refuse
+/// (one written before create-once enrollment, say) is an internal fault
+/// (500), never "not enrolled". Enrollment checked the key under the
+/// deployment's suite policy when it wrote the record.
 pub(crate) async fn enrolled_key(
     vault: &dyn VaultStore,
     tenant: TenantId,
@@ -1477,18 +1478,15 @@ pub(crate) async fn enrolled_key(
         Err(StorageError::NotFound) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    serde_json::from_slice::<EnrollmentBody>(&stored)
-        .ok()
-        .and_then(|record| B64.decode(record.hpke_public_key_b64).ok())
-        .and_then(|raw| {
-            platform_crypto::TenantPublicKey::from_raw(
-                &raw,
-                platform_crypto::SuitePolicy::DEVELOPMENT,
-            )
-            .ok()
-        })
+    let dev = platform_crypto::SuitePolicy::DEVELOPMENT;
+    let record = verify_enrollment_record(&stored, dev).map_err(|_| ApiError::Internal)?;
+    // Verified above, so neither step fails.
+    let raw = B64
+        .decode(&record.hpke_public_key_b64)
+        .map_err(|_| ApiError::Internal)?;
+    platform_crypto::TenantPublicKey::from_raw(&raw, dev)
         .map(Some)
-        .ok_or(ApiError::Backend)
+        .map_err(|_| ApiError::Internal)
 }
 
 async fn get_enrollment(

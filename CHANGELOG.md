@@ -76,9 +76,9 @@ uses [Semantic Versioning](https://semver.org/).
   `ConnectorQueryService::verify_recipient` accepts a sealed request's
   recipient key, as `open_sealed` parsed it, only if it equals, by suite and
   bytes, the key enrolled for the researcher: 403 with no enrolled key or
-  another one, 502 for an unreadable enrollment record, and 503 in a
-  release build until create-once enrollment (P33). Each refusal is audited
-  as `auth.decision` with the key's fingerprint, never the key.
+  another one, 500 for an enrollment record that fails verification, and
+  503 in a release build until create-once enrollment (P33). Each refusal
+  is audited as `auth.decision` with the key's fingerprint, never the key.
   `ConnectorQueryService::seal_research_result` seals the whole result to
   that key under `research_result(tid, research_query_binding(…))`, in the
   key's suite, and signs the frame with the key set's result-signing key,

@@ -2292,10 +2292,7 @@ async fn sealed_research_recipient_refusals_are_audited_with_fingerprints_only()
 
     // A release build, before create-once enrollment (P33), refuses even the
     // enrolled key.
-    assert_eq!(
-        common::enroll_key(&app, &token_for(researcher), &browser).await,
-        StatusCode::NO_CONTENT
-    );
+    common::write_enrollment(&*vault, researcher, &browser).await;
     let before = count_outcome(&capture, "auth.decision", "denied");
     assert!(matches!(
         verify_recipient(false, &*vault, researcher, &presented).await,

@@ -304,8 +304,8 @@ impl std::fmt::Debug for VerifiedRecipient {
 /// branch is tested.
 ///
 /// A release build is a 503 before anything is read. An enrollment record
-/// that does not parse is a 502. Otherwise see [`check_recipient`]. Every
-/// refusal is audited once.
+/// that fails [`crate::verify_enrollment_record`] is a 500. Otherwise see
+/// [`check_recipient`]. Every refusal is audited once.
 pub async fn verify_recipient(
     dev_build: bool,
     vault: &dyn VaultStore,
@@ -868,8 +868,11 @@ mod tests {
     /// enrollment writes it.
     async fn enrolled_vault(researcher: TenantId, key: &TenantPublicKey) -> ObjectStoreVault {
         let vault = ObjectStoreVault::new_in_memory();
-        let record = crate::EnrollmentBody {
+        let record = crate::EnrollmentRecord {
             hpke_public_key_b64: crate::B64.encode(key.to_raw()),
+            key_id: key.fingerprint(),
+            suite: key.suite().name().to_owned(),
+            created_at_unix: 1,
         };
         vault
             .put(
@@ -923,7 +926,7 @@ mod tests {
             .expect("put");
         assert!(matches!(
             verify_recipient(true, &vault, researcher, &enrolled).await,
-            Err(ApiError::Backend)
+            Err(ApiError::Internal)
         ));
     }
 

@@ -36,7 +36,7 @@ use platform_core::{
 use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantKeypair, TenantPublicKey};
 use platform_enclave::{AttestationProvider, DevAttestation};
 use platform_storage::{
-    ObjectStoreVault, StorageError, StorageUsage, VaultEntry, VaultPath, VaultStore,
+    ObjectStoreVault, StorageError, StorageUsage, TenantPaths, VaultEntry, VaultPath, VaultStore,
 };
 use quackxide_engine::{EngineSettings, QueryLimits};
 use sha2::Sha256;
@@ -533,6 +533,24 @@ pub async fn enroll_key(app: &Router, token: &str, key: &TenantPublicKey) -> Sta
     )
     .await
     .0
+}
+
+/// Write a valid enrollment record for `key` straight into `vault`, as an
+/// operator with storage access could, past create-once enrollment.
+pub async fn write_enrollment(vault: &dyn VaultStore, tenant: TenantId, key: &TenantPublicKey) {
+    let record = platform_api::EnrollmentRecord {
+        hpke_public_key_b64: base64::engine::general_purpose::STANDARD.encode(key.to_raw()),
+        key_id: key.fingerprint(),
+        suite: key.suite().name().to_owned(),
+        created_at_unix: 1,
+    };
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(tenant),
+            Bytes::from(serde_json::to_vec(&record).expect("json")),
+        )
+        .await
+        .expect("put");
 }
 
 /// An app over `vault` where each steward's key is held for queries but no
