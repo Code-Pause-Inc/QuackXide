@@ -26,7 +26,6 @@ use axum::Json;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use base64::Engine as _;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use platform_config::PlatformConfig;
@@ -35,15 +34,14 @@ use platform_connectors::upload::{self, UploadCommitError, UploadError};
 use platform_core::{
     ConnectorSlug, DatasetKind, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
 };
-use platform_crypto::{EnvelopeSuite, SuitePolicy, TenantPublicKey};
-use platform_storage::{StorageError, TenantPaths, VaultStore};
+use platform_crypto::{EnvelopeSuite, SuitePolicy};
+use platform_storage::{StorageError, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    ApiError, AppState, AuthedTenant, B64, EnrollmentBody, LIST_READ_CONCURRENCY,
-    MAX_LISTED_OBJECTS,
+    ApiError, AppState, AuthedTenant, LIST_READ_CONCURRENCY, MAX_LISTED_OBJECTS, enrolled_key,
 };
 
 /// The request body limit for uploads: the dataset size limit
@@ -77,21 +75,9 @@ async fn enrolled_suite(
     state: &AppState,
     steward: TenantId,
 ) -> Result<Option<EnvelopeSuite>, ApiError> {
-    let stored = match state
-        .vault
-        .get(&TenantPaths::tenant_enrollment(steward))
-        .await
-    {
-        Ok(stored) => stored,
-        Err(StorageError::NotFound) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let key = serde_json::from_slice::<EnrollmentBody>(&stored)
-        .ok()
-        .and_then(|record| B64.decode(record.hpke_public_key_b64).ok())
-        .and_then(|raw| TenantPublicKey::from_raw(&raw, SuitePolicy::DEVELOPMENT).ok())
-        .ok_or(ApiError::Backend)?;
-    Ok(Some(key.suite()))
+    Ok(enrolled_key(&*state.vault, steward)
+        .await?
+        .map(|key| key.suite()))
 }
 
 /// `PUT /api/v1/datasets/{dataset}` — store a browser-sealed upload as the

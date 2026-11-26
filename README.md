@@ -334,8 +334,10 @@ production release (details in `docs/PROJECT_SCOPE.md`):
   `bin/key-release`), with once-per-query key sessions and zeroize-on-drop,
   is implemented and built only with the `dev` feature.
 * **Durability** — registries are in-memory behind traits.
-* **Encrypted results** — results leave as JSON over TLS. Sealing them to the
-  researcher's key and signing them in the enclave (P55) remain.
+* **Encrypted results** — results leave as JSON over TLS. The enclave's
+  seal to the researcher's enrolled key, its signature and the recipient-key
+  check are built (`platform_api::sealed`, ADR 0010) but not yet wired into
+  the sealed research route, which returns results as JSON.
 * **Post-quantum cryptography** — target is X25519 + ML-KEM-768 and
   Ed25519 + ML-DSA-65. Backend tenant envelopes are X-Wing (`HPK2`); the
   browser is X25519 (`HPK1`, development only) and tokens are RS256.

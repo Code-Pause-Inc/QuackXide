@@ -345,6 +345,54 @@ pub async fn research_app_for(
     })
 }
 
+/// As [`research_app`] on the simulated TEE (so the service issues evidence
+/// bundles), with an `HPK2` steward key. Also returns the query service, for
+/// calling the sealed-result functions directly, and the vault, for writing
+/// records directly.
+pub async fn sealed_result_app(
+    secret: &str,
+    steward: TenantId,
+    steward_keypair: TenantKeypair,
+) -> (
+    Router,
+    Arc<platform_api::query::ConnectorQueryService>,
+    Arc<dyn VaultStore>,
+) {
+    let connector = ConnectorSlug::new("health").expect("slug");
+    let mut stack = DevResearchStack::new();
+    stack
+        .commit_snapshot(
+            steward,
+            steward_keypair,
+            &connector,
+            "cohorts",
+            &cohorts_parquet(),
+        )
+        .await
+        .expect("commit");
+    let vault = stack.vault();
+    let research = Arc::new(ResearchService::new(
+        ResearchStores::in_memory(),
+        vault.clone(),
+        5,
+        100,
+    ));
+    let service = Arc::new(stack.query_service(
+        EngineSettings {
+            zk: ZkMode::Disabled,
+            max_concurrent_queries: 4,
+            limits: QueryLimits::default(),
+        },
+        research.clone(),
+    ));
+    let app = build_app(AppState {
+        research: Some(research),
+        query: Some(service.clone()),
+        ..app_state(secret, vault.clone())
+    });
+    (app, service, vault)
+}
+
 /// The insecure development attestation, for builders that take one.
 pub fn dev_attestation() -> Arc<dyn AttestationProvider> {
     Arc::new(DevAttestation::allow_insecure_dev())
