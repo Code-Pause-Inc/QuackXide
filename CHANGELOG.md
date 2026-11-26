@@ -8,6 +8,19 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* A regression check for the browser timings (P73, #185). On pull requests
+  that touch the timed code or the wasm envelope module, the `bench`
+  workflow's `browser-timings` job runs `npm run bench:browser` in Chromium
+  at the base commit and then the head, on one runner, each with its own
+  wasm module and dependencies, and `scripts/bench-compare.sh vitest`
+  applies the native benchmarks' threshold: a benchmark whose whole 95 %
+  interval of the mean change is more than 10 % slower is flagged as a
+  warning, the interval coming from each run's mean and standard error. A
+  benchmark with one sample, such as the wasm cold start, is listed but not
+  judged, and the job fails only when the comparison cannot run. The job
+  summary also gives each commit's wasm module size. `scripts/bench-targets.sh`
+  now lists the bench targets of every workspace crate, and
+  `docs/BENCHMARKS.md` says how a new benchmark joins the comparison.
 * Steward dataset upload in the browser (ADR 0014, P40): the research
   portal's stewardship panel lists the steward's stored datasets from
   `GET /api/v1/datasets` (id, object count, ciphertext size, suite, write

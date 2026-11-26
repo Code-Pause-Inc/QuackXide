@@ -1,11 +1,11 @@
 name: bench
 
-# On pull requests, benchmarks the base commit and then the head in one job,
-# on one runner, and warns in the job summary when a benchmark is
-# significantly more than 10 % slower (scripts/bench-compare.sh). The job
-# fails only when the comparison itself cannot run. Shared runners vary
-# between runs, so numbers are only compared within the job. Not a required
-# check.
+# On pull requests, the `bench` job (criterion) and the `browser-timings` job
+# (`npm run bench:browser` in Chromium) each benchmark the base commit and
+# then the head, on one runner, and warn in the job summary when a benchmark
+# is significantly more than 10 % slower (scripts/bench-compare.sh). Each
+# fails only when its comparison cannot run. Shared runners vary between
+# runs, so numbers are only compared within a job. Not a required check.
 # docs/BENCHMARKS.md describes the method, the recorded numbers and targets.
 # The `wasm-seal` job runs the wasm envelope seal in Chromium and reports
 # only; it fails only when a seal fails.
@@ -20,7 +20,10 @@ on:
       - "scripts/build-wasm.sh"
       - "frontend/src/lib/crypto/envelope.ts"
       - "frontend/src/lib/crypto/seal*"
+      - "frontend/src/lib/crypto/core.ts"
+      - "frontend/src/**/*.browser.bench.ts"
       - "frontend/scripts/seal-bench-report.mjs"
+      - "frontend/package.json"
       - "frontend/package-lock.json"
       - "frontend/vite.config.ts"
       - "scripts/bench-compare.sh"
@@ -36,7 +39,10 @@ on:
       - "scripts/build-wasm.sh"
       - "frontend/src/lib/crypto/envelope.ts"
       - "frontend/src/lib/crypto/seal*"
+      - "frontend/src/lib/crypto/core.ts"
+      - "frontend/src/**/*.browser.bench.ts"
       - "frontend/scripts/seal-bench-report.mjs"
+      - "frontend/package.json"
       - "frontend/package-lock.json"
       - "frontend/vite.config.ts"
       - "scripts/bench-compare.sh"
@@ -201,3 +207,152 @@ jobs:
             echo
             cat "$RUNNER_TEMP/wasm-seal.md" 2>/dev/null || echo "(no benchmark output)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The browser timings (`npm run bench:browser`, Vitest) in Chromium at the
+  # base commit and then the head, judged like the native benchmarks
+  # (`scripts/bench-compare.sh vitest`). Each side builds its own wasm module
+  # and installs its own dependencies, in this one checkout, so the base's
+  # build reuses the restored cache. Not run on demand: the `browser`
+  # workflow times all three browsers then.
+  browser-timings:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge ref and its parents.
+          fetch-depth: 2
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+          # As above: only the build-only push run saves.
+          save-if: ${{ github.event_name == 'push' }}
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Commits and the wasm-bindgen versions they pin
+        id: commits
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          # build-wasm.sh refuses a CLI other than the one Cargo.lock pins.
+          pin() {
+            local version
+            version="$(grep -A1 '^name = "wasm-bindgen"$' | sed -n 's/^version = "\(.*\)"$/\1/p')"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no wasm-bindgen pin in Cargo.lock" >&2; return 1; }
+            echo "$version"
+          }
+          head_pin="$(pin < backend/Cargo.lock)"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "head-wasm-bindgen=$head_pin" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT" == pull_request ]]; then
+            # The merge ref's first parent is the base branch as merged, so
+            # this is right even when the pull request's base moved or is stacked.
+            base_pin="$(git show HEAD^1:backend/Cargo.lock | pin)"
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "base-wasm-bindgen=$base_pin" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: github.event_name == 'pull_request'
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Check out the base commit
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ steps.commits.outputs.base }}
+        run: git checkout --detach "$BASE"
+      - name: Install wasm-bindgen CLI (the base commit's pin)
+        if: github.event_name == 'pull_request'
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: wasm-bindgen@${{ steps.commits.outputs.base-wasm-bindgen }}
+      - name: Browser timings at the base commit
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        env:
+          SIDE: base
+        run: |
+          set -o pipefail
+          # This side's rust-toolchain.toml may pin another toolchain.
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+          scripts/build-wasm.sh
+          wasm=frontend/src/lib/crypto/wasm/envelope_bg.wasm
+          echo "$(wc -c < "$wasm") bytes, $(gzip -c "$wasm" | wc -c) gzipped" > "$RUNNER_TEMP/$SIDE-module.txt"
+          cd frontend
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node --input-type=module -e "import { chromium } from 'playwright'; const b = await chromium.launch(); console.log(b.version()); await b.close();" > "$RUNNER_TEMP/$SIDE-chromium.txt"
+          # The other side's report is still here: never compare it.
+          rm -rf .vitest
+          BROWSERS=chromium npm run bench:browser
+          cp .vitest/bench.json "$RUNNER_TEMP/$SIDE.json"
+      - name: Check out the head
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_COMMIT: ${{ steps.commits.outputs.head }}
+        run: git checkout --detach "$HEAD_COMMIT"
+      - name: Install wasm-bindgen CLI (the head's pin)
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: wasm-bindgen@${{ steps.commits.outputs.head-wasm-bindgen }}
+      - name: Build the module for the cache
+        if: github.event_name == 'push'
+        run: scripts/build-wasm.sh
+      - name: Browser timings at the head
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        env:
+          SIDE: head
+        run: |
+          set -o pipefail
+          # This side's rust-toolchain.toml may pin another toolchain.
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+          scripts/build-wasm.sh
+          wasm=frontend/src/lib/crypto/wasm/envelope_bg.wasm
+          echo "$(wc -c < "$wasm") bytes, $(gzip -c "$wasm" | wc -c) gzipped" > "$RUNNER_TEMP/$SIDE-module.txt"
+          cd frontend
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node --input-type=module -e "import { chromium } from 'playwright'; const b = await chromium.launch(); console.log(b.version()); await b.close();" > "$RUNNER_TEMP/$SIDE-chromium.txt"
+          # The other side's report is still here: never compare it.
+          rm -rf .vitest
+          BROWSERS=chromium npm run bench:browser
+          cp .vitest/bench.json "$RUNNER_TEMP/$SIDE.json"
+      - name: Compare with the base commit
+        if: github.event_name == 'pull_request'
+        run: |
+          status=0
+          scripts/bench-compare.sh vitest "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json" 0.10 > "$RUNNER_TEMP/compare.md" || status=$?
+          # In the log as well as the summary, so the machine can be read back with `gh run view --log`.
+          {
+            lscpu | grep -E '^(Model name|CPU\(s\)):'
+            echo "Chromium: base $(cat "$RUNNER_TEMP/base-chromium.txt"), head $(cat "$RUNNER_TEMP/head-chromium.txt")"
+            echo "wasm envelope module: base $(cat "$RUNNER_TEMP/base-module.txt"), head $(cat "$RUNNER_TEMP/head-module.txt")"
+          } | tee "$RUNNER_TEMP/machine.txt"
+          cat "$RUNNER_TEMP/compare.md"
+          {
+            echo "## Browser timings: head against base"
+            echo
+            echo "Chromium, on the page's main thread. Each sample is a batch of calls lasting at least 50 ms;"
+            echo "the cold start is one sample. A benchmark regresses when its whole 95 % interval is more than"
+            echo "10 % slower; one with a single sample is not judged."
+            echo
+            cat "$RUNNER_TEMP/compare.md"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/machine.txt"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A regression is a warning until the team decides to gate on it.
+          # Exit 2 (nothing judged, unusable reports) still fails the job.
+          if [[ $status == 1 ]]; then
+            echo "::warning::browser timing regression, see the job summary"
+            status=0
+          fi
+          exit "$status"
