@@ -37,8 +37,9 @@ build contains, such as the in-memory vault or HS256.
   before building anything: `platform-api` at the start of
   `platform_api::wiring::build_state`, `connector-worker` at the start of
   `platform_connectors::startup::build`. It is not part of `from_source`, so tests can
-  build any configuration. In production it refuses `JWT_HS256_SECRET`, an
-  unset `STORAGE_BUCKET`, `TEE_ATTESTATION_REQUIRED=false`,
+  build any configuration. In production it refuses a bound configuration
+  the release attestation policy refuses (`ConfigPolicy::RELEASE`, ADR
+  0010), `JWT_HS256_SECRET`, an unset `STORAGE_BUCKET`,
   `SIM_ATTESTATION_URL`, `KEY_RELEASE_URL`, and, for `connector-worker`,
   the demo tenant and fixture sources. A refusal lists every reason, by key
   name only, and emits a `service.start` "denied" audit event.
@@ -50,8 +51,10 @@ build contains, such as the in-memory vault or HS256.
 * The frontend has a release build mode (`vite build --mode release`, run
   by `release.yml`) that fails unless `VITE_VAULT_MODE` is `http` and fails
   if `VITE_DEV_JWT` or `VITE_ADMIN_JWT` is set.
-* `FEATURE_ZK_ENABLED=false` is not refused yet; whether production mode
-  refuses it is left to the maintainer (research mode already forces ZK on).
+* The release attestation policy refuses `TEE_ATTESTATION_REQUIRED` or
+  `FEATURE_ZK_ENABLED` off, `RESEARCH_MIN_COHORT_SIZE` below 11 and
+  `RESEARCH_DOMINANCE_PERCENT` below 10, so production runs only a
+  configuration a release verifier accepts.
 
 ## Consequences
 

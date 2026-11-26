@@ -1028,6 +1028,12 @@ is read from the process environment before anything else, and `.env` is
 loaded only in development, so a stray `.env` can neither select
 development nor change a production setting.
 
+Leave `APP_ENV` unset in production. Attestation binds it (ADR 0010): the
+workload digests the value in its own environment, and a value the image
+sets with a Dockerfile `ENV` may not appear in the token, so every verifier
+would refuse the enclave. Unset, it adds nothing to the digest, so a
+verifier built before `APP_ENV` was bound still accepts the deployment.
+
 At startup each service calls `PlatformConfig::check_production` before it
 builds anything. In production it refuses to start, with every reason
 listed and a `service.start` "denied" audit event naming keys only, when:
