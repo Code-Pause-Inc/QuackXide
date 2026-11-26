@@ -1464,6 +1464,33 @@ async fn rotate_enrollment(
     Err(ApiError::Forbidden)
 }
 
+/// The key enrolled for `tenant`, or `None` when none is. Enrollment is the
+/// only writer of the record and validates the key under the deployment's
+/// suite policy first, so a record that does not parse is a backend fault
+/// (502), never "not enrolled".
+pub(crate) async fn enrolled_key(
+    vault: &dyn VaultStore,
+    tenant: TenantId,
+) -> Result<Option<platform_crypto::TenantPublicKey>, ApiError> {
+    let stored = match vault.get(&TenantPaths::tenant_enrollment(tenant)).await {
+        Ok(stored) => stored,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    serde_json::from_slice::<EnrollmentBody>(&stored)
+        .ok()
+        .and_then(|record| B64.decode(record.hpke_public_key_b64).ok())
+        .and_then(|raw| {
+            platform_crypto::TenantPublicKey::from_raw(
+                &raw,
+                platform_crypto::SuitePolicy::DEVELOPMENT,
+            )
+            .ok()
+        })
+        .map(Some)
+        .ok_or(ApiError::Backend)
+}
+
 async fn get_enrollment(
     State(state): State<AppState>,
     Extension(AuthedTenant(tenant)): Extension<AuthedTenant>,

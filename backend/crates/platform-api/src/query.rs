@@ -37,7 +37,7 @@ use platform_connectors::upload::MAX_MANIFEST_BYTES;
 use platform_core::{
     ConnectorSlug, DatasetKind, DeclaredSchema, QueryLimit, SnapshotVersion, TenantId,
 };
-use platform_crypto::{CryptoError, EnvelopeSuite, SecretBytes, TenantKeypair};
+use platform_crypto::{CryptoError, EnvelopeSuite, SecretBytes, TenantKeypair, TenantPublicKey};
 use platform_enclave::{AttestationProvider, fresh_nonce, gate_execution};
 use platform_storage::{SnapshotRecord, StorageError, TenantPaths, VaultPath, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
@@ -55,7 +55,7 @@ use crate::ApiError;
 use crate::key_release::{AttestationBundle, EnclaveIdentity, attestation_bundle};
 use crate::research::ResearchService;
 use crate::research_replay::{Begin, ReplayStore, StoredOutcome};
-use crate::sealed::OpenedQuery;
+use crate::sealed::{OpenedQuery, ResultBinding, SealedQueryResponse, VerifiedRecipient};
 
 /// Per-query handle holding a tenant's released key in enclave RAM for the
 /// duration of a single query.
@@ -346,6 +346,34 @@ impl ConnectorQueryService {
             .map_err(|_| ApiError::AttestationUnavailable)?;
 
         Ok(attestation_bundle(&self.identity, evidence.token))
+    }
+
+    /// Check a sealed research query's `recipient_key`, as
+    /// [`crate::sealed::open_sealed`] parsed it, against the key enrolled for
+    /// `researcher` (ADR 0010 "Recipient key"), before any grant check or
+    /// budget charge: [`crate::sealed::verify_recipient`] in this build. A
+    /// release build refuses with 503 until create-once enrollment (P33);
+    /// otherwise no enrolled key or another key is a 403, and an unreadable
+    /// enrollment record a 502. Every refusal is audited.
+    pub async fn verify_recipient(
+        &self,
+        researcher: TenantId,
+        recipient: &TenantPublicKey,
+    ) -> Result<VerifiedRecipient, ApiError> {
+        crate::sealed::verify_recipient(cfg!(feature = "dev"), &*self.vault, researcher, recipient)
+            .await
+    }
+
+    /// Seal a research result to `recipient` and sign it with this key set
+    /// (ADR 0010 "Sealed and signed result"). `payload` is the whole response
+    /// body [`research_query`](Self::research_query) returns.
+    pub fn seal_research_result(
+        &self,
+        recipient: &VerifiedRecipient,
+        binding: &ResultBinding<'_>,
+        payload: &SecretBytes,
+    ) -> Result<SealedQueryResponse, ApiError> {
+        crate::sealed::seal_and_sign(&self.identity, recipient, binding, payload.expose())
     }
 
     /// Enable research queries, which check grants and charge budgets
@@ -993,8 +1021,8 @@ impl ConnectorQueryService {
         }
         .await
         .and_then(|body| {
-            serde_json::to_vec(&body)
-                .map(SecretBytes::new)
+            crate::sealed::to_json_zeroizing(&body)
+                .map(|mut json| SecretBytes::new(std::mem::take(&mut *json)))
                 .map_err(|_| ApiError::Backend)
         });
         if let Some(guard) = guard {

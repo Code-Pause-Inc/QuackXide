@@ -35,14 +35,13 @@ use platform_core::{
     ConnectorSlug, DatasetKind, DeclaredSchema, ObjectId, SnapshotVersion, TenantId,
 };
 use platform_crypto::{EnvelopeSuite, SuitePolicy};
-use platform_storage::{StorageError, TenantPaths, VaultStore};
+use platform_storage::{StorageError, VaultStore};
 use platform_telemetry::{AuditKind, security_audit_event};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    ApiError, AppState, AuthedTenant, LIST_READ_CONCURRENCY, MAX_LISTED_OBJECTS,
-    verify_enrollment_record,
+    ApiError, AppState, AuthedTenant, LIST_READ_CONCURRENCY, MAX_LISTED_OBJECTS, enrolled_key,
 };
 
 /// The request body limit for uploads: the dataset size limit
@@ -70,33 +69,19 @@ fn audit_refusal(steward: TenantId, dataset: &str, outcome: &str, reason: &str) 
 }
 
 /// The suite of the steward's enrolled key, or `None` when no key is
-/// enrolled. The record is read through [`verify_enrollment_record`], like
-/// every other reader, so a record enrollment would refuse (one written
-/// before create-once enrollment, say) is refused here too: an internal
-/// fault (500), since enrollment is the only writer of the record. The
-/// development policy accepts every suite; the upload's own suite is
-/// checked against the deployment's policy separately.
+/// enrolled. [`enrolled_key`] reads the record through
+/// [`crate::verify_enrollment_record`], like every other reader, so a record
+/// enrollment would refuse (one written before create-once enrollment, say)
+/// is refused here too: an internal fault (500). The development policy
+/// accepts every suite; the upload's own suite is checked against the
+/// deployment's policy separately.
 async fn enrolled_suite(
     state: &AppState,
     steward: TenantId,
 ) -> Result<Option<EnvelopeSuite>, ApiError> {
-    let stored = match state
-        .vault
-        .get(&TenantPaths::tenant_enrollment(steward))
-        .await
-    {
-        Ok(stored) => stored,
-        Err(StorageError::NotFound) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let record = verify_enrollment_record(&stored, SuitePolicy::DEVELOPMENT)
-        .map_err(|_| ApiError::Internal)?;
-    // `verify_enrollment_record` has checked that the suite is the key's own.
-    [EnvelopeSuite::Hpk1, EnvelopeSuite::Hpk2]
-        .into_iter()
-        .find(|suite| suite.name() == record.suite)
-        .map(Some)
-        .ok_or(ApiError::Internal)
+    Ok(enrolled_key(&*state.vault, steward)
+        .await?
+        .map(|key| key.suite()))
 }
 
 /// `PUT /api/v1/datasets/{dataset}` — store a browser-sealed upload as the

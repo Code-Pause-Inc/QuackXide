@@ -2205,3 +2205,137 @@ async fn a_snapshot_with_no_releasable_key_is_audited() {
         "no tenant key can be released to open the snapshot",
     );
 }
+
+#[tokio::test]
+async fn sealed_research_recipient_refusals_are_audited_with_fingerprints_only() {
+    use base64::Engine as _;
+    use platform_api::sealed::{recipient_key_fingerprint, verify_recipient};
+
+    let capture = AuditCapture::install();
+    let steward = TenantId::generate();
+    let researcher = TenantId::generate();
+    let (app, service, vault) = common::sealed_result_app(
+        SECRET,
+        steward,
+        TenantKeypair::generate(EnvelopeSuite::Hpk2),
+    )
+    .await;
+    let browser = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    let substitute = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    let presented = browser.clone();
+    let fingerprint = recipient_key_fingerprint(&browser);
+
+    // No enrolled key.
+    let before = count_outcome(&capture, "auth.decision", "denied");
+    assert!(
+        service
+            .verify_recipient(researcher, &presented)
+            .await
+            .is_err()
+    );
+    assert_audited_once(
+        &capture,
+        before,
+        "denied",
+        researcher,
+        &format!(
+            "sealed research query refused: no enrolled key recipient_fingerprint={fingerprint}"
+        ),
+    );
+
+    // An enrolled key other than the one presented.
+    assert_eq!(
+        common::enroll_key(&app, &token_for(researcher), &substitute).await,
+        StatusCode::NO_CONTENT
+    );
+    let before = count_outcome(&capture, "auth.decision", "denied");
+    assert!(
+        service
+            .verify_recipient(researcher, &presented)
+            .await
+            .is_err()
+    );
+    assert_audited_once(
+        &capture,
+        before,
+        "denied",
+        researcher,
+        &format!(
+            "sealed research query refused: recipient key is not the enrolled key \
+             recipient_fingerprint={fingerprint} enrolled_fingerprint={}",
+            recipient_key_fingerprint(&substitute)
+        ),
+    );
+
+    // An enrollment record that does not parse.
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(researcher),
+            Bytes::from_static(b"not a record"),
+        )
+        .await
+        .expect("put");
+    let before = count_outcome(&capture, "auth.decision", "failed");
+    assert!(
+        service
+            .verify_recipient(researcher, &presented)
+            .await
+            .is_err()
+    );
+    assert_audited_once(
+        &capture,
+        before,
+        "failed",
+        researcher,
+        "sealed research query refused: enrollment record unreadable",
+    );
+
+    // A release build, before create-once enrollment (P33), refuses even the
+    // enrolled key.
+    assert_eq!(
+        common::enroll_key(&app, &token_for(researcher), &browser).await,
+        StatusCode::NO_CONTENT
+    );
+    let before = count_outcome(&capture, "auth.decision", "denied");
+    assert!(matches!(
+        verify_recipient(false, &*vault, researcher, &presented).await,
+        Err(ApiError::ResearchUnavailable)
+    ));
+    assert_audited_once(
+        &capture,
+        before,
+        "denied",
+        researcher,
+        "sealed research query refused: create-once enrollment (P33) is not built",
+    );
+
+    // Fingerprints only: neither key's bytes reach the audit stream.
+    let events = format!("{:?}", capture.events());
+    for key in [&browser, &substitute] {
+        let raw = key.to_raw();
+        for encoded in [
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw),
+            base64::engine::general_purpose::STANDARD.encode(&raw),
+        ] {
+            assert!(!events.contains(&encoded[..32]), "{events}");
+        }
+    }
+}
+
+/// Exactly one `auth.decision` event with `outcome` was recorded since the
+/// count was `before`, and it is `tenant`'s with this detail.
+fn assert_audited_once(
+    capture: &AuditCapture,
+    before: usize,
+    outcome: &str,
+    tenant: TenantId,
+    detail: &str,
+) {
+    assert_eq!(
+        count_outcome(capture, "auth.decision", outcome) - before,
+        1,
+        "{detail:?} audited other than once in {:?}",
+        capture.events()
+    );
+    assert_tenant_event(capture, "auth.decision", outcome, tenant, detail);
+}
