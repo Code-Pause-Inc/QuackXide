@@ -71,6 +71,27 @@ Client key architecture:
   open, hands it to wasm, and both copies are zeroed when the open ends.
   Device records saved before this scheme held a Web Crypto key that could
   never open anything; the worker replaces it with a new key in this form.
+* **Keys per identity** — the IndexedDB key store (`lib/crypto/keystore.ts`,
+  database version 2) holds one row per verified identity (`iss`, `sub`,
+  `tid`), and the tenant id bound into every AAD is the session's `tid`.
+  A row that does not match the session is refused. Local mode, with no
+  session, has one fixed identity. Version 1's single `device` row, whose
+  tenant id was a random UUID, is left unread: data sealed under it is
+  unsupported pre-v1 data.
+* **Key enrollment** (ADR 0004) — `PUT /api/v1/drive/enrollment` is
+  create-once. The record at `control/enrollments/{tenant}.json` holds the
+  base64 public key, `key_id` (lowercase hex SHA-256 of the raw public
+  key, `TenantPublicKey::fingerprint`), the key's suite name and
+  `created_at_unix`. The same key again is a success; a different key is
+  409 and a `crypto.key_enrollment` denial, which the browser shows as a
+  second-device refusal (v1 has no multi-device keys or recovery). A
+  stored record that fails `verify_enrollment_record` is a backend fault
+  (502, audited "failed"), as `enrolled_suite` treats one.
+  `POST /api/v1/drive/enrollment/rotate` is the only way to replace a key;
+  it refuses (403, audited) until it requires a fresh second factor (P30).
+  In development only, an `HPK1` key may be replaced by an `HPK2` key (the
+  P36 migration), audited as a migration. Anything that seals to an
+  enrolled key reads it through `verify_enrollment_record`.
 * **Worker isolation** — all key handling, encryption, and vault I/O run in a
   dedicated Web Worker (`lib/crypto/worker.ts`). The DOM/UI thread exchanges
   only opaque ids, decrypted summaries it asked for, and download Blobs. A
@@ -579,8 +600,8 @@ browser module share): Google's signature and the token's validity, the
 platform claims, the image digest, its own challenge, and the binding of the
 enclave's keys and of the configuration the token reports
 (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
-`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`). Two inputs
-steer them, both set by the build.
+`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`, `APP_ENV`). Two
+inputs steer them, both set by the build.
 The configuration policy (`ConfigPolicy`) is the simulator's in development
 and test builds and the release one in every other. The trust values (the
 issuer, the key-set URL and the image digests) come from
@@ -1028,13 +1049,23 @@ is read from the process environment before anything else, and `.env` is
 loaded only in development, so a stray `.env` can neither select
 development nor change a production setting.
 
+Leave `APP_ENV` unset in production. Attestation binds it (ADR 0010): the
+workload digests the value in its own environment, and a value the image
+sets with a Dockerfile `ENV` may not appear in the token, so every verifier
+would refuse the enclave. Unset, it adds nothing to the digest, so a
+verifier built before `APP_ENV` was bound still accepts the deployment.
+
 At startup each service calls `PlatformConfig::check_production` before it
 builds anything. In production it refuses to start, with every reason
 listed and a `service.start` "denied" audit event naming keys only, when:
 
+* the bound configuration fails the release attestation policy
+  (`ConfigPolicy::RELEASE`, ADR 0010): `TEE_ATTESTATION_REQUIRED` or
+  `FEATURE_ZK_ENABLED` off, `RESEARCH_MIN_COHORT_SIZE` below 11, or
+  `RESEARCH_DOMINANCE_PERCENT` below 10, so production runs only a
+  configuration a release verifier accepts;
 * `JWT_HS256_SECRET` is set (shared-secret tokens are development-only);
 * `STORAGE_BUCKET` is unset (the in-memory vault);
-* `TEE_ATTESTATION_REQUIRED=false` (development or simulated attestation);
 * `SIM_ATTESTATION_URL` is set (the simulated attestation provider);
 * `KEY_RELEASE_URL` is set (the key-release stand-in, which trusts only the
   simulated root);

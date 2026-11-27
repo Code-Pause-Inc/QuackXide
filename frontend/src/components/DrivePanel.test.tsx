@@ -30,6 +30,8 @@ const ready: InitResult = {
   hpkeKeyAvailable: true,
   hpkePublicKeyB64: "AAAA",
   fingerprint: "ab12-cd34-ef56-7890",
+  identityKey: '["quackxide-dev","user-1","6f2c8a2e-1111-4222-8333-444455556666"]',
+  enrollment: "enrolled",
 };
 
 const file: DriveFileSummary = {

@@ -432,6 +432,17 @@ impl TenantPublicKey {
     pub fn to_framed(&self) -> Vec<u8> {
         [&self.suite().magic()[..], &self.to_raw()].concat()
     }
+
+    /// Lowercase hex SHA-256 of the raw key: the enrollment `key_id`, and
+    /// the fingerprint ADR 0004 matches a researcher's key against.
+    #[cfg(feature = "server")]
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest as _;
+        Sha256::digest(self.to_raw())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for TenantPublicKey {
@@ -709,6 +720,28 @@ impl ZeroizeOnDrop for TenantKeypair {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn fingerprint_is_hex_sha256_of_the_raw_key() {
+        let key = TenantKeypair::derive(EnvelopeSuite::Hpk2, b"fingerprint test").public_key();
+        let fp = key.fingerprint();
+        assert_eq!(fp.len(), 64);
+        assert!(
+            fp.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        let expected: String = {
+            use sha2::Digest as _;
+            Sha256::digest(key.to_raw())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(fp, expected);
+        let other = TenantKeypair::derive(EnvelopeSuite::Hpk2, b"other").public_key();
+        assert_ne!(fp, other.fingerprint());
+    }
 
     #[cfg(feature = "server")]
     const KEY: [u8; AES_KEY_BYTES] = [7u8; AES_KEY_BYTES];

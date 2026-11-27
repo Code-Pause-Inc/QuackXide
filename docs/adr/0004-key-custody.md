@@ -184,7 +184,7 @@ cannot open any.
 
 | Topic | Decision |
 | --- | --- |
-| Enrollment (P33) | One key per tenant, created once; replacing it is an explicit, audited rotation. |
+| Enrollment (P33) | One key per tenant, created once; replacing it is an explicit, audited rotation that requires a fresh second factor (P30) and refuses until then. The record holds the base64 public key, `key_id`, the suite name and `created_at_unix`. `key_id` is the lowercase hex SHA-256 of the raw public key; it is the fingerprint the enclave matches the researcher's key against. A reader verifies the record (`verify_enrollment_record`) and refuses one that fails. The development-only `HPK1` to `HPK2` migration (P36) is the one replacement outside rotation. |
 | Steward loses their device | Queries keep working through the KMS copy; the steward loses direct access to their uploads. Recovery is out of v1 and documented as a limit. Re-wrapping data keys to a newly enrolled key needs enrollment the operator cannot forge (P33), so no such path is proposed. |
 | Revoked grant, changed image | Effective on the next query; no released key outlives a query. |
 | Rotation (P77) | New KMS key versions for new datasets; existing data keys re-wrapped inside the enclave. |

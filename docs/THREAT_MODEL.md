@@ -201,6 +201,11 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   operator, and the in-memory vault, HS256 verifier and demo seed are
   compiled into release binaries. `APP_ENV=development` on a production
   host turns them all back on; the startup audit event records the mode.
+  Attestation binds `APP_ENV`, so a release verifier (the browser,
+  `enclave-check`) refuses a token that reports development and seals no
+  query to it, but the API's other routes still run in development mode.
+  The binding holds only if the token reports `APP_ENV`, which depends on
+  how P49's image and launch policy set it.
   The simulator and key-release stand-in are not affected: they compile
   only with the `dev` feature.
 * **Resource limits as a side channel.** Whether a query runs out of its
@@ -253,7 +258,7 @@ The suite seams are `EnvelopeSuite` (add a suite and move `CURRENT`), the
   process list; it serves the simulated-TEE script, not researchers.
 * **Configuration bound so far.** Attestation binds
   `TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
-  `RESEARCH_MIN_COHORT_SIZE` and `RESEARCH_DOMINANCE_PERCENT`.
+  `RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT` and `APP_ENV`.
   `RESEARCH_DEFAULT_QUERY_BUDGET`, `JWT_ISSUER` and `JWT_AUDIENCE`, which
   ADR 0005 also names, are not bound yet.
 * **Forged or rolled-back snapshots.** Connector objects, uploaded objects

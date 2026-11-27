@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { LocalVault } from "../vault/localVault";
 import { decryptPayload, privateKeyAad } from "./core";
-import { loadDeviceKeys } from "./keystore";
+import { LOCAL_IDENTITY, loadDeviceKeys } from "./keystore";
 import { DriveWorkerClient } from "./workerClient";
 
 const clients: DriveWorkerClient[] = [];
@@ -54,7 +54,8 @@ describe("crypto worker in a real browser", () => {
   it("starts the module worker and creates device keys", async () => {
     const init = await client().init();
     expect(init.created).toBe(true);
-    expect(init.tenantId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    // Local mode has one fixed identity; its tid is the tenant id.
+    expect(init.tenantId).toBe(LOCAL_IDENTITY.tid);
     // The envelope module loads in every supported browser, so the device
     // always gets an HPKE key.
     expect(init.hpkeKeyAvailable).toBe(true);
@@ -63,7 +64,7 @@ describe("crypto worker in a real browser", () => {
 
   it("keeps the KEK non-extractable and the HPKE private key sealed", async () => {
     const init = await client().init();
-    const keys = await loadDeviceKeys();
+    const keys = await loadDeviceKeys(LOCAL_IDENTITY);
     expect(keys).not.toBeNull();
     expect(keys!.kek.extractable).toBe(false);
     await expect(crypto.subtle.exportKey("raw", keys!.kek)).rejects.toThrow();

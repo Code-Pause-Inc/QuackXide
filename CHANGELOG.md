@@ -8,6 +8,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Create-once key enrollment (P33, #175; ADR 0004). An enrollment record
+  carries `key_id` (the lowercase hex SHA-256 of the raw public key), the
+  key's suite and `created_at_unix`, and `verify_enrollment_record`
+  refuses one that fails any check. `POST /api/v1/drive/enrollment/rotate`
+  is the only way to replace a key and refuses (403, audited) until it
+  requires a fresh second factor (P30). The drive's key setup screen
+  refuses a second device, since v1 has no multi-device keys or recovery.
 * A research query box in the portal (#220, first slice): each authorized
   dataset gets a SQL box that sends the plaintext research query, which
   only development builds accept, and shows the released groups, the
@@ -88,9 +95,9 @@ uses [Semantic Versioning](https://semver.org/).
   `ConnectorQueryService::verify_recipient` accepts a sealed request's
   recipient key, as `open_sealed` parsed it, only if it equals, by suite and
   bytes, the key enrolled for the researcher: 403 with no enrolled key or
-  another one, 502 for an unreadable enrollment record, and 503 in a
-  release build until create-once enrollment (P33). Each refusal is audited
-  as `auth.decision` with the key's fingerprint, never the key.
+  another one, 500 for an enrollment record that fails verification, and
+  503 in a release build until create-once enrollment (P33). Each refusal
+  is audited as `auth.decision` with the key's fingerprint, never the key.
   `ConnectorQueryService::seal_research_result` seals the whole result to
   that key under `research_result(tid, research_query_binding(…))`, in the
   key's suite, and signs the frame with the key set's result-signing key,
@@ -515,6 +522,14 @@ uses [Semantic Versioning](https://semver.org/).
   panic's message to stderr, outside the JSON logs: a panic now logs one
   error event with its location and never its message, which can carry
   request or customer data (`platform_telemetry::install_panic_hook`).
+* Production mode refuses to start on a bound configuration the release
+  attestation policy refuses: `TEE_ATTESTATION_REQUIRED` or
+  `FEATURE_ZK_ENABLED` off, `RESEARCH_MIN_COHORT_SIZE` below 11, or
+  `RESEARCH_DOMINANCE_PERCENT` below 10, each listed by name. Attestation
+  binds `APP_ENV` too, and the release policy refuses `development`, so a
+  release verifier refuses a deployment running in development mode
+  (`platform_enclave::config::ConfigPolicy::refusals` lists every refused
+  value).
 * The secret scan also reads every commit message in the history it scans
   (`gitleaks stdin`), since a squash merge copies them onto main, and
   `.github/workflows/secret-scan.yml` runs it on every push to every
@@ -753,6 +768,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `PUT /api/v1/drive/enrollment` no longer replaces an enrolled key: the
+  same key again succeeds, a different key is 409 (audited
+  `crypto.key_enrollment` "denied"), and a stored record that fails
+  verification is 500 (audited "failed"), as is a
+  dataset upload whose enrolled record fails it. Records written before this
+  change have no key id or creation time and fail verification; delete
+  them in development (see #175). In development only, an `HPK1` key may
+  still be replaced by an `HPK2` key (P36).
+* The browser key store is keyed by verified identity (`iss`, `sub`,
+  `tid`), and the tenant id in every AAD is the session's `tid`. The
+  previous single `device` row and data sealed under its random tenant id
+  are no longer read.
 * The pinned Rust toolchain moves from 1.94.1 to 1.100.0
   (`rust-toolchain.toml` and the simulated-TEE `Dockerfile`). `rust-version`
   stays 1.94.

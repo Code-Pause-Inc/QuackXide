@@ -7,28 +7,44 @@ import { resolveBrand } from "../../config/brand";
 import type { AttestationDeps } from "./attestation";
 import type { WorkerResponse } from "./protocol";
 
-vi.mock("./keystore", () => ({
-  loadDeviceKeys: vi.fn(async () => ({
-    tenantId: "local-tenant",
-    kek: {} as CryptoKey,
-    hpkePrivateKey: null,
-    hpkePublicKeyRaw: null,
-    createdAtIso: "2026-01-01T00:00:00.000Z",
-  })),
-  saveDeviceKeys: vi.fn(),
+const stored = vi.hoisted(() => ({
+  /** Whether the stored keys already hold an HPKE key. */
+  hasHpke: false,
+  /** Whether the envelope module loads, so a new HPKE key can be made. */
+  moduleLoads: false,
+  enrollStatus: 204,
+}));
+
+const hpkeKey = vi.hoisted(() => (fill: number) => ({
+  seedKey: {} as CryptoKey,
+  publicKeyRaw: new Uint8Array(32).fill(fill).buffer,
+  sealedPrivateKey: { iv: new ArrayBuffer(12), data: new ArrayBuffer(48) },
+}));
+
+vi.mock("./keystore", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./keystore")>();
+  return {
+    ...actual,
+    loadDeviceKeys: vi.fn(async (identity: { iss: string; sub: string; tid: string }) => ({
+      identity,
+      tenantId: identity.tid,
+      kek: { stand_in: "kek" } as unknown as CryptoKey,
+      hpke: stored.hasHpke ? hpkeKey(1) : null,
+      createdAtIso: "2026-01-01T00:00:00.000Z",
+    })),
+    saveDeviceKeys: vi.fn(),
+  };
+});
+
+vi.mock("./devicekey", () => ({
+  createDeviceHpkeKey: vi.fn(async () => {
+    if (!stored.moduleLoads) throw new Error("envelope module unavailable");
+    return hpkeKey(9);
+  }),
 }));
 
 // The envelope WebAssembly is a build artifact; sealing is not under test.
 vi.mock("./envelope", () => ({ loadEnvelopeModule: vi.fn(async () => undefined) }));
-
-// Key creation succeeds here, so a request that creates a key is seen.
-vi.mock("./devicekey", () => ({
-  createDeviceHpkeKey: vi.fn(async () => ({
-    seedKey: {} as CryptoKey,
-    publicKeyRaw: new ArrayBuffer(32),
-    sealedPrivateKey: { iv: new ArrayBuffer(12), data: new ArrayBuffer(48) },
-  })),
-}));
 
 // Stand-in drive layer: makes one vault request and reports the session
 // claims the worker handed to the crypto core.
@@ -78,6 +94,9 @@ async function send(msg: Record<string, unknown>): Promise<WorkerResponse> {
 
 beforeEach(async () => {
   vi.resetModules();
+  stored.hasHpke = false;
+  stored.moduleLoads = false;
+  stored.enrollStatus = 204;
   responses = [];
   authHeaders = [];
   cache.current.mockReset();
@@ -92,7 +111,10 @@ beforeEach(async () => {
   vi.stubGlobal("location", { origin: "http://localhost:5173" });
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/enrollment") && init?.method === "PUT") {
+        return new Response(null, { status: stored.enrollStatus });
+      }
       authHeaders.push(new Headers(init?.headers).get("Authorization"));
       return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
     }),
@@ -149,6 +171,54 @@ describe("crypto worker session", () => {
     await send({ op: "session", token: "bad" });
     await send({ op: "list" });
     expect(JSON.stringify(responses)).not.toContain(token);
+  });
+});
+
+describe("crypto worker keys and enrollment", () => {
+  it("binds the keys and tenant id to the session identity", async () => {
+    await send({ op: "session", token: jwt("user-1", "tenant-9") });
+    const init = await send({ op: "init" });
+    expect(init).toMatchObject({
+      type: "result",
+      result: {
+        tenantId: "tenant-9",
+        identityKey: JSON.stringify(["quackxide-dev", "user-1", "tenant-9"]),
+      },
+    });
+  });
+
+  it("has no keys without a session in http mode", async () => {
+    expect(await send({ op: "init" })).toMatchObject({ type: "error", message: "no session token" });
+  });
+
+  it("reports an enrolled key, and a refused one from another device", async () => {
+    stored.hasHpke = true;
+    await send({ op: "session", token: jwt("user-1") });
+    expect(await send({ op: "init" })).toMatchObject({ result: { enrollment: "enrolled" } });
+
+    stored.enrollStatus = 409;
+    expect(await send({ op: "init" })).toMatchObject({ result: { enrollment: "refused" } });
+  });
+
+  it("adds an HPKE key later without replacing the master key", async () => {
+    const keystore = await import("./keystore");
+    await send({ op: "session", token: jwt("user-1") });
+    expect(await send({ op: "init" })).toMatchObject({ result: { enrollment: "unavailable" } });
+    expect(keystore.saveDeviceKeys).not.toHaveBeenCalled();
+
+    // The envelope module now loads; a new worker starts.
+    stored.moduleLoads = true;
+    vi.resetModules();
+    await import("./worker");
+    const ks = await import("./keystore");
+    await send({ op: "session", token: jwt("user-1") });
+    expect(await send({ op: "init" })).toMatchObject({ result: { enrollment: "enrolled" } });
+    expect(ks.saveDeviceKeys).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kek: { stand_in: "kek" },
+        hpke: expect.objectContaining({ publicKeyRaw: expect.any(ArrayBuffer) }),
+      }),
+    );
   });
 });
 
