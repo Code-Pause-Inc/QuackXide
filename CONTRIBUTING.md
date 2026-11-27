@@ -49,7 +49,8 @@ Every pull request runs:
   `docs/BENCHMARKS.md` at the base commit and the head, in one job, in the
   job summary; a benchmark significantly more than 10 % slower is flagged
   as a warning, and the job fails only when the comparison cannot run (not
-  a required check);
+  a required check). The browser timings in Chromium are compared the same
+  way when their code or the browser envelope module changes;
 * when the browser envelope module or `backend/` changes, the wasm envelope
   seal in Chromium (`docs/BENCHMARKS.md`), in the job summary (report only,
   never fails on the numbers);
