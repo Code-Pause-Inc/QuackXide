@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use platform_core::{QueryLimits, SecretString, ZkMode};
+use platform_enclave::config::ConfigPolicy;
 use zeroize::Zeroizing;
 
 /// Neutral fallback used until an operator sets `APP_PUBLIC_NAME`.
@@ -105,7 +106,7 @@ impl Service {
 #[error("production mode refuses to start {}: {}", service.as_str(), reasons.join("; "))]
 pub struct ProductionRefusal {
     pub service: Service,
-    pub reasons: Vec<&'static str>,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -383,41 +384,48 @@ impl PlatformConfig {
 
     /// The single production-mode gate, run by every service at startup
     /// before it builds anything. Development passes; production refuses
-    /// every development-only path at once, listing each reason. Kept out of
+    /// every development-only path and every bound value the release
+    /// attestation policy refuses at once, listing each reason. Kept out of
     /// [`Self::from_source`] so tests can build any configuration.
     pub fn check_production(&self, service: Service) -> Result<(), ProductionRefusal> {
         if !self.env.is_production() {
             return Ok(());
         }
-        let mut reasons = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        // The bound configuration first, as attestation reports it: every
+        // value the release policy refuses (ADR 0010 check 5), attestation
+        // turned off included.
+        let env = &self.enclave.attested_env;
+        for refused in ConfigPolicy::RELEASE.refusals(|name| env.get(name).cloned()) {
+            reasons.push(format!(
+                "{refused}: production holds the bound configuration to the release attestation policy"
+            ));
+        }
         if self.auth.hs256_secret.is_some() {
-            reasons
-                .push("JWT_HS256_SECRET is set: shared-secret HS256 tokens are development-only");
-        }
-        if self.storage.bucket.is_none() {
-            reasons.push("STORAGE_BUCKET is unset: the in-memory vault is development-only");
-        }
-        if !self.features.tee_attestation_required {
             reasons.push(
-                "TEE_ATTESTATION_REQUIRED=false: the development and simulated attestation providers are development-only",
+                "JWT_HS256_SECRET is set: shared-secret HS256 tokens are development-only".into(),
             );
         }
+        if self.storage.bucket.is_none() {
+            reasons.push("STORAGE_BUCKET is unset: the in-memory vault is development-only".into());
+        }
         if self.enclave.sim_attestation_url.is_some() {
-            reasons.push("SIM_ATTESTATION_URL is set: the simulated attestation provider is development-only");
+            reasons.push("SIM_ATTESTATION_URL is set: the simulated attestation provider is development-only".into());
         }
         if self.enclave.key_release_url.is_some() {
             reasons.push(
-                "KEY_RELEASE_URL is set: the key-release stand-in trusts only the simulated attestation root",
+                "KEY_RELEASE_URL is set: the key-release stand-in trusts only the simulated attestation root".into(),
             );
         }
         if service == Service::ConnectorWorker {
             if self.connectors.demo_tenant.is_set() {
-                reasons.push("DEMO_TENANT_* is set: the demo tenant is development-only");
+                reasons.push("DEMO_TENANT_* is set: the demo tenant is development-only".into());
             }
             // connector-worker has no production source yet; every job it
             // can schedule is an embedded fixture.
             reasons.push(
-                "connector-worker syncs only embedded fixture sources, which are development-only",
+                "connector-worker syncs only embedded fixture sources, which are development-only"
+                    .into(),
             );
         }
         if reasons.is_empty() {
@@ -918,11 +926,51 @@ mod tests {
             &[
                 ("JWT_HS256_SECRET", "x"),
                 ("TEE_ATTESTATION_REQUIRED", "false"),
+                ("RESEARCH_MIN_COHORT_SIZE", "2"),
             ],
             Service::PlatformApi,
         )
         .expect("refused");
-        assert_eq!(err.reasons.len(), 3, "{err}");
+        assert_eq!(err.reasons.len(), 4, "{err}");
+    }
+
+    /// Production starts only on a bound configuration the release
+    /// attestation policy accepts, so a loosened control never runs where
+    /// only the client's check would stop it (ADR 0010 check 5).
+    #[test]
+    fn production_refuses_what_the_release_policy_refuses() {
+        for (extra, name) in [
+            (
+                ("TEE_ATTESTATION_REQUIRED", "false"),
+                "TEE_ATTESTATION_REQUIRED",
+            ),
+            (("FEATURE_ZK_ENABLED", "false"), "FEATURE_ZK_ENABLED"),
+            (
+                ("RESEARCH_MIN_COHORT_SIZE", "10"),
+                "RESEARCH_MIN_COHORT_SIZE",
+            ),
+            (
+                ("RESEARCH_DOMINANCE_PERCENT", "9"),
+                "RESEARCH_DOMINANCE_PERCENT",
+            ),
+        ] {
+            let err = refusal(&with(PRODUCTION_OK, &[extra]), Service::PlatformApi)
+                .unwrap_or_else(|| panic!("{extra:?} must be refused"));
+            assert_eq!(
+                err.reasons,
+                [format!(
+                    "{name} loosens a control: production holds the bound configuration to the release attestation policy"
+                )],
+            );
+        }
+        assert!(refusal(PRODUCTION_OK, Service::PlatformApi).is_none());
+        assert!(
+            refusal(
+                &with(PRODUCTION_OK, &[("RESEARCH_MIN_COHORT_SIZE", "11")]),
+                Service::PlatformApi
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -933,6 +981,7 @@ mod tests {
             ("TEE_ATTESTATION_REQUIRED", "false"),
             ("SIM_ATTESTATION_URL", "http://127.0.0.1:8070"),
             ("DEMO_TENANT_ID", "t"),
+            ("RESEARCH_MIN_COHORT_SIZE", "2"),
         ]))
         .expect("loads");
         assert_eq!(cfg.env, AppEnv::Development);
@@ -1273,12 +1322,16 @@ mod tests {
         let cfg = PlatformConfig::from_source(source(&[
             ("RESEARCH_MIN_COHORT_SIZE", " 5 "),
             ("FEATURE_ZK_ENABLED", ""),
+            ("APP_ENV", " development "),
             ("PATH", "/bin"),
         ]))
         .expect("loads");
         assert_eq!(
             cfg.enclave.attested_env.into_iter().collect::<Vec<_>>(),
-            [("RESEARCH_MIN_COHORT_SIZE".to_owned(), "5".to_owned())]
+            [
+                ("APP_ENV".to_owned(), "development".to_owned()),
+                ("RESEARCH_MIN_COHORT_SIZE".to_owned(), "5".to_owned()),
+            ]
         );
     }
 
@@ -1334,6 +1387,27 @@ mod tests {
                     "{raw:?}"
                 ),
             }
+        }
+        for raw in [
+            "development",
+            " DEVELOPMENT ",
+            "production",
+            "staging",
+            "",
+            "  ",
+        ] {
+            let pairs = [("APP_ENV", raw)];
+            let cfg = PlatformConfig::from_source(source(&pairs)).expect("any APP_ENV loads");
+            let expected = if cfg.env.is_production() {
+                Ok(())
+            } else {
+                Err(ConfigRefused::Loosens("APP_ENV"))
+            };
+            assert_eq!(
+                ConfigPolicy::RELEASE.check(source(&pairs)),
+                expected,
+                "{raw:?}"
+            );
         }
         let absent = PlatformConfig::from_source(source(&[])).expect("defaults load");
         assert!(absent.features.zk.is_enabled() && absent.features.tee_attestation_required);

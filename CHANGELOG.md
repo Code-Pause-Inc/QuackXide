@@ -516,6 +516,14 @@ uses [Semantic Versioning](https://semver.org/).
   panic's message to stderr, outside the JSON logs: a panic now logs one
   error event with its location and never its message, which can carry
   request or customer data (`platform_telemetry::install_panic_hook`).
+* Production mode refuses to start on a bound configuration the release
+  attestation policy refuses: `TEE_ATTESTATION_REQUIRED` or
+  `FEATURE_ZK_ENABLED` off, `RESEARCH_MIN_COHORT_SIZE` below 11, or
+  `RESEARCH_DOMINANCE_PERCENT` below 10, each listed by name. Attestation
+  binds `APP_ENV` too, and the release policy refuses `development`, so a
+  release verifier refuses a deployment running in development mode
+  (`platform_enclave::config::ConfigPolicy::refusals` lists every refused
+  value).
 * The secret scan also reads every commit message in the history it scans
   (`gitleaks stdin`), since a squash merge copies them onto main, and
   `.github/workflows/secret-scan.yml` runs it on every push to every

@@ -600,8 +600,8 @@ browser module share): Google's signature and the token's validity, the
 platform claims, the image digest, its own challenge, and the binding of the
 enclave's keys and of the configuration the token reports
 (`TEE_ATTESTATION_REQUIRED`, `FEATURE_ZK_ENABLED`,
-`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`). Two inputs
-steer them, both set by the build.
+`RESEARCH_MIN_COHORT_SIZE`, `RESEARCH_DOMINANCE_PERCENT`, `APP_ENV`). Two
+inputs steer them, both set by the build.
 The configuration policy (`ConfigPolicy`) is the simulator's in development
 and test builds and the release one in every other. The trust values (the
 issuer, the key-set URL and the image digests) come from
@@ -1049,13 +1049,23 @@ is read from the process environment before anything else, and `.env` is
 loaded only in development, so a stray `.env` can neither select
 development nor change a production setting.
 
+Leave `APP_ENV` unset in production. Attestation binds it (ADR 0010): the
+workload digests the value in its own environment, and a value the image
+sets with a Dockerfile `ENV` may not appear in the token, so every verifier
+would refuse the enclave. Unset, it adds nothing to the digest, so a
+verifier built before `APP_ENV` was bound still accepts the deployment.
+
 At startup each service calls `PlatformConfig::check_production` before it
 builds anything. In production it refuses to start, with every reason
 listed and a `service.start` "denied" audit event naming keys only, when:
 
+* the bound configuration fails the release attestation policy
+  (`ConfigPolicy::RELEASE`, ADR 0010): `TEE_ATTESTATION_REQUIRED` or
+  `FEATURE_ZK_ENABLED` off, `RESEARCH_MIN_COHORT_SIZE` below 11, or
+  `RESEARCH_DOMINANCE_PERCENT` below 10, so production runs only a
+  configuration a release verifier accepts;
 * `JWT_HS256_SECRET` is set (shared-secret tokens are development-only);
 * `STORAGE_BUCKET` is unset (the in-memory vault);
-* `TEE_ATTESTATION_REQUIRED=false` (development or simulated attestation);
 * `SIM_ATTESTATION_URL` is set (the simulated attestation provider);
 * `KEY_RELEASE_URL` is set (the key-release stand-in, which trusts only the
   simulated root);
