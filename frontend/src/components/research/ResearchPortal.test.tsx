@@ -639,13 +639,14 @@ describe("ResearchPortal", () => {
     const claims = authorizedItem("Claims aggregates");
     expect(claims.getByText("Data dictionary · 2 columns")).toBeInTheDocument();
     expect(claims.getByText("Diagnosis group")).toBeInTheDocument();
-    expect(claims.getByText("SELECT COUNT(*) AS n FROM claims")).toBeInTheDocument();
+    // The example, not the query box it prefills.
+    expect(claims.getByText("SELECT COUNT(*) AS n FROM claims", { selector: "code" })).toBeInTheDocument();
 
     // No listing names it now: the slug, quoted, still queries it.
     const gone = authorizedItem("gone-2");
     expect(gone.getByText("Data dictionary · listing withdrawn")).toBeInTheDocument();
     expect(gone.getByText(/withdrew this listing/)).toBeInTheDocument();
-    expect(gone.getByText('SELECT COUNT(*) AS n FROM "gone-2"')).toBeInTheDocument();
+    expect(gone.getByText('SELECT COUNT(*) AS n FROM "gone-2"', { selector: "code" })).toBeInTheDocument();
   });
 
   it("pre-fills a connector dataset's dictionary in the publish form", async () => {
