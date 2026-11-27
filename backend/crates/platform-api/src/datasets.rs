@@ -69,8 +69,12 @@ fn audit_refusal(steward: TenantId, dataset: &str, outcome: &str, reason: &str) 
 }
 
 /// The suite of the steward's enrolled key, or `None` when no key is
-/// enrolled. Enrollment is the only writer of the record and validates the
-/// key first, so a record that does not parse is a backend fault.
+/// enrolled. [`enrolled_key`] reads the record through
+/// [`crate::verify_enrollment_record`], like every other reader, so a record
+/// enrollment would refuse (one written before create-once enrollment, say)
+/// is refused here too: an internal fault (500). The development policy
+/// accepts every suite; the upload's own suite is checked against the
+/// deployment's policy separately.
 async fn enrolled_suite(
     state: &AppState,
     steward: TenantId,

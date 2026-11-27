@@ -62,8 +62,10 @@ class MemoryVault implements VaultClient {
 }
 
 async function deviceKeys(): Promise<DeviceKeys> {
+  const tid = crypto.randomUUID();
   return {
-    tenantId: crypto.randomUUID(),
+    identity: { iss: "test-issuer", sub: "user-1", tid },
+    tenantId: tid,
     kek: await generateMasterKey(),
     hpke: null,
     createdAtIso: new Date().toISOString(),

@@ -41,9 +41,9 @@ async fn enrollment_vectors_are_accepted_or_refused_as_recorded() {
         SECRET,
         Arc::new(ObjectStoreVault::new_in_memory()),
     ));
-    let token = common::token_for(SECRET, TenantId::generate());
-
     for case in vectors["enrollment"].as_array().expect("enrollment cases") {
+        // Enrollment is create-once, so each case enrolls a fresh tenant.
+        let token = common::token_for(SECRET, TenantId::generate());
         let body = serde_json::json!({ "hpke_public_key_b64": case["public_b64"] });
         let before = denied();
         let (status, _) = send(

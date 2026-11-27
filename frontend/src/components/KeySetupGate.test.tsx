@@ -11,6 +11,8 @@ const info: InitResult = {
   hpkeKeyAvailable: true,
   hpkePublicKeyB64: "AAAA",
   fingerprint: "ab12-cd34-ef56-7890",
+  identityKey: '["quackxide-dev","user-1","6f2c8a2e-1111-4222-8333-444455556666"]',
+  enrollment: "enrolled",
 };
 
 describe("KeySetupGate", () => {
@@ -46,5 +48,14 @@ describe("KeySetupGate", () => {
     );
     expect(screen.getByText(/could not load the encryption module/)).toBeInTheDocument();
     expect(screen.queryByText(/fingerprint/i)).not.toBeInTheDocument();
+  });
+
+  it("refuses a second device instead of offering to open the drive", () => {
+    render(<KeySetupGate info={{ ...info, enrollment: "refused" }} onAcknowledge={vi.fn()} />);
+    expect(screen.getByRole("alert")).toContainElement(
+      screen.getByText(/keys are on another device/i),
+    );
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
   });
 });

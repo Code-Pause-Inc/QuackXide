@@ -353,8 +353,8 @@ impl ConnectorQueryService {
     /// `researcher` (ADR 0010 "Recipient key"), before any grant check or
     /// budget charge: [`crate::sealed::verify_recipient`] in this build. A
     /// release build refuses with 503 until create-once enrollment (P33);
-    /// otherwise no enrolled key or another key is a 403, and an unreadable
-    /// enrollment record a 502. Every refusal is audited.
+    /// otherwise no enrolled key or another key is a 403, and an enrollment
+    /// record that fails verification a 500. Every refusal is audited.
     pub async fn verify_recipient(
         &self,
         researcher: TenantId,

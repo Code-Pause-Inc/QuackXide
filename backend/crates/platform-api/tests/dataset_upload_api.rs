@@ -892,29 +892,46 @@ async fn an_upload_in_another_suite_than_the_enrolled_key_is_refused() {
 #[tokio::test]
 async fn an_unreadable_enrollment_record_fails_the_upload_closed() {
     let capture = platform_telemetry::capture::AuditCapture::install();
-    let vault = in_memory();
-    let (app, steward) = app_over(vault.clone());
-    vault
-        .put(
-            &TenantPaths::tenant_enrollment(steward.tenant),
-            Bytes::from_static(b"not an enrollment record"),
-        )
-        .await
-        .expect("put");
-    let sealed = cohorts_upload(steward.tenant, &steward.key, DATASET, None);
-    let (status, body) = put_upload(&app, Some(&steward.token), DATASET, sealed.body).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (0, 0, 0));
-    assert!(
-        capture
-            .events()
-            .iter()
-            .any(|e| e.audit_kind == "data.access"
+    for legacy in [false, true] {
+        let vault = in_memory();
+        let (app, steward) = app_over(vault.clone());
+        // Garbage, or a record written before create-once enrollment (#175):
+        // the key parses, but there is no key id or creation time, so
+        // `verify_enrollment_record` refuses it and the upload must too.
+        let stored = if legacy {
+            use base64::Engine as _;
+            let key_b64 = base64::engine::general_purpose::STANDARD.encode(steward.key.to_raw());
+            let record = serde_json::json!({
+                "hpke_public_key_b64": key_b64,
+                "suite": steward.key.suite().name(),
+            });
+            Bytes::from(serde_json::to_vec(&record).expect("json"))
+        } else {
+            Bytes::from_static(b"not an enrollment record")
+        };
+        vault
+            .put(&TenantPaths::tenant_enrollment(steward.tenant), stored)
+            .await
+            .expect("put");
+        let sealed = cohorts_upload(steward.tenant, &steward.key, DATASET, None);
+        let (status, body) = put_upload(&app, Some(&steward.token), DATASET, sealed.body).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy={legacy} {body}"
+        );
+        assert_eq!(snapshot_paths(&*vault, steward.tenant).await, (0, 0, 0));
+    }
+    let failed = capture
+        .events()
+        .iter()
+        .filter(|e| {
+            e.audit_kind == "data.access"
                 && e.outcome == "failed"
-                && e.detail == "upload failed dataset=upload_cohorts reason=enrollment_unreadable"),
-        "{:?}",
-        capture.events()
-    );
+                && e.detail == "upload failed dataset=upload_cohorts reason=enrollment_unreadable"
+        })
+        .count();
+    assert_eq!(failed, 2, "{:?}", capture.events());
 }
 
 #[tokio::test]

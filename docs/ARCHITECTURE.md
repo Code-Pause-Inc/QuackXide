@@ -71,6 +71,27 @@ Client key architecture:
   open, hands it to wasm, and both copies are zeroed when the open ends.
   Device records saved before this scheme held a Web Crypto key that could
   never open anything; the worker replaces it with a new key in this form.
+* **Keys per identity** — the IndexedDB key store (`lib/crypto/keystore.ts`,
+  database version 2) holds one row per verified identity (`iss`, `sub`,
+  `tid`), and the tenant id bound into every AAD is the session's `tid`.
+  A row that does not match the session is refused. Local mode, with no
+  session, has one fixed identity. Version 1's single `device` row, whose
+  tenant id was a random UUID, is left unread: data sealed under it is
+  unsupported pre-v1 data.
+* **Key enrollment** (ADR 0004) — `PUT /api/v1/drive/enrollment` is
+  create-once. The record at `control/enrollments/{tenant}.json` holds the
+  base64 public key, `key_id` (lowercase hex SHA-256 of the raw public
+  key, `TenantPublicKey::fingerprint`), the key's suite name and
+  `created_at_unix`. The same key again is a success; a different key is
+  409 and a `crypto.key_enrollment` denial, which the browser shows as a
+  second-device refusal (v1 has no multi-device keys or recovery). A
+  stored record that fails `verify_enrollment_record` is a backend fault
+  (502, audited "failed"), as `enrolled_suite` treats one.
+  `POST /api/v1/drive/enrollment/rotate` is the only way to replace a key;
+  it refuses (403, audited) until it requires a fresh second factor (P30).
+  In development only, an `HPK1` key may be replaced by an `HPK2` key (the
+  P36 migration), audited as a migration. Anything that seals to an
+  enrolled key reads it through `verify_enrollment_record`.
 * **Worker isolation** — all key handling, encryption, and vault I/O run in a
   dedicated Web Worker (`lib/crypto/worker.ts`). The DOM/UI thread exchanges
   only opaque ids, decrypted summaries it asked for, and download Blobs. A

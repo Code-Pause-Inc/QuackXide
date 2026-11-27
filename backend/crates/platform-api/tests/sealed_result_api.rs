@@ -144,7 +144,7 @@ async fn a_research_result_is_sealed_to_the_enrolled_key_and_signed() {
 async fn a_recipient_key_substituted_in_the_enrollment_record_is_refused() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
-    let (app, service, _vault) = sealed_result_app(
+    let (app, service, vault) = sealed_result_app(
         SECRET,
         steward,
         TenantKeypair::generate(EnvelopeSuite::Hpk2),
@@ -176,10 +176,7 @@ async fn a_recipient_key_substituted_in_the_enrollment_record_is_refused() {
             .await
             .is_ok()
     );
-    assert_eq!(
-        enroll_key(&app, &token, &substitute.public_key()).await,
-        StatusCode::NO_CONTENT
-    );
+    common::write_enrollment(&*vault, researcher, &substitute.public_key()).await;
     let refused = service.verify_recipient(researcher, &presented).await;
     assert_eq!(
         refused.map_err(status_of).err(),
@@ -202,7 +199,7 @@ async fn a_recipient_key_substituted_in_the_enrollment_record_is_refused() {
 }
 
 #[tokio::test]
-async fn an_unreadable_enrollment_record_refuses_the_recipient_with_502() {
+async fn an_unreadable_enrollment_record_refuses_the_recipient_with_500() {
     let steward = TenantId::generate();
     let researcher = TenantId::generate();
     let (_app, service, vault) = sealed_result_app(
@@ -222,6 +219,6 @@ async fn an_unreadable_enrollment_record_refuses_the_recipient_with_502() {
     let refused = service.verify_recipient(researcher, &key).await;
     assert_eq!(
         refused.map_err(status_of).err(),
-        Some(StatusCode::BAD_GATEWAY)
+        Some(StatusCode::INTERNAL_SERVER_ERROR)
     );
 }

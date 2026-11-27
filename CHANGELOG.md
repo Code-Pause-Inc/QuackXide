@@ -8,6 +8,13 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* Create-once key enrollment (P33, #175; ADR 0004). An enrollment record
+  carries `key_id` (the lowercase hex SHA-256 of the raw public key), the
+  key's suite and `created_at_unix`, and `verify_enrollment_record`
+  refuses one that fails any check. `POST /api/v1/drive/enrollment/rotate`
+  is the only way to replace a key and refuses (403, audited) until it
+  requires a fresh second factor (P30). The drive's key setup screen
+  refuses a second device, since v1 has no multi-device keys or recovery.
 * A regression check for the browser timings (P73, #185). On pull requests
   that touch the timed code or the wasm envelope module, the `bench`
   workflow's `browser-timings` job runs `npm run bench:browser` in Chromium
@@ -82,9 +89,9 @@ uses [Semantic Versioning](https://semver.org/).
   `ConnectorQueryService::verify_recipient` accepts a sealed request's
   recipient key, as `open_sealed` parsed it, only if it equals, by suite and
   bytes, the key enrolled for the researcher: 403 with no enrolled key or
-  another one, 502 for an unreadable enrollment record, and 503 in a
-  release build until create-once enrollment (P33). Each refusal is audited
-  as `auth.decision` with the key's fingerprint, never the key.
+  another one, 500 for an enrollment record that fails verification, and
+  503 in a release build until create-once enrollment (P33). Each refusal
+  is audited as `auth.decision` with the key's fingerprint, never the key.
   `ConnectorQueryService::seal_research_result` seals the whole result to
   that key under `research_result(tid, research_query_binding(…))`, in the
   key's suite, and signs the frame with the key set's result-signing key,
@@ -747,6 +754,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+* `PUT /api/v1/drive/enrollment` no longer replaces an enrolled key: the
+  same key again succeeds, a different key is 409 (audited
+  `crypto.key_enrollment` "denied"), and a stored record that fails
+  verification is 500 (audited "failed"), as is a
+  dataset upload whose enrolled record fails it. Records written before this
+  change have no key id or creation time and fail verification; delete
+  them in development (see #175). In development only, an `HPK1` key may
+  still be replaced by an `HPK2` key (P36).
+* The browser key store is keyed by verified identity (`iss`, `sub`,
+  `tid`), and the tenant id in every AAD is the session's `tid`. The
+  previous single `device` row and data sealed under its random tenant id
+  are no longer read.
 * The pinned Rust toolchain moves from 1.94.1 to 1.100.0
   (`rust-toolchain.toml` and the simulated-TEE `Dockerfile`). `rust-version`
   stays 1.94.

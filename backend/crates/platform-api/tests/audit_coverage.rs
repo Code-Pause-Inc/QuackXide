@@ -353,6 +353,138 @@ async fn key_enrollment_handshake_is_audited_and_validated() {
 }
 
 #[tokio::test]
+async fn enrollment_is_create_once_and_rotation_fails_closed() {
+    use base64::Engine as _;
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let app = full_app(tenant, ZkMode::Disabled).await;
+    let token = token_for(tenant);
+    let enroll = |key: &TenantKeypair| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key.public_key().to_raw());
+        format!(r#"{{"hpke_public_key_b64":"{b64}"}}"#).into_bytes()
+    };
+    let denied_with = |needle: &str| {
+        capture.events().iter().any(|e| {
+            e.audit_kind == "crypto.key_enrollment"
+                && e.outcome == "denied"
+                && e.detail.contains(needle)
+        })
+    };
+    let first = TenantKeypair::generate(EnvelopeSuite::Hpk2);
+    let second = TenantKeypair::generate(EnvelopeSuite::Hpk2);
+
+    // The first enrollment and an identical retry both succeed.
+    for _ in 0..2 {
+        let (status, _) = send(
+            &app,
+            "PUT",
+            "/api/v1/drive/enrollment",
+            &[bearer(&token), json_header()],
+            enroll(&first),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let (_, stored) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    let record =
+        platform_api::verify_enrollment_record(&stored, platform_crypto::SuitePolicy::DEVELOPMENT)
+            .expect("record verifies");
+    assert_eq!(record.key_id, first.public_key().fingerprint());
+
+    // A different key is refused, audited, and leaves the first in place.
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token), json_header()],
+        enroll(&second),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, after) = send(
+        &app,
+        "GET",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(after, stored);
+    assert!(
+        denied_with("refused re-enrollment"),
+        "{:?}",
+        capture.events()
+    );
+
+    // Rotation refuses until the fresh second factor (P30) exists.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/v1/drive/enrollment/rotate",
+        &[bearer(&token), json_header()],
+        enroll(&second),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(denied_with("rotation refused"), "{:?}", capture.events());
+}
+
+#[tokio::test]
+async fn an_enrollment_record_that_fails_verification_is_a_backend_fault() {
+    let capture = AuditCapture::install();
+    let tenant = TenantId::generate();
+    let vault = Arc::new(ObjectStoreVault::new_in_memory());
+    let mut state = common::app_state(SECRET, vault.clone());
+    state.config = Arc::new(common::development_config());
+    let app = build_app(state);
+    let key = TenantKeypair::generate(EnvelopeSuite::Hpk2).public_key();
+    let key_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(key.to_raw())
+    };
+    // A record written before create-once enrollment: no key id or time.
+    let legacy = serde_json::json!({
+        "hpke_public_key_b64": key_b64,
+        "suite": EnvelopeSuite::Hpk2.name(),
+    });
+    vault
+        .put(
+            &TenantPaths::tenant_enrollment(tenant),
+            serde_json::to_vec(&legacy).expect("json").into(),
+        )
+        .await
+        .expect("seed record");
+
+    // Not a 409: no other device holds a key; the stored record is at fault.
+    let body = format!(r#"{{"hpke_public_key_b64":"{key_b64}"}}"#);
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/api/v1/drive/enrollment",
+        &[bearer(&token_for(tenant)), json_header()],
+        body.into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        capture.events().iter().any(|e| {
+            e.audit_kind == "crypto.key_enrollment"
+                && e.outcome == "failed"
+                && e.detail.contains("fails verification")
+        }),
+        "{:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test]
 async fn query_path_audits_attestation_and_execution_including_failure() {
     let capture = AuditCapture::install();
     let tenant = TenantId::generate();
@@ -1833,7 +1965,7 @@ async fn an_unreadable_enrollment_record_is_audited_on_upload() {
         sealed.body,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_tenant_event(
         &capture,
         "data.access",
@@ -2160,10 +2292,7 @@ async fn sealed_research_recipient_refusals_are_audited_with_fingerprints_only()
 
     // A release build, before create-once enrollment (P33), refuses even the
     // enrolled key.
-    assert_eq!(
-        common::enroll_key(&app, &token_for(researcher), &browser).await,
-        StatusCode::NO_CONTENT
-    );
+    common::write_enrollment(&*vault, researcher, &browser).await;
     let before = count_outcome(&capture, "auth.decision", "denied");
     assert!(matches!(
         verify_recipient(false, &*vault, researcher, &presented).await,
