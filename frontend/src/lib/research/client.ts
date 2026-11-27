@@ -285,8 +285,8 @@ export class ResearchClient {
    *  query, which only `dev` builds accept; a release build takes the sealed
    *  query instead (ADR 0010, #239). Refusals carry the API's fixed message,
    *  which never quotes data. */
-  // ponytail: plain query for the simulated-TEE demo; sealing it in the
-  // browser (#186, #239) replaces this body, not the result handling.
+  // Sealing in the browser (#186, #239) replaces this body, not the result
+  // handling.
   async researchQuery(steward: string, connector: string, sql: string): Promise<ResearchResultView> {
     const response = await fetch(this.url("/api/v1/research/query"), {
       method: "POST",

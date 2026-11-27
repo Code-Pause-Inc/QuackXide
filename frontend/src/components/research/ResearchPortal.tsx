@@ -37,6 +37,10 @@ import { Meter, SectionLabel, StatusChip } from "./ui";
 // development.
 
 const NOTE_MAX = 1000;
+/** The query box sends the plaintext query, a development path: a release
+ *  bundle (`vite build --mode release`, ADR 0009) leaves it out, so no SQL
+ *  leaves the page in the clear. The sealed query (#239) lifts this. */
+const PLAIN_QUERY = import.meta.env.MODE !== "release";
 
 interface PortalData {
   catalog: CatalogView;
@@ -316,17 +320,19 @@ export default function ResearchPortal() {
                     {listing ? (
                       <>
                         <DataDictionaryPanel dictionary={listing.data_dictionary} />
-                        <QueryPanel
-                          initialSql={`SELECT COUNT(*) AS n FROM ${listing.data_dictionary.table}`}
-                          run={(sql) =>
-                            client().researchQuery(grant.steward_tenant, grant.connector, sql)
-                          }
-                          onRan={() => {
-                            refresh().catch((err: unknown) =>
-                              setError(errorMessage(err, "failed to reload the portal")),
-                            );
-                          }}
-                        />
+                        {PLAIN_QUERY && (
+                          <QueryPanel
+                            initialSql={`SELECT COUNT(*) AS n FROM ${listing.data_dictionary.table}`}
+                            run={(sql) =>
+                              client().researchQuery(grant.steward_tenant, grant.connector, sql)
+                            }
+                            onRan={() => {
+                              refresh().catch((err: unknown) =>
+                                setError(errorMessage(err, "failed to reload the portal")),
+                              );
+                            }}
+                          />
+                        )}
                       </>
                     ) : (
                       <DataDictionaryPanel
