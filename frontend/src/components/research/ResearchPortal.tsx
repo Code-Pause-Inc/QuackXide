@@ -25,11 +25,13 @@ import DatasetUploadForm from "./DatasetUploadForm";
 import IssuedGrantRow from "./IssuedGrantRow";
 import RequestRow from "./RequestRow";
 import PublishForm from "./PublishForm";
+import QueryPanel from "./QueryPanel";
 import { inputCls, primaryBtnCls, quietBtnCls } from "./styles";
 import { Meter, SectionLabel, StatusChip } from "./ui";
 
 // Research portal for both roles. Researchers see authorized datasets and the
-// priced catalog, each with its data dictionary, and can request access;
+// priced catalog, each with its data dictionary, query what they are granted
+// (the plain query of `dev` builds), and can request access;
 // stewards review requests, manage listings, and top up or revoke issued
 // access. The token is pasted in (or prefilled from VITE_DEV_JWT) for
 // development.
@@ -312,7 +314,20 @@ export default function ResearchPortal() {
                       <StatusChip tone="active" label="Active" />
                     </div>
                     {listing ? (
-                      <DataDictionaryPanel dictionary={listing.data_dictionary} />
+                      <>
+                        <DataDictionaryPanel dictionary={listing.data_dictionary} />
+                        <QueryPanel
+                          initialSql={`SELECT COUNT(*) AS n FROM ${listing.data_dictionary.table}`}
+                          run={(sql) =>
+                            client().researchQuery(grant.steward_tenant, grant.connector, sql)
+                          }
+                          onRan={() => {
+                            refresh().catch((err: unknown) =>
+                              setError(errorMessage(err, "failed to reload the portal")),
+                            );
+                          }}
+                        />
+                      </>
                     ) : (
                       <DataDictionaryPanel
                         dictionary={{ table: quotedTableName(grant.connector), columns: [] }}

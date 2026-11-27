@@ -168,6 +168,18 @@ export interface PublishListingBody {
   data_dictionary: { columns: DictionaryColumn[] };
 }
 
+/** A research query's released aggregates (`POST /api/v1/research/query`). */
+export interface ResearchResultView {
+  rows: Record<string, unknown>[];
+  row_count: number;
+  /** Groups withheld because they fell below `min_cohort`. */
+  suppressed_rows: number;
+  min_cohort: number;
+  budget_remaining: number;
+  /** "simulated" or "development" off real TEE hardware. */
+  tee_platform: string;
+}
+
 export interface ResolvedRequestView {
   request: AccessRequestView;
   grant?: GrantView & { budget?: BudgetView };
@@ -267,6 +279,27 @@ export class ResearchClient {
     if (response.status === 404) throw new Error(`${what}: not found`);
     if (!response.ok) throw new Error(`${what} failed (${response.status})`);
     return (await response.json()) as T;
+  }
+
+  /** Runs an aggregate query over a granted dataset. The body is the plain
+   *  query, which only `dev` builds accept; a release build takes the sealed
+   *  query instead (ADR 0010, #239). Refusals carry the API's fixed message,
+   *  which never quotes data. */
+  // ponytail: plain query for the simulated-TEE demo; sealing it in the
+  // browser (#186, #239) replaces this body, not the result handling.
+  async researchQuery(steward: string, connector: string, sql: string): Promise<ResearchResultView> {
+    const response = await fetch(this.url("/api/v1/research/query"), {
+      method: "POST",
+      headers: this.headers(true),
+      body: JSON.stringify({ steward_tenant: steward, connector, sql }),
+    });
+    if (response.status === 401) throw new Error("not authenticated");
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as { error?: unknown } | null;
+      const reason = typeof body?.error === "string" ? body.error : "query failed";
+      throw new Error(`${reason} (${response.status})`);
+    }
+    return (await response.json()) as ResearchResultView;
   }
 
   // Steward operations

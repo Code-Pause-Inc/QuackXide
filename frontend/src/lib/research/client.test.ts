@@ -174,3 +174,41 @@ describe("ResearchClient.connectors", () => {
     );
   });
 });
+
+describe("ResearchClient.researchQuery", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("posts the plain query with the caller's token", async () => {
+    const result = {
+      rows: [{ condition: "flu", n: 6 }],
+      row_count: 1,
+      suppressed_rows: 1,
+      min_cohort: 5,
+      budget_remaining: 99,
+      tee_platform: "simulated",
+    };
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify(result)));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(
+      new ResearchClient("https://api.example", "tok").researchQuery("s1", "health", "SELECT 1"),
+    ).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://api.example/api/v1/research/query");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      steward_tenant: "s1",
+      connector: "health",
+      sql: "SELECT 1",
+    });
+  });
+
+  it("shows the API's fixed refusal message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ error: "query refused" }), { status: 422 })),
+    );
+    await expect(new ResearchClient("", "t").researchQuery("s", "c", "x")).rejects.toThrow(
+      "query refused (422)",
+    );
+  });
+});

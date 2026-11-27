@@ -219,8 +219,17 @@ The local stack is a development build, so it takes this plaintext query; a
 release build takes only a query sealed to the enclave (ADR 0010). The query
 releases only conditions with at least `RESEARCH_MIN_COHORT_SIZE` rows and
 counts the rest in `suppressed_rows`: with the default of 11, seven are
-released and two suppressed. The frontend has no research-query form yet, so
-these steps use `curl`.
+released and two suppressed.
+
+The same lifecycle runs in the browser. With the frontend running (above),
+open **Research**, paste the researcher token, choose **Open portal** and
+request access to the listing. Paste the steward token, open the portal
+again and approve the request. Paste the researcher token again: the
+dataset now appears under "Authorized datasets" with a query box. Run the
+query above to see the released groups, the suppressed count and the
+remaining allowance, or `SELECT * FROM health` to see a refusal. Like the
+`curl` steps, the portal sends the plaintext query, so it works only against
+a development build.
 
 ### Simulated TEE (local Docker)
 

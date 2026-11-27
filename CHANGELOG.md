@@ -8,6 +8,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* A research query box in the portal (#220, first slice): each authorized
+  dataset gets a SQL box that sends the plaintext research query, which
+  only development builds accept, and shows the released groups, the
+  suppressed count, the remaining allowance and the TEE platform, or the
+  API's fixed refusal message. The allowance meter reloads after every run,
+  refused or not. The browser-sealed query (#239) replaces the request body.
 * A regression check for the browser timings (P73, #185). On pull requests
   that touch the timed code or the wasm envelope module, the `bench`
   workflow's `browser-timings` job runs `npm run bench:browser` in Chromium
