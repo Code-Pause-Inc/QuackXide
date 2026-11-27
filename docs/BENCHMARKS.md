@@ -90,6 +90,47 @@ comparison with `scripts/bench-compare.sh backend/target/criterion` (needs
 `jq`), starting from an empty `backend/target/criterion`: it judges every
 earlier comparison it finds there.
 
+The browser timings ("Browser timings" below) compare the same way, from
+the repository root, each side with its own wasm module (and its own
+dependencies, `npm ci` in `frontend/`, if the branch changes them):
+
+```sh
+# On main
+scripts/build-wasm.sh
+(cd frontend && npm run bench:browser && cp .vitest/bench.json .vitest/base.json)
+# On the branch
+scripts/build-wasm.sh
+(cd frontend && npm run bench:browser)
+scripts/bench-compare.sh vitest frontend/.vitest/base.json frontend/.vitest/bench.json
+```
+
+On a pull request that touches the timed code, the `bench` workflow's
+`browser-timings` job does this in Chromium: each commit, base first, builds
+its own wasm module and installs its own dependencies on the same runner,
+and the script judges the result with the same threshold. The job summary
+also gives each commit's Chromium version and the wasm module's size, raw
+and gzipped. As above, a regression is a warning, and the job fails only
+when the comparison cannot run (a benchmark failed, none could be judged, a
+report is unreadable).
+
+## Adding a benchmark
+
+Later benchmarks join the same comparison, each with its own target:
+
+* A native benchmark is a criterion bench target (`[[bench]]` with
+  `harness = false`) in any workspace crate. `scripts/bench-targets.sh` lists
+  every bench target, so the `bench` job runs and compares it.
+* A browser benchmark is a Vitest `bench` in a
+  `frontend/src/**/*.browser.bench.ts` file, with a name no other benchmark
+  uses and more than one sample, so the `browser-timings` job compares it.
+* Add the paths of the code it times to both `paths` lists in
+  `.github/workflows/bench.yml`, so that a change to that code runs the
+  comparison.
+* A benchmark new at the head has no base to compare with, so it is judged
+  from the next pull request on (the `browser-timings` job lists it as new).
+* Record its method, its numbers and the machine they come from in this
+  file, with a target agreed with the maintainer.
+
 ## Suites
 
 | Suite | Construction | Public key | Envelope overhead |
@@ -166,7 +207,9 @@ The wasm envelope module, with the enclave evidence checks linked, is
 * Firefox and WebKit report `performance.now()` to 1 ms, so their cold
   starts carry about ±1 ms, and each is a single sample.
 * Like the backend numbers, these vary from run to run and are a reference,
-  not a gate.
+  not a gate. A pull request that touches the timed code compares the
+  Chromium timings with its base commit's, on one runner ("Comparing a
+  change").
 
 ## Steward upload in the browser
 
@@ -258,6 +301,16 @@ above +10 %, so the whole interval is a slowdown of more than 10 %. The
 it.
 Comparing against the numbers recorded above instead would flag runner
 noise, which often exceeds 10 % between runs.
+
+**The browser timings, proposed, needs @AxolDad:** the same threshold,
+applied by the `browser-timings` job. Vitest reports each benchmark's mean
+and its standard error, not an interval for the change, so
+`scripts/bench-compare.sh vitest` computes one: the change is the head's
+mean over the base's, less one, and its 95 % interval comes from the delta
+method for the ratio of two independent means, with the larger of the two
+runs' t critical values (that of the smaller sample). A benchmark with one
+sample in either run, such as the wasm cold start, has no interval: the job
+lists it without a verdict.
 
 **Targets**, on a GitHub-hosted `ubuntu-latest` runner, read against the
 recorded tables:
@@ -378,7 +431,3 @@ Agreed with the maintainer (2026-11-23). On the machine above, in Chromium:
 The regression threshold is the one above. Since these runs are
 not criterion runs, base and head are compared by running the script on
 each, on one machine, in one session.
-
-## Still to come (#185)
-
-* A regression run for the browser timings above.

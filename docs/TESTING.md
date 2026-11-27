@@ -164,7 +164,11 @@ Vitest's JSON output, with the runner's CPU, the browser version and the
 module's raw and gzipped size, to each run's job summary: Chromium on pull
 requests, and Chromium, Firefox and WebKit on `main`, nightly and on demand.
 The step fails, without failing the run, if the bench run fails or prints no
-results. Recorded numbers belong in `docs/BENCHMARKS.md`.
+results. Recorded numbers belong in `docs/BENCHMARKS.md`. On a pull request
+that touches the timed code, the `bench` workflow's `browser-timings` job
+also times them in Chromium at the base commit and the head, and flags a
+significant slowdown of more than 10 % as a warning ("Comparing a change"
+in `docs/BENCHMARKS.md`, which also says how a new benchmark joins it).
 
 ### Envelope vectors
 
